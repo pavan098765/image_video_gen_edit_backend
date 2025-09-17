@@ -1,0 +1,13 @@
+accelerate
+diffusers
+transformers
+einops
+fastapi
+uvicorn
+pillow
+numpy
+xformers==0.0.32.post1
+triton==3.4
+sageattention
+torchsde
+av

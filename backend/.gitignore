@@ -1,0 +1,6 @@
+# Ignore video and image outputs
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.safetensors
