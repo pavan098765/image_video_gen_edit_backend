@@ -1,6 +1,5 @@
 import os
 import time
-import uuid
 import json
 import logging
 import asyncio
@@ -15,6 +14,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from tenacity import retry, wait_exponential, stop_after_attempt
 
+
 # -----------------------
 # GPU cleanup
 # -----------------------
@@ -22,39 +22,82 @@ def cleanup_gpu():
     """Free GPU memory completely (stateless safe mode)."""
     try:
         import torch
+
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
     except Exception:
         pass
     gc.collect()
 
+
 # -----------------------
-# Import inference functions from workers
+# Import inference functions
 # -----------------------
-from quickpod_worker.worker_ltx_video.src.ltx_video_I2V_inference import run_inference_ltx_video_i2v
-from quickpod_worker.worker_ltx_video.src.ltx_video_V2V_inference import run_inference_ltx_video_v2v
+from quickpod_worker.worker_ltx_video.src.ltx_video_I2V_inference import (
+    run_inference_ltx_video_i2v,
+)
+from quickpod_worker.worker_ltx_video.src.ltx_video_V2V_inference import (
+    run_inference_ltx_video_v2v,
+)
 
-from backend.src.quickpod_worker.worker_fastwan.src.fastwan_inference import run_inference_wan_t2i, run_inference_wan_t2v
+from quickpod_worker.worker_fastwan.src.fastwan_1b_inference import (
+    run_inference_wan_1b_t2i,
+    run_inference_wan_1b_t2v,
+)
 
-from quickpod_worker.worker_flux_kontext_dev.src.flux_kontext_dev_inference import run_inference_flux_kontext_dev
+from quickpod_worker.worker_fastwan.src.fastwan_5b_inference import (
+    run_inference_wan_5b_t2i,
+    run_inference_wan_5b_t2v,
+)
 
-from quickpod_worker.worker_qwen_image_edit.src.qwen_image_edit_inference import run_inference_qwen_image_edit
+from quickpod_worker.worker_flux_kontext_dev.src.flux_kontext_dev_inference import (
+    run_inference_flux_kontext_dev,
+)
 
-from backend.src.quickpod_worker.worker_sdxl_photomaker.src.sdxl_photomaker_T2I_inference import run_inference_sdxl_photomaker_t2i
+from quickpod_worker.worker_qwen_image_edit.src.qwen_image_edit_inference import (
+    run_inference_qwen_image_edit,
+)
 
-from quickpod_worker.worker_stable_diffusion_15.src.sd15_I2I_inference import run_inference_sd15_i2i
-from quickpod_worker.worker_stable_diffusion_15.src.sd15_inpaint_inference import run_inference_sd15_inpaint
-from quickpod_worker.worker_stable_diffusion_15.src.sd15_T2I_inference import run_inference_sd15_t2i
+from quickpod_worker.worker_stable_diffusion_15.src.sd15_I2I_inference import (
+    run_inference_sd15_i2i,
+)
+from quickpod_worker.worker_stable_diffusion_15.src.sd15_inpaint_inference import (
+    run_inference_sd15_inpaint,
+)
+from quickpod_worker.worker_stable_diffusion_15.src.sd15_T2I_inference import (
+    run_inference_sd15_t2i,
+)
 
-from quickpod_worker.worker_stable_diffusion_35.src.sd35_I2I_inference import run_inference_sd35_i2i
-from quickpod_worker.worker_stable_diffusion_35.src.sd35_inpaint_inference import run_inference_sd35_inpaint
-from quickpod_worker.worker_stable_diffusion_35.src.sd35_T2I_inference import run_inference_sd35_t2i
+from quickpod_worker.worker_stable_diffusion_35.src.sd35_I2I_inference import (
+    run_inference_sd35_i2i,
+)
+from quickpod_worker.worker_stable_diffusion_35.src.sd35_inpaint_inference import (
+    run_inference_sd35_inpaint,
+)
+from quickpod_worker.worker_stable_diffusion_35.src.sd35_T2I_inference import (
+    run_inference_sd35_t2i,
+)
 
-from quickpod_worker.worker_stable_diffusion_xl.src.sdxl_I2I_inference import run_inference_sdxl_i2i
-from quickpod_worker.worker_stable_diffusion_xl.src.sdxl_inpaint_inference import run_inference_sdxl_inpaint
-from quickpod_worker.worker_stable_diffusion_xl.src.sdxl_T2I_inference import run_inference_sdxl_t2i
+from quickpod_worker.worker_stable_diffusion_xl.src.sdxl_I2I_inference import (
+    run_inference_sdxl_i2i,
+)
+from quickpod_worker.worker_stable_diffusion_xl.src.sdxl_inpaint_inference import (
+    run_inference_sdxl_inpaint,
+)
+from quickpod_worker.worker_stable_diffusion_xl.src.sdxl_T2I_inference import (
+    run_inference_sdxl_t2i,
+)
 
-from quickpod_worker.worker_chroma_flux.src.chroma_flux_T2I_inference import run_inference_chroma_flux_t2i
+from quickpod_worker.worker_stable_diffusion_xl_outpaint.src.diffuser_outpaint_inference import run_inference_diffuser_outpaint
+
+from quickpod_worker.worker_basic_utils.src.bg_remover import run_inference_rmbg
+from quickpod_worker.worker_basic_utils.src.simple_lama_inpaint import run_inference_simple_lama_inpaint
+
+from quickpod_worker.worker_image_upscaler.src.aurasrv2_upscaler import run_inference_aurasr_upscale
+from quickpod_worker.worker_image_upscaler.src.swin2sr_upscaler import run_inference_swin2sr
+# from quickpod_worker.worker_image_upscaler.src.realesrgan_upscaler import run_inference_realesrgan
+# from quickpod_worker.worker_video_upscalers.src.upscale_a_video_inference import run_video_upscale
+
 
 # -----------------------
 # Model Registry
@@ -65,15 +108,14 @@ MODEL_REGISTRY = {
         "v2v": run_inference_ltx_video_v2v,
     },
     "fastwan": {
-        # "14b_i2v": run_inference_fastwan_i2v, 
-        "1b_t2v": run_inference_wan_t2v,
-        "5b_i2v": run_inference_wan_t2v,
-        "5b_t2v": run_inference_wan_t2v,
-        "5b_t2i": run_inference_wan_t2i,
+        "1b_t2v": run_inference_wan_1b_t2v,
+        "1b_t2i": run_inference_wan_1b_t2i,
+        "5b_i2v": run_inference_wan_5b_t2v,
+        "5b_t2v": run_inference_wan_5b_t2v,
+        "5b_t2i": run_inference_wan_5b_t2i,
     },
-    "flux_kontext_dev": run_inference_flux_kontext_dev, 
+    "flux_kontext_dev": run_inference_flux_kontext_dev,
     "qwen_image_edit": run_inference_qwen_image_edit,
-    "sdxl_photomaker": run_inference_sdxl_photomaker_t2i,
     "sd15": {
         "i2i": run_inference_sd15_i2i,
         "t2i": run_inference_sd15_t2i,
@@ -89,7 +131,19 @@ MODEL_REGISTRY = {
         "t2i": run_inference_sdxl_t2i,
         "inpaint": run_inference_sdxl_inpaint,
     },
-    "chroma_flux": run_inference_chroma_flux_t2i,
+    "diffusers_outpaint":run_inference_diffuser_outpaint,
+    "basic_utils":  {
+        "bg_remove": run_inference_rmbg,
+        "lama_inpaint": run_inference_simple_lama_inpaint,
+    },
+    "image_upscale":  {
+        "aurasrv2": run_inference_aurasr_upscale,
+        # "realesrgan": run_inference_realesrgan,
+        "swin2sr": run_inference_swin2sr
+    },
+    # "video_upscale":  {
+    #     "upscale_a_video": run_video_upscale
+    # }
 }
 
 # -----------------------
@@ -101,13 +155,24 @@ logger = logging.getLogger("worker")
 # -----------------------
 # Configuration from env
 # -----------------------
-WORKER_ID = os.getenv("WORKER_ID", str(uuid.uuid4()))
+# Keep backward compatibility with CONTAINER_ID while preferring QuickPod-provided vars
+CONTAINER_ID = os.getenv("CONTAINER_LABEL")
+
+# prefer QuickPod-provided vars; keep backward compat with CONTAINER_ID
+POD_UUID = CONTAINER_ID
+PUBLIC_IPADDR = os.getenv("PUBLIC_IPADDR")
+
+# allow explicit override, else default WORKER_ID = POD_UUID
+WORKER_ID = POD_UUID
+
 MODEL_KEY = os.getenv("MODEL_KEY", "multi-model-worker")
 CONTROLLER_URL = os.getenv("CONTROLLER_URL")
 CONTROLLER_SHARED_SECRET = os.getenv("CONTROLLER_SHARED_SECRET")
 CONTROLLER_API_KEY = os.getenv("CONTROLLER_API_KEY", "")
-WORKER_PUBLIC_URL = os.getenv("WORKER_PUBLIC_URL")
-PORT = int(os.getenv("PORT", "8080"))
+WORKER_PUBLIC_URL = PUBLIC_IPADDR
+INTERNAL_PORT = 8000  # inside pod
+EXTERNAL_PORT = os.getenv(f"QUICKPOD_PORT_{INTERNAL_PORT}")
+PORT = int(EXTERNAL_PORT) if EXTERNAL_PORT else INTERNAL_PORT
 
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "20"))
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
@@ -121,12 +186,11 @@ os.makedirs(WORKSPACE_DIR, exist_ok=True)
 app = FastAPI(title=f"QuickPod Worker ({MODEL_KEY})")
 
 # Job queue & status
-job_queue: asyncio.Queue = asyncio.Queue()
+job_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 job_status: Dict[str, Dict[str, Any]] = {}
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
-
-# Track last model for smart cleanup
 last_model_key: Optional[str] = None
+
 
 # -----------------------
 # Request Models
@@ -137,23 +201,35 @@ class RunRequest(BaseModel):
     model: str
     mode: str | None = None
     params: Dict[str, Any] = {}
+    upload_url: str
+    result_key: str
+
 
 # -----------------------
 # HMAC utils
 # -----------------------
 def sign_payload_bytes(payload_bytes: bytes) -> str:
-    mac = hmac.new(CONTROLLER_SHARED_SECRET.encode("utf-8"), payload_bytes, hashlib.sha256)
+    mac = hmac.new(
+        CONTROLLER_SHARED_SECRET.encode("utf-8"), payload_bytes, hashlib.sha256
+    )
     return "sha256=" + mac.hexdigest()
 
-def post_signed_json(url: str, payload: dict, timeout: int = 10) -> requests.Response:
+
+def signed_headers(payload: dict) -> Dict[str, str]:
     b = json.dumps(payload).encode("utf-8")
     sig = sign_payload_bytes(b)
     headers = {"X-Signature": sig, "Content-Type": "application/json"}
     if CONTROLLER_API_KEY:
         headers["Authorization"] = f"Bearer {CONTROLLER_API_KEY}"
-    resp = requests.post(url, data=b, headers=headers, timeout=timeout)
+    return headers
+
+
+def post_signed_json(url: str, payload: dict, timeout: int = 10) -> requests.Response:
+    headers = signed_headers(payload)
+    resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
     resp.raise_for_status()
     return resp
+
 
 # -----------------------
 # Controller integration
@@ -163,8 +239,12 @@ def register_with_controller():
     register_payload = {
         "worker_id": WORKER_ID,
         "models": list(MODEL_REGISTRY.keys()),
-        "endpoint": WORKER_PUBLIC_URL or f"http://{os.getenv('HOSTNAME')}:{PORT}",
-        "container_id": os.getenv("CONTAINER_ID", None),
+        # prefer explicit public URL if provided otherwise try PUBLIC_IPADDR or HOSTNAME
+        "endpoint": f"http://{PUBLIC_IPADDR}:{PORT}",
+        # send both for compatibility: controller currently expects container_id, accept pod_uuid as preferred
+        "container_id": POD_UUID,   # legacy DB column / server expects this name
+        "pod_uuid": POD_UUID,       # explicit preferred key (controller will accept)
+        "public_ip": PUBLIC_IPADDR,
         "info": {"started_at": datetime.utcnow().isoformat()},
     }
     url = f"{CONTROLLER_URL.rstrip('/')}/register_worker"
@@ -172,19 +252,17 @@ def register_with_controller():
     resp = post_signed_json(url, register_payload, timeout=10)
     return resp.json()
 
+
 @retry(wait=wait_exponential(min=2, max=20), stop=stop_after_attempt(6))
 def send_heartbeat():
-    payload = {"worker_id": WORKER_ID, "timestamp": int(time.time())}
+    payload = {"worker_id": WORKER_ID, "pod_uuid": POD_UUID, "timestamp": int(time.time())}
     url = f"{CONTROLLER_URL.rstrip('/')}/heartbeat"
-    b = json.dumps(payload).encode("utf-8")
-    sig = sign_payload_bytes(b)
-    headers = {"X-Signature": sig, "Content-Type": "application/json"}
-    r = requests.post(url, data=b, headers=headers, timeout=5)
-    r.raise_for_status()
-    return r.json()
+    resp = post_signed_json(url, payload, timeout=5)
+    return resp.json()
+
 
 # -----------------------
-# Inference dispatcher (Smart Cleanup Mode)
+# Inference dispatcher
 # -----------------------
 def resolve_inference_callable(model: str, mode: Optional[str]):
     if model not in MODEL_REGISTRY:
@@ -192,11 +270,16 @@ def resolve_inference_callable(model: str, mode: Optional[str]):
     inference_func = MODEL_REGISTRY[model]
     if isinstance(inference_func, dict):
         if not mode or mode not in inference_func:
-            raise ValueError(f"Mode required for {model}. Available: {list(inference_func.keys())}")
+            raise ValueError(
+                f"Mode required for {model}. Available: {list(inference_func.keys())}"
+            )
         inference_func = inference_func[mode]
     return inference_func
 
-async def run_inference_and_save(job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]) -> str:
+
+async def run_inference_and_save(
+    job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]
+) -> str:
     global last_model_key
     loop = asyncio.get_event_loop()
     params = params.copy()
@@ -205,16 +288,20 @@ async def run_inference_and_save(job_id: str, prompt: str, model: str, mode: Opt
     inference_func = resolve_inference_callable(model, mode)
     model_key = f"{model}:{mode or ''}"
 
-    # cleanup only if model switched
     if last_model_key and last_model_key != model_key:
-        logger.info(f"Switching model {last_model_key} -> {model_key}, cleaning up GPU first")
+        logger.info(
+            f"Switching model {last_model_key} -> {model_key}, cleaning up GPU first"
+        )
         cleanup_gpu()
 
     try:
-        out_path = await loop.run_in_executor(None, inference_func, job_id, prompt, params)
+        out_path = await loop.run_in_executor(
+            None, inference_func, job_id, prompt, params
+        )
         return out_path
     finally:
-        last_model_key = model_key  # track last used model
+        last_model_key = model_key
+
 
 # -----------------------
 # Job Processing
@@ -225,29 +312,51 @@ async def process_job_item(item: Dict[str, Any]):
     mode = item.get("mode")
     prompt = item["prompt"]
     params = item.get("params", {})
+    upload_url = item["upload_url"]
+    result_key = item["result_key"]
 
     logger.info(f"Processing job {job_id} with model={model}, mode={mode}")
-    job_status[job_id] = {"status": "running", "started_at": datetime.utcnow().isoformat()}
+    job_status[job_id] = {
+        "status": "running",
+        "started_at": datetime.utcnow().isoformat(),
+    }
 
     try:
         async with semaphore:
-            out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
-            filename = os.path.basename(out_local)
+            out_local = await run_inference_and_save(
+                job_id, prompt, model, mode, params
+            )
 
-            r2_key = f"results/{job_id}/{filename}"
-            payload = {"job_id": job_id, "result_r2_key": r2_key}
+            # Upload to presigned URL (provided by controller)
+            with open(out_local, "rb") as f:
+                resp = requests.put(upload_url, data=f)
+                resp.raise_for_status()
+
+            # Notify controller job is complete
+            payload = {"job_id": job_id, "result_r2_key": result_key}
             url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
             post_signed_json(url, payload)
 
             job_status[job_id] = {
                 "status": "completed",
-                "result_r2_key": r2_key,
+                "result_r2_key": result_key,
                 "finished_at": datetime.utcnow().isoformat(),
             }
             logger.info("Job %s completed", job_id)
     except Exception as e:
         logger.exception("Job %s failed: %s", job_id, e)
         job_status[job_id] = {"status": "failed", "error": str(e)}
+        payload = {
+            "job_id": job_id,
+            "result_r2_key": None,
+            "failed": True,
+            "error": str(e),
+        }
+        try:
+            post_signed_json(f"{CONTROLLER_URL.rstrip('/')}/job_complete", payload)
+        except Exception as e2:
+            logger.error("Failed to notify controller of failure: %s", e2)
+
 
 async def worker_loop():
     logger.info("Starting worker loop")
@@ -258,32 +367,42 @@ async def worker_loop():
         finally:
             job_queue.task_done()
 
+
 # -----------------------
 # FastAPI Endpoints
 # -----------------------
 @app.post("/run")
 async def run_endpoint(req: RunRequest):
-    if req.job_id in job_status and job_status[req.job_id].get("status") in ("queued", "running"):
+    if req.job_id in job_status and job_status[req.job_id].get("status") in (
+        "queued",
+        "running",
+    ):
         raise HTTPException(status_code=409, detail="job already queued or running")
     await job_queue.put(req.dict())
-    job_status[req.job_id] = {"status": "queued", "queued_at": datetime.utcnow().isoformat()}
+    job_status[req.job_id] = {
+        "status": "queued",
+        "queued_at": datetime.utcnow().isoformat(),
+    }
     logger.info("Enqueued job %s", req.job_id)
     return {"status": "accepted", "job_id": req.job_id}
+
 
 @app.get("/health")
 def health():
     return {"status": "ok", "worker_id": WORKER_ID, "queue_size": job_queue.qsize()}
 
+
 @app.get("/status")
 def status():
     return {"queue_size": job_queue.qsize(), "jobs": job_status}
+
 
 # -----------------------
 # Startup / Shutdown
 # -----------------------
 @app.on_event("startup")
 async def on_startup():
-    logger.info("Worker starting in smart cleanup mode (reuse same model, cleanup on switch)")
+    logger.info("Worker starting in smart cleanup mode")
     try:
         register_with_controller()
     except Exception as e:
@@ -300,6 +419,7 @@ async def on_startup():
 
     asyncio.create_task(hb_loop())
     asyncio.create_task(worker_loop())
+
 
 @app.on_event("shutdown")
 def on_shutdown():

@@ -1,0 +1,12 @@
+fastapi==0.108.0
+uvicorn==0.35.0
+pydantic==2.11.7
+pydantic_core==2.33.2
+requests==2.32.5
+tenacity==9.1.2
+
+pillow==11.3.0
+numpy==1.26.4
+huggingface-hub==0.35.0
+xformers==0.0.32.post2
+realesrgan @ git+https://github.com/xinntao/Real-ESRGAN.git@a4abfb2979a7bbff3f69f58f58ae324608821e27

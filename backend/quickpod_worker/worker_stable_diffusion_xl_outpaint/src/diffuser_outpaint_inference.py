@@ -136,7 +136,7 @@ def preview_image_and_mask(image, width, height, overlap_percentage, resize_opti
     
     return preview
 
-def infer(
+def run_inference_diffuser_outpaint(
     pipe,
     image, 
     width, 
@@ -271,7 +271,7 @@ if __name__ == "__main__":
     # --- 4. Run Inference ---
     print("\n🧠 Starting image generation...")
     # Combine the dictionaries to pass all required parameters to infer
-    control_image, final_image = infer(pipe, input_image, **preview_params, **inference_params)
+    control_image, final_image = run_inference_diffuser_outpaint(pipe, input_image, **preview_params, **inference_params)
     
     # --- 5. Save Results ---
     if final_image:

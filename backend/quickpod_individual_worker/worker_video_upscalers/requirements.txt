@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+pydantic
+requests
+tenacity
+
+pillow
+numpy
+torch
+diffusers
+transformers
+accelerate
+safetensors
+huggingface-hub
+xformers

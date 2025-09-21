@@ -67,7 +67,7 @@ def _get_model(scale: str):
 # -------------------------
 # Main Upscale function
 # -------------------------
-def run_inference(job_id: str, params: Dict[str, Any]) -> str:
+def run_inference_realesrgan(job_id: str, params: Dict[str, Any]) -> str:
     input_image = _load_image(params.get("image"))
     if input_image is None:
         raise ValueError("input_image is required for upscaling")
@@ -102,5 +102,5 @@ if __name__ == "__main__":
         "output_dir": "./outputs",
     }
 
-    out = run_inference(job_id, params=params)
+    out = run_inference_realesrgan(job_id, params=params)
     print("✅ Upscale result saved at:", out)

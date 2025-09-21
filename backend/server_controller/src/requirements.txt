@@ -1,8 +1,45 @@
-fastapi
-uvicorn[standard]
-requests
-python-dotenv
-sqlalchemy
-pydantic
-tenacity
-python-jose
+# Web Framework and ASGI Server
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
+# Database
+sqlalchemy>=2.0.0
+
+# HTTP Client
+requests>=2.31.0
+
+# Environment and Configuration
+python-dotenv>=1.0.0
+
+# Data Validation and Settings
+pydantic>=2.1.0
+
+# Retry Logic
+tenacity>=8.2.0
+
+# JWT/Token Handling
+python-jose>=3.3.0
+
+# AWS SDK (for R2/S3 operations)
+boto3>=1.28.0
+
+# Date/Time Handling
+python-dateutil>=2.8.2
+
+# Type Hints (for development)
+typing-extensions>=4.7.0
+
+# Logging Enhancements
+structlog>=23.1.0
+
+# Testing (for development)
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+httpx>=0.24.0  # For async HTTP client in tests
+
+# Security
+cryptography>=41.0.0
+
+# Performance Monitoring
+psutil>=5.9.0  # For system resource monitoring
+
