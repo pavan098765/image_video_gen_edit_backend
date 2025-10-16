@@ -1,39 +1,53 @@
 # upscale_realesrgan_local.py
-import base64
+import sys
 import os
+import base64
 from io import BytesIO
 from typing import Dict, Any, Optional, Union
+import numpy as np
+import cv2
 from PIL import Image
 import torch
-from realesrgan import RealESRGAN
+
+# --- Compatibility shim for basicsr + newer torchvision ---
+try:
+    from torchvision.transforms import functional as F
+    sys.modules["torchvision.transforms.functional_tensor"] = F
+except ImportError:
+    pass
+# -----------------------------------------------------------
+
+from realesrgan import RealESRGANer
+from realesrgan.archs.srvgg_arch import SRVGGNetCompact
+from basicsr.archs.rrdbnet_arch import RRDBNet
+from gfpgan import GFPGANer
+
 
 # -------------------------
 # Config / paths
 # -------------------------
-os.environ["HF_HOME"] = "/models_storage/all_models"
-os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
-
-MODEL_DIR = os.path.join("/models_storage", "all_models", "realesrgan")
-os.makedirs(MODEL_DIR, exist_ok=True)
-
+MODEL_DIR = os.environ.get("REALESRGAN_LOCAL_PATH", "/app/models/realesrgan")
+GFPGAN_MODEL_PATH = os.path.join(MODEL_DIR, "GFPGANv1.3.pth")
 DEFAULT_OUTPUT_DIR = "./outputs"
+os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
-# Model mapping for scales -> local .pth files
 MODEL_MAP = {
-    "x4_general": "realesr-general-x4v3.pth",
-    "x4_general_wdn": "realesr-general-wdn-x4v3.pth",
-    "x4_plus": "RealESRGAN_x4plus.pth",
+    "RealESRGAN_x4plus": os.path.join(MODEL_DIR, "RealESRGAN_x4plus.pth"),
+    "RealESRNet_x4plus": os.path.join(MODEL_DIR, "RealESRNet_x4plus.pth"),
+    "RealESRGAN_x4plus_anime_6B": os.path.join(MODEL_DIR, "RealESRGAN_x4plus_anime_6B.pth"),
+    "RealESRGAN_x2plus": os.path.join(MODEL_DIR, "RealESRGAN_x2plus.pth"),
+    "realesr-general-x4v3": os.path.join(MODEL_DIR, "realesr-general-x4v3.pth"),
+    "realesr-general-wdn-x4v3": os.path.join(MODEL_DIR, "realesr-general-wdn-x4v3.pth"),
 }
 
-# Cache loaded models to avoid reloading
-LOADED_MODELS: Dict[str, RealESRGAN] = {}
-
+LOADED_MODELS: Dict[str, RealESRGANer] = {}
 
 # -------------------------
 # Helpers
 # -------------------------
 def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image.Image]:
+    """Load image from PIL, bytes, path, or base64 string."""
     if img is None:
         return None
     if isinstance(img, Image.Image):
@@ -48,59 +62,128 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
     except Exception as e:
         raise ValueError(f"Unable to decode image from input: {e}")
 
+def _strip_metadata(img: Image.Image) -> Image.Image:
+    """Remove EXIF/ICC metadata safely."""
+    with BytesIO() as buf:
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return Image.open(buf).convert("RGB")
 
-def _parse_scale(scale_key: str) -> int:
-    """Extract numeric scale (x2, x4, x8) from model key."""
-    for num in [8, 4, 2]:
-        if f"x{num}" in scale_key:
-            return num
-    raise ValueError(f"Cannot infer numeric scale from key: {scale_key}")
+def _get_model(model_name: str, params: Dict[str, Any]) -> RealESRGANer:
+    """Load and cache RealESRGAN model from local weights."""
+    if model_name in LOADED_MODELS:
+        return LOADED_MODELS[model_name]
 
+    if model_name not in MODEL_MAP:
+        raise ValueError(f"Unsupported model '{model_name}'. Available: {list(MODEL_MAP.keys())}")
 
-def _get_model(scale: str) -> RealESRGAN:
-    """Load and cache the local RealESRGAN model."""
-    scale = scale.lower()
-    if scale not in MODEL_MAP:
-        raise ValueError(f"Unsupported scale '{scale}'. Supported: {list(MODEL_MAP.keys())}")
+    model_path = MODEL_MAP[model_name]
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"❌ Missing model weights at {model_path}")
 
-    if scale in LOADED_MODELS:
-        return LOADED_MODELS[scale]
+    # Pick correct architecture
+    if model_name in ["RealESRGAN_x4plus", "RealESRNet_x4plus"]:
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                        num_block=23, num_grow_ch=32, scale=4)
+        netscale = 4
+    elif model_name == "RealESRGAN_x4plus_anime_6B":
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                        num_block=6, num_grow_ch=32, scale=4)
+        netscale = 4
+    elif model_name == "RealESRGAN_x2plus":
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                        num_block=23, num_grow_ch=32, scale=2)
+        netscale = 2
+    elif model_name == "realesr-general-x4v3":
+        model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3,
+                                num_feat=64, num_conv=32,
+                                upscale=4, act_type="prelu")
+        netscale = 4
+    else:
+        raise ValueError(f"Model architecture not implemented: {model_name}")
 
-    model_path = os.path.join(MODEL_DIR, MODEL_MAP[scale])
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    scale_num = _parse_scale(scale)
+    # Handle optional DNI blending
+    dni_weight = None
+    if model_name == "realesr-general-x4v3":
+        denoise_strength = float(params.get("denoise_strength", 1.0))
+        if denoise_strength != 1.0:
+            wdn_model_path = MODEL_MAP["realesr-general-wdn-x4v3"]
+            model_path = [model_path, wdn_model_path]
+            dni_weight = [denoise_strength, 1 - denoise_strength]
 
-    model = RealESRGAN(device, scale=scale_num)
-    model.load_weights(model_path, download=False)
-    model.eval()
+    upsampler = RealESRGANer(
+        scale=netscale,
+        model_path=model_path,
+        model=model,
+        dni_weight=dni_weight,
+        tile=int(params.get("tile", 0)),
+        tile_pad=int(params.get("tile_pad", 10)),
+        pre_pad=int(params.get("pre_pad", 0)),
+        half=not params.get("fp32", False),
+        gpu_id=0 if torch.cuda.is_available() else None
+    )
 
-    LOADED_MODELS[scale] = model
-    print(f"[Init] Loaded RealESRGAN model '{scale}' on {device}")
-    return model
+    LOADED_MODELS[model_name] = upsampler
+    return upsampler
 
 
 # -------------------------
-# Main Upscale function
+# Main Upscale Function
 # -------------------------
 def run_inference_realesrgan(job_id: str, params: Dict[str, Any]) -> str:
-    # Backward compat: accept both "init_image" and "image"
-    init_image = params.get("init_image") or params.get("image")
-    input_image = _load_image(init_image)
+    """
+    Run RealESRGAN (optionally with GFPGAN) and return output path.
+    Supports all models listed in MODEL_MAP.
+    """
+    input_image = _load_image(params.get("init_image"))
     if input_image is None:
-        raise ValueError("init_image is required for upscaling")
+        raise ValueError("❌ 'init_image' parameter required")
 
-    scale = params.get("scale", "x4_plus")
-    model = _get_model(scale)
+    model_name = params.get("model_name", "RealESRGAN_x4plus")
+    upsampler = _get_model(model_name, params)
+
+    # Optional GFPGAN for face enhancement
+    face_enhance = bool(params.get("face_enhance", False))
+    face_enhancer = None
+    if face_enhance:
+        if not os.path.exists(GFPGAN_MODEL_PATH):
+            raise FileNotFoundError("❌ GFPGAN weights missing in container.")
+        face_enhancer = GFPGANer(
+            model_path=GFPGAN_MODEL_PATH,
+            upscale=params.get("outscale", 4),
+            arch="clean",
+            channel_multiplier=2,
+            bg_upsampler=upsampler,
+        )
 
     output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f"upscaled_{scale}_{job_id}.png")
+    suffix = params.get("suffix", "out")
+    outscale = float(params.get("outscale", 4))
+    out_path = os.path.join(output_dir, f"upscaled_{job_id}_{suffix}.png")
 
-    # Upscale
-    with torch.no_grad():
-        out_img = model.predict(input_image)
+    try:
+        # Convert input RGB → BGR for OpenCV / RealESRGAN
+        np_input = cv2.cvtColor(np.array(input_image), cv2.COLOR_RGB2BGR)
 
-    out_img.save(out_path)
+        if face_enhancer:
+            _, _, output = face_enhancer.enhance(
+                np_input, has_aligned=False, only_center_face=False, paste_back=True
+            )
+        else:
+            output, _ = upsampler.enhance(np_input, outscale=outscale)
+
+        # Convert BGR → RGB for correct color display
+        output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
+        output_rgb = np.clip(output_rgb, 0, 255).astype(np.uint8)
+
+        pil_img = Image.fromarray(output_rgb)
+        clean_img = _strip_metadata(pil_img)  # ✅ Remove metadata before saving
+        clean_img.save(out_path)
+
+    except Exception as e:
+        raise RuntimeError(f"❌ Inference failed (try smaller tile or fp32=True): {e}")
+
     return out_path
 
 
@@ -110,14 +193,23 @@ def run_inference_realesrgan(job_id: str, params: Dict[str, Any]) -> str:
 if __name__ == "__main__":
     job_id = "realesrgan_local_test"
     input_path = "./input_image.jpg"
+    if not os.path.exists(input_path):
+        raise SystemExit("❌ Please provide input_image.jpg to test this script.")
 
     with open(input_path, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode("utf-8")
 
     params = {
         "init_image": img_b64,
-        "scale": "x4_plus",  # x4_general, x4_general_wdn, x4_plus
+        "model_name": "RealESRGAN_x4plus",  # any from MODEL_MAP
+        "outscale": 4,
+        "face_enhance": False,
+        "tile": 0,
+        "tile_pad": 10,
+        "fp32": False,
+        "suffix": "test",
         "output_dir": "./outputs",
+        "denoise_strength": 0.8,  # optional for general-x4v3
     }
 
     out = run_inference_realesrgan(job_id, params=params)

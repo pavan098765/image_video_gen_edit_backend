@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from typing import List, Optional, Union
-import sys
+
 import cv2
 import PIL.Image
 import torch
@@ -24,9 +24,8 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline, StableDiffusio
 from diffusers.schedulers import KarrasDiffusionSchedulers
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
-sys.path.append("/quickpod")
-from quickpod_worker.worker_stable_diffusion_xl_outpaint.src.controlnet_union import ControlNetModel_Union
 
+from controlnet_union import ControlNetModel_Union
 
 
 def latents_to_rgb(latents):

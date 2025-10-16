@@ -1,4 +1,3 @@
-# simple_lama_inpaint.py
 """
 Simple LaMa inpainting wrapper with outpainting-friendly mask preparation.
 """
@@ -9,28 +8,28 @@ from io import BytesIO
 from typing import Dict, Any, Optional, Union
 from PIL import Image
 import torch
-
-# ----------------------------
-# Environment Setup
-# ----------------------------
-os.environ["XFORMERS_OFFLOAD_CPU"] = "1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
-    "garbage_collection_threshold:0.6,max_split_size_mb:512,expandable_segments:True"
-)
-
-# Force HuggingFace model caches into /models_storage
-CACHE_DIR = "/models_storage/all_models"
-for var in ["LAMA_MODEL", "HF_HOME", "HF_HUB_CACHE", "XDG_CACHE_HOME"]:
-    os.environ[var] = CACHE_DIR
-
 from simple_lama_inpainting import SimpleLama
+from upscaler import upscale_image
 
 # ----------------------------
 # Globals
 # ----------------------------
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda"  # enforce GPU only
 DEFAULT_OUTPUT_DIR = "./outputs_outpaint"
 os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
+
+# Local baked TorchScript path (set in container build or startup)
+LAMA_LOCAL_PATH = os.environ.get("LAMA_LOCAL_PATH", "/app/models/basic_utils/lama/lama.pt").strip()
+os.environ["LAMA_MODEL"] = LAMA_LOCAL_PATH
+
+# Initialize model once
+try:
+    if not os.path.exists(LAMA_LOCAL_PATH):
+        raise FileNotFoundError(f"❌ LaMa model file not found at {LAMA_LOCAL_PATH}")
+    SIMPLE_LAMA = SimpleLama()
+    print(f"✅ SimpleLama initialized from: {LAMA_LOCAL_PATH}")
+except Exception as e:
+    raise RuntimeError(f"❌ Failed to initialize SimpleLama. Error: {e}")
 
 # ----------------------------
 # Helpers
@@ -51,35 +50,45 @@ def _safe_b64decode(data: Union[str, bytes]) -> bytes:
     return base64.b64decode(raw)
 
 
-def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image.Image]:
+def _load_image(img: Optional[Union[str, Image.Image, bytes]], force_gray: bool = False) -> Optional[Image.Image]:
     """Load an image from path, PIL, bytes, or base64."""
     if img is None:
         return None
     if isinstance(img, Image.Image):
-        return img.convert("RGB")
+        return img.convert("L" if force_gray else "RGB")
     if isinstance(img, bytes):
-        return Image.open(BytesIO(img)).convert("RGB")
+        return Image.open(BytesIO(img)).convert("L" if force_gray else "RGB")
 
     s = str(img)
     if os.path.exists(s):
-        return Image.open(s).convert("RGB")
+        return Image.open(s).convert("L" if force_gray else "RGB")
 
     try:
         decoded = _safe_b64decode(s)
-        return Image.open(BytesIO(decoded)).convert("RGB")
+        return Image.open(BytesIO(decoded)).convert("L" if force_gray else "RGB")
     except Exception as e:
         raise ValueError(f"Unable to decode image: {e}")
 
 
-def process_with_lama(init_image: Image.Image, mask_image: Image.Image, output_path: str) -> str:
+def process_with_lama(job_id: str, init_image: Image.Image, mask_image: Image.Image, output_dir: str, params: Dict[str, Any]) -> str:
     """Run LaMa inpainting given an image and mask."""
-    # Initialize model once
-    SIMPLE_LAMA = SimpleLama()
 
-    result = SIMPLE_LAMA.inpaint(init_image, mask_image)
-    result.save(output_path)
-    return os.path.abspath(output_path)
+    out_path = os.path.join(output_dir, f"lama_inpaint_{job_id}.png")
+    result = SIMPLE_LAMA(init_image, mask_image)
+    result.save(out_path)
 
+    # -------------------------
+    # Optional Upscaling and compulsory metadata removal
+    # -------------------------
+    scale_image = params.get("scale_image", True)
+    scale_factor = params.get("scale_factor", 2) if scale_image else 0
+    model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
+
+    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
+
+    upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
+    upscaled.save(upscaled_path)
+    return os.path.abspath(upscaled_path)
 
 # ----------------------------
 # Core Function
@@ -95,7 +104,7 @@ def run_inference_simple_lama_inpaint(job_id: str, prompt: Optional[str], params
         output_dir (optional) - where to save output
     """
     init_image = _load_image(params.get("init_image"))
-    mask_img = _load_image(params.get("mask_image"))
+    mask_img = _load_image(params.get("mask_image"), force_gray=True)
 
     if init_image is None:
         raise ValueError("init_image is required for inpainting")
@@ -107,9 +116,7 @@ def run_inference_simple_lama_inpaint(job_id: str, prompt: Optional[str], params
     output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
     os.makedirs(output_dir, exist_ok=True)
 
-    out_path = os.path.join(output_dir, f"lama_inpaint_{job_id}.png")
-    return process_with_lama(init_image, mask_img, out_path)
-
+    return process_with_lama(job_id, init_image, mask_img, output_dir, params)
 
 # ----------------------------
 # Example usage

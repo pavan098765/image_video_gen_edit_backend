@@ -1,46 +1,62 @@
 # aurasrv2_upscaler.py
+# ✅ Lazy-loading implementation for AuraSR-v2
+# Supports 2x or 4x upscale, auto-handles multiple calls efficiently.
 
-import os
-os.environ["HF_HOME"] = "/models_storage/all_models"
-os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
 import base64
+import os
 from typing import Dict, Any, Optional, Union
 from io import BytesIO
 from PIL import Image
+import httpx
 import numpy as np
 import torch
+
+torch.cuda.empty_cache()
+
 from aura_sr import AuraSR
 
-# -------------------------
-# Setup
-# -------------------------
-
-# Patch torch.load temporarily for device mapping
-_original_load = torch.load
-torch.load = lambda *args, **kwargs: _original_load(
-    *args,
-    **kwargs,
-    map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-)
+# --- Auto-merge split safetensors if merge.py exists ---
+try:
+    from merge import main as merge_main
+    print("🔍 Scanning for .safetensors.part-* files...")
+    merge_main()
+except Exception as e:
+    print(f"⚠️ merge.py auto-merge skipped or failed: {e}")
 
 # -------------------------
-# Lazy globals
+# Model Setup (Lazy Loading)
 # -------------------------
-_aura_sr = None
+AURASR_LOCAL = os.environ.get("AURASR_LOCAL_PATH")
+if not AURASR_LOCAL or not os.path.exists(AURASR_LOCAL):
+    raise RuntimeError("❌ AuraSR local model not found. Ensure it is baked or downloaded to AURASR_LOCAL_PATH.")
+
+_model_cache = {
+    "aura_sr": None
+}
+
+def get_aura_sr() -> AuraSR:
+    """
+    Lazily load AuraSR-v2 model once, cache it globally for reuse.
+    """
+    global _model_cache
+    if _model_cache["aura_sr"] is not None:
+        return _model_cache["aura_sr"]
+
+    print("🧠 Loading AuraSR-v2 model...")
+    aura_sr = AuraSR.from_pretrained("fal/AuraSR-v2")
+    _model_cache["aura_sr"] = aura_sr
+    print("✅ AuraSR-v2 model loaded and cached.")
+    return aura_sr
 
 
-def _get_aura_sr() -> AuraSR:
-    """Lazy-load AuraSR model once and cache it."""
-    global _aura_sr
-    if _aura_sr is None:
-        print("[Init] Loading AuraSR-v2 model...")
-        _aura_sr = AuraSR.from_pretrained("fal/AuraSR-v2")
-        print("[Init] AuraSR-v2 model ready")
-    return _aura_sr
-
-
-# Restore original torch.load
-torch.load = _original_load
+def unload_aura_sr():
+    """
+    Optional cleanup: unload AuraSR and free VRAM/CPU cache.
+    """
+    global _model_cache
+    _model_cache["aura_sr"] = None
+    torch.cuda.empty_cache()
+    print("🧹 AuraSR model cache cleared and GPU memory freed.")
 
 
 # -------------------------
@@ -67,21 +83,22 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
 # -------------------------
 def upscale_image(input_image: np.ndarray, scale: int = 4) -> np.ndarray:
     """
-    Upscale an image using AuraSR.
-    AuraSR natively supports 4x; we emulate 2x by downscaling the 4x output.
+    Upscale an image by 4x using AuraSR.
+    Supports 2x via resizing down from 4x.
     """
     if input_image is None:
         raise ValueError("No input image provided for upscaling.")
 
+    aura_sr = get_aura_sr()
     pil_image = Image.fromarray(input_image)
-    aura_sr = _get_aura_sr()
 
-    # AuraSR only supports 4x
+    print(f"⚙️ Running AuraSR upscale ({scale}x)...")
     upscaled_image = aura_sr.upscale_4x(pil_image)
 
     if scale == 2:
         w, h = upscaled_image.size
         upscaled_image = upscaled_image.resize((w // 2, h // 2), Image.LANCZOS)
+        print("🔁 Downscaled from 4x to 2x for final output.")
 
     return np.array(upscaled_image)
 
@@ -90,6 +107,11 @@ def upscale_image(input_image: np.ndarray, scale: int = 4) -> np.ndarray:
 # Inference wrapper
 # -------------------------
 def run_inference_aurasr_upscale(job_id: str, params: Dict[str, Any]) -> str:
+    """
+    Run AuraSR-v2 inference for 2x or 4x upscaling.
+    Returns path to the upscaled image.
+    """
+    print(f"🧩 Starting AuraSR upscale job: {job_id}")
     init_image = _load_image(params.get("init_image"))
     if init_image is None:
         raise ValueError("init_image is required for upscaling")
@@ -98,11 +120,15 @@ def run_inference_aurasr_upscale(job_id: str, params: Dict[str, Any]) -> str:
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"aurasr_upscaled_{job_id}.png")
 
-    scale = int(params.get("scale", 4))  # default 4x
+    scale = int(params.get("scale", 4))
+    if scale not in [2, 4]:
+        raise ValueError("Scale must be 2 or 4 for AuraSR upscaling.")
+
     result = upscale_image(np.array(init_image), scale=scale)
     Image.fromarray(result).save(out_path)
 
-    return out_path
+    print(f"✅ Upscaled image saved to {out_path}")
+    return os.path.abspath(out_path)
 
 
 # -------------------------
@@ -110,10 +136,14 @@ def run_inference_aurasr_upscale(job_id: str, params: Dict[str, Any]) -> str:
 # -------------------------
 if __name__ == "__main__":
     job_id = "upscale_debug"
-    input_path = "./input_image.jpg"
+    url = "https://pub-67f874d172874988b5754734cc4fcb7e.r2.dev/Snapinsta.app_262322643_4937545659591345_7487236998017046274_n_1080.jpg"
 
-    with open(input_path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+    with httpx.Client(timeout=60) as c:
+        img_bytes = c.get(url).content
+    img_b64 = base64.b64encode(img_bytes).decode()
+
+
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
     params = {
         "init_image": img_b64,

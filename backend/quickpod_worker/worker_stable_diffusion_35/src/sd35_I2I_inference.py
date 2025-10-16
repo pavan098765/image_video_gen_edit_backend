@@ -1,90 +1,91 @@
-# sd35_i2i_inference.py
-# Stable Diffusion 3.5 Img2Img (GGUF backend)
+# sd35_inpaint_inference.py
+# ✅ Lazy-loading implementation
+# SD 3.5 Img2Img using pre-downloaded GGUF + text encoders (GPU-only, baked models)
 
 import os
-os.environ["HF_HOME"] = "/models_storage/all_models"
-os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
 import base64
 from io import BytesIO
 from typing import Any, Dict, Optional, Union
 from PIL import Image
+import torch
+
 from stable_diffusion_cpp import StableDiffusion
-from huggingface_hub import hf_hub_download
+from upscaler import upscale_image
+
+torch.cuda.empty_cache()
 
 # -------------------------
-# Environment setup
+# Environment / Paths
 # -------------------------
+MODEL_DIR = "/models/sd35"
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+SD35_LOCAL_PATH = os.environ.get(
+    "SD35_LOCAL_PATH",
+    os.path.join(MODEL_DIR, "hf_models", "second-state_stable-diffusion-3.5-large-GGUF"),
+)
 
-MODEL_DIR = os.path.join("/models_storage", "all_models")
-os.makedirs(MODEL_DIR, exist_ok=True)
-
-HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
-
-# -------------------------
-# Model definitions
-# -------------------------
+# Model component filenames (baked in image)
 MODEL_FILES = {
-    "DIFFUSION_MODEL": (
-        "second-state/stable-diffusion-3.5-large-GGUF",
-        "sd3.5_large-Q8_0.gguf",
-    ),
-    "CLIP_L_PATH": (
-        "second-state/stable-diffusion-3.5-large-GGUF",
-        "clip_l.safetensors",
-    ),
-    "CLIP_G_PATH": (
-        "second-state/stable-diffusion-3.5-large-GGUF",
-        "clip_g-Q8_0.gguf",
-    ),
-    "T5XXL_PATH": (
-        "second-state/stable-diffusion-3.5-large-GGUF",
-        "t5xxl-Q8_0.gguf",
-    ),
+    "DIFFUSION_MODEL": "sd3.5_large-Q8_0.gguf",
+    "CLIP_L_PATH": "clip_l.safetensors",
+    "CLIP_G_PATH": "clip_g-Q8_0.gguf",
+    "T5XXL_PATH": "t5xxl-Q8_0.gguf",
 }
 
-# Cache pipeline
-STABLE_DIFFUSION: Optional[StableDiffusion] = None
+MODEL_PATHS = {k: os.path.join(SD35_LOCAL_PATH, v) for k, v in MODEL_FILES.items()}
+
+# Validate model files exist
+for key, path in MODEL_PATHS.items():
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"❌ Missing required model file: {path}")
+    else:
+        print(f"✓ {key} found at {path}")
+
+# -------------------------
+# Lazy Loader Cache
+# -------------------------
+_model_cache = {
+    "sd35": None
+}
+
+def get_sd35() -> StableDiffusion:
+    """
+    Lazily load the Stable Diffusion 3.5 model.
+    Cached globally for reuse across Img2Img jobs.
+    """
+    global _model_cache
+    if _model_cache["sd35"] is not None:
+        return _model_cache["sd35"]
+
+    print("🧠 Loading Stable Diffusion 3.5 model (GGUF + CLIP + T5)...")
+    sd = StableDiffusion(
+        model_path=MODEL_PATHS["DIFFUSION_MODEL"],
+        clip_l_path=MODEL_PATHS["CLIP_L_PATH"],
+        clip_g_path=MODEL_PATHS["CLIP_G_PATH"],
+        t5xxl_path=MODEL_PATHS["T5XXL_PATH"],
+        keep_vae_on_cpu=True,
+        keep_clip_on_cpu=True
+    )
+    _model_cache["sd35"] = sd
+    print("✅ Stable Diffusion 3.5 model loaded and cached.")
+    return sd
+
+
+def unload_sd35():
+    """
+    Optional cleanup: unload SD3.5 model and free GPU/CPU memory.
+    """
+    global _model_cache
+    _model_cache["sd35"] = None
+    torch.cuda.empty_cache()
+    print("🧹 Stable Diffusion 3.5 model cache cleared and GPU memory freed.")
 
 
 # -------------------------
 # Helpers
 # -------------------------
-def _download_models():
-    """Download required models into MODEL_DIR."""
-    local_paths = {}
-    for key, (repo_id, filename) in MODEL_FILES.items():
-        print(f"[Download] {key} → {repo_id}/{filename}")
-        path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            token=HF_TOKEN,
-            cache_dir=MODEL_DIR,
-        )
-        local_paths[key] = path
-    return local_paths
-
-
-def _get_pipeline() -> StableDiffusion:
-    """Lazy init Stable Diffusion 3.5 pipeline."""
-    global STABLE_DIFFUSION
-    if STABLE_DIFFUSION is not None:
-        return STABLE_DIFFUSION
-
-    model_paths = _download_models()
-    STABLE_DIFFUSION = StableDiffusion(
-        model_path=model_paths["DIFFUSION_MODEL"],
-        clip_l_path=model_paths["CLIP_L_PATH"],
-        clip_g_path=model_paths["CLIP_G_PATH"],
-        t5xxl_path=model_paths["T5XXL_PATH"],
-    )
-    print("[Init] Stable Diffusion 3.5 i2i pipeline loaded")
-    return STABLE_DIFFUSION
-
-
 def _get_dynamic_size(img: Image.Image, max_dim: int = 1152) -> tuple[int, int]:
-    """Keep aspect ratio, round to multiple-of-64, max dimension capped."""
+    """Compute output resolution keeping aspect ratio, multiple-of-64, within max_dim."""
     w, h = img.size
     aspect = w / h
     if w > h:
@@ -103,7 +104,7 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
     if img is None:
         return None
     if isinstance(img, Image.Image):
-        return img
+        return img.convert("RGB")
     if isinstance(img, bytes):
         return Image.open(BytesIO(img)).convert("RGB")
     if os.path.exists(str(img)):
@@ -112,35 +113,40 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
         decoded = base64.b64decode(img)
         return Image.open(BytesIO(decoded)).convert("RGB")
     except Exception as e:
-        raise ValueError(f"Unable to decode image from input: {e}")
+        raise ValueError(f"Unable to decode image: {e}")
 
 
 # -------------------------
-# Main inference
+# Main Inference
 # -------------------------
 def run_inference_sd35_i2i(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
     """
-    Run SD 3.5 Img2Img and save result locally.
-    Returns PNG path.
+    Run SD 3.5 Img2Img inference and save the result locally.
+    Returns the path to the saved PNG file.
     """
-    pipe = _get_pipeline()
+    print(f"🧩 Starting SD 3.5 Img2Img job: {job_id}")
+    sd = get_sd35()
 
-    negative_prompt = params.get("negative_prompt")
+    negative_prompt = params.get("negative_prompt", "lowres, bad anatomy, error, cropped, worst quality")
     strength = float(params.get("strength", 0.65))
-    init_image = _load_image(params.get("images"))
+    init_image = _load_image(params.get("init_image"))
     steps = int(params.get("sample_steps", 25))
     cfg = float(params.get("cfg_scale", 4.5))
     method = params.get("sample_method", "euler")
     seed = int(params.get("seed", -1))
     output_dir = params.get("output_dir", "./outputs")
-    os.makedirs(output_dir, exist_ok=True)
 
     if init_image is None:
         raise ValueError("init_image is required for img2img")
 
+    # Compute output resolution
     width, height = _get_dynamic_size(init_image, max_dim=1152)
 
-    out = pipe.generate_image(
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"⚙️ Running SD3.5 Inference | Steps={steps}, CFG={cfg}, Strength={strength}, Method={method}")
+
+    # Run inference
+    output = sd.generate_image(
         prompt=prompt,
         negative_prompt=negative_prompt,
         init_image=init_image,
@@ -153,27 +159,45 @@ def run_inference_sd35_i2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
         seed=seed,
     )
 
-    out_path = os.path.join(output_dir, f"sd35_i2i_{job_id}.png")
+    out_path = os.path.join(output_dir, f"sd_35_i2i_{job_id}.png")
 
-    # Save robustly
-    img = out[0] if isinstance(out, list) else out
-    if isinstance(img, Image.Image):
-        img.save(out_path)
+    if isinstance(output, list) and isinstance(output[0], Image.Image):
+        output[0].save(out_path)
+    elif isinstance(output, Image.Image):
+        output.save(out_path)
     else:
-        Image.fromarray(img).save(out_path)
+        Image.fromarray(output).save(out_path)
 
-    return out_path
+    print(f"🖼️ Base generated image saved to {out_path}")
+
+    # -------------------------
+    # Optional Upscaling and Metadata Removal
+    # -------------------------
+    scale_image = params.get("scale_image", True)
+    scale_factor = params.get("scale_factor", 2) if scale_image else 0
+    model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
+
+    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
+
+    upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
+    upscaled.save(upscaled_path)
+
+    print(f"🚀 Upscaled image saved to {upscaled_path}")
+    return os.path.abspath(upscaled_path)
 
 
 # -------------------------
-# Example usage
+# CLI Test
 # -------------------------
 if __name__ == "__main__":
-    job_id = "test2"
-    prompt = "high quality, photorealistic, intricate details"
+    job_id = "test_sd35_i2i"
+    prompt = "A cinematic landscape with mountains at sunset, high detail, photorealistic"
+    input_path = "./input_image.jpg"
 
-    image_input_path = "./input_image.jpg"
-    with open(image_input_path, "rb") as f:
+    if not os.path.exists(input_path):
+        raise SystemExit("❌ Please provide input_image.jpg to test this script.")
+
+    with open(input_path, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode("utf-8")
 
     params = {
@@ -184,8 +208,8 @@ if __name__ == "__main__":
         "output_dir": "./outputs",
         "images": img_b64,
         "negative_prompt": (
-            "lowres, bad anatomy, error body, error hands, error fingers, "
-            "deformed, blurry, extra limbs, cloned face, malformed limbs"
+            "lowres, bad anatomy, error body, blurry, fuzzy, out of focus, malformed, "
+            "extra limbs, cloned face, gross proportions, deformed, disfigured"
         ),
     }
 

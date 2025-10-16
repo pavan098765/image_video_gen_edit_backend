@@ -1,11 +1,11 @@
-# realism_illustrious_infer.py
-# Robust SDXL Txt2Img with dynamic resolution + embedding auto-prepend
+# inference_sdxl_t2i.py
+# ✅ Lazy-loading implementation
+# SDXL Txt2Img with scheduler switch, embedding auto-prepend, and upscaling
+# GPU-only, assumes baked local models
 
 import os
-os.environ["HF_HOME"] = "/models_storage/all_models"
-os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
 import random
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any
 from PIL import Image
 import torch
 from diffusers import (
@@ -13,137 +13,118 @@ from diffusers import (
     DPMSolverMultistepScheduler,
     EulerAncestralDiscreteScheduler,
 )
+from upscaler import upscale_image
+
+torch.cuda.empty_cache()
 
 # -------------------------
-# Environment
+# Paths / Config
 # -------------------------
+MODEL_ID = os.environ.get("SDXL_LOCAL_PATH")
+if not MODEL_ID or not os.path.exists(MODEL_ID):
+    raise RuntimeError("❌ SDXL_LOCAL_PATH is not set or invalid. Ensure the model is baked and available.")
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+EMBEDDINGS_DIR = os.environ.get("SDXL_EMBEDDINGS_PATH", os.path.join(MODEL_ID, "embeddings"))
+POS_EMBED_PATH = os.path.join(EMBEDDINGS_DIR, "Stable_Yogis_Illustrious_Positives.safetensors")
+NEG_EMBED_PATH = os.path.join(EMBEDDINGS_DIR, "Stable_Yogis_Illustrious_Negatives-neg.safetensors")
 
-MODEL_DIR = os.path.join("/models_storage", "all_models")
-os.makedirs(MODEL_DIR, exist_ok=True)
-
-MODEL_ID = "John6666/realism-illustrious-by-stable-yogi-v50-fp16-sdxl"
-
-EMB_DIR = os.path.join(MODEL_DIR, "realism_illustrious", "embeddings")
-os.makedirs(EMB_DIR, exist_ok=True)
-
-POS_EMB_FILENAME = "Stable_Yogis_Illustrious_Positives.safetensors"
-NEG_EMB_FILENAME = "Stable_Yogis_Illustrious_Negatives-neg.safetensors"
-POS_EMB_PATH = os.path.join(EMB_DIR, POS_EMB_FILENAME)
-NEG_EMB_PATH = os.path.join(EMB_DIR, NEG_EMB_FILENAME)
+POS_TOKEN = "illustrious_pos"
+NEG_TOKEN = "illustrious_neg"
 
 DEFAULT_OUTPUT_DIR = "./outputs"
 os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
 # -------------------------
-# Cached pipeline
+# Lazy Loader Cache
 # -------------------------
-PIPE: Optional[StableDiffusionXLPipeline] = None
-DEFAULT_SCHEDULER_CONFIG = None
-POS_EMB_PREPEND: Optional[str] = None
-NEG_EMB_PREPEND: Optional[str] = None
+_model_cache = {"pipe": None, "scheduler_config": None}
 
 
-def _get_pipeline() -> StableDiffusionXLPipeline:
-    """Lazy-load pipeline + textual inversion embeddings."""
-    global PIPE, DEFAULT_SCHEDULER_CONFIG, POS_EMB_PREPEND, NEG_EMB_PREPEND
-    if PIPE is not None:
-        return PIPE
+def get_sdxl_t2i_pipe():
+    """Lazy-load the SDXL Txt2Img pipeline and cache it."""
+    global _model_cache
+    if _model_cache["pipe"] is not None:
+        return _model_cache["pipe"], _model_cache["scheduler_config"]
 
-    PIPE = StableDiffusionXLPipeline.from_pretrained(
+    print("🧠 Loading SDXL Txt2Img pipeline...")
+    pipe = StableDiffusionXLPipeline.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16,
         use_safetensors=True,
-        cache_dir=MODEL_DIR,
     ).to("cuda")
 
-    DEFAULT_SCHEDULER_CONFIG = PIPE.scheduler.config
+    scheduler_config = pipe.scheduler.config
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(scheduler_config)
 
-    # Try loading textual inversion embeddings
-    POS_EMB_PREPEND = "illustrious_pos"
-    NEG_EMB_PREPEND = "illustrious_neg"
+    # Load textual inversion embeddings (optional)
+    if os.path.exists(POS_EMBED_PATH):
+        try:
+            pipe.load_textual_inversion(POS_EMBED_PATH, token=POS_TOKEN)
+            print(f"✅ Loaded positive embedding: {POS_EMBED_PATH}")
+        except Exception as e:
+            print(f"⚠️ Failed to load POS embedding: {e}")
 
-    try:
-        if os.path.exists(POS_EMB_PATH):
-            PIPE.load_textual_inversion(POS_EMB_PATH, token=POS_EMB_PREPEND)
-        else:
-            POS_EMB_PREPEND = f"embedding:{POS_EMB_FILENAME}"
-    except Exception:
-        POS_EMB_PREPEND = f"embedding:{POS_EMB_FILENAME}"
+    if os.path.exists(NEG_EMBED_PATH):
+        try:
+            pipe.load_textual_inversion(NEG_EMBED_PATH, token=NEG_TOKEN)
+            print(f"✅ Loaded negative embedding: {NEG_EMBED_PATH}")
+        except Exception as e:
+            print(f"⚠️ Failed to load NEG embedding: {e}")
 
-    try:
-        if os.path.exists(NEG_EMB_PATH):
-            PIPE.load_textual_inversion(NEG_EMB_PATH, token=NEG_EMB_PREPEND)
-        else:
-            NEG_EMB_PREPEND = f"embedding:{NEG_EMB_FILENAME}"
-    except Exception:
-        NEG_EMB_PREPEND = f"embedding:{NEG_EMB_FILENAME}"
-
-    print("[Init] SDXL Txt2Img pipeline loaded")
-    return PIPE
+    _model_cache["pipe"] = pipe
+    _model_cache["scheduler_config"] = scheduler_config
+    print("✅ SDXL Txt2Img pipeline loaded and cached.")
+    return pipe, scheduler_config
 
 
-# -------------------------
-# Helpers
-# -------------------------
-def _get_dynamic_size(
-    ref_img: Optional[Union[str, Image.Image]] = None, max_dim: int = 1152
-) -> tuple[int, int]:
-    """
-    Compute width/height for Txt2Img keeping aspect ratio of reference image.
-    If no image is provided, defaults to max_dim x max_dim (multiple of 64).
-    """
-    if isinstance(ref_img, str) and os.path.exists(ref_img):
-        ref_img = Image.open(ref_img).convert("RGB")
-    if isinstance(ref_img, Image.Image):
-        w, h = ref_img.size
-        aspect = w / h
-        if w > h:
-            new_w = min(w, max_dim)
-            new_h = int(new_w / aspect)
-        else:
-            new_h = min(h, max_dim)
-            new_w = int(new_h * aspect)
-    else:
-        new_w = new_h = max_dim
-
-    new_w = max(64, (new_w // 64) * 64)
-    new_h = max(64, (new_h // 64) * 64)
-    return new_w, new_h
+def unload_sdxl_t2i_pipe():
+    """Optional cleanup: unload SDXL Txt2Img pipeline and free GPU memory."""
+    global _model_cache
+    _model_cache["pipe"] = None
+    _model_cache["scheduler_config"] = None
+    torch.cuda.empty_cache()
+    print("🧹 SDXL Txt2Img pipeline cache cleared and GPU memory freed.")
 
 
 # -------------------------
-# Main Txt2Img inference
+# Main Inference
 # -------------------------
 def run_inference_sdxl_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
-    pipe = _get_pipeline()
+    """Run SDXL Txt2Img inference with lazy loading and embedding auto-prepend."""
+    print(f"🧩 Starting SDXL Txt2Img job: {job_id}")
+    pipe, scheduler_config = get_sdxl_t2i_pipe()
 
     negative_prompt = params.get("negative_prompt", "")
 
-    # Auto-prepend embeddings
-    if POS_EMB_PREPEND and POS_EMB_PREPEND not in prompt:
-        prompt = f"{POS_EMB_PREPEND}, {prompt}"
-    if NEG_EMB_PREPEND and NEG_EMB_PREPEND not in str(negative_prompt):
-        negative_prompt = f"{NEG_EMB_PREPEND}, {negative_prompt}"
+    # Auto-prepend embeddings if not already in prompt
+    if POS_TOKEN not in prompt:
+        prompt = f"{POS_TOKEN}, {prompt}"
+    if NEG_TOKEN not in str(negative_prompt):
+        negative_prompt = f"{NEG_TOKEN}, {negative_prompt}"
 
     # Scheduler selection
     sampler_name = params.get("sampler", "DPMSolverMultistep")
     if sampler_name == "DPMSolverMultistep":
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(DEFAULT_SCHEDULER_CONFIG)
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(scheduler_config)
     elif sampler_name == "EulerA":
-        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(DEFAULT_SCHEDULER_CONFIG)
+        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(scheduler_config)
+    else:
+        print(f"⚠️ Unknown sampler '{sampler_name}', defaulting to DPMSolverMultistep.")
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(scheduler_config)
 
+    # Parameters
     steps = int(params.get("sample_steps", 30))
-    width = int(params.get("width", 512))
-    height = int(params.get("height", 512))
+    width = int(params.get("width", 768))
+    height = int(params.get("height", 768))
     cfg = float(params.get("cfg_scale", 5))
     seed = int(params.get("seed", random.randint(0, 2**32 - 1)))
     output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
     os.makedirs(output_dir, exist_ok=True)
+
+    print(f"⚙️ Running Txt2Img | Steps={steps}, CFG={cfg}, Sampler={sampler_name}, Seed={seed}")
     generator = torch.manual_seed(seed) if seed >= 0 else None
 
-    # Run inference
+    # Inference
     result = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
@@ -155,17 +136,32 @@ def run_inference_sdxl_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     )
 
     image = result.images[0]
-    out_path = os.path.join(output_dir, f"realism_illustrious_{job_id}.png")
+    out_path = os.path.join(output_dir, f"sdxl_t2i_{job_id}.png")
     image.save(out_path)
-    return out_path
+    print(f"🖼️ Base image saved at {out_path}")
+
+    # -------------------------
+    # Optional Upscaling and metadata removal
+    # -------------------------
+    scale_image = params.get("scale_image", True)
+    scale_factor = params.get("scale_factor", 2) if scale_image else 0
+    model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
+
+    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
+
+    upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
+    upscaled.save(upscaled_path)
+    print(f"🚀 Upscaled image saved at {upscaled_path}")
+
+    return os.path.abspath(upscaled_path)
 
 
 # -------------------------
-# CLI test
+# CLI Test
 # -------------------------
 if __name__ == "__main__":
     job_id = "test_rlsxl"
-    prompt = "a beautiful indian girl in bikini, highly detailed, cinematic lighting, ultra realistic"
+    prompt = "a beautiful indian girl, highly detailed, cinematic lighting, ultra realistic"
 
     params = {
         "sample_steps": 30,

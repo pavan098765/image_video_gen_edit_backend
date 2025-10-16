@@ -1,105 +1,216 @@
-
-import base64
-import datetime
-import gc
-from io import BytesIO
 import os
-from pathlib import Path
-from typing import Any, Dict
-import torch
-from diffusers import LTXConditionPipeline, LTXLatentUpsamplePipeline
-from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
-from diffusers.utils import export_to_video, load_video
+import base64
+import random
+import tempfile
+from io import BytesIO
+from typing import Dict, Any, Optional
 from PIL import Image
+import numpy as np
+import torch
+import imageio
+import yaml
 
-MODEL_PATH = "../all_models/ltx_video/" 
+# --- Auto-merge split safetensors if merge.py exists ---
+try:
+    from merge import main as merge_main
+    print("🔍 Scanning for .safetensors.part-* files...")
+    merge_main()
+except Exception as e:
+    print(f"⚠️ merge.py auto-merge skipped or failed: {e}")
 
-pipe = LTXConditionPipeline.from_pretrained("jbilcke-hf/LTX-Video-2b-0-9-8-distilled-HFIE", torch_dtype=torch.bfloat16)
-pipe_upsample = LTXLatentUpsamplePipeline.from_pretrained("Lightricks/ltxv-spatial-upscaler-0.9.7", vae=pipe.vae, torch_dtype=torch.bfloat16)
-pipe.to("cuda")
-pipe_upsample.to("cuda")
-pipe.vae.enable_tiling()
+# -----------------------------
+# Model Configuration
+# -----------------------------
+MODEL_DIR = os.environ.get("LTX_VIDEO_LOCAL_PATH", "/app/models/ltx_video")
+CONFIG_PATH = os.environ.get("LTX_CONFIG_PATH", "configs/ltxv-13b-0.9.8-distilled.yaml")
 
-def round_to_nearest_resolution_acceptable_by_vae(height, width):
-    height = height - (height % pipe.vae_spatial_compression_ratio)
-    width = width - (width % pipe.vae_spatial_compression_ratio)
-    return height, width
+PIPELINE_CACHE = {}
+FPS = 30
+MAX_SEED = np.iinfo(np.int32).max
 
-def run_inference_ltx_video_i2v(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
+# -----------------------------
+# Core Imports
+# -----------------------------
+from inference import (
+    create_ltx_video_pipeline,
+    create_latent_upsampler,
+    seed_everething,
+    calculate_padding,
+    load_image_to_tensor_with_resize_and_crop,
+    load_media_file,
+)
+from ltx_video.pipelines.pipeline_ltx_video import LTXMultiScalePipeline, ConditioningItem
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _calculate_frame_params(duration_sec: float, fps: int = FPS) -> int:
+    target_frames = round(max(1, min(257, duration_sec * fps)))
+    n_val = round((target_frames - 1) / 8.0)
+    return int(n_val * 8 + 1)
+
+
+def _pad_dimensions(h: int, w: int) -> tuple[int, int]:
+    h_pad = ((h - 1) // 32 + 1) * 32
+    w_pad = ((w - 1) // 32 + 1) * 32
+    return h_pad, w_pad
+
+
+def get_pipelines() -> dict:
+    """Load and cache the LTX Video pipeline + upscaler."""
+    if "ltx" in PIPELINE_CACHE:
+        return PIPELINE_CACHE["ltx"]
+
+    print(f"[LTX] Loading from local path: {MODEL_DIR}")
+    with open(CONFIG_PATH, "r") as f:
+        config = yaml.safe_load(f)
+
+    ckpt_path = os.path.join(MODEL_DIR, "ltxv-13b-0.9.8-distilled.safetensors")
+    upscaler_path = os.path.join(MODEL_DIR, "spatial_upscaler.safetensors")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipe = create_ltx_video_pipeline(
+        ckpt_path=ckpt_path,
+        precision=config["precision"],
+        text_encoder_model_name_or_path=config["text_encoder_model_name_or_path"],
+        sampler=config["sampler"],
+        device=device,
+        enhance_prompt=False,
+        prompt_enhancer_image_caption_model_name_or_path=config["prompt_enhancer_image_caption_model_name_or_path"],
+        prompt_enhancer_llm_model_name_or_path=config["prompt_enhancer_llm_model_name_or_path"],
+    )
+
+    upsampler = None
+    if os.path.exists(upscaler_path):
+        upsampler = create_latent_upsampler(upscaler_path, device)
+
+    PIPELINE_CACHE["ltx"] = {"pipe": pipe, "upsampler": upsampler, "device": device, "config": config}
+    print("✅ LTX Video pipeline cached and ready.")
+    return PIPELINE_CACHE["ltx"]
+
+
+# -----------------------------
+# Inference Logic
+# -----------------------------
+def run_inference_ltx_t2v_i2v_v2v(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
     """
-    Run ltx video Img2Img inference and save the result locally.
-    Returns the path to the saved MP4 file.
+    Unified Text-to-Video, Image-to-Video, Video-to-Video inference for LTX Video.
     """
-    mode = params.get("mode", "Ltx_Video_I2V-2B")
-    negative_prompt = params.get("negative_prompt", None)
-    expected_width = params.get("width", 512)
-    expected_height = params.get("height", 512)
-    init_images=params.get("init_image", None)  
-    decoded_bytes = base64.b64decode(init_images)
+    data = get_pipelines()
+    pipe = data["pipe"]
+    upsampler = data["upsampler"]
+    device = data["device"]
+    config = data["config"]
 
-    if image is not None and not isinstance(image, Image.Image):
-        image = Image.open(BytesIO(decoded_bytes)).convert("RGB")
-        
-    video = load_video(export_to_video([image])) # compress the image using video compression as the model was trained on videos
-    output_dir = params.get("output_dir", "/quickpod")
-    num_frames=params.get("num_frames", 96),
-    downscale_factor = 2 / 3
-    num_frames = 96
+    mode = params.get("mode", "text-to-video")
+    negative_prompt = params.get("negative_prompt", "worst quality, inconsistent motion, blurry, jittery, distorted")
+    height = int(params.get("height", 512))
+    width = int(params.get("width", 704))
+    duration = float(params.get("duration", 2.0))
+    seed = int(params.get("seed", 42))
+    randomize_seed = bool(params.get("randomize_seed", True))
+    guidance_scale = float(params.get("guidance_scale", 3.0))
+    improve_texture = bool(params.get("improve_texture_flag", True))
+    frames_to_use = int(params.get("frames_to_use", 9))
+    init_image = params.get("init_image")
+    init_video = params.get("init_video")
 
-    condition1 = LTXVideoCondition(video=video, frame_index=0)
+    # Seed
+    if randomize_seed:
+        seed = random.randint(0, MAX_SEED)
+    seed_everething(seed)
 
-    downscaled_height, downscaled_width = int(expected_height * downscale_factor), int(expected_width * downscale_factor)
-    downscaled_height, downscaled_width = round_to_nearest_resolution_acceptable_by_vae(downscaled_height, downscaled_width)
-    
-    # Ensure output dir exists
-    os.makedirs(output_dir, exist_ok=True)
+    # Dimensions & padding
+    num_frames = _calculate_frame_params(duration, FPS)
+    h_pad, w_pad = _pad_dimensions(height, width)
+    padding = calculate_padding(height, width, h_pad, w_pad)
 
-    # Generate the video
-    latents = pipe(
-    conditions=[condition1],
-    prompt=prompt,
-    negative_prompt=negative_prompt,
-    width=downscaled_width,
-    height=downscaled_height,
-    num_frames=num_frames,
-    num_inference_steps=30,
-    generator=torch.Generator().manual_seed(0),
-    output_type="latent",
-    ).frames
+    # Call parameters
+    call_kwargs = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "height": h_pad,
+        "width": w_pad,
+        "num_frames": num_frames,
+        "frame_rate": FPS,
+        "generator": torch.Generator(device=device).manual_seed(seed),
+        "output_type": "pt",
+        "conditioning_items": None,
+        "media_items": None,
+        "decode_timestep": config["decode_timestep"],
+        "decode_noise_scale": config["decode_noise_scale"],
+        "stochastic_sampling": config["stochastic_sampling"],
+        "is_video": True,
+        "vae_per_channel_normalize": True,
+    }
 
-    # Part 2. Upscale generated video using latent upsampler with fewer inference steps
-    # The available latent upsampler upscales the height/width by 2x
-    upscaled_height, upscaled_width = downscaled_height * 2, downscaled_width * 2
-    upscaled_latents = pipe_upsample(
-        latents=latents,
-        output_type="latent"
-    ).frames
+    # Mode-specific setup
+    if mode == "image-to-video" and init_image:
+        print("[LTX] Running Image-to-Video...")
+        img = Image.open(BytesIO(base64.b64decode(init_image))).convert("RGB")
+        img_path = f"/tmp/{job_id}_init.png"
+        img.save(img_path)
+        tensor = load_image_to_tensor_with_resize_and_crop(img_path, height, width)
+        tensor = torch.nn.functional.pad(tensor, padding)
+        call_kwargs["conditioning_items"] = [ConditioningItem(tensor.to(device), 0, 1.0)]
 
-    # Part 3. Denoise the upscaled video with few steps to improve texture (optional, but recommended)
-    video = pipe(
-        conditions=[condition1],
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        width=upscaled_width,
-        height=upscaled_height,
-        num_frames=num_frames,
-        denoise_strength=0.4,  # Effectively, 4 inference steps out of 10
-        num_inference_steps=10,
-        latents=upscaled_latents,
-        decode_timestep=0.05,
-        image_cond_noise_scale=0.025,
-        generator=torch.Generator().manual_seed(0),
-        output_type="pil",
-    ).frames[0]
+    elif mode == "video-to-video" and init_video:
+        print("[LTX] Running Video-to-Video...")
+        tmp_video = f"/tmp/{job_id}_input.mp4"
+        with open(tmp_video, "wb") as f:
+            f.write(base64.b64decode(init_video))
+        call_kwargs["media_items"] = load_media_file(
+            media_path=tmp_video,
+            height=height,
+            width=width,
+            max_frames=frames_to_use,
+            padding=padding
+        ).to(device)
+    else:
+        print("[LTX] Running Text-to-Video...")
 
-    # Part 4. Downscale the video to the expected resolution
-    video = [frame.resize((expected_width, expected_height)) for frame in video]
-    output_dir = params.get("output_dir", "/quickpod")
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = str(Path(output_dir) / f"ltx_video_I2v_{job_id}_{timestamp}.mp4")
-    export_to_video(video, out_path, fps=24)
+    # Run pipeline
+    if improve_texture and upsampler:
+        final_pipe = LTXMultiScalePipeline(pipe, upsampler)
+    else:
+        final_pipe = pipe
 
-    gc.collect()
-    
-    return out_path
-    
+    print(f"[LTX] Generating with seed {seed}, {num_frames} frames at {FPS} fps...")
+    result = final_pipe(**call_kwargs)
+    tensor_out = result.images
+
+    if tensor_out is None:
+        raise RuntimeError("❌ LTX Video generation failed: no frames returned.")
+
+    video_np = tensor_out[0].permute(1, 2, 3, 0).cpu().float().numpy()
+    video_np = np.clip(video_np, 0, 1)
+    video_np = (video_np * 255).astype(np.uint8)
+
+    tmp_dir = tempfile.mkdtemp()
+    out_path = os.path.join(tmp_dir, f"{job_id}_{mode}.mp4")
+
+    with imageio.get_writer(out_path, fps=FPS, macro_block_size=1) as writer:
+        for f in range(video_np.shape[0]):
+            writer.append_data(video_np[f])
+
+    print(f"[LTX] ✅ Video saved at {out_path}")
+    return os.path.abspath(out_path)
+
+
+# -----------------------------
+# Example CLI usage
+# -----------------------------
+if __name__ == "__main__":
+    job_id = "demo_" + str(random.randint(1000, 9999))
+    prompt = "A cinematic aerial drone shot of snowy mountains at sunrise"
+    params = {
+        "mode": "text-to-video",
+        "height": 512,
+        "width": 704,
+        "duration": 2.0,
+        "guidance_scale": 3.0,
+        "randomize_seed": True,
+    }
+    out = run_inference_ltx_t2v_i2v_v2v(job_id, prompt, params)
+    print("✅ Demo complete:", out)
