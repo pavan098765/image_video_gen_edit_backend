@@ -3,6 +3,8 @@
 
 import base64
 import os
+os.environ["HF_HOME"] = "/models_storage/all_models"
+os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
 import random
 from typing import Dict, Any, Optional, Union
 from io import BytesIO
@@ -12,7 +14,7 @@ import torch
 from diffusers import (
     StableDiffusionXLInpaintPipeline,
     DPMSolverMultistepScheduler,
-    EulerAncestralDiscreteScheduler
+    EulerAncestralDiscreteScheduler,
 )
 
 # -------------------------
@@ -30,58 +32,45 @@ os.makedirs(EMB_DIR, exist_ok=True)
 
 POS_EMB_FILENAME = "Stable_Yogis_Illustrious_Positives.safetensors"
 NEG_EMB_FILENAME = "Stable_Yogis_Illustrious_Negatives-neg.safetensors"
-POS_EMB_PATH = os.path.join(EMB_DIR, POS_EMB_FILENAME)
-NEG_EMB_PATH = os.path.join(EMB_DIR, NEG_EMB_FILENAME)
-POS_TOKEN = "illustrious_pos"
-NEG_TOKEN = "illustrious_neg"
+POS_EMB = f"embedding:{POS_EMB_FILENAME}"
+NEG_EMB = f"embedding:{NEG_EMB_FILENAME}"
 
 # -------------------------
-# Load pipeline
+# Cached pipeline + scheduler
 # -------------------------
-pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
-    MODEL_ID,
-    torch_dtype=torch.float16,
-    use_safetensors=True,
-    cache_dir=MODEL_DIR,
-).to("cuda")
+PIPE: Optional[StableDiffusionXLInpaintPipeline] = None
+DEFAULT_SCHEDULER_CONFIG = None
 
-# Keep a copy of default scheduler config for safe re-init
-default_scheduler_config = pipe.scheduler.config
-# Recommended default scheduler for V5
-pipe.scheduler = DPMSolverMultistepScheduler.from_config(default_scheduler_config)
 
-# -------------------------
-# Load embeddings
-# -------------------------
-POS_EMB_PREPEND = None
-NEG_EMB_PREPEND = None
+def _get_pipeline() -> StableDiffusionXLInpaintPipeline:
+    """Lazy-load SDXL inpaint pipeline (cached)."""
+    global PIPE, DEFAULT_SCHEDULER_CONFIG
+    if PIPE is not None:
+        return PIPE
 
-if os.path.exists(POS_EMB_PATH):
-    try:
-        pipe.load_textual_inversion(POS_EMB_PATH, token=POS_TOKEN)
-        POS_EMB_PREPEND = POS_TOKEN
-    except Exception:
-        POS_EMB_PREPEND = f"embedding:{POS_EMB_FILENAME}"
-else:
-    POS_EMB_PREPEND = f"embedding:{POS_EMB_FILENAME}"
+    PIPE = StableDiffusionXLInpaintPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.float16,
+        use_safetensors=True,
+        cache_dir=MODEL_DIR,
+    ).to("cuda")
 
-if os.path.exists(NEG_EMB_PATH):
-    try:
-        pipe.load_textual_inversion(NEG_EMB_PATH, token=NEG_TOKEN)
-        NEG_EMB_PREPEND = NEG_TOKEN
-    except Exception:
-        NEG_EMB_PREPEND = f"embedding:{NEG_EMB_FILENAME}"
-else:
-    NEG_EMB_PREPEND = f"embedding:{NEG_EMB_FILENAME}"
+    DEFAULT_SCHEDULER_CONFIG = PIPE.scheduler.config
+    PIPE.scheduler = DPMSolverMultistepScheduler.from_config(DEFAULT_SCHEDULER_CONFIG)
+
+    print("[Init] SDXL Inpaint pipeline loaded")
+    return PIPE
+
 
 # -------------------------
 # Helpers
 # -------------------------
 def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image.Image]:
+    """Load image from path, PIL.Image, bytes, or base64 string."""
     if img is None:
         return None
     if isinstance(img, Image.Image):
-        return img
+        return img.convert("RGB")
     if isinstance(img, bytes):
         return Image.open(BytesIO(img)).convert("RGB")
     if os.path.exists(str(img)):
@@ -90,7 +79,7 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
         decoded = base64.b64decode(img)
         return Image.open(BytesIO(decoded)).convert("RGB")
     except Exception as e:
-        raise ValueError(f"Unable to decode image from input: {e}")
+        raise ValueError(f"Unable to decode image: {e}")
 
 
 def _process_mask_for_diffusers(
@@ -100,8 +89,9 @@ def _process_mask_for_diffusers(
     threshold: int = 127,
     invert: bool = False,
     resize_nearest: bool = False,
-    debug_save_path: Optional[str] = None
+    debug_save_path: Optional[str] = None,
 ) -> Image.Image:
+    """Preprocess mask: resize, binarize, invert, save debug copy if requested."""
     if mask is None:
         return None
     if mask.mode != "L":
@@ -121,7 +111,9 @@ def _process_mask_for_diffusers(
             pass
     return mask
 
+
 def _get_dynamic_size(img: Image.Image, max_dim: int = 1152) -> tuple[int, int]:
+    """Compute output resolution keeping aspect ratio, multiple-of-64, within max_dim."""
     w, h = img.size
     aspect = w / h
     if w > h:
@@ -136,24 +128,26 @@ def _get_dynamic_size(img: Image.Image, max_dim: int = 1152) -> tuple[int, int]:
     new_h = max(64, new_h)
     return new_w, new_h
 
+
 # -------------------------
 # Main inpaint function
 # -------------------------
 def run_inference_sdxl_inpaint(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
+    pipe = _get_pipeline()
+
     init_image = _load_image(params.get("init_image"))
     if init_image is None:
         raise ValueError("init_image is required for inpainting")
 
     raw_mask = _load_image(params.get("mask_image"))
+
+    # Mask preprocessing
     binarize = params.get("binarize_mask", True)
     invert_mask = params.get("invert_mask", False)
     mask_threshold = params.get("mask_threshold", 127)
     debug_save_mask = params.get("debug_save_mask", False)
 
-    # Dynamic resolution
     width, height = _get_dynamic_size(init_image, max_dim=1152)
-    # init_image = init_image.resize((width, height), resample=Image.LANCZOS)
-
     mask_image = None
     if raw_mask is not None:
         mask_image = _process_mask_for_diffusers(
@@ -163,37 +157,39 @@ def run_inference_sdxl_inpaint(job_id: str, prompt: str, params: Dict[str, Any])
             threshold=mask_threshold,
             invert=invert_mask,
             resize_nearest=True,
-            debug_save_path=(os.path.join(params.get("output_dir", DEFAULT_OUTPUT_DIR),
-                                          f"debug_{job_id}_processed_mask.png")
-                             if debug_save_mask else None)
+            debug_save_path=(
+                os.path.join(params.get("output_dir", DEFAULT_OUTPUT_DIR),
+                             f"debug_{job_id}_processed_mask.png")
+                if debug_save_mask else None
+            ),
         )
         arr = np.array(mask_image)
         white = int((arr >= 128).sum())
         total = arr.size
-        print(f"[mask diagnostics] white pixels (to be inpainted): {white}/{total} "
-              f"({white/total*100:.2f}%) ; invert_mask={invert_mask} ; binarize={binarize}")
+        print(f"[mask diagnostics] white={white}/{total} ({white/total*100:.2f}%)")
         if white == 0:
-            raise ValueError("Processed mask has zero white pixels (nothing to inpaint). "
-                             "Check invert_mask/binarize settings and mask orientation.")
+            raise ValueError("Processed mask has zero white pixels (nothing to inpaint).")
 
+    # Embedding prepend
     negative_prompt = params.get("negative_prompt", "")
-    if POS_EMB_PREPEND and POS_EMB_PREPEND not in prompt:
-        prompt = f"{POS_EMB_PREPEND}, {prompt}"
-    if NEG_EMB_PREPEND and NEG_EMB_PREPEND not in str(negative_prompt):
-        negative_prompt = f"{NEG_EMB_PREPEND}, {negative_prompt}"
+    if POS_EMB and POS_EMB not in prompt:
+        prompt = f"{POS_EMB}, {prompt}"
+    if NEG_EMB and NEG_EMB not in str(negative_prompt):
+        negative_prompt = f"{NEG_EMB}, {negative_prompt}"
 
-    # Scheduler
+    # Scheduler selection
     sampler_name = params.get("sampler", "DPMSolverMultistep")
     if sampler_name == "DPMSolverMultistep":
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(default_scheduler_config)
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(DEFAULT_SCHEDULER_CONFIG)
     elif sampler_name == "EulerA":
-        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(default_scheduler_config)
+        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(DEFAULT_SCHEDULER_CONFIG)
 
-    steps = params.get("sample_steps", 30)
-    cfg = params.get("cfg_scale", 5)
-    seed = params.get("seed", random.randint(0, 2**32 - 1))
+    steps = int(params.get("sample_steps", 30))
+    cfg = float(params.get("cfg_scale", 5))
+    seed = int(params.get("seed", random.randint(0, 2**32 - 1)))
     output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
-    generator = torch.manual_seed(seed) if seed is not None and seed >= 0 else None
+    os.makedirs(output_dir, exist_ok=True)
+    generator = torch.manual_seed(seed) if seed >= 0 else None
 
     # Run inpainting
     result = pipe(
@@ -205,14 +201,14 @@ def run_inference_sdxl_inpaint(job_id: str, prompt: str, params: Dict[str, Any])
         mask_image=mask_image,
         num_inference_steps=steps,
         guidance_scale=cfg,
-        generator=generator
+        generator=generator,
     )
 
     out_img = result.images[0]
-    os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"inpaint_{job_id}.png")
     out_img.save(out_path)
     return out_path
+
 
 # -------------------------
 # Example usage
@@ -240,7 +236,7 @@ if __name__ == "__main__":
         "cfg_scale": 5,
         "output_dir": "./outputs",
         "negative_prompt": "blurry, low quality",
-        "sampler": "DPMSolverMultistep"
+        "sampler": "DPMSolverMultistep",
     }
 
     out = run_inference_sdxl_inpaint(job_id, prompt, params=params)

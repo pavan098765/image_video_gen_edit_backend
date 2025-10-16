@@ -1,3 +1,4 @@
+from io import BytesIO
 import os
 import time
 import json
@@ -8,11 +9,17 @@ import hashlib
 import gc
 from typing import Dict, Any, Optional
 from datetime import datetime
+import uuid
+import httpx
+import base64
+from PIL import Image
 
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from tenacity import retry, wait_exponential, stop_after_attempt
+from contextlib import asynccontextmanager
+
 
 # -----------------------
 # GPU cleanup
@@ -21,27 +28,30 @@ def cleanup_gpu():
     """Free GPU memory completely (stateless safe mode)."""
     try:
         import torch
+
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
     except Exception:
         pass
     gc.collect()
 
+
 # -----------------------
 # Import inference functions
 # -----------------------
 from fastwan_5b_inference import (
     run_inference_wan_5b_t2i,
-    run_inference_wan_5b_t2v
+    run_inference_wan_5b_t2v,
 )
 
 # -----------------------
-# Model Registry (FastWAN only)
+# Model Registry (FastWAN 5B)
 # -----------------------
 MODEL_REGISTRY = {
     "fastwan": {
         "t2i": run_inference_wan_5b_t2i,
         "t2v": run_inference_wan_5b_t2v,
+        "i2v": run_inference_wan_5b_t2v,  # reuse t2v fn with init_image
     }
 }
 
@@ -75,18 +85,16 @@ WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
 # -----------------------
-# FastAPI app
+# Job queue
 # -----------------------
-app = FastAPI(title=f"QuickPod Worker ({MODEL_KEY})")
-
-# Job queue & status
 job_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 job_status: Dict[str, Dict[str, Any]] = {}
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 last_model_key: Optional[str] = None
 
+
 # -----------------------
-# Request Models
+# Request Model
 # -----------------------
 class RunRequest(BaseModel):
     job_id: str
@@ -97,6 +105,7 @@ class RunRequest(BaseModel):
     upload_url: str
     result_key: str
 
+
 # -----------------------
 # HMAC utils
 # -----------------------
@@ -106,6 +115,7 @@ def sign_payload_bytes(payload_bytes: bytes) -> str:
     )
     return "sha256=" + mac.hexdigest()
 
+
 def signed_headers(payload: dict) -> Dict[str, str]:
     b = json.dumps(payload).encode("utf-8")
     sig = sign_payload_bytes(b)
@@ -114,11 +124,13 @@ def signed_headers(payload: dict) -> Dict[str, str]:
         headers["Authorization"] = f"Bearer {CONTROLLER_API_KEY}"
     return headers
 
+
 def post_signed_json(url: str, payload: dict, timeout: int = 10) -> requests.Response:
     headers = signed_headers(payload)
     resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
     resp.raise_for_status()
     return resp
+
 
 # -----------------------
 # Controller integration
@@ -139,12 +151,18 @@ def register_with_controller():
     resp = post_signed_json(url, register_payload, timeout=10)
     return resp.json()
 
+
 @retry(wait=wait_exponential(min=2, max=20), stop=stop_after_attempt(6))
 def send_heartbeat():
-    payload = {"worker_id": WORKER_ID, "pod_uuid": POD_UUID, "timestamp": int(time.time())}
+    payload = {
+        "worker_id": WORKER_ID,
+        "pod_uuid": POD_UUID,
+        "timestamp": int(time.time()),
+    }
     url = f"{CONTROLLER_URL.rstrip('/')}/heartbeat"
     resp = post_signed_json(url, payload, timeout=5)
     return resp.json()
+
 
 # -----------------------
 # Inference dispatcher
@@ -161,6 +179,8 @@ def resolve_inference_callable(model: str, mode: Optional[str]):
         inference_func = inference_func[mode]
     return inference_func
 
+
+# --- Inside run_inference_and_save ---
 async def run_inference_and_save(
     job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]
 ) -> str:
@@ -179,12 +199,29 @@ async def run_inference_and_save(
         cleanup_gpu()
 
     try:
-        out_path = await loop.run_in_executor(
-            None, inference_func, job_id, prompt, params
-        )
+        if model == "fastwan" and mode == "i2v":
+            init_image_b64 = params.pop("init_image", None)
+            init_image = None
+            if init_image_b64:
+                try:
+                    init_image = Image.open(
+                        BytesIO(base64.b64decode(init_image_b64))
+                    ).convert("RGB")
+                except Exception as e:
+                    logger.error(f"Failed to decode init_image: {e}")
+                    init_image = None
+
+            out_path = await loop.run_in_executor(
+                None, inference_func, job_id, prompt, params, init_image
+            )
+        else:
+            out_path = await loop.run_in_executor(
+                None, inference_func, job_id, prompt, params
+            )
         return out_path
     finally:
         last_model_key = model_key
+
 
 # -----------------------
 # Job Processing
@@ -209,13 +246,16 @@ async def process_job_item(item: Dict[str, Any]):
             out_local = await run_inference_and_save(
                 job_id, prompt, model, mode, params
             )
-            with open(out_local, "rb") as f:
-                resp = requests.put(upload_url, data=f)
-                resp.raise_for_status()
+            if upload_url.startswith("http://dummy-upload"):
+                logger.info("Skipping upload for dummy URL")
+            else:
+                with open(out_local, "rb") as f:
+                    resp = requests.put(upload_url, data=f)
+                    resp.raise_for_status()
 
             payload = {"job_id": job_id, "result_r2_key": result_key}
             url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
-            post_signed_json(url, payload)
+            post_signed_json(url, payload, timeout=30)
 
             job_status[job_id] = {
                 "status": "completed",
@@ -228,14 +268,14 @@ async def process_job_item(item: Dict[str, Any]):
         job_status[job_id] = {"status": "failed", "error": str(e)}
         payload = {
             "job_id": job_id,
-            "result_r2_key": None,
+            "result_r2_key": "None",
             "failed": True,
-            "error": str(e),
         }
         try:
             post_signed_json(f"{CONTROLLER_URL.rstrip('/')}/job_complete", payload)
         except Exception as e2:
             logger.error("Failed to notify controller of failure: %s", e2)
+
 
 async def worker_loop():
     logger.info("Starting worker loop")
@@ -246,9 +286,146 @@ async def worker_loop():
         finally:
             job_queue.task_done()
 
+
 # -----------------------
-# FastAPI Endpoints
+# Auto-test
 # -----------------------
+async def run_autotest():
+    await asyncio.sleep(5)
+    logger.info("🚀 Starting FastWAN 5B auto-test (T2I, T2V, I2V)")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
+        "Referer": "https://ibb.co",
+        "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
+        # --- T2I ---
+        t2i_job_id = f"autotest-t2i-{uuid.uuid4()}"
+        t2i_params = {
+            "steps": 6,
+            "guidance_scale": 0.0,
+            "height": 512,
+            "width": 512,
+            "output_dir": "./outputs",
+        }
+        resp = await client.post(
+            "http://127.0.0.1:8000/run",
+            json={
+                "job_id": t2i_job_id,
+                "prompt": "A cinematic portrait of a woman, ultra realistic, 8k lighting",
+                "model": "fastwan",
+                "mode": "t2i",
+                "params": t2i_params,
+                "upload_url": "http://dummy-upload/skip",
+                "result_key": f"{t2i_job_id}.png",
+            },
+        )
+        logger.info(f"🔥 T2I response: {resp.status_code} {resp.text}")
+
+        # --- T2V ---
+        t2v_job_id = f"autotest-t2v-{uuid.uuid4()}"
+        t2v_params = {
+            "steps": 4,
+            "guidance_scale": 0.0,
+            "height": 512,
+            "width": 512,
+            "duration_seconds": 3,
+            "output_dir": "./outputs",
+        }
+        resp = await client.post(
+            "http://127.0.0.1:8000/run",
+            json={
+                "job_id": t2v_job_id,
+                "prompt": "A cinematic shot of a beach at sunset filled with people, smooth motion",
+                "model": "fastwan",
+                "mode": "t2v",
+                "params": t2v_params,
+                "upload_url": "http://dummy-upload/skip",
+                "result_key": f"{t2v_job_id}.mp4",
+            },
+        )
+        logger.info(f"🔥 T2V response: {resp.status_code} {resp.text}")
+
+        # --- I2V ---
+        i2v_job_id = f"autotest-i2v-{uuid.uuid4()}"
+        i2v_params = {
+            "steps": 4,
+            "guidance_scale": 0.0,
+            "duration_seconds": 3,
+            "height": 512,
+            "width": 512,
+            "output_dir": "./outputs",
+        }
+
+        img_url = "https://pub-67f874d172874988b5754734cc4fcb7e.r2.dev/Snapinsta.app_262322643_4937545659591345_7487236998017046274_n_1080.jpg"
+
+        try:
+            resp = await client.get(img_url)
+            resp.raise_for_status()
+            img_b64 = base64.b64encode(resp.content).decode("utf-8")
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch I2V image: {e}")
+            img_b64 = None
+
+        resp = await client.post(
+            "http://127.0.0.1:8000/run",
+            json={
+                "job_id": i2v_job_id,
+                "prompt": "Animate this image with cinematic motion, smooth and realistic",
+                "model": "fastwan",
+                "mode": "i2v",
+                "params": {**i2v_params, "init_image": img_b64},
+                "upload_url": "http://dummy-upload/skip",
+                "result_key": f"{i2v_job_id}.mp4",
+            },
+        )
+        logger.info(f"🔥 I2V response: {resp.status_code} {resp.text}")
+
+
+# -----------------------
+# Lifespan
+# -----------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("✅ Application fully started, registering worker now")
+
+    try:
+        register_with_controller()
+    except Exception as e:
+        logger.exception("Failed to register worker with controller: %s", e)
+        raise
+
+    asyncio.create_task(worker_loop())
+    asyncio.create_task(_hb_loop())
+
+    if os.getenv("ENABLE_AUTOTEST", "1") == "1":
+        asyncio.create_task(run_autotest())
+
+    yield
+
+    logger.info("Worker shutting down; final GPU cleanup")
+    cleanup_gpu()
+
+
+# -----------------------
+# Heartbeat loop
+# -----------------------
+async def _hb_loop():
+    while True:
+        try:
+            send_heartbeat()
+        except Exception as e:
+            logger.exception("Heartbeat failed: %s", e)
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
+# -----------------------
+# FastAPI app
+# -----------------------
+app = FastAPI(title=f"QuickPod Worker ({MODEL_KEY})", lifespan=lifespan)
+
+
 @app.post("/run")
 async def run_endpoint(req: RunRequest):
     if req.job_id in job_status and job_status[req.job_id].get("status") in (
@@ -264,38 +441,12 @@ async def run_endpoint(req: RunRequest):
     logger.info("Enqueued job %s", req.job_id)
     return {"status": "accepted", "job_id": req.job_id}
 
+
 @app.get("/health")
 def health():
     return {"status": "ok", "worker_id": WORKER_ID, "queue_size": job_queue.qsize()}
 
+
 @app.get("/status")
 def status():
     return {"queue_size": job_queue.qsize(), "jobs": job_status}
-
-# -----------------------
-# Startup / Shutdown
-# -----------------------
-@app.on_event("startup")
-async def on_startup():
-    logger.info("Worker starting in smart cleanup mode")
-    try:
-        register_with_controller()
-    except Exception as e:
-        logger.exception("Failed to register worker with controller: %s", e)
-        raise
-
-    async def hb_loop():
-        while True:
-            try:
-                send_heartbeat()
-            except Exception as e:
-                logger.exception("Heartbeat failed: %s", e)
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-
-    asyncio.create_task(hb_loop())
-    asyncio.create_task(worker_loop())
-
-@app.on_event("shutdown")
-def on_shutdown():
-    logger.info("Worker shutting down; final GPU cleanup")
-    cleanup_gpu()

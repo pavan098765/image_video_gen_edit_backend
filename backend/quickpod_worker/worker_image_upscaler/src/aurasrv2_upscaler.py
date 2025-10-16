@@ -1,7 +1,9 @@
 # aurasrv2_upscaler.py
 
-import base64
 import os
+os.environ["HF_HOME"] = "/models_storage/all_models"
+os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
+import base64
 from typing import Dict, Any, Optional, Union
 from io import BytesIO
 from PIL import Image
@@ -12,20 +14,33 @@ from aura_sr import AuraSR
 # -------------------------
 # Setup
 # -------------------------
-os.environ["HF_HOME"] = "/models_storage/all_models"
-os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
 
-# Use GPU if available, otherwise CPU
-original_load = torch.load
-torch.load = lambda *args, **kwargs: original_load(
-    *args, **kwargs, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Patch torch.load temporarily for device mapping
+_original_load = torch.load
+torch.load = lambda *args, **kwargs: _original_load(
+    *args,
+    **kwargs,
+    map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 )
 
-# Initialize AuraSR model
-aura_sr = AuraSR.from_pretrained("fal/AuraSR-v2")
+# -------------------------
+# Lazy globals
+# -------------------------
+_aura_sr = None
+
+
+def _get_aura_sr() -> AuraSR:
+    """Lazy-load AuraSR model once and cache it."""
+    global _aura_sr
+    if _aura_sr is None:
+        print("[Init] Loading AuraSR-v2 model...")
+        _aura_sr = AuraSR.from_pretrained("fal/AuraSR-v2")
+        print("[Init] AuraSR-v2 model ready")
+    return _aura_sr
+
 
 # Restore original torch.load
-torch.load = original_load
+torch.load = _original_load
 
 
 # -------------------------
@@ -35,7 +50,7 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
     if img is None:
         return None
     if isinstance(img, Image.Image):
-        return img
+        return img.convert("RGB")
     if isinstance(img, bytes):
         return Image.open(BytesIO(img)).convert("RGB")
     if os.path.exists(str(img)):
@@ -52,13 +67,14 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
 # -------------------------
 def upscale_image(input_image: np.ndarray, scale: int = 4) -> np.ndarray:
     """
-    Upscale an image by 4x using AuraSR.
-    Optionally supports 2x via downscaling.
+    Upscale an image using AuraSR.
+    AuraSR natively supports 4x; we emulate 2x by downscaling the 4x output.
     """
     if input_image is None:
         raise ValueError("No input image provided for upscaling.")
 
     pil_image = Image.fromarray(input_image)
+    aura_sr = _get_aura_sr()
 
     # AuraSR only supports 4x
     upscaled_image = aura_sr.upscale_4x(pil_image)

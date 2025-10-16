@@ -1,7 +1,7 @@
 import os
 
-os.environ["HF_HOME"] = "/models_storage/all_models/fastwan"
-os.environ["HF_HUB_CACHE"] = "/models_storage/all_models/fastwan"
+os.environ["HF_HOME"] = "/models_storage/all_models"
+os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
 import uuid
 from typing import Dict, Any, Optional
 from PIL import Image

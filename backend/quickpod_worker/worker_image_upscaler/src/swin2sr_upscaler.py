@@ -2,8 +2,6 @@
 
 import base64
 import os
-os.environ["HF_HOME"] = "/models_storage/all_models"
-os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
 from io import BytesIO
 from typing import Dict, Any, Optional, Union
 from PIL import Image
@@ -13,6 +11,9 @@ from transformers import AutoImageProcessor, Swin2SRForImageSuperResolution
 # -------------------------
 # Config / paths
 # -------------------------
+os.environ["HF_HOME"] = "/models_storage/all_models"
+os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
+
 MODEL_DIR = os.path.join("/models_storage", "all_models", "swin2sr")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -27,6 +28,10 @@ MODEL_MAP = {
     "x4": "caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
 }
 
+# Cache loaded models to avoid reloading
+LOADED_MODELS: Dict[str, tuple] = {}
+
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -35,7 +40,7 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
     if img is None:
         return None
     if isinstance(img, Image.Image):
-        return img
+        return img.convert("RGB")
     if isinstance(img, bytes):
         return Image.open(BytesIO(img)).convert("RGB")
     if os.path.exists(str(img)):
@@ -46,8 +51,6 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
     except Exception as e:
         raise ValueError(f"Unable to decode image from input: {e}")
 
-# Cache loaded models to avoid reloading
-LOADED_MODELS = {}
 
 def _get_model(scale: str):
     """Load and cache the model for the given scale."""
@@ -65,22 +68,26 @@ def _get_model(scale: str):
     model.eval()
 
     LOADED_MODELS[scale] = (processor, model, device)
+    print(f"[Init] Loaded Swin2SR model '{scale}' on {device}")
     return processor, model, device
+
 
 # -------------------------
 # Main Upscale function
 # -------------------------
 def run_inference_swin2sr(job_id: str, params: Dict[str, Any]) -> str:
-    input_image = _load_image(params.get("image"))
+    # Backward compat: accept both "init_image" and "image"
+    init_image = params.get("init_image") or params.get("image")
+    input_image = _load_image(init_image)
     if input_image is None:
-        raise ValueError("input_image is required for upscaling")
+        raise ValueError("init_image is required for upscaling")
 
-    scale = params.get("scale", "x2")
+    scale = params.get("scale", "x2").lower()
     processor, model, device = _get_model(scale)
 
     output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f"upscaled_{scale}_{job_id}.png")
+    out_path = os.path.join(output_dir, f"swin2sr_upscaled_{scale}_{job_id}.png")
 
     # -------------------------
     # Preprocess input
@@ -100,9 +107,9 @@ def run_inference_swin2sr(job_id: str, params: Dict[str, Any]) -> str:
     out_img = (out_img * 255.0).round().astype("uint8")
     out_img = Image.fromarray(out_img.transpose(1, 2, 0))  # C,H,W -> H,W,C
 
-    # Save
     out_img.save(out_path)
     return out_path
+
 
 # -------------------------
 # Example usage
@@ -116,8 +123,8 @@ if __name__ == "__main__":
 
     params = {
         "output_dir": "./outputs",
-        "image": img_b64,
-        "scale": "x4",  # choose x2 or x4
+        "init_image": img_b64,  # unified param name
+        "scale": "x4",  # choose "x2" or "x4"
     }
 
     out = run_inference_swin2sr(job_id, params=params)

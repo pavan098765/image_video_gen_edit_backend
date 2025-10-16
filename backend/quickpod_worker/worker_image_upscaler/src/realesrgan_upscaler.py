@@ -1,8 +1,6 @@
 # upscale_realesrgan_local.py
 import base64
 import os
-os.environ["HF_HOME"] = "/models_storage/all_models"
-os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
 from io import BytesIO
 from typing import Dict, Any, Optional, Union
 from PIL import Image
@@ -12,6 +10,9 @@ from realesrgan import RealESRGAN
 # -------------------------
 # Config / paths
 # -------------------------
+os.environ["HF_HOME"] = "/models_storage/all_models"
+os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
+
 MODEL_DIR = os.path.join("/models_storage", "all_models", "realesrgan")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -26,7 +27,8 @@ MODEL_MAP = {
 }
 
 # Cache loaded models to avoid reloading
-LOADED_MODELS = {}
+LOADED_MODELS: Dict[str, RealESRGAN] = {}
+
 
 # -------------------------
 # Helpers
@@ -35,7 +37,7 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
     if img is None:
         return None
     if isinstance(img, Image.Image):
-        return img
+        return img.convert("RGB")
     if isinstance(img, bytes):
         return Image.open(BytesIO(img)).convert("RGB")
     if os.path.exists(str(img)):
@@ -46,8 +48,17 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
     except Exception as e:
         raise ValueError(f"Unable to decode image from input: {e}")
 
-def _get_model(scale: str):
-    """Load and cache the local RealESRGAN model"""
+
+def _parse_scale(scale_key: str) -> int:
+    """Extract numeric scale (x2, x4, x8) from model key."""
+    for num in [8, 4, 2]:
+        if f"x{num}" in scale_key:
+            return num
+    raise ValueError(f"Cannot infer numeric scale from key: {scale_key}")
+
+
+def _get_model(scale: str) -> RealESRGAN:
+    """Load and cache the local RealESRGAN model."""
     scale = scale.lower()
     if scale not in MODEL_MAP:
         raise ValueError(f"Unsupported scale '{scale}'. Supported: {list(MODEL_MAP.keys())}")
@@ -57,23 +68,29 @@ def _get_model(scale: str):
 
     model_path = os.path.join(MODEL_DIR, MODEL_MAP[scale])
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = RealESRGAN(device, scale=int(scale[1]))
+    scale_num = _parse_scale(scale)
+
+    model = RealESRGAN(device, scale=scale_num)
     model.load_weights(model_path, download=False)
     model.eval()
 
-    LOADED_MODELS[scale] = (model, device)
-    return model, device
+    LOADED_MODELS[scale] = model
+    print(f"[Init] Loaded RealESRGAN model '{scale}' on {device}")
+    return model
+
 
 # -------------------------
 # Main Upscale function
 # -------------------------
 def run_inference_realesrgan(job_id: str, params: Dict[str, Any]) -> str:
-    input_image = _load_image(params.get("image"))
+    # Backward compat: accept both "init_image" and "image"
+    init_image = params.get("init_image") or params.get("image")
+    input_image = _load_image(init_image)
     if input_image is None:
-        raise ValueError("input_image is required for upscaling")
+        raise ValueError("init_image is required for upscaling")
 
-    scale = params.get("scale", "x4")
-    model, device = _get_model(scale)
+    scale = params.get("scale", "x4_plus")
+    model = _get_model(scale)
 
     output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
     os.makedirs(output_dir, exist_ok=True)
@@ -86,6 +103,7 @@ def run_inference_realesrgan(job_id: str, params: Dict[str, Any]) -> str:
     out_img.save(out_path)
     return out_path
 
+
 # -------------------------
 # Example usage
 # -------------------------
@@ -97,8 +115,8 @@ if __name__ == "__main__":
         img_b64 = base64.b64encode(f.read()).decode("utf-8")
 
     params = {
-        "image": img_b64,
-        "scale": "x4_plus",  # x2, x4, x8
+        "init_image": img_b64,
+        "scale": "x4_plus",  # x4_general, x4_general_wdn, x4_plus
         "output_dir": "./outputs",
     }
 

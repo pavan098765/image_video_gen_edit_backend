@@ -8,11 +8,14 @@ import hashlib
 import gc
 from typing import Dict, Any, Optional
 from datetime import datetime
-
+import uuid
+import httpx
+import base64
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from tenacity import retry, wait_exponential, stop_after_attempt
+from contextlib import asynccontextmanager
 
 # -----------------------
 # GPU cleanup
@@ -69,11 +72,8 @@ WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
 # -----------------------
-# FastAPI app
+# Job queue
 # -----------------------
-app = FastAPI(title=f"QuickPod Worker ({MODEL_KEY})")
-
-# Job queue & status
 job_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 job_status: Dict[str, Dict[str, Any]] = {}
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
@@ -160,9 +160,7 @@ async def run_inference_and_save(
     model_key = model
 
     if last_model_key and last_model_key != model_key:
-        logger.info(
-            f"Switching model {last_model_key} -> {model_key}, cleaning up GPU first"
-        )
+        logger.info(f"Switching model {last_model_key} -> {model_key}, cleaning up GPU first")
         cleanup_gpu()
 
     try:
@@ -196,9 +194,12 @@ async def process_job_item(item: Dict[str, Any]):
             out_local = await run_inference_and_save(
                 job_id, prompt, model, mode, params
             )
-            with open(out_local, "rb") as f:
-                resp = requests.put(upload_url, data=f)
-                resp.raise_for_status()
+            if upload_url.startswith("http://dummy-upload"):
+                logger.info("Skipping upload (dummy). File at %s", out_local)
+            else:
+                with open(out_local, "rb") as f:
+                    resp = requests.put(upload_url, data=f)
+                    resp.raise_for_status()
 
             payload = {"job_id": job_id, "result_r2_key": result_key}
             url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
@@ -234,14 +235,98 @@ async def worker_loop():
             job_queue.task_done()
 
 # -----------------------
-# FastAPI Endpoints
+# Auto-test
 # -----------------------
+async def run_autotest():
+    await asyncio.sleep(5)
+    logger.info("🚀 Starting Qwen Image Edit auto-test")
+
+    img_url = "https://pub-67f874d172874988b5754734cc4fcb7e.r2.dev/Snapinsta.app_262322643_4937545659591345_7487236998017046274_n_1080.jpg"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
+        "Referer": "https://ibb.co",
+        "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+
+    try:
+        async with httpx.AsyncClient(headers=headers,timeout=60.0) as client:
+            resp = await client.get(img_url)
+            resp.raise_for_status()
+            img_bytes = resp.content
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch test image: {e}")
+        return
+
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+    test_job_id = f"autotest-qwen-{uuid.uuid4()}"
+    params = {
+        "cfg_scale": 1.0,
+        "output_dir": "./outputs",
+        "init_image": img_b64,
+        "negative_prompt": " ",
+        "num_inference_steps": 4,
+        "scale_image": True,
+        "scale_factor": 2,
+    }
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        resp = await client.post(
+            "http://127.0.0.1:8000/run",
+            json={
+                "job_id": test_job_id,
+                "prompt": "Change body orientation to face the camera directly",
+                "model": "qwen_image_edit",
+                "params": params,
+                "upload_url": "http://dummy-upload/skip",
+                "result_key": f"{test_job_id}.png",
+            },
+        )
+        logger.info(f"🔥 Auto-test response: {resp.status_code} {resp.text}")
+
+# -----------------------
+# Lifespan
+# -----------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("✅ Application fully started, registering worker now")
+
+    try:
+        register_with_controller()
+    except Exception as e:
+        logger.exception("Failed to register worker with controller: %s", e)
+        raise
+
+    asyncio.create_task(worker_loop())
+    asyncio.create_task(_hb_loop())
+
+    if os.getenv("ENABLE_AUTOTEST", "1") == "1":
+        asyncio.create_task(run_autotest())
+
+    yield
+
+    logger.info("Worker shutting down; final GPU cleanup")
+    cleanup_gpu()
+
+# -----------------------
+# Heartbeat loop
+# -----------------------
+async def _hb_loop():
+    while True:
+        try:
+            send_heartbeat()
+        except Exception as e:
+            logger.exception("Heartbeat failed: %s", e)
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+# -----------------------
+# FastAPI app
+# -----------------------
+app = FastAPI(title=f"QuickPod Worker ({MODEL_KEY})", lifespan=lifespan)
+
 @app.post("/run")
 async def run_endpoint(req: RunRequest):
-    if req.job_id in job_status and job_status[req.job_id].get("status") in (
-        "queued",
-        "running",
-    ):
+    if req.job_id in job_status and job_status[req.job_id].get("status") in ("queued", "running"):
         raise HTTPException(status_code=409, detail="job already queued or running")
     await job_queue.put(req.dict())
     job_status[req.job_id] = {
@@ -258,31 +343,3 @@ def health():
 @app.get("/status")
 def status():
     return {"queue_size": job_queue.qsize(), "jobs": job_status}
-
-# -----------------------
-# Startup / Shutdown
-# -----------------------
-@app.on_event("startup")
-async def on_startup():
-    logger.info("Worker starting in smart cleanup mode")
-    try:
-        register_with_controller()
-    except Exception as e:
-        logger.exception("Failed to register worker with controller: %s", e)
-        raise
-
-    async def hb_loop():
-        while True:
-            try:
-                send_heartbeat()
-            except Exception as e:
-                logger.exception("Heartbeat failed: %s", e)
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-
-    asyncio.create_task(hb_loop())
-    asyncio.create_task(worker_loop())
-
-@app.on_event("shutdown")
-def on_shutdown():
-    logger.info("Worker shutting down; final GPU cleanup")
-    cleanup_gpu()

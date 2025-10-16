@@ -33,80 +33,80 @@ def cleanup_gpu():
 # -----------------------
 # Import inference functions
 # -----------------------
-from quickpod_worker.worker_ltx_video.src.ltx_video_I2V_inference import (
-    run_inference_ltx_video_i2v,
-)
-from quickpod_worker.worker_ltx_video.src.ltx_video_V2V_inference import (
-    run_inference_ltx_video_v2v,
-)
+# from worker_ltx_video.src.ltx_video_I2V_inference import (
+#     run_inference_ltx_video_i2v,
+# )
+# from worker_ltx_video.src.ltx_video_V2V_inference import (
+#     run_inference_ltx_video_v2v,
+# )
 
-from quickpod_worker.worker_fastwan.src.fastwan_1b_inference import (
+from worker_fastwan.src.fastwan_1b_inference import (
     run_inference_wan_1b_t2i,
     run_inference_wan_1b_t2v,
 )
 
-from quickpod_worker.worker_fastwan.src.fastwan_5b_inference import (
+from worker_fastwan.src.fastwan_5b_inference import (
     run_inference_wan_5b_t2i,
     run_inference_wan_5b_t2v,
 )
 
-from quickpod_worker.worker_flux_kontext_dev.src.flux_kontext_dev_inference import (
+from worker_flux_kontext_dev.src.flux_kontext_dev_inference import (
     run_inference_flux_kontext_dev,
 )
 
-from quickpod_worker.worker_qwen_image_edit.src.qwen_image_edit_inference import (
+from worker_qwen_image_edit.src.qwen_image_edit_inference import (
     run_inference_qwen_image_edit,
 )
 
-from quickpod_worker.worker_stable_diffusion_15.src.sd15_I2I_inference import (
+from worker_stable_diffusion_15.src.sd15_I2I_inference import (
     run_inference_sd15_i2i,
 )
-from quickpod_worker.worker_stable_diffusion_15.src.sd15_inpaint_inference import (
+from worker_stable_diffusion_15.src.sd15_inpaint_inference import (
     run_inference_sd15_inpaint,
 )
-from quickpod_worker.worker_stable_diffusion_15.src.sd15_T2I_inference import (
+from worker_stable_diffusion_15.src.sd15_T2I_inference import (
     run_inference_sd15_t2i,
 )
 
-from quickpod_worker.worker_stable_diffusion_35.src.sd35_I2I_inference import (
+from worker_stable_diffusion_35.src.sd35_I2I_inference import (
     run_inference_sd35_i2i,
 )
-from quickpod_worker.worker_stable_diffusion_35.src.sd35_inpaint_inference import (
+from worker_stable_diffusion_35.src.sd35_inpaint_inference import (
     run_inference_sd35_inpaint,
 )
-from quickpod_worker.worker_stable_diffusion_35.src.sd35_T2I_inference import (
+from worker_stable_diffusion_35.src.sd35_T2I_inference import (
     run_inference_sd35_t2i,
 )
 
-from quickpod_worker.worker_stable_diffusion_xl.src.sdxl_I2I_inference import (
+from worker_stable_diffusion_xl.src.sdxl_I2I_inference import (
     run_inference_sdxl_i2i,
 )
-from quickpod_worker.worker_stable_diffusion_xl.src.sdxl_inpaint_inference import (
+from worker_stable_diffusion_xl.src.sdxl_inpaint_inference import (
     run_inference_sdxl_inpaint,
 )
-from quickpod_worker.worker_stable_diffusion_xl.src.sdxl_T2I_inference import (
+from worker_stable_diffusion_xl.src.sdxl_T2I_inference import (
     run_inference_sdxl_t2i,
 )
 
-from quickpod_worker.worker_stable_diffusion_xl_outpaint.src.diffuser_outpaint_inference import run_inference_diffuser_outpaint
+from worker_stable_diffusion_xl_outpaint.src.diffuser_outpaint_inference import run_inference_diffuser_outpaint
 
-from quickpod_worker.worker_basic_utils.src.bg_remover import run_inference_rmbg
-from quickpod_worker.worker_basic_utils.src.simple_lama_inpaint import run_inference_simple_lama_inpaint
+from worker_basic_utils.src.bg_remover import run_inference_rmbg
+from worker_basic_utils.src.simple_lama_inpaint import run_inference_simple_lama_inpaint
 
-from quickpod_worker.worker_image_upscaler.src.aurasrv2_upscaler import run_inference_aurasr_upscale
-from quickpod_worker.worker_image_upscaler.src.swin2sr_upscaler import run_inference_swin2sr
-# from quickpod_worker.worker_image_upscaler.src.realesrgan_upscaler import run_inference_realesrgan
-# from quickpod_worker.worker_video_upscalers.src.upscale_a_video_inference import run_video_upscale
+from worker_image_upscaler.src.aurasrv2_upscaler import run_inference_aurasr_upscale
+from worker_image_upscaler.src.swin2sr_upscaler import run_inference_swin2sr
+# from worker_image_upscaler.src.realesrgan_upscaler import run_inference_realesrgan
+# from worker_video_upscalers.src.upscale_a_video_inference import run_video_upscale
 
 
 # -----------------------
 # Model Registry
 # -----------------------
 MODEL_REGISTRY = {
-    "ltx_video": {
-        "i2v": run_inference_ltx_video_i2v,
-        "v2v": run_inference_ltx_video_v2v,
-    },
+    # "ltx_video": {
+    #     "i2v": run_inference_ltx_video_i2v,
+    #     "v2v": run_inference_ltx_video_v2v,
+    # },
     "fastwan": {
         "1b_t2v": run_inference_wan_1b_t2v,
         "1b_t2i": run_inference_wan_1b_t2i,

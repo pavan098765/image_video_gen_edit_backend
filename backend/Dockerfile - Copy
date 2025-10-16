@@ -1,0 +1,29 @@
+# =========================
+# Stage 1: Extend from base
+# =========================
+
+FROM pavanalur3/deps-base:py311-cu129
+
+# Install missing runtime libs for C++/ML packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    libstdc++6 \
+    libquadmath0 \
+    libssl3 \
+    libffi8 \
+    libtiff6 \
+    libjpeg62-turbo \
+    libpng16-16 \
+    libwebp7 \
+    libopenjp2-7 \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Install extra Python deps on top of existing venv
+RUN pip install --no-cache-dir \
+    httpx \
+    ftfy \
+    imageio-ffmpeg \
+ && rm -rf /root/.cache/pip /tmp/*
+
+WORKDIR /app

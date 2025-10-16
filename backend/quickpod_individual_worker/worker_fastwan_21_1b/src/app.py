@@ -8,7 +8,10 @@ import hashlib
 import gc
 from typing import Dict, Any, Optional
 from datetime import datetime
+import uuid
+from contextlib import asynccontextmanager
 
+import httpx
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -75,18 +78,15 @@ WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
 # -----------------------
-# FastAPI app
+# Job queue
 # -----------------------
-app = FastAPI(title=f"QuickPod Worker ({MODEL_KEY})")
-
-# Job queue & status
 job_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 job_status: Dict[str, Dict[str, Any]] = {}
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 last_model_key: Optional[str] = None
 
 # -----------------------
-# Request Models
+# Request Model
 # -----------------------
 class RunRequest(BaseModel):
     job_id: str
@@ -141,7 +141,11 @@ def register_with_controller():
 
 @retry(wait=wait_exponential(min=2, max=20), stop=stop_after_attempt(6))
 def send_heartbeat():
-    payload = {"worker_id": WORKER_ID, "pod_uuid": POD_UUID, "timestamp": int(time.time())}
+    payload = {
+        "worker_id": WORKER_ID,
+        "pod_uuid": POD_UUID,
+        "timestamp": int(time.time()),
+    }
     url = f"{CONTROLLER_URL.rstrip('/')}/heartbeat"
     resp = post_signed_json(url, payload, timeout=5)
     return resp.json()
@@ -209,13 +213,16 @@ async def process_job_item(item: Dict[str, Any]):
             out_local = await run_inference_and_save(
                 job_id, prompt, model, mode, params
             )
-            with open(out_local, "rb") as f:
-                resp = requests.put(upload_url, data=f)
-                resp.raise_for_status()
+            if upload_url.startswith("http://dummy-upload"):
+                logger.info("Skipping upload for dummy URL")
+            else:
+                with open(out_local, "rb") as f:
+                    resp = requests.put(upload_url, data=f)
+                    resp.raise_for_status()
 
             payload = {"job_id": job_id, "result_r2_key": result_key}
             url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
-            post_signed_json(url, payload)
+            post_signed_json(url, payload, timeout=30)
 
             job_status[job_id] = {
                 "status": "completed",
@@ -228,9 +235,9 @@ async def process_job_item(item: Dict[str, Any]):
         job_status[job_id] = {"status": "failed", "error": str(e)}
         payload = {
             "job_id": job_id,
-            "result_r2_key": None,
+            "result_r2_key": "None",
             "failed": True,
-            "error": str(e),
+            # "error": str(e), <- currently not accepted by controller, but will add later
         }
         try:
             post_signed_json(f"{CONTROLLER_URL.rstrip('/')}/job_complete", payload)
@@ -247,8 +254,117 @@ async def worker_loop():
             job_queue.task_done()
 
 # -----------------------
-# FastAPI Endpoints
+# Auto-test
 # -----------------------
+async def run_autotest():
+    await asyncio.sleep(5)  # short delay to let server settle
+    try:
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            # --- T2I test ---
+            t2i_job_id = f"autotest-t2i-{uuid.uuid4()}"
+            t2i_params = {
+                "steps": 10,
+                "guidance_scale": 0.0,
+                "seed": 42,
+                "randomize_seed": True,
+                "height": 896,
+                "width": 896,
+                "negative_prompt": "blurry, distorted, lowres",
+                "output_dir": "./outputs",
+            }
+            logger.info(f"🔥 Running T2I auto-test job {t2i_job_id}")
+            resp = await client.post(
+                "http://127.0.0.1:8000/run",
+                json={
+                    "job_id": t2i_job_id,
+                    "prompt": "A cinematic portrait of a woman, ultra realistic, 8k lighting",
+                    "model": "fastwan",
+                    "mode": "t2i",
+                    "params": t2i_params,
+                    "upload_url": "http://dummy-upload/skip",
+                    "result_key": f"{t2i_job_id}.png",        
+                },
+            )
+            if resp.status_code == 200:
+                logger.info(f"🔥 T2I auto-test success: {resp.json()}")
+            else:
+                logger.error(f"🔥 T2I auto-test failed: {resp.status_code} {resp.text}")
+
+            # --- T2V test ---
+            t2v_job_id = f"autotest-t2v-{uuid.uuid4()}"
+            t2v_params = {
+                "steps": 8,
+                "guidance_scale": 0.0,
+                "seed": 42,
+                "randomize_seed": True,
+                "height": 896,
+                "width": 896,
+                "duration_seconds": 5,
+                "negative_prompt": "blurry, distorted, lowres",
+                "output_dir": "./outputs",
+            }
+            logger.info(f"🔥 Running T2V auto-test job {t2v_job_id}")
+            resp = await client.post(
+                "http://127.0.0.1:8000/run",
+                json={
+                    "job_id": t2v_job_id,
+                    "prompt": "A cinematic shot of a beach at sunset filled with people, smooth motion",
+                    "model": "fastwan",
+                    "mode": "t2v",
+                    "params": t2v_params,
+                    "upload_url": "http://dummy-upload/skip",   
+                    "result_key": f"{t2v_job_id}.png",         
+                },
+            )
+            if resp.status_code == 200:
+                logger.info(f"🔥 T2V auto-test success: {resp.json()}")
+            else:
+                logger.error(f"🔥 T2V auto-test failed: {resp.status_code} {resp.text}")
+
+    except Exception as e:
+        logger.error(f"🔥 Auto-test exception: {e}")
+
+# -----------------------
+# Lifespan
+# -----------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # uvicorn will bind sockets first, then this runs
+    logger.info("✅ Application fully started, registering worker now")
+
+    try:
+        register_with_controller()
+    except Exception as e:
+        logger.exception("Failed to register worker with controller: %s", e)
+        raise
+
+    asyncio.create_task(worker_loop())
+    asyncio.create_task(_hb_loop())
+
+    if os.getenv("ENABLE_AUTOTEST", "1") == "1":
+        asyncio.create_task(run_autotest())
+
+    yield  # server runs until shutdown
+
+    logger.info("Worker shutting down; final GPU cleanup")
+    cleanup_gpu()
+
+# -----------------------
+# Heartbeat loop
+# -----------------------
+async def _hb_loop():
+    while True:
+        try:
+            send_heartbeat()
+        except Exception as e:
+            logger.exception("Heartbeat failed: %s", e)
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+# -----------------------
+# FastAPI app
+# -----------------------
+app = FastAPI(title=f"QuickPod Worker ({MODEL_KEY})", lifespan=lifespan)
+
 @app.post("/run")
 async def run_endpoint(req: RunRequest):
     if req.job_id in job_status and job_status[req.job_id].get("status") in (
@@ -271,31 +387,3 @@ def health():
 @app.get("/status")
 def status():
     return {"queue_size": job_queue.qsize(), "jobs": job_status}
-
-# -----------------------
-# Startup / Shutdown
-# -----------------------
-@app.on_event("startup")
-async def on_startup():
-    logger.info("Worker starting in smart cleanup mode")
-    try:
-        register_with_controller()
-    except Exception as e:
-        logger.exception("Failed to register worker with controller: %s", e)
-        raise
-
-    async def hb_loop():
-        while True:
-            try:
-                send_heartbeat()
-            except Exception as e:
-                logger.exception("Heartbeat failed: %s", e)
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-
-    asyncio.create_task(hb_loop())
-    asyncio.create_task(worker_loop())
-
-@app.on_event("shutdown")
-def on_shutdown():
-    logger.info("Worker shutting down; final GPU cleanup")
-    cleanup_gpu()

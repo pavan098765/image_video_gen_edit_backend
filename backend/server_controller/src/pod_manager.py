@@ -1,14 +1,36 @@
 # pod_manager.py
 import os
 import time
+import json
+import tempfile
 import logging
 import asyncio
-from typing import Dict, Optional, Any
+import enum
+from typing import Dict, Optional, Any, List, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
-from quickpod_api import QuickPodManager  # assumed sync client
+from collections import deque
+from quickpod_api import QuickPodManager  # shared global QuickPodManager
 
 logger = logging.getLogger("pod_manager")
+
+
+class PodStrategyType(str, enum.Enum):
+    WARM_AND_INDIVIDUAL = "warm_and_individual"
+    MACHINE_BASED = "machine_based"
+
+
+MACHINE_PRIORITY_LIST: List[Tuple[str, str]] = [
+    ("562", "4x 5090"),
+    ("14762", "1x 5090"),
+    ("275", "1x 5090"),
+    ("14774", "4x 4090"),
+    ("266", "4x 4090"),
+    ("416", "2x 4090"),
+]
+
+MAX_JOBS_PER_POD = 100
+MAX_SAME_JOB_PER_POD = 100
 
 
 @dataclass
@@ -16,12 +38,15 @@ class PodInfo:
     pod_uuid: str
     model: str
     mode: Optional[str]
-    status: str  # "starting", "ready", "error", "stopped"
+    status: str
     created_at: datetime
     last_active: datetime
     queue_size: int = 0
     error_count: int = 0
-    # NEW: optional metadata for quick lookup (public ip, ports, etc.)
+    machine_id: Optional[str] = None
+    total_jobs_processed: int = 0
+    unique_job_ids: set = field(default_factory=set)
+    job_id_counts: Dict[str, int] = field(default_factory=dict)
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -36,277 +61,655 @@ class PodManager:
         self.own_warm_pod: bool = False
         self.individual_pods: Dict[str, PodInfo] = {}
         self.individual_pod_managers: Dict[str, QuickPodManager] = {}
-
         self._lock = asyncio.Lock()
 
+        self.pending_jobs: Dict[str, set] = {}
+        self._jobs_lock = asyncio.Lock()
+        self.recently_destroyed: Dict[str, float] = {}
+
+        self.pod_strategy = PodStrategyType(
+            os.getenv("POD_STRATEGY", PodStrategyType.WARM_AND_INDIVIDUAL.value)
+        )
         self.max_individual_pods = int(os.getenv("MAX_INDIVIDUAL_PODS", "3"))
-        self.pod_startup_timeout = int(os.getenv("POD_STARTUP_TIMEOUT", "300"))
+        self.pod_startup_timeout = int(os.getenv("POD_STARTUP_TIMEOUT", "180"))
         self.template_uuids = {
             "sd15": os.getenv("SD15_TEMPLATE_UUID"),
             "sd35": os.getenv("SD35_TEMPLATE_UUID"),
             "sdxl": os.getenv("SDXL_TEMPLATE_UUID"),
-            "default": os.getenv("DEFAULT_TEMPLATE_UUID"),
+            "diffusers_outpaint": os.getenv("DIFFUSERS_OUTPAINT_TEMPLATE_UUID"),
+            "qwen_image_edit": os.getenv("QWEN_IMAGE_EDIT_TEMPLATE_UUID"),
+            "qwen_image_edit_2509": os.getenv("QWEN_IMAGE_EDIT_2509_TEMPLATE_UUID"),
+            "flux_kontext_dev": os.getenv("FLUX_KONTEXT_DEV_TEMPLATE_UUID"),
+            "fastwan_21_1b": os.getenv("FASTWAN_21_1B_TEMPLATE_UUID"),
+            "fastwan_22_5b": os.getenv("FASTWAN_22_5B_TEMPLATE_UUID"),
+            "aurasrv2": os.getenv("AURASRV2_TEMPLATE_UUID"),
+            "realesrgan": os.getenv("REALESRGAN_TEMPLATE_UUID"),
+            "swin2sr": os.getenv("SWIN2SR_TEMPLATE_UUID"),
+            "basic_utils": os.getenv("BASIC_UTILS_TEMPLATE_UUID"),
+        }
+        self.template_disk_size = {
+            "sd15": 30,
+            "sd35": 40,
+            "sdxl": 30,
+            "diffusers_outpaint": 50,
+            "qwen_image_edit": 80,
+            "qwen_image_edit_2509": 85,
+            "flux_kontext_dev": 45,
+            "fastwan_21_1b": 60,
+            "fastwan_22_5b": 60,
+            "aurasrv2": 30,
+            "realesrgan": 30,
+            "swin2sr": 30,
+            "basic_utils": 30,
         }
 
+        # 🔹 Shared global QuickPodManager
+        self.global_qp = QuickPodManager(email, password)
+        self._global_qp_lock = asyncio.Lock()
+        self._global_qp_logged_in = False
+        self._global_qp_last_login = None
+
+        # 🔹 Machine cache persistence
+        self.machine_cache_path = os.getenv("MACHINE_CACHE_PATH", "machine_cache.json")
+        self.machine_cache = {"machines": {}, "meta": {"version": 1, "updated_at": None}}
+        self._machine_cache_lock = asyncio.Lock()
+
+        # 🔹 Fallback event tracking (for autoscaler)
+        self.fallback_events = deque()
+        self.last_autoscale_ts = 0
+        self.autoscale_cooldown = int(os.getenv("AUTOSCALE_COOLDOWN", "600"))
+
+    @property
+    def active_pods(self) -> Dict[str, PodInfo]:
+        """
+        Returns a unified dict of all currently tracked pods (warm + individual).
+        This is used by the controller to validate incoming worker registrations.
+        """
+        pods = dict(self.individual_pods)
+        if self.warm_pod_uuid and self.own_warm_pod:
+            pods[self.warm_pod_uuid] = PodInfo(
+                pod_uuid=self.warm_pod_uuid,
+                model="warm",
+                mode=None,
+                status="ready",
+                created_at=datetime.utcnow(),
+                last_active=datetime.utcnow(),
+            )
+        return pods
+
+    # --------------------------------------------------------------------------
+    # MACHINE CACHE HELPERS
+    # --------------------------------------------------------------------------
+    async def load_machine_cache(self):
+        """Load machine_cache.json from disk (if exists)."""
+        async with self._machine_cache_lock:
+            if not os.path.exists(self.machine_cache_path):
+                return
+            try:
+                with open(self.machine_cache_path, "r") as f:
+                    self.machine_cache = json.load(f)
+                    logger.info("Loaded machine cache with %d machines", len(self.machine_cache.get("machines", {})))
+            except Exception:
+                logger.exception("Failed to load machine cache file")
+
+    async def _persist_machine_cache(self):
+        async with self._machine_cache_lock:
+            try:
+                cache_dir = os.path.dirname(self.machine_cache_path)
+                if cache_dir and not os.path.exists(cache_dir):
+                    # create with safe perms
+                    os.makedirs(cache_dir, exist_ok=True)
+                # write to a temp file in same directory (avoid cross-device rename issues)
+                tmp_path = f"{self.machine_cache_path}.tmp"
+                def _write():
+                    with open(tmp_path, "w") as f:
+                        json.dump(self.machine_cache, f, indent=2)
+                    os.replace(tmp_path, self.machine_cache_path)
+                await asyncio.to_thread(_write)
+                logger.debug("Persisted machine cache to %s", self.machine_cache_path)
+            except Exception:
+                # include path in logs for easier debugging
+                logger.exception("Failed to persist machine cache (path=%s)", self.machine_cache_path)
+
+    async def mark_image_cached_on_machine(self, machine_id: str, image_name: str):
+        """Mark an image as cached on a given machine."""
+        async with self._machine_cache_lock:
+            now = datetime.utcnow().isoformat() + "Z"
+            mc = self.machine_cache.setdefault("machines", {})
+            m = mc.setdefault(str(machine_id), {"cached_images": {}, "is_priority": False})
+            m["cached_images"][image_name] = {
+                "added_at": now,
+                "score": m["cached_images"].get(image_name, {}).get("score", 0.0) + 1.0,
+            }
+            m["last_seen"] = now
+            self.machine_cache["meta"]["updated_at"] = now
+        await self._persist_machine_cache()
+        logger.info(f"✅ Cached record updated: {image_name} on machine {machine_id}")
+
+    # --------------------------------------------------------------------------
+    # AUTOSCALER HELPERS
+    # --------------------------------------------------------------------------
+    async def record_fallback_event(self, model: str, machine_id: str):
+        now = time.time()
+        self.fallback_events.append((now, model, machine_id))
+        window = int(os.getenv("FALLBACK_WINDOW_SECONDS", "600"))
+        while self.fallback_events and now - self.fallback_events[0][0] > window:
+            self.fallback_events.popleft()
+
+    async def autoscaler_loop(self):
+        """Detect fallback frequency and trigger warm pod spin-up."""
+        FALLBACK_THRESHOLD = int(os.getenv("FALLBACK_THRESHOLD", "5"))
+        QUEUE_MIN_FOR_SCALE = int(os.getenv("QUEUE_MIN_FOR_SCALE", "3"))
+        while True:
+            try:
+                now = time.time()
+                if now - self.last_autoscale_ts < self.autoscale_cooldown:
+                    await asyncio.sleep(5)
+                    continue
+
+                counts: Dict[str, int] = {}
+                for ts, model, mid in self.fallback_events:
+                    counts[model] = counts.get(model, 0) + 1
+
+                for model, cnt in counts.items():
+                    if cnt >= FALLBACK_THRESHOLD:
+                        logger.info(f"Autoscaler trigger: model={model}, fallback_count={cnt}")
+                        self.last_autoscale_ts = now
+                        # call scaler (simple implementation; queue checks can be added later)
+                        await self.scale_up_unified_warm_pod_for_model(model)
+                        break
+            except Exception:
+                logger.exception("Autoscaler loop error")
+            await asyncio.sleep(5)
+
+    async def scale_up_unified_warm_pod_for_model(self, model: str):
+        """Create a unified warm pod on a chosen machine when fallback frequency high.
+
+        NOTE: This is intentionally conservative. You can later implement logic to pick the
+        cheapest available machine_id (e.g., by reading machine metadata / costs).
+        """
+        try:
+            logger.info(f"🚀 Scaling unified warm pod for model={model}")
+            # For now, create machine-based pod using the priority list selection logic.
+            # You may adapt to pass a preferred_machine_id (quickpod_api.get_best_offer supports it).
+            pod_uuid = await self.create_machine_based_pod(model, mode=None)
+            if pod_uuid:
+                logger.info(f"Scaled unified warm pod {pod_uuid} for model {model}")
+            else:
+                logger.warning("Scale attempt failed (no pod created)")
+        except Exception:
+            logger.exception("Failed to scale unified warm pod")
+
+    # --------------------------------------------------------------------------
+    # GLOBAL LOGIN / RETRY
+    # --------------------------------------------------------------------------
+    async def _ensure_global_login(self, force_refresh: bool = False):
+        async with self._global_qp_lock:
+            needs_login = (
+                force_refresh
+                or not self._global_qp_logged_in
+                or not self.global_qp._is_token_valid()
+            )
+            if needs_login:
+                try:
+                    await asyncio.to_thread(self.global_qp.login)
+                    self._global_qp_logged_in = True
+                    self._global_qp_last_login = datetime.utcnow()
+                    logger.info("QuickPodManager: global login successful.")
+                except Exception as e:
+                    logger.error("Global QuickPodManager login failed: %s", e)
+                    raise
+
+    async def _call_with_retry(self, func, *args, **kwargs):
+        try:
+            return await asyncio.to_thread(func, *args, **kwargs)
+        except Exception as e:
+            logger.warning("QuickPod API call failed (%s); retrying once...", e)
+            await asyncio.sleep(2)
+            await self._ensure_global_login(force_refresh=True)
+            return await asyncio.to_thread(func, *args, **kwargs)
+
+    # --------------------------------------------------------------------------
+    # INITIALIZATION
+    # --------------------------------------------------------------------------
     async def initialize(self) -> None:
-        """Initialize the pod manager and attempt to start warm pod (non-blocking)."""
+        await self.load_machine_cache()
         if not self.warm_pod_manager:
             logger.info("No warm pod configured.")
             self.own_warm_pod = False
             return
-
         try:
-            logger.info("Logging into QuickPod for warm pod...")
-            await asyncio.to_thread(self.warm_pod_manager.login)
-
-            logger.info("Attempting to start warm pod...")
+            logger.info("Initializing warm pod...")
+            await self._ensure_global_login()
             resp = await asyncio.to_thread(self.warm_pod_manager.start_pod)
-
-            if isinstance(resp, dict) and resp.get("status") == "busy":
-                logger.warning("Warm pod is allocated to someone else")
+            if isinstance(resp, dict) and "busy" in str(resp.get("error", "")).lower():
+                logger.warning("Warm pod busy, cannot acquire.")
                 self.own_warm_pod = False
             else:
                 self.own_warm_pod = True
-                logger.info("Warm pod started successfully")
+                logger.info("Warm pod started successfully.")
         except Exception as e:
-            logger.exception("Failed to initialize warm pod manager: %s", e)
+            logger.exception("Failed to initialize warm pod: %s", e)
             self.own_warm_pod = False
 
+    # --------------------------------------------------------------------------
+    # JOB DISPATCH (entry)
+    # --------------------------------------------------------------------------
     async def dispatch_job(self, job_id: str, model: str, mode: Optional[str] = None) -> str:
+        if self.pod_strategy == PodStrategyType.WARM_AND_INDIVIDUAL:
+            return await self._dispatch_job_warm_and_individual(job_id, model, mode)
+        else:
+            return await self._dispatch_job_machine_based(job_id, model, mode)
+
+    # --------------------------------------------------------------------------
+    # WARM + INDIVIDUAL DISPATCH
+    # --------------------------------------------------------------------------
+    async def _dispatch_job_warm_and_individual(self, job_id: str, model: str, mode: Optional[str] = None) -> str:
+        """Dispatch flow when running warm+individual strategy.
+
+        Prefer the warm pod worker if available; otherwise create an individual pod.
         """
-        Assign a job to warm pod if available, else reuse a ready individual pod,
-        else create a new individual pod. Returns worker_id of the registered worker.
-        """
-        if self.own_warm_pod and self.warm_pod_uuid:
-            logger.info("Dispatching job %s to warm pod %s", job_id, self.warm_pod_uuid)
-            start = time.time()
-            timeout = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "180"))
-            from db import SessionLocal, Worker
+        from db import SessionLocal, Worker, Job
+        from job_manager import JobState
+
+        await self.add_pending_job(job_id, model)
+
+        # 1) try to find a ready warm worker in DB
+        with SessionLocal() as db:
+            w = (
+                db.query(Worker)
+                .filter(Worker.is_warm_pod == True, Worker.model == model, Worker.status == "ready")
+                .order_by(Worker.last_active.desc())
+                .first()
+            )
+            if w:
+                # mark dispatching and return worker_id
+                w.status = "dispatching"
+                w.last_active = datetime.utcnow()
+                job = db.query(Job).filter(Job.job_id == job_id).first()
+                if job:
+                    job.status = JobState.DISPATCHING.value
+                    job.updated_at = datetime.utcnow()
+                db.commit()
+                logger.info("Dispatching job %s to warm worker %s", job_id, w.worker_id)
+                return w.worker_id
+
+        # 2) no warm worker available -> create an individual pod and wait for registration
+        pod_uuid = await self.create_individual_pod(model, mode)
+        if not pod_uuid:
+            raise RuntimeError("Failed to create individual pod")
+
+        # wait for worker registration
+        start = time.time()
+        timeout = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "180"))
+        with SessionLocal() as db:
             while time.time() - start < timeout:
-                with SessionLocal() as db:
-                    w = db.query(Worker).filter(
-                        Worker.container_id == self.warm_pod_uuid,
-                        Worker.model == model,
-                        Worker.status.in_(["ready", "processing"]),
-                    ).first()
-                    if w:
-                        logger.info(
-                            "Found registered warm worker %s for pod %s",
-                            w.worker_id,
-                            self.warm_pod_uuid,
-                        )
-                        return w.worker_id
+                w = (
+                    db.query(Worker)
+                    .filter(Worker.container_id == pod_uuid, Worker.model == model, Worker.status == "ready")
+                    .first()
+                )
+                if w:
+                    w.status = "dispatching"
+                    w.last_active = datetime.utcnow()
+                    # update job state
+                    job = db.query(Job).filter(Job.job_id == job_id).first()
+                    if job:
+                        job.status = JobState.DISPATCHING.value
+                        job.updated_at = datetime.utcnow()
+                    db.commit()
+                    return w.worker_id
                 await asyncio.sleep(1)
 
-            logger.warning(
-                "Warm pod configured but worker not registered for pod %s after %s seconds",
-                self.warm_pod_uuid,
-                timeout,
-            )
+        raise RuntimeError(f"Worker registration timeout for pod {pod_uuid}")
+
+    # --------------------------------------------------------------------------
+    # MACHINE-BASED DISPATCH
+    # --------------------------------------------------------------------------
+    async def _dispatch_job_machine_based(self, job_id: str, model: str, mode: Optional[str] = None) -> str:
+        from db import SessionLocal, Worker, Job
+        from job_manager import JobState
+
+        await self.add_pending_job(job_id, model)
 
         async with self._lock:
             for pod_uuid, info in self.individual_pods.items():
-                if info.model == model and info.status == "ready":
+                if info.model == model and info.status == "ready" and self.can_reuse_pod(info, job_id):
                     info.last_active = datetime.utcnow()
-                    info.queue_size += 1
-                    logger.info("Reusing ready individual pod %s for job %s", pod_uuid, job_id)
-                    from db import SessionLocal, Worker
+                    self.update_pod_job_counts(info, job_id)
+                    logger.info("Reusing machine-based pod %s for job %s", pod_uuid, job_id)
                     with SessionLocal() as db:
                         w = db.query(Worker).filter(
                             Worker.container_id == pod_uuid, Worker.model == model
                         ).first()
                         if w:
+                            w.status = "dispatching"
+                            w.last_active = datetime.utcnow()
+                            job = db.query(Job).filter(Job.job_id == job_id).first()
+                            if job:
+                                job.status = JobState.DISPATCHING.value
+                                job.updated_at = datetime.utcnow()
+                            db.commit()
                             return w.worker_id
 
-        pod_uuid = await self.create_individual_pod(model, mode)
+        # Attempt to create on priority machines
+        pod_uuid = await self.create_machine_based_pod(model, mode)
         if not pod_uuid:
-            raise RuntimeError("No pod available for job")
+            raise RuntimeError("Failed to create machine-based pod")
 
-        logger.info("Waiting for worker registration for pod %s (job %s)", pod_uuid, job_id)
+        # wait for worker registration
         start = time.time()
         timeout = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "180"))
-        from db import SessionLocal, Worker
+        from db import SessionLocal
         while time.time() - start < timeout:
             with SessionLocal() as db:
                 w = db.query(Worker).filter(
                     Worker.container_id == pod_uuid,
                     Worker.model == model,
-                    Worker.status.in_(["ready", "processing"]),
+                    Worker.status == "ready",
                 ).first()
                 if w:
-                    logger.info("Worker %s registered for pod %s", w.worker_id, pod_uuid)
+                    w.status = "dispatching"
+                    w.last_active = datetime.utcnow()
+                    db.commit()
                     return w.worker_id
             await asyncio.sleep(1)
 
-        logger.error("Worker did not register for pod %s within timeout", pod_uuid)
-        await self.stop_individual_pod(pod_uuid)
-        raise RuntimeError(f"Worker for pod {pod_uuid} did not register")
+        raise RuntimeError(f"Worker registration timeout for pod {pod_uuid}")
 
-    async def create_individual_pod(self, model: str, mode: Optional[str] = None) -> Optional[str]:
-        """Create a new individual pod for a specific model/mode (auto-started)."""
-        async with self._lock:
-            if len(self.individual_pods) >= self.max_individual_pods:
-                logger.warning(
-                    "Maximum number of individual pods reached (%s/%s)",
-                    len(self.individual_pods),
-                    self.max_individual_pods,
+    # --------------------------------------------------------------------------
+    # CREATE MACHINE-BASED POD (updated for caching & fallback tracking)
+    # --------------------------------------------------------------------------
+
+    async def create_machine_based_pod(self, model: str, mode: Optional[str] = None) -> Optional[str]:
+        """Create a new machine-based pod, trying priority machines first,
+        then automatically falling back to the best global offer via QuickPod's tier logic."""
+        
+        await self._ensure_global_login()
+
+        template_id = self._get_template_for_model(model)
+        if not template_id:
+            logger.error(f"No template found for model {model}")
+            return None
+
+        # 🔹 Try preferred machines first
+        for machine_id, desc in MACHINE_PRIORITY_LIST:
+            try:
+                offer_id, actual_machine_id = await self._call_with_retry(self.global_qp.get_best_offer, machine_id)
+                if not offer_id:
+                    logger.warning(f"No offer available on preferred machine {machine_id}")
+                    continue
+
+                if str(actual_machine_id) != str(machine_id):
+                    logger.warning(f"⚠️ Preferred machine {machine_id} unavailable — using fallback machine {actual_machine_id}.")
+                    machine_id = actual_machine_id
+
+                logger.info(f"🚀 Creating pod for {model} on preferred machine {machine_id} ({desc})")
+                pod_data = await self._call_with_retry(
+                    self.global_qp.create_pod,
+                    offer_id,
+                    template_id,
+                    self.template_disk_size.get(model, 100),
                 )
-                raise RuntimeError("Maximum number of individual pods reached")
 
-        pod_manager = None
-        pod_uuid = None
+                if not isinstance(pod_data, dict):
+                    logger.warning(f"Unexpected response type when creating pod on machine {machine_id}")
+                    continue
+
+                pod_uuid = pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
+                if not pod_uuid:
+                    logger.warning(f"No pod UUID returned for machine {machine_id}")
+                    continue
+
+                # Register pod internally
+                async with self._lock:
+                    self.individual_pods[pod_uuid] = PodInfo(
+                        pod_uuid=pod_uuid,
+                        model=model,
+                        mode=mode,
+                        status="starting",
+                        created_at=datetime.utcnow(),
+                        last_active=datetime.utcnow(),
+                        machine_id=str(machine_id),
+                    )
+                    self.individual_pod_managers[pod_uuid] = QuickPodManager(self.email, self.password, pod_uuid)
+
+                # Wait until worker registers (ready)
+                start_time = time.time()
+                while time.time() - start_time < self.pod_startup_timeout:
+                    if await self.check_pod_ready(pod_uuid):
+                        async with self._lock:
+                            self.individual_pods[pod_uuid].status = "ready"
+                        await self.mark_image_cached_on_machine(machine_id, model)
+                        logger.info(f"✅ Pod {pod_uuid} ready on machine {machine_id} for {model}")
+                        return pod_uuid
+                    await asyncio.sleep(5)
+
+                logger.error(f"Pod {pod_uuid} startup timeout on machine {machine_id}")
+                await self.destroy_individual_pod(pod_uuid)
+
+            except RuntimeError as re:
+                msg = str(re).lower()
+                if "database query failed" in msg or "database" in msg:
+                    logger.warning(f"QuickPod DB error on machine {machine_id}: {re} — skipping.")
+                    await asyncio.sleep(2)
+                    continue
+                else:
+                    logger.exception(f"Runtime error creating pod on machine {machine_id}: {re}")
+                    continue
+            except Exception as e:
+                logger.exception(f"Unexpected error creating pod on machine {machine_id}: {e}")
+                continue
+
+        # 🔹 All priority machines failed → rely on QuickPodManager global fallback logic
         try:
-            pod_manager = QuickPodManager(self.email, self.password)
-            logger.info("Looking up best offer for pod (model=%s mode=%s)", model, mode)
-            offer_id = await asyncio.to_thread(pod_manager.get_best_offer)
-            if not offer_id:
-                raise RuntimeError("No offer returned by QuickPod")
+            logger.warning(f"⚠️ All preferred machines unavailable for {model}. Trying global fallback offer...")
+            global_offer_id = await self._call_with_retry(self.global_qp.get_best_offer)
+            if not global_offer_id:
+                logger.error(f"❌ No global fallback offer available for {model}.")
+                return None
 
-            template_name = f"{model}_{mode}_startup_template" if mode else f"{model}_startup_template"
-            logger.info("Looking for template '%s'", template_name)
-            template_uuid = await asyncio.to_thread(pod_manager.get_template_by_name, template_name)
-            if not template_uuid:
-                logger.info("Falling back to default_startup_template")
-                template_uuid = await asyncio.to_thread(
-                    pod_manager.get_template_by_name, "default_startup_template"
-                )
-                if not template_uuid:
-                    raise RuntimeError(f"No suitable template found for {model}")
-
-            logger.info("Creating pod (offer=%s template=%s)...", offer_id, template_uuid)
-            pod_data = await asyncio.to_thread(
-                pod_manager.create_pod,
-                offer_id=offer_id,
-                template_uuid=template_uuid,
-                disk_size=50000,
+            pod_data = await self._call_with_retry(
+                self.global_qp.create_pod,
+                global_offer_id,
+                template_id,
+                self.template_disk_size.get(model, 100),
             )
+
             if not isinstance(pod_data, dict):
-                raise RuntimeError("Unexpected response creating pod")
+                logger.error("Invalid fallback pod creation response.")
+                return None
 
             pod_uuid = pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
             if not pod_uuid:
-                raise RuntimeError("No pod UUID returned from creation")
+                logger.error("No pod UUID returned for fallback pod creation.")
+                return None
 
-            logger.info("Created pod %s for model %s (mode=%s)", pod_uuid, model, mode)
-
-            # Collect metadata for quick lookup
-            pod_meta = {
-                "public_ip": pod_data.get("public_ipaddr"),
-                "ports": (pod_data.get("open_port_start"), pod_data.get("open_port_end")),
-            }
-
-            pod_info = PodInfo(
-                pod_uuid=pod_uuid,
-                model=model,
-                mode=mode,
-                status="starting",
-                created_at=datetime.utcnow(),
-                last_active=datetime.utcnow(),
-                meta=pod_meta,
-            )
             async with self._lock:
-                self.individual_pods[pod_uuid] = pod_info
-                self.individual_pod_managers[pod_uuid] = pod_manager
-
-            # Pods auto-start after creation
-            return pod_uuid
-
-        except Exception as e:
-            logger.exception("Failed to create pod: %s", e)
-
-        if pod_uuid:
-            await self.stop_individual_pod(pod_uuid)
-        return None
-
-    async def start_individual_pod(self, pod_uuid: str) -> bool:
-        """Attempt to start a pod if needed (normally unused since create_pod auto-starts)."""
-        async with self._lock:
-            pod_manager = self.individual_pod_managers.get(pod_uuid)
-            pod_info = self.individual_pods.get(pod_uuid)
-
-        if not pod_manager or not pod_info:
-            logger.error("start_individual_pod: unknown pod_uuid %s", pod_uuid)
-            return False
-
-        try:
-            logger.info("Starting pod %s (manual)...", pod_uuid)
-            await asyncio.to_thread(pod_manager.start_pod)
+                self.individual_pods[pod_uuid] = PodInfo(
+                    pod_uuid=pod_uuid,
+                    model=model,
+                    mode=mode,
+                    status="starting",
+                    created_at=datetime.utcnow(),
+                    last_active=datetime.utcnow(),
+                    machine_id="fallback",
+                )
+                self.individual_pod_managers[pod_uuid] = QuickPodManager(self.email, self.password, pod_uuid)
 
             start_time = time.time()
             while time.time() - start_time < self.pod_startup_timeout:
                 if await self.check_pod_ready(pod_uuid):
                     async with self._lock:
-                        pod_info.status = "ready"
-                        pod_info.last_active = datetime.utcnow()
-                    logger.info("Pod %s is ready", pod_uuid)
-                    return True
+                        self.individual_pods[pod_uuid].status = "ready"
+                    logger.info(f"✅ Fallback pod {pod_uuid} ready for {model}")
+                    return pod_uuid
                 await asyncio.sleep(5)
 
-            raise RuntimeError("Pod startup timeout")
+            logger.error(f"⚠️ Fallback pod {pod_uuid} startup timeout for {model}")
+            await self.destroy_individual_pod(pod_uuid)
+            return None
+
         except Exception as e:
-            logger.exception("Failed to start pod %s: %s", pod_uuid, e)
-            async with self._lock:
-                if pod_info:
-                    pod_info.status = "error"
-                    pod_info.error_count += 1
-            return False
+            logger.exception(f"⚠️ Global fallback path failed for {model}: {e}")
+            return None
 
-    async def check_pod_ready(self, pod_uuid: str) -> bool:
-        """Check if a pod is ready (DB worker registration preferred)."""
-        from db import SessionLocal, Worker
+    async def destroy_unexpected_pod(self, pod_uuid: str):
+        """Force-stop and destroy a pod that was not requested by the orchestrator."""
+        try:
+            logger.warning(f"💣 Destroying unexpected pod {pod_uuid} to prevent cost.")
 
-        with SessionLocal() as db:
-            w = db.query(Worker).filter(Worker.container_id == pod_uuid).first()
-            if w and w.status in ("ready", "processing"):
-                return True
+            # Create a temporary QuickPodManager bound to this specific pod UUID
+            temp_manager = QuickPodManager(self.email, self.password, pod_uuid)
 
+            # Stop and destroy via proper calls (each manager knows its pod_uuid)
+            await asyncio.to_thread(temp_manager.stop_pod)
+            await asyncio.sleep(2)  # small grace period
+            await asyncio.to_thread(temp_manager.destroy_pod)
+
+            logger.info(f"✅ Unexpected pod {pod_uuid} stopped and destroyed.")
+        except Exception as e:
+            logger.error(f"❌ Failed to destroy unexpected pod {pod_uuid}: {e}")
+        finally:
+            self.recently_destroyed[pod_uuid] = time.time()
+
+    # --------------------------------------------------------------------------
+    # INDIVIDUAL POD (WARM+INDIVIDUAL)
+    # --------------------------------------------------------------------------
+    async def create_individual_pod(self, model: str, mode: Optional[str] = None) -> Optional[str]:
+        await self._ensure_global_login()
         async with self._lock:
-            pod_manager = self.individual_pod_managers.get(pod_uuid)
-        if not pod_manager:
-            return False
+            if len(self.individual_pods) >= self.max_individual_pods:
+                raise RuntimeError("Maximum number of individual pods reached")
 
         try:
-            response = await asyncio.to_thread(pod_manager.get_logs)
-            if isinstance(response, dict):
-                return "ready" in str(response.get("status", "")).lower()
-            elif isinstance(response, str):
-                return "ready" in response.lower()
-        except Exception as e:
-            logger.exception("check_pod_ready failed for %s: %s", pod_uuid, e)
-        return False
+            offer_id = await self._call_with_retry(self.global_qp.get_best_offer)
+            if not offer_id:
+                raise RuntimeError("No offer returned by QuickPod")
 
+            template_uuid = self._get_template_for_model(model)
+            pod_data = await self._call_with_retry(self.global_qp.create_pod, offer_id, template_uuid, self.template_disk_size.get(model, 100))
+
+            pod_uuid = pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
+            if not pod_uuid:
+                raise RuntimeError("No pod UUID returned")
+
+            async with self._lock:
+                self.individual_pods[pod_uuid] = PodInfo(
+                    pod_uuid=pod_uuid,
+                    model=model,
+                    mode=mode,
+                    status="starting",
+                    created_at=datetime.utcnow(),
+                    last_active=datetime.utcnow(),
+                )
+                self.individual_pod_managers[pod_uuid] = QuickPodManager(self.email, self.password, pod_uuid)
+            return pod_uuid
+        except Exception as e:
+            logger.exception("Failed to create individual pod: %s", e)
+        return None
+
+    # --------------------------------------------------------------------------
+    # CLEANUP
+    # --------------------------------------------------------------------------
     async def stop_individual_pod(self, pod_uuid: str) -> None:
-        """Stop and clean up an individual pod."""
+        await self._ensure_global_login()
         async with self._lock:
-            pod_manager = self.individual_pod_managers.get(pod_uuid)
+            pod_manager = self.individual_pod_managers.get(pod_uuid) or self.global_qp
             exists = pod_uuid in self.individual_pods
-
-        if not exists or not pod_manager:
-            async with self._lock:
-                self.individual_pods.pop(pod_uuid, None)
-                self.individual_pod_managers.pop(pod_uuid, None)
+        if not exists:
             return
-
         try:
-            logger.info("Stopping pod %s ...", pod_uuid)
-            await asyncio.to_thread(pod_manager.stop_pod)
-        except Exception:
-            logger.exception("Error while stopping pod %s", pod_uuid)
-
+            await self._call_with_retry(pod_manager.stop_pod)
+        except Exception as e:
+            logger.warning("stop_individual_pod failed: %s", e)
         await asyncio.sleep(1)
         try:
-            logger.info("Destroying pod %s ...", pod_uuid)
-            await asyncio.to_thread(pod_manager.destroy_pod)
-        except Exception:
-            logger.exception("Error while destroying pod %s", pod_uuid)
-
+            await self._call_with_retry(pod_manager.destroy_pod)
+        except Exception as e:
+            logger.warning("destroy_pod failed: %s", e)
         async with self._lock:
             self.individual_pods.pop(pod_uuid, None)
             self.individual_pod_managers.pop(pod_uuid, None)
         logger.info("Pod %s cleaned up", pod_uuid)
 
+    async def destroy_individual_pod(self, pod_uuid: str) -> None:
+        await self._ensure_global_login()
+        async with self._lock:
+            manager = self.individual_pod_managers.get(pod_uuid)
+            exists = pod_uuid in self.individual_pods
+
+        if not exists:
+            return
+
+        try:
+            use_temp = True
+            if manager and getattr(manager, "pod_uuid", None) == pod_uuid:
+                use_temp = False
+
+            if use_temp:
+                # create a temporary manager bound to correct pod_uuid
+                tmp_mgr = QuickPodManager(self.email, self.password, pod_uuid)
+                await self._call_with_retry(tmp_mgr.destroy_pod)
+            else:
+                await self._call_with_retry(manager.destroy_pod)
+        except Exception as e:
+            logger.warning("destroy_individual_pod failed: %s", e)
+
+        async with self._lock:
+            self.individual_pods.pop(pod_uuid, None)
+            self.individual_pod_managers.pop(pod_uuid, None)
+        logger.info("Individual pod %s destroyed", pod_uuid)
+
+    # --------------------------------------------------------------------------
+    # HELPERS
+    # --------------------------------------------------------------------------
+    def _get_template_for_model(self, model: str) -> Optional[str]:
+        return self.template_uuids.get(model) or self.template_uuids.get("default")
+
+    def can_reuse_pod(self, pod_info: PodInfo, job_id: str) -> bool:
+        if pod_info.total_jobs_processed >= MAX_JOBS_PER_POD:
+            return False
+        if job_id in pod_info.job_id_counts:
+            return pod_info.job_id_counts[job_id] < MAX_SAME_JOB_PER_POD
+        return len(pod_info.unique_job_ids) < MAX_JOBS_PER_POD
+
+    def update_pod_job_counts(self, pod_info: PodInfo, job_id: str) -> None:
+        pod_info.total_jobs_processed += 1
+        pod_info.unique_job_ids.add(job_id)
+        pod_info.job_id_counts[job_id] = pod_info.job_id_counts.get(job_id, 0) + 1
+
+    async def check_pod_ready(self, pod_uuid: str) -> bool:
+        from db import SessionLocal, Worker
+        with SessionLocal() as db:
+            w = db.query(Worker).filter(Worker.container_id == pod_uuid).first()
+            if w and w.status in ("ready", "processing"):
+                return True
+        return False
+
+    async def add_pending_job(self, job_id: str, model: str):
+        async with self._jobs_lock:
+            if model not in self.pending_jobs:
+                self.pending_jobs[model] = set()
+            self.pending_jobs[model].add(job_id)
+
+    async def remove_pending_job(self, job_id: str, model: str):
+        async with self._jobs_lock:
+            if model in self.pending_jobs:
+                self.pending_jobs[model].discard(job_id)
+                if not self.pending_jobs[model]:
+                    del self.pending_jobs[model]
+
+    async def has_pending_jobs_for_model(self, model: str) -> bool:
+        async with self._jobs_lock:
+            return model in self.pending_jobs and bool(self.pending_jobs[model])
+
+    async def should_keep_pod_alive(self, pod_info: PodInfo) -> bool:
+        if self.pod_strategy == PodStrategyType.WARM_AND_INDIVIDUAL:
+            return True
+        return await self.has_pending_jobs_for_model(pod_info.model)
+
     async def cleanup_inactive_pods(self) -> None:
-        """Clean up inactive or errored pods."""
         now = datetime.utcnow()
         to_stop = []
         async with self._lock:
@@ -317,13 +720,21 @@ class PodManager:
                 )
                 if info.error_count >= 3 or inactive or starting_timed_out:
                     to_stop.append(pod_uuid)
-
         if not to_stop:
             return
-
         logger.info("Cleaning up %d pods: %s", len(to_stop), to_stop)
         for pod_uuid in to_stop:
             try:
                 await self.stop_individual_pod(pod_uuid)
             except Exception:
                 logger.exception("Error cleaning up pod %s", pod_uuid)
+
+    async def stop_warm_pod(self, pod_uuid: str) -> None:
+        if not self.warm_pod_manager or pod_uuid != self.warm_pod_uuid:
+            logger.warning("stop_warm_pod called for non-warm pod %s", pod_uuid)
+            return
+        try:
+            await self._call_with_retry(self.warm_pod_manager.stop_pod)
+            self.own_warm_pod = False
+        except Exception:
+            logger.exception("Error stopping warm pod %s", pod_uuid)

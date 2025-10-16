@@ -15,21 +15,34 @@ from transformers import pipeline
 os.environ["HF_HOME"] = "/models_storage/all_models"
 os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
 
-# Force torch.load to respect GPU if available
-original_load = torch.load
-torch.load = lambda *args, **kwargs: original_load(
-    *args, **kwargs, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-)
+# -------------------------
+# Globals
+# -------------------------
+_bg_remover = None  # cache
 
-# Initialize RMBG model (background remover)
-bg_remover = pipeline(
-    task="image-segmentation",
-    model="briaai/RMBG-1.4",
-    trust_remote_code=True
-)
 
-# Restore original torch.load
-torch.load = original_load
+def _get_bg_remover():
+    """Lazy load RMBG pipeline (only once)."""
+    global _bg_remover
+    if _bg_remover is None:
+        # Temporarily override torch.load to respect GPU if available
+        original_load = torch.load
+        torch.load = lambda *args, **kwargs: original_load(
+            *args,
+            **kwargs,
+            map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        )
+
+        _bg_remover = pipeline(
+            task="image-segmentation",
+            model="briaai/RMBG-1.4",
+            trust_remote_code=True,
+        )
+
+        # Restore torch.load
+        torch.load = original_load
+
+    return _bg_remover
 
 
 # -------------------------
@@ -64,6 +77,7 @@ def remove_background(input_image: np.ndarray, return_mask: bool = False) -> np.
         raise ValueError("No input image provided for background removal.")
 
     pil_image = Image.fromarray(input_image)
+    bg_remover = _get_bg_remover()
 
     if return_mask:
         mask = bg_remover(pil_image, return_mask=True)
@@ -92,32 +106,3 @@ def run_inference_rmbg(job_id: str, params: Dict[str, Any]) -> str:
     Image.fromarray(result).save(out_path)
 
     return out_path
-
-
-# -------------------------
-# Example usage
-# -------------------------
-if __name__ == "__main__":
-    job_id = "rmbg_debug"
-    input_path = "./input_image.jpg"
-
-    with open(input_path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-    # Remove background (transparent output)
-    params1 = {
-        "init_image": img_b64,
-        "output_dir": "./outputs",
-        "return_mask": False,  # set True if you want just the mask
-    }
-    out1 = run_inference_rmbg(job_id, params=params1)
-    print("✅ Background removed image saved at:", out1)
-
-    # Save mask instead
-    params2 = {
-        "init_image": img_b64,
-        "output_dir": "./outputs",
-        "return_mask": True,
-    }
-    out2 = run_inference_rmbg(job_id + "_mask", params=params2)
-    print("✅ Mask saved at:", out2)

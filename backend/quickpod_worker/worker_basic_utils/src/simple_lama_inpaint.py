@@ -32,9 +32,6 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DEFAULT_OUTPUT_DIR = "./outputs_outpaint"
 os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
-# Initialize model once
-SIMPLE_LAMA = SimpleLama()
-
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -76,6 +73,9 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
 
 def process_with_lama(init_image: Image.Image, mask_image: Image.Image, output_path: str) -> str:
     """Run LaMa inpainting given an image and mask."""
+    # Initialize model once
+    SIMPLE_LAMA = SimpleLama()
+
     result = SIMPLE_LAMA.inpaint(init_image, mask_image)
     result.save(output_path)
     return os.path.abspath(output_path)

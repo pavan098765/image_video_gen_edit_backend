@@ -1,35 +1,55 @@
-# Download the weights from the links below:
-
-# Download sd3.5_large from https://huggingface.co/city96/stable-diffusion-3.5-large-gguf/blob/main/sd3.5_large-Q5_0.gguf
-# Download clip_g from https://huggingface.co/Comfy-Org/stable-diffusion-3.5-fp8/blob/main/text_encoders/clip_g.safetensors
-# Download clip_l from https://huggingface.co/Comfy-Org/stable-diffusion-3.5-fp8/blob/main/text_encoders/clip_l.safetensors
-# Download t5xxl from https://huggingface.co/Comfy-Org/stable-diffusion-3.5-fp8/blob/main/text_encoders/t5xxl_fp16.safetensors
-
+# sd35_t2i_inference.py
+# Stable Diffusion 3.5 Txt2Img (GGUF backend)
 
 import os
-import uuid
+import base64
 from typing import Dict, Any, Optional
 from PIL import Image
 from stable_diffusion_cpp import StableDiffusion
 from huggingface_hub import hf_hub_download
 
-# Always use /quickpod/all_models inside cloud GPU
+# -------------------------
+# Environment setup
+# -------------------------
+os.environ["HF_HOME"] = "/models_storage/all_models"
+os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 MODEL_DIR = os.path.join("/models_storage", "all_models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Hugging Face token (must be set in env for gated models)
-HF_TOKEN = f"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"
+HF_TOKEN = os.environ.get("HF_TOKEN", "hf_xxx")
 
-# Define models
+# -------------------------
+# Model definitions
+# -------------------------
 MODEL_FILES = {
-    "DIFFUSION_MODEL": ("second-state/stable-diffusion-3.5-large-GGUF", "sd3.5_large-Q8_0.gguf"),
-    "CLIP_L_PATH": ("second-state/stable-diffusion-3.5-large-GGUF", "clip_l.safetensors"),
-    "CLIP_G_PATH": ("second-state/stable-diffusion-3.5-large-GGUF", "clip_g-Q8_0.gguf"),
-    "T5XXL_PATH": ("second-state/stable-diffusion-3.5-large-GGUF", "t5xxl-Q8_0.gguf")
+    "DIFFUSION_MODEL": (
+        "city96/stable-diffusion-3.5-large-gguf",
+        "sd3.5_large-Q5_0.gguf",
+    ),
+    "CLIP_L_PATH": (
+        "Comfy-Org/stable-diffusion-3.5-fp8",
+        "text_encoders/clip_l.safetensors",
+    ),
+    "CLIP_G_PATH": (
+        "Comfy-Org/stable-diffusion-3.5-fp8",
+        "text_encoders/clip_g.safetensors",
+    ),
+    "T5XXL_PATH": (
+        "Comfy-Org/stable-diffusion-3.5-fp8",
+        "text_encoders/t5xxl_fp16.safetensors",
+    ),
 }
 
-def download_models():
-    """Download required models into /quickpod/all_models using huggingface_hub"""
+STABLE_DIFFUSION: Optional[StableDiffusion] = None
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def _download_models():
+    """Download all required model files into MODEL_DIR."""
     local_paths = {}
     for key, (repo_id, filename) in MODEL_FILES.items():
         print(f"[Download] {key} → {repo_id}/{filename}")
@@ -37,45 +57,52 @@ def download_models():
             repo_id=repo_id,
             filename=filename,
             token=HF_TOKEN,
-            cache_dir=MODEL_DIR
+            cache_dir=MODEL_DIR,
         )
         local_paths[key] = path
     return local_paths
 
-# Ensure all models are available
-MODEL_PATHS = download_models()
 
-# Environment-default model paths (override via env)
-MODEL_PATH = MODEL_PATHS["DIFFUSION_MODEL"]
-CLIP_L_PATH   = MODEL_PATHS["CLIP_L_PATH"]
-CLIP_G_PATH   = MODEL_PATHS["CLIP_G_PATH"]
-T5XXL_PATH   = MODEL_PATHS["T5XXL_PATH"]
+def _get_pipeline() -> StableDiffusion:
+    """Lazy init Stable Diffusion 3.5 pipeline (cached)."""
+    global STABLE_DIFFUSION
+    if STABLE_DIFFUSION is not None:
+        return STABLE_DIFFUSION
 
-stable_diffusion = StableDiffusion(
-    model_path=MODEL_PATH,
-    clip_l_path=CLIP_L_PATH,
-    clip_g_path=CLIP_G_PATH,
-    t5xxl_path=T5XXL_PATH,
-    vae_decode_only=True, # Can be True if we are not generating image to image
-)
+    model_paths = _download_models()
+    STABLE_DIFFUSION = StableDiffusion(
+        model_path=model_paths["DIFFUSION_MODEL"],
+        clip_l_path=model_paths["CLIP_L_PATH"],
+        clip_g_path=model_paths["CLIP_G_PATH"],
+        t5xxl_path=model_paths["T5XXL_PATH"],
+        vae_decode_only=True,  # safe for Txt2Img
+    )
+    print("[Init] Stable Diffusion 3.5 Txt2Img pipeline loaded")
+    return STABLE_DIFFUSION
 
 
+# -------------------------
+# Inference
+# -------------------------
 def run_inference_sd35_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
     """
     Run SD 3.5 Txt2Img inference and save the result locally.
     Returns the path to the saved PNG file.
     """
-    negative_prompt = params.get("negative_prompt", None)
-    width           = params.get("width", 512)
-    height          = params.get("height", 512)
-    steps           = params.get("sample_steps", 25)
-    cfg             = params.get("cfg_scale", 4.5)
-    method          = params.get("sample_method", "euler")
-    seed            = params.get("seed", -1)
-    output_dir      = params.get("output_dir", "/quickpod")
+    pipe = _get_pipeline()
+
+    negative_prompt = params.get("negative_prompt")
+    width = int(params.get("width", 512))
+    height = int(params.get("height", 512))
+    steps = int(params.get("sample_steps", 25))
+    cfg = float(params.get("cfg_scale", 4.5))
+    method = params.get("sample_method", "euler")
+    seed = int(params.get("seed", -1))
+    output_dir = params.get("output_dir", "./outputs")
+    os.makedirs(output_dir, exist_ok=True)
 
     # Run inference
-    output = stable_diffusion.generate_image(
+    out = pipe.generate_image(
         prompt=prompt,
         negative_prompt=negative_prompt,
         width=width,
@@ -86,25 +113,23 @@ def run_inference_sd35_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
         seed=seed,
     )
 
-    # Ensure output dir exists
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f"sd_35_t2i_{job_id}.png")
-
-    if isinstance(output, list) and isinstance(output[0], Image.Image):
-        output[0].save(out_path)
-    elif isinstance(output, Image.Image):
-        output.save(out_path)
+    out_path = os.path.join(output_dir, f"sd35_t2i_{job_id}.png")
+    img = out[0] if isinstance(out, list) else out
+    if isinstance(img, Image.Image):
+        img.save(out_path)
     else:
-        Image.fromarray(output).save(out_path)
+        Image.fromarray(img).save(out_path)
 
     return out_path
 
 
+# -------------------------
+# Example usage
+# -------------------------
 if __name__ == "__main__":
-    
     job_id = "test2"
     prompt = "a beautiful indian girl, high quality, detailed, intricate, digital art"
-    
+
     params = {
         "width": 768,
         "height": 1024,
@@ -113,8 +138,10 @@ if __name__ == "__main__":
         "sample_method": "dpmpp2mv2",
         "seed": -1,
         "output_dir": "./outputs",
-        "negative_prompt": "lowres, bad anatomy, error body, error hands, error fingers, error legs, error arms, disfigured, deformed, blurry, fuzzy, out of focus, extra limbs, cloned face, gross proportions, malformed limbs, missing arms, missing legs, extra arms, extra legs, mutated hands and fingers, poorly drawn hands and fingers, fused fingers, too many fingers, long neck",
-
+        "negative_prompt": (
+            "lowres, bad anatomy, error body, error hands, error fingers, "
+            "disfigured, deformed, blurry, cloned face, malformed limbs"
+        ),
     }
 
     out = run_inference_sd35_t2i(job_id, prompt, params)

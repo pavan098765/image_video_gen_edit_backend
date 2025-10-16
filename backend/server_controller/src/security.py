@@ -9,9 +9,9 @@ from db import SessionLocal, Device
 
 
 # env secrets
-SHARED_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "")
-API_KEYS = set([k.strip() for k in os.getenv("CONTROLLER_API_KEYS", "").split(",") if k.strip()])
-DEVICE_SIGNING_SECRET = os.getenv("DEVICE_SIGNING_SECRET", os.getenv("CONTROLLER_SHARED_SECRET", ""))  # use separate if set
+SHARED_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "SECRETKEY")
+API_KEYS = set([k.strip() for k in os.getenv("CONTROLLER_API_KEYS", "SECRETKEY").split(",") if k.strip()])
+DEVICE_SIGNING_SECRET = os.getenv("DEVICE_SIGNING_SECRET", os.getenv("CONTROLLER_SHARED_SECRET", "SECRETKEY"))  # use separate if set
 DEVICE_TIMESTAMP_WINDOW = int(os.getenv("DEVICE_TIMESTAMP_WINDOW", "300"))  # seconds, default 5 minutes
 
 # Worker HMAC
@@ -22,9 +22,10 @@ def sign_payload_bytes(payload_bytes: bytes) -> str:
     return "sha256=" + mac.hexdigest()
 
 def verify_signature(header_signature: str, payload_bytes: bytes) -> bool:
-    if not SHARED_SECRET:
-        return False
-    if not header_signature:
+    """
+    Accept signatures generated from either compact or pretty JSON encoding.
+    """
+    if not SHARED_SECRET or not header_signature:
         return False
     try:
         algo, hexsig = header_signature.split("=", 1)
@@ -32,8 +33,23 @@ def verify_signature(header_signature: str, payload_bytes: bytes) -> bool:
         return False
     if algo != "sha256":
         return False
+
+    # 1️⃣ Primary check: raw body as received
     mac = hmac.new(SHARED_SECRET.encode(), payload_bytes, hashlib.sha256)
-    return hmac.compare_digest(mac.hexdigest(), hexsig)
+    if hmac.compare_digest(mac.hexdigest(), hexsig):
+        return True
+
+    # 2️⃣ Fallback: normalize JSON and re-sign (for workers that sign compact JSON)
+    try:
+        data = json.loads(payload_bytes.decode("utf-8"))
+        alt_bytes = json.dumps(data).encode("utf-8")  # worker’s signing format
+        alt_mac = hmac.new(SHARED_SECRET.encode(), alt_bytes, hashlib.sha256)
+        if hmac.compare_digest(alt_mac.hexdigest(), hexsig):
+            return True
+    except Exception:
+        pass
+
+    return False
 
 # --------------------------------------------------
 # Device / API key auth helpers used by main.py
@@ -44,16 +60,17 @@ def hash_fingerprint(raw_fingerprint: str) -> str:
     return hashlib.sha256(raw_fingerprint.encode("utf-8")).hexdigest()
 
 def verify_api_key(auth_header: Optional[str]) -> bool:
-    """Expect Authorization: Bearer <key>"""
     if not auth_header:
         return False
     parts = auth_header.split()
     if len(parts) != 2:
         return False
     scheme, key = parts
+    print(f"🔍 verify_api_key(): got key={key}, valid keys={API_KEYS}")
     if scheme.lower() != "bearer":
         return False
     return key in API_KEYS
+
 
 def find_device_by_fingerprint(session: Session, fingerprint_hash: str) -> Optional[Device]:
     return session.query(Device).filter(Device.fingerprint_hash == fingerprint_hash).order_by(Device.last_seen.desc()).first()

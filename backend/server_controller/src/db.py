@@ -50,6 +50,11 @@ class Worker(Base):
     error_count = Column(Integer, default=0)
     queue_size = Column(Integer, default=0)
     resource_limits = Column(JSON, nullable=True)  # optional limits per worker
+    
+    # Job tracking fields
+    total_jobs_processed = Column(Integer, default=0)
+    job_id_counts = Column(MutableDict.as_mutable(JSON), default=dict)  # Track jobs per worker
+    machine_id = Column(String, nullable=True, index=True)  # Store machine ID for machine-based strategy
 
     __table_args__ = (
         Index("ix_worker_model_status", "model", "status"),

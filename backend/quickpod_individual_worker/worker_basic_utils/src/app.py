@@ -8,11 +8,16 @@ import hashlib
 import gc
 from typing import Dict, Any, Optional
 from datetime import datetime
+import uuid
+import base64
+from contextlib import asynccontextmanager
 
+import httpx
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from tenacity import retry, wait_exponential, stop_after_attempt
+
 
 # -----------------------
 # GPU cleanup
@@ -21,11 +26,13 @@ def cleanup_gpu():
     """Free GPU memory completely (stateless safe mode)."""
     try:
         import torch
+
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
     except Exception:
         pass
     gc.collect()
+
 
 # -----------------------
 # Import inference functions
@@ -34,7 +41,7 @@ from bg_remover import run_inference_rmbg
 from simple_lama_inpaint import run_inference_simple_lama_inpaint
 
 # -----------------------
-# Model Registry (only bg remover + simple lama)
+# Model Registry (bg remover + lama)
 # -----------------------
 MODEL_REGISTRY = {
     "basic_utils": {
@@ -73,18 +80,16 @@ WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
 # -----------------------
-# FastAPI app
+# Job queue
 # -----------------------
-app = FastAPI(title=f"QuickPod Worker ({MODEL_KEY})")
-
-# Job queue & status
 job_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 job_status: Dict[str, Dict[str, Any]] = {}
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 last_model_key: Optional[str] = None
 
+
 # -----------------------
-# Request Models
+# Request Model
 # -----------------------
 class RunRequest(BaseModel):
     job_id: str
@@ -95,6 +100,7 @@ class RunRequest(BaseModel):
     upload_url: str
     result_key: str
 
+
 # -----------------------
 # HMAC utils
 # -----------------------
@@ -104,6 +110,7 @@ def sign_payload_bytes(payload_bytes: bytes) -> str:
     )
     return "sha256=" + mac.hexdigest()
 
+
 def signed_headers(payload: dict) -> Dict[str, str]:
     b = json.dumps(payload).encode("utf-8")
     sig = sign_payload_bytes(b)
@@ -112,11 +119,13 @@ def signed_headers(payload: dict) -> Dict[str, str]:
         headers["Authorization"] = f"Bearer {CONTROLLER_API_KEY}"
     return headers
 
+
 def post_signed_json(url: str, payload: dict, timeout: int = 10) -> requests.Response:
     headers = signed_headers(payload)
     resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
     resp.raise_for_status()
     return resp
+
 
 # -----------------------
 # Controller integration
@@ -137,12 +146,18 @@ def register_with_controller():
     resp = post_signed_json(url, register_payload, timeout=10)
     return resp.json()
 
+
 @retry(wait=wait_exponential(min=2, max=20), stop=stop_after_attempt(6))
 def send_heartbeat():
-    payload = {"worker_id": WORKER_ID, "pod_uuid": POD_UUID, "timestamp": int(time.time())}
+    payload = {
+        "worker_id": WORKER_ID,
+        "pod_uuid": POD_UUID,
+        "timestamp": int(time.time()),
+    }
     url = f"{CONTROLLER_URL.rstrip('/')}/heartbeat"
     resp = post_signed_json(url, payload, timeout=5)
     return resp.json()
+
 
 # -----------------------
 # Inference dispatcher
@@ -159,8 +174,13 @@ def resolve_inference_callable(model: str, mode: Optional[str]):
         inference_func = inference_func[mode]
     return inference_func
 
+
 async def run_inference_and_save(
-    job_id: str, prompt: Optional[str], model: str, mode: Optional[str], params: Dict[str, Any]
+    job_id: str,
+    prompt: Optional[str],
+    model: str,
+    mode: Optional[str],
+    params: Dict[str, Any],
 ) -> str:
     global last_model_key
     loop = asyncio.get_event_loop()
@@ -183,6 +203,7 @@ async def run_inference_and_save(
         return out_path
     finally:
         last_model_key = model_key
+
 
 # -----------------------
 # Job Processing
@@ -207,9 +228,12 @@ async def process_job_item(item: Dict[str, Any]):
             out_local = await run_inference_and_save(
                 job_id, prompt, model, mode, params
             )
-            with open(out_local, "rb") as f:
-                resp = requests.put(upload_url, data=f)
-                resp.raise_for_status()
+            if upload_url.startswith("http://dummy-upload"):
+                logger.info("Skipping upload for dummy URL")
+            else:
+                with open(out_local, "rb") as f:
+                    resp = requests.put(upload_url, data=f)
+                    resp.raise_for_status()
 
             payload = {"job_id": job_id, "result_r2_key": result_key}
             url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
@@ -226,14 +250,14 @@ async def process_job_item(item: Dict[str, Any]):
         job_status[job_id] = {"status": "failed", "error": str(e)}
         payload = {
             "job_id": job_id,
-            "result_r2_key": None,
+            "result_r2_key": "None",
             "failed": True,
-            "error": str(e),
         }
         try:
             post_signed_json(f"{CONTROLLER_URL.rstrip('/')}/job_complete", payload)
         except Exception as e2:
             logger.error("Failed to notify controller of failure: %s", e2)
+
 
 async def worker_loop():
     logger.info("Starting worker loop")
@@ -244,9 +268,113 @@ async def worker_loop():
         finally:
             job_queue.task_done()
 
+
 # -----------------------
-# FastAPI Endpoints
+# Auto-test
 # -----------------------
+async def run_autotest():
+    await asyncio.sleep(5)  # short delay to let server settle
+    logger.info("🚀 Starting basic-utils auto-test (bg_remove + lama_inpaint)")
+
+    img_url = "https://pub-67f874d172874988b5754734cc4fcb7e.r2.dev/Snapinsta.app_262322643_4937545659591345_7487236998017046274_n_1080.jpg"
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
+            "Referer": "https://ibb.co",
+            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+        }
+        async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
+            resp = await client.get(img_url)
+            resp.raise_for_status()
+            img_bytes = resp.content
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch test image: {e}")
+        return
+
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+    mask_b64 = img_b64  # reuse same as mask for demo
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        # --- BG REMOVE ---
+        bg_job_id = f"autotest-bg-{uuid.uuid4()}"
+        resp = await client.post(
+            "http://127.0.0.1:8000/run",
+            json={
+                "job_id": bg_job_id,
+                "prompt": None,
+                "model": "basic_utils",
+                "mode": "bg_remove",
+                "params": {"init_image": img_b64, "output_dir": "./outputs"},
+                "upload_url": "http://dummy-upload/skip",
+                "result_key": f"{bg_job_id}.png",
+            },
+        )
+        logger.info(f"🔥 BG_REMOVE response: {resp.status_code} {resp.text}")
+
+        # --- LAMA INPAINT ---
+        lama_job_id = f"autotest-lama-{uuid.uuid4()}"
+        resp = await client.post(
+            "http://127.0.0.1:8000/run",
+            json={
+                "job_id": lama_job_id,
+                "prompt": None,
+                "model": "basic_utils",
+                "mode": "lama_inpaint",
+                "params": {
+                    "init_image": img_b64,
+                    "mask_image": mask_b64,
+                    "output_dir": "./outputs",
+                },
+                "upload_url": "http://dummy-upload/skip",
+                "result_key": f"{lama_job_id}.png",
+            },
+        )
+        logger.info(f"🔥 LAMA_INPAINT response: {resp.status_code} {resp.text}")
+
+
+# -----------------------
+# Lifespan
+# -----------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("✅ Application fully started, registering worker now")
+
+    try:
+        register_with_controller()
+    except Exception as e:
+        logger.exception("Failed to register worker with controller: %s", e)
+        raise
+
+    asyncio.create_task(worker_loop())
+    asyncio.create_task(_hb_loop())
+
+    if os.getenv("ENABLE_AUTOTEST", "1") == "1":
+        asyncio.create_task(run_autotest())
+
+    yield  # server runs until shutdown
+
+    logger.info("Worker shutting down; final GPU cleanup")
+    cleanup_gpu()
+
+
+# -----------------------
+# Heartbeat loop
+# -----------------------
+async def _hb_loop():
+    while True:
+        try:
+            send_heartbeat()
+        except Exception as e:
+            logger.exception("Heartbeat failed: %s", e)
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
+# -----------------------
+# FastAPI app
+# -----------------------
+app = FastAPI(title=f"QuickPod Worker ({MODEL_KEY})", lifespan=lifespan)
+
+
 @app.post("/run")
 async def run_endpoint(req: RunRequest):
     if req.job_id in job_status and job_status[req.job_id].get("status") in (
@@ -262,39 +390,12 @@ async def run_endpoint(req: RunRequest):
     logger.info("Enqueued job %s", req.job_id)
     return {"status": "accepted", "job_id": req.job_id}
 
+
 @app.get("/health")
 def health():
     return {"status": "ok", "worker_id": WORKER_ID, "queue_size": job_queue.qsize()}
 
+
 @app.get("/status")
 def status():
     return {"queue_size": job_queue.qsize(), "jobs": job_status}
-
-# -----------------------
-# Startup / Shutdown
-# -----------------------
-@app.on_event("startup")
-async def on_startup():
-    logger.info("Worker starting in smart cleanup mode")
-    try:
-        register_with_controller()
-    except Exception as e:
-        logger.exception("Failed to register worker with controller: %s", e)
-        raise
-
-    async def hb_loop():
-        while True:
-            try:
-                send_heartbeat()
-            except Exception as e:
-                logger.exception("Heartbeat failed: %s", e)
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-
-    asyncio.create_task(hb_loop())
-    asyncio.create_task(worker_loop())
-
-@app.on_event("shutdown")
-def on_shutdown():
-    logger.info("Worker shutting down; final GPU cleanup")
-    cleanup_gpu()
-s

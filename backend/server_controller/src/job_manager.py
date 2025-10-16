@@ -22,6 +22,8 @@ class JobState(Enum):
     TIMEOUT = "timeout"
     RECOVERED = "recovered"
     CANCELLED = "cancelled"
+    DISPATCHING = "dispatching"
+
 
 
 class JobStateError(Exception):
@@ -39,6 +41,7 @@ class JobManager:
             JobState.QUEUED: [JobState.RUNNING, JobState.CANCELLED, JobState.TIMEOUT, JobState.FAILED],
             JobState.RUNNING: [JobState.COMPLETED, JobState.FAILED, JobState.TIMEOUT, JobState.RECOVERED],
             JobState.COMPLETED: [],
+            JobState.DISPATCHING: [JobState.RUNNING, JobState.FAILED],
             JobState.FAILED: [JobState.RECOVERED],
             JobState.TIMEOUT: [JobState.RECOVERED],
             JobState.RECOVERED: [JobState.QUEUED],
@@ -48,6 +51,16 @@ class JobManager:
     def _validate_transition(self, current_state: JobState, new_state: JobState):
         if new_state not in self.allowed_transitions[current_state]:
             raise JobStateError(f"Invalid state transition from {current_state} to {new_state}")
+
+    def _reset_worker_if_dispatching(self, db: Session, worker_id: Optional[str]):
+        """Ensure worker doesn't stay stuck in 'dispatching' if job fails/cancels."""
+        if not worker_id:
+            return
+        worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+        if worker and worker.status == "dispatching":
+            logger.info(f"Resetting worker {worker.worker_id} from 'dispatching' → 'ready'")
+            worker.status = "ready"
+            worker.last_active = datetime.utcnow()
 
     def update_job_state(self, job_id: str, new_state: JobState, error_message: Optional[str] = None) -> Job:
         with self.session_factory() as db:
@@ -61,31 +74,22 @@ class JobManager:
             job.status = new_state.value
             job.updated_at = datetime.utcnow()
 
+            # If job failed/cancelled/timeout, free up worker
+            if new_state in [JobState.FAILED, JobState.TIMEOUT, JobState.CANCELLED]:
+                self._reset_worker_if_dispatching(db, job.worker_id)
+
             if error_message:
                 job.error_log = (job.error_log or []) + [{
                     "timestamp": datetime.utcnow().isoformat(),
                     "state": new_state.value,
                     "error": error_message,
                 }]
-                # if not job.error_log:
-                #     job.error_log = []
-                # job.error_log.append(
-                #     {
-                #         "timestamp": datetime.utcnow().isoformat(),
-                #         "state": new_state.value,
-                #         "error": error_message,
-                #     }
-                # )
 
             db.commit()
             db.refresh(job)
             return job
 
     async def assign_job(self, job_id: str, model: str, mode: Optional[str] = None) -> str:
-        """
-        Dispatch job via PodManager and assign to a worker.
-        Returns worker_id (canonical Worker.worker_id).
-        """
         with self.session_factory() as db:
             job = db.query(Job).filter(Job.job_id == job_id).first()
             if not job:
@@ -127,8 +131,11 @@ class JobManager:
                             "error": f"Job timed out after {self.job_timeout.total_seconds()/60} minutes",
                         }
                     ]
-                    db.commit()
 
+                    # Reset worker if it was still stuck in dispatching
+                    self._reset_worker_if_dispatching(db, job.worker_id)
+
+                    db.commit()
                     await self.recover_job(job.job_id)
 
                 except Exception as e:
@@ -145,6 +152,8 @@ class JobManager:
                     job.status = JobState.FAILED.value
                     job.error = "max retries exceeded"
                     job.updated_at = datetime.utcnow()
+                    # Reset worker if stuck
+                    self._reset_worker_if_dispatching(db, job.worker_id)
                     db.commit()
                     logger.error(f"Job {job_id} failed: max retries exceeded")
                     return
@@ -158,6 +167,9 @@ class JobManager:
                         "error": "Job recovered for retry",
                     }
                 ]
+
+                # Reset worker if stuck
+                self._reset_worker_if_dispatching(db, job.worker_id)
 
                 job.status = JobState.QUEUED.value
                 job.retry_count = (job.retry_count or 0) + 1
@@ -177,6 +189,8 @@ class JobManager:
                         "error": f"Recovery failed: {str(e)}",
                     }
                 ]
+                # Reset worker if stuck
+                self._reset_worker_if_dispatching(db, job.worker_id)
                 db.commit()
 
     def cancel_job(self, job_id: str, reason: str) -> None:
@@ -196,6 +210,8 @@ class JobManager:
                         "error": reason,
                     }
                 ]
+                # Reset worker if stuck
+                self._reset_worker_if_dispatching(db, job.worker_id)
                 db.commit()
             else:
                 raise JobStateError(f"Cannot cancel job in state {current_state}")

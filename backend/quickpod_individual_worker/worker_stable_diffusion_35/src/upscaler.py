@@ -1,0 +1,168 @@
+# upscale_realesrgan_local.py
+import sys
+import os
+import base64
+import requests
+from io import BytesIO
+from typing import Union
+from PIL import Image
+import numpy as np
+import cv2
+import torch
+
+# --- Compatibility shim for basicsr + newer torchvision ---
+try:
+    from torchvision.transforms import functional as F
+    sys.modules["torchvision.transforms.functional_tensor"] = F
+except ImportError:
+    pass
+# -----------------------------------------------------------
+
+from realesrgan import RealESRGANer
+from basicsr.archs.rrdbnet_arch import RRDBNet
+
+
+# -------------------------
+# Config / Model Paths
+# -------------------------
+MODEL_DIR: str = os.environ.get("REALESRGAN_LOCAL_PATH", "/app/models/realesrgan")
+
+MODEL_MAP = {
+    "RealESRGAN_x4plus": os.path.join(MODEL_DIR, "RealESRGAN_x4plus.pth"),
+    "RealESRGAN_x2plus": os.path.join(MODEL_DIR, "RealESRGAN_x2plus.pth"),
+}
+
+MODEL_CACHE = {}
+
+# -------------------------
+# Helpers
+# -------------------------
+def _decode_image(img: Union[str, bytes, Image.Image]) -> np.ndarray:
+    """Decode input into OpenCV BGR uint8 array."""
+    if isinstance(img, Image.Image):
+        img = np.array(img.convert("RGB"))
+        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    if isinstance(img, bytes):
+        arr = np.frombuffer(img, np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if os.path.exists(str(img)):
+        return cv2.imread(str(img), cv2.IMREAD_COLOR)
+    try:
+        decoded = base64.b64decode(img)
+        arr = np.frombuffer(decoded, np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception as e:
+        raise ValueError(f"Unable to decode image: {e}")
+
+
+def _strip_metadata(pil_img: Image.Image) -> Image.Image:
+    """
+    Remove all EXIF, ICC, and ancillary metadata by re-saving to PNG in memory.
+    Ensures output is clean and deterministic.
+    """
+    with BytesIO() as buf:
+        pil_img.save(buf, format="PNG")
+        buf.seek(0)
+        return Image.open(buf).convert("RGB")
+
+
+def _get_model(model_name: str, gpu_id: int = 0) -> RealESRGANer:
+    """Load a RealESRGAN model from local weights (supports only 2x, 4x)."""
+    if model_name in MODEL_CACHE:
+        return MODEL_CACHE[model_name]
+
+    if model_name not in MODEL_MAP:
+        raise ValueError(f"Unsupported model '{model_name}'. Available: {list(MODEL_MAP.keys())}")
+
+    model_path = MODEL_MAP[model_name]
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"❌ Missing model weights at {model_path}")
+
+    # Select model architecture and scale
+    if model_name == "RealESRGAN_x4plus":
+        scale = 4
+        model = RRDBNet(num_in_ch=3, num_out_ch=3,
+                        num_feat=64, num_block=23,
+                        num_grow_ch=32, scale=scale)
+    elif model_name == "RealESRGAN_x2plus":
+        scale = 2
+        model = RRDBNet(num_in_ch=3, num_out_ch=3,
+                        num_feat=64, num_block=23,
+                        num_grow_ch=32, scale=scale)
+    else:
+        raise ValueError(f"Model not supported: {model_name}")
+
+    upsampler = RealESRGANer(
+        scale=scale,
+        model_path=model_path,
+        model=model,
+        tile=0,
+        tile_pad=10,
+        pre_pad=0,
+        half=torch.cuda.is_available(),
+        gpu_id=gpu_id if torch.cuda.is_available() else None
+    )
+
+    MODEL_CACHE[model_name] = upsampler
+    return upsampler
+
+
+# -------------------------
+# Main Function
+# -------------------------
+def upscale_image(
+    input_image: Union[str, bytes, Image.Image],
+    model_name: str = "RealESRGAN_x4plus",
+    scale_factor: float = 4.0,
+    remove_metadata: bool = True,
+) -> Image.Image:
+    """
+    Upscale an image using RealESRGAN_x2plus or RealESRGAN_x4plus.
+    Args:
+        input_image: path, bytes, base64, or PIL.Image
+        model_name: 'RealESRGAN_x2plus' or 'RealESRGAN_x4plus'
+        scale_factor: typically 2 or 4
+        remove_metadata: remove EXIF/ICC metadata from output
+    Returns:
+        PIL.Image (RGB)
+    """
+    img = _decode_image(input_image)
+    upsampler = _get_model(model_name)
+
+    try:
+        output, _ = upsampler.enhance(img, outscale=scale_factor)
+    except RuntimeError as e:
+        raise RuntimeError(f"❌ RealESRGAN inference failed: {e}")
+
+    # Convert to RGB for PIL
+    output = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(output)
+
+    if remove_metadata:
+        pil_img = _strip_metadata(pil_img)
+
+    return pil_img
+
+
+# -------------------------
+# Example CLI Usage
+# -------------------------
+def fetch_image_bytes(url: str) -> bytes:
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    return resp.content
+
+
+if __name__ == "__main__":
+    url = "https://pub-67f874d172874988b5754734cc4fcb7e.r2.dev/Snapinsta.app_262322643_4937545659591345_7487236998017046274_n_1080.jpg"
+    out_path = "out_upscaled_x2_clean.png"
+
+    out_img = upscale_image(
+        input_image=fetch_image_bytes(url),
+        model_name="RealESRGAN_x2plus",  # or RealESRGAN_x4plus
+        scale_factor=2.0,
+        remove_metadata=True
+    )
+
+    out_img.save(out_path)
+    print(f"✅ Saved upscaled, metadata-free image to {out_path}")

@@ -1,59 +1,89 @@
-# Download the weights from the links below:
+# sd35_inpaint_inference.py
+# ✅ Lazy-loading implementation
+# SD 3.5 Img2Img using pre-downloaded GGUF + text encoders (GPU-only, baked models)
 
-# Download sd3.5_large from https://huggingface.co/stabilityai/stable-diffusion-3.5-large/blob/main/sd3.5_large.safetensors
-# Download clip_g from https://huggingface.co/Comfy-Org/stable-diffusion-3.5-fp8/blob/main/text_encoders/clip_g.safetensors
-# Download clip_l from https://huggingface.co/Comfy-Org/stable-diffusion-3.5-fp8/blob/main/text_encoders/clip_l.safetensors
-# Download t5xxl from https://huggingface.co/Comfy-Org/stable-diffusion-3.5-fp8/blob/main/text_encoders/t5xxl_fp16.safetensors
-
-
-#sd35 inpaint_inference.py
+import os
 import base64
 from io import BytesIO
-import os
 from typing import Any, Dict, Optional, Union
 from PIL import Image
-from stable_diffusion_cpp import StableDiffusion
-from huggingface_hub import hf_hub_download
+import torch
 
-# Always use /quickpod/all_models inside cloud GPU
-MODEL_DIR = os.environ.get("HF_HOME", "/models_storage/all_models")
+from stable_diffusion_cpp import StableDiffusion
+from upscaler import upscale_image
+
+torch.cuda.empty_cache()
+
+# -------------------------
+# Environment / Paths
+# -------------------------
+MODEL_DIR = "/models/sd35"
+
 SD35_LOCAL_PATH = os.environ.get(
     "SD35_LOCAL_PATH",
-    os.path.join(MODEL_DIR, "hf_models", "second-state_stable-diffusion-3.5-large-GGUF")
+    os.path.join(MODEL_DIR, "hf_models", "second-state_stable-diffusion-3.5-large-GGUF"),
 )
 
-# Define models
+# Model component filenames (baked in image)
 MODEL_FILES = {
     "DIFFUSION_MODEL": "sd3.5_large-Q8_0.gguf",
     "CLIP_L_PATH": "clip_l.safetensors",
     "CLIP_G_PATH": "clip_g-Q8_0.gguf",
-    "T5XXL_PATH": "t5xxl-Q8_0.gguf"
+    "T5XXL_PATH": "t5xxl-Q8_0.gguf",
 }
 
 MODEL_PATHS = {k: os.path.join(SD35_LOCAL_PATH, v) for k, v in MODEL_FILES.items()}
 
+# Validate model files exist
 for key, path in MODEL_PATHS.items():
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing required model file: {path}")
+        raise FileNotFoundError(f"❌ Missing required model file: {path}")
     else:
         print(f"✓ {key} found at {path}")
 
+# -------------------------
+# Lazy Loader Cache
+# -------------------------
+_model_cache = {
+    "sd35": None
+}
 
-# Environment-default model paths (override via env)
-MODEL_PATH = MODEL_PATHS["DIFFUSION_MODEL"]
-CLIP_L_PATH   = MODEL_PATHS["CLIP_L_PATH"]
-CLIP_G_PATH   = MODEL_PATHS["CLIP_G_PATH"]
-T5XXL_PATH   = MODEL_PATHS["T5XXL_PATH"]
+def get_sd35() -> StableDiffusion:
+    """
+    Lazily load the Stable Diffusion 3.5 model.
+    Cached globally for reuse across Img2Img jobs.
+    """
+    global _model_cache
+    if _model_cache["sd35"] is not None:
+        return _model_cache["sd35"]
 
-# Initialize once at import (match README usage)
-sd = StableDiffusion(
-    model_path=MODEL_PATH,
-    clip_l_path=CLIP_L_PATH,
-    clip_g_path=CLIP_G_PATH,
-    t5xxl_path=T5XXL_PATH
-)
+    print("🧠 Loading Stable Diffusion 3.5 model (GGUF + CLIP + T5)...")
+    sd = StableDiffusion(
+        model_path=MODEL_PATHS["DIFFUSION_MODEL"],
+        clip_l_path=MODEL_PATHS["CLIP_L_PATH"],
+        clip_g_path=MODEL_PATHS["CLIP_G_PATH"],
+        t5xxl_path=MODEL_PATHS["T5XXL_PATH"],
+        keep_vae_on_cpu=True,
+        keep_clip_on_cpu=True
+    )
+    _model_cache["sd35"] = sd
+    print("✅ Stable Diffusion 3.5 model loaded and cached.")
+    return sd
 
 
+def unload_sd35():
+    """
+    Optional cleanup: unload SD3.5 model and free GPU/CPU memory.
+    """
+    global _model_cache
+    _model_cache["sd35"] = None
+    torch.cuda.empty_cache()
+    print("🧹 Stable Diffusion 3.5 model cache cleared and GPU memory freed.")
+
+
+# -------------------------
+# Helpers
+# -------------------------
 def _get_dynamic_size(img: Image.Image, max_dim: int = 1152) -> tuple[int, int]:
     """Compute output resolution keeping aspect ratio, multiple-of-64, within max_dim."""
     w, h = img.size
@@ -64,18 +94,17 @@ def _get_dynamic_size(img: Image.Image, max_dim: int = 1152) -> tuple[int, int]:
     else:
         new_h = min(h, max_dim)
         new_w = int(new_h * aspect)
-    new_w = (new_w // 64) * 64
-    new_h = (new_h // 64) * 64
-    new_w = max(64, new_w)
-    new_h = max(64, new_h)
+    new_w = max(64, (new_w // 64) * 64)
+    new_h = max(64, (new_h // 64) * 64)
     return new_w, new_h
+
 
 def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image.Image]:
     """Load image from path, PIL.Image, bytes, or base64 string."""
     if img is None:
         return None
     if isinstance(img, Image.Image):
-        return img
+        return img.convert("RGB")
     if isinstance(img, bytes):
         return Image.open(BytesIO(img)).convert("RGB")
     if os.path.exists(str(img)):
@@ -84,29 +113,37 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
         decoded = base64.b64decode(img)
         return Image.open(BytesIO(decoded)).convert("RGB")
     except Exception as e:
-        raise ValueError(f"Unable to decode image from input: {e}")
+        raise ValueError(f"Unable to decode image: {e}")
 
 
+# -------------------------
+# Main Inference
+# -------------------------
 def run_inference_sd35_i2i(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
     """
-    Run SD 3.5 Txt2Img inference and save the result locally.
+    Run SD 3.5 Img2Img inference and save the result locally.
     Returns the path to the saved PNG file.
     """
-    negative_prompt = params.get("negative_prompt", None)
-    strength        = params.get("strength", 0.65)
-    init_image     = _load_image(params.get("images"))
-    steps           = params.get("sample_steps", 25)
-    cfg             = params.get("cfg_scale", 4.5)
-    method          = params.get("sample_method", "euler")
-    seed            = params.get("seed", -1)
-    output_dir      = params.get("output_dir", "/quickpod")
+    print(f"🧩 Starting SD 3.5 Img2Img job: {job_id}")
+    sd = get_sd35()
+
+    negative_prompt = params.get("negative_prompt", "lowres, bad anatomy, error, cropped, worst quality")
+    strength = float(params.get("strength", 0.65))
+    init_image = _load_image(params.get("init_image"))
+    steps = int(params.get("sample_steps", 25))
+    cfg = float(params.get("cfg_scale", 4.5))
+    method = params.get("sample_method", "euler")
+    seed = int(params.get("seed", -1))
+    output_dir = params.get("output_dir", "./outputs")
 
     if init_image is None:
         raise ValueError("init_image is required for img2img")
 
-
-   # Decide output resolution (close to input, multiple-of-64)
+    # Compute output resolution
     width, height = _get_dynamic_size(init_image, max_dim=1152)
+
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"⚙️ Running SD3.5 Inference | Steps={steps}, CFG={cfg}, Strength={strength}, Method={method}")
 
     # Run inference
     output = sd.generate_image(
@@ -122,8 +159,6 @@ def run_inference_sd35_i2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
         seed=seed,
     )
 
-    # Ensure output dir exists
-    os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"sd_35_i2i_{job_id}.png")
 
     if isinstance(output, list) and isinstance(output[0], Image.Image):
@@ -133,16 +168,36 @@ def run_inference_sd35_i2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     else:
         Image.fromarray(output).save(out_path)
 
-    return out_path
+    print(f"🖼️ Base generated image saved to {out_path}")
+
+    # -------------------------
+    # Optional Upscaling and Metadata Removal
+    # -------------------------
+    scale_image = params.get("scale_image", True)
+    scale_factor = params.get("scale_factor", 2) if scale_image else 0
+    model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
+
+    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
+
+    upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
+    upscaled.save(upscaled_path)
+
+    print(f"🚀 Upscaled image saved to {upscaled_path}")
+    return os.path.abspath(upscaled_path)
 
 
+# -------------------------
+# CLI Test
+# -------------------------
 if __name__ == "__main__":
-    
-    job_id = "test2"
-    prompt = "remove her all clothes, naked, 8k, high quality, detailed skin texture, photorealistic, intricate details, award winning photography"
-    image_input_path = "/quickpod/quickpod_workers/worker_stable_diffusion_35/input_image.jpg"
+    job_id = "test_sd35_i2i"
+    prompt = "A cinematic landscape with mountains at sunset, high detail, photorealistic"
+    input_path = "./input_image.jpg"
 
-    with open(image_input_path, "rb") as f:
+    if not os.path.exists(input_path):
+        raise SystemExit("❌ Please provide input_image.jpg to test this script.")
+
+    with open(input_path, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode("utf-8")
 
     params = {
@@ -152,8 +207,10 @@ if __name__ == "__main__":
         "seed": -1,
         "output_dir": "./outputs",
         "images": img_b64,
-        "negative_prompt": "lowres, bad anatomy, error body, error hands, error fingers, error legs, error arms, disfigured, deformed, blurry, fuzzy, out of focus, extra limbs, cloned face, gross proportions, malformed limbs, missing arms, missing legs, extra arms, extra legs, mutated hands and fingers, poorly drawn hands and fingers, fused fingers, too many fingers, long neck",
-
+        "negative_prompt": (
+            "lowres, bad anatomy, error body, blurry, fuzzy, out of focus, malformed, "
+            "extra limbs, cloned face, gross proportions, deformed, disfigured"
+        ),
     }
 
     out = run_inference_sd35_i2i(job_id, prompt, params)

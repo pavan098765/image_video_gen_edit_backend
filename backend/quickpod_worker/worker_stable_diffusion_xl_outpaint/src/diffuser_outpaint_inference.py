@@ -1,4 +1,5 @@
 import os
+import sys
 os.environ["HF_HOME"] = "/models_storage/all_models"
 os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
 import torch
@@ -6,10 +7,19 @@ from diffusers import AutoencoderKL, TCDScheduler
 from diffusers.models.model_loading_utils import load_state_dict
 from huggingface_hub import hf_hub_download
 from PIL import Image, ImageDraw
+# sys.path.append(os.path.join(os.path.dirname(__file__), "../../src"))
+sys.path.append("/quickpod")
 
 # Custom local imports from the original project structure
-from controlnet_union import ControlNetModel_Union
-from pipeline_fill_sd_xl import StableDiffusionXLFillPipeline
+# from controlnet_union import ControlNetModel_Union
+# from pipeline_fill_sd_xl import StableDiffusionXLFillPipeline
+
+from quickpod_worker.worker_stable_diffusion_xl_outpaint.src.controlnet_union import ControlNetModel_Union
+from quickpod_worker.worker_stable_diffusion_xl_outpaint.src.pipeline_fill_sd_xl import StableDiffusionXLFillPipeline
+
+# from ...src.controlnet_union import ControlNetModel_Union
+# from ...src.pipeline_fill_sd_xl import StableDiffusionXLFillPipeline
+
 
 ## --- Core Functionalities ---
 

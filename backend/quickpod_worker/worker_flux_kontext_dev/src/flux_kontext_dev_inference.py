@@ -3,8 +3,8 @@
 # Dynamic resolution (keeps aspect ratio, multiple-of-64), seed, CFG, steps
 
 import os
-os.environ["HF_HOME"] = "/models_storage/all_models/flux_kontext_dev"
-os.environ["HF_HUB_CACHE"] = "/models_storage/all_models/flux_kontext_dev"
+os.environ["HF_HOME"] = "/models_storage/all_models"
+os.environ["HF_HUB_CACHE"] = "/models_storage/all_models"
 import base64
 from io import BytesIO
 from typing import Dict, Any
@@ -20,6 +20,7 @@ from nunchaku.utils import get_precision
 # -------------------------
 # Paths / Model config
 # -------------------------
+
 MODEL_DIR = os.path.join("/models_storage", "all_models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -32,7 +33,14 @@ MODEL_FILES = {
     ),
 }
 
-def download_models():
+# -------------------------
+# Lazy globals
+# -------------------------
+_pipeline = None
+_transformer = None
+
+
+def _download_models():
     local_paths = {}
     for key, (repo_id, filename) in MODEL_FILES.items():
         print(f"[Download] {key} → {repo_id}/{filename}")
@@ -46,40 +54,25 @@ def download_models():
         local_paths[key] = path
     return local_paths
 
-MODEL_PATHS = download_models()
-TRANSFORMER_PATH = MODEL_PATHS["DIFFUSION_MODEL"]
 
-# -------------------------
-# Initialize Diffusers pipeline
-# -------------------------
-transformer = NunchakuFluxTransformer2dModel.from_pretrained(TRANSFORMER_PATH)
+def _get_pipeline():
+    """Lazy load Flux-Kontext pipeline only once."""
+    global _pipeline, _transformer
+    if _pipeline is None:
+        model_paths = _download_models()
+        transformer_path = model_paths["DIFFUSION_MODEL"]
 
-pipeline = FluxKontextPipeline.from_pretrained(
-    "black-forest-labs/FLUX.1-Kontext-dev",
-    transformer=transformer,
-    torch_dtype=torch.bfloat16,
-    token=HF_TOKEN
-).to("cuda")
+        _transformer = NunchakuFluxTransformer2dModel.from_pretrained(transformer_path)
+        _pipeline = FluxKontextPipeline.from_pretrained(
+            "black-forest-labs/FLUX.1-Kontext-dev",
+            transformer=_transformer,
+            torch_dtype=torch.bfloat16,
+            token=HF_TOKEN
+        ).to("cuda")
+        print("[Init] Flux-Kontext pipeline initialized")
 
-# ### LoRA Related Code ###
-# # """
-# # first convert the LoRA to nunchaku format using the command below, then load it in the code.
-# # python -m nunchaku.lora.flux.convert \
-# #     --quant-path mit-han-lab/svdq-int4-flux.1-dev/transformer_blocks.safetensors \
-# #     --lora-path /models_storage/all_models/nunchaku-flux_kontext_nsfw_lora/background_remover_v0_flux_kontext.safetensors \
-# #     --lora-format diffusers \
-# #     --output-root /models_storage/all_models/nunchaku-flux_kontext_nsfw_lora \
-# #     --lora-name background_remover_v0_flux_kontext_nunchaku
-# # """
+    return _pipeline, _transformer
 
-
-# transformer.update_lora_params(
-#     lora_path
-#     # "nunchaku-tech/nunchaku-test-models/relight-kontext-lora-single-caption_comfy.safetensors"
-#     # "linoyts/relight-kontext-lora-single-caption/relight-kontext-lora-single-caption.safetensors"
-# )  # Path to your LoRA safetensors, can also be a remote HuggingFace path
-# transformer.set_lora_strength(1)  # Your LoRA strength here
-# ### End of LoRA Related Code ###
 
 # -------------------------
 # LoRA Setup (optional)
@@ -111,6 +104,7 @@ def _load_image(img_b64: str) -> Image.Image:
     decoded_bytes = base64.b64decode(img_b64)
     return Image.open(BytesIO(decoded_bytes)).convert("RGB")
 
+
 def _get_dynamic_size(img: Image.Image, max_dim: int = 1152) -> tuple[int, int]:
     """Return width/height close to input, within max_dim, multiple-of-64."""
     w, h = img.size
@@ -125,6 +119,7 @@ def _get_dynamic_size(img: Image.Image, max_dim: int = 1152) -> tuple[int, int]:
     new_w = max(64, (new_w // 64) * 64)
     new_h = max(64, (new_h // 64) * 64)
     return new_w, new_h
+
 
 # -------------------------
 # Main inference
@@ -149,6 +144,9 @@ def run_inference_flux_kontext_dev(job_id: str, prompt: str, params: Dict[str, A
     steps = params.get("sample_steps", 28)
     cfg = params.get("cfg_scale", 1.5)
 
+    pipeline, transformer = _get_pipeline()
+    maybe_apply_lora(transformer, params)
+
     # Run Diffusers pipeline
     output = pipeline(
         image=image,          # keep original image as input
@@ -163,13 +161,14 @@ def run_inference_flux_kontext_dev(job_id: str, prompt: str, params: Dict[str, A
     output.save(out_path)
     return out_path
 
+
 # -------------------------
 # Example usage
 # -------------------------
 if __name__ == "__main__":
     job_id = "bikini_dynamic"
-    prompt = "Completely remove the subjects clothes. Her clothes are now completely removed to expose her (small breasts) and clean shaven vagina. Maintain identical camera angle, framing, and perspective and make sure to leave her facial features identical. The rest of the image remains the same, only remove her clothes to expose her naked body, mnmk"
-    input_path = "/quickpod/quickpod_workers/worker_flux_kontext_dev/input_image.jpg"
+    prompt = "A test safe prompt example."
+    input_path = "./input_image.jpg"
 
     with open(input_path, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -179,8 +178,7 @@ if __name__ == "__main__":
         "cfg_scale": 2.5,
         "output_dir": "./outputs",
         "images": img_b64,
-        "apply_lora": True,
-        "lora_strength": 1.0
+        "apply_lora": False,
     }
 
     out = run_inference_flux_kontext_dev(job_id, prompt, params)
