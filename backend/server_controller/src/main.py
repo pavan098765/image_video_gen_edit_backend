@@ -87,7 +87,8 @@ else:
 
 # also tell pod_manager about selected strategy via env (it already reads POD_STRATEGY itself)
 os.environ["POD_STRATEGY"] = pod_strategy_env
-
+ENABLE_AUTOTEST = os.getenv("ENABLE_AUTOTEST", "true").lower() == "true"
+logger.info(f"Pod strategy: {pod_strategy_env}, AUTOTEST mode: {'ON' if ENABLE_AUTOTEST else 'OFF'}")
 job_manager: Optional[JobManager] = None
 
 app = FastAPI(title="Server Controller")
@@ -901,7 +902,7 @@ async def register_worker(request: Request):
     recently_destroyed = getattr(pod_manager, "recently_destroyed", {})
     expiry_window = 5  # seconds
 
-    # 1️⃣ Reject pods destroyed recently
+    # 1️⃣ Reject pods destroyed recently (always enforced)
     if pod_uuid in recently_destroyed and time.time() - recently_destroyed[pod_uuid] < expiry_window:
         logger.warning(
             f"⚠️ Ignoring re-registration from recently destroyed pod {pod_uuid} "
@@ -909,15 +910,22 @@ async def register_worker(request: Request):
         )
         return Response(status_code=403, content="Pod was recently destroyed")
 
-    # 2️⃣ Reject and destroy completely unexpected pods
+    # 2️⃣ Handle unknown pods based on ENABLE_AUTOTEST
     if pod_uuid not in expected_pods:
-        logger.warning(
-            f"🚫 Unexpected worker registration attempt from pod {pod_uuid} "
-            f"(IP={endpoint}). Initiating forced destroy to prevent cost."
-        )
-        # fire-and-forget async destroy
-        asyncio.create_task(pod_manager.destroy_unexpected_pod(pod_uuid))
-        return Response(status_code=403, content="Unrequested pod destroyed")
+        if ENABLE_AUTOTEST:
+            logger.warning(
+                f"⚠️ [AUTOTEST MODE] Allowing unknown pod {pod_uuid} to register normally "
+                f"(IP={endpoint})."
+            )
+        else:
+            logger.warning(
+                f"🚫 Unexpected worker registration attempt from pod {pod_uuid} "
+                f"(IP={endpoint}). Initiating forced destroy to prevent cost."
+            )
+            # fire-and-forget async destroy
+            asyncio.create_task(pod_manager.destroy_unexpected_pod(pod_uuid))
+            return Response(status_code=403, content="Unrequested pod destroyed")
+
 
     # ---- NORMAL REGISTRATION FLOW ----
     with SessionLocal() as db:
