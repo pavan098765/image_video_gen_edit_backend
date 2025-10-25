@@ -6,12 +6,13 @@ import uuid
 import asyncio
 import logging
 import json
+from fastapi.responses import StreamingResponse
 import requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 import time
 
-from fastapi import FastAPI, BackgroundTasks, Request, HTTPException, Depends, Header, Response
+from fastapi import FastAPI, BackgroundTasks, Query, Request, HTTPException, Depends, Header, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
@@ -31,7 +32,9 @@ from security import (
 # Optional R2 client
 import boto3
 from botocore.client import Config
+from botocore.exceptions import ClientError
 from pathlib import Path
+import mimetypes
 
 # ------------------------
 # ENV & INIT
@@ -158,6 +161,7 @@ async def persist_bans():
             data = banned_ips.copy()
             tmp = BANS_FILE.with_suffix(".tmp")
             def _write():
+                print(f"🟢 Writing bans file to {tmp}") 
                 with open(tmp, "w") as f:
                     json.dump(data, f)
                 tmp.replace(BANS_FILE)
@@ -261,13 +265,20 @@ def check_rate_limit(ip: str) -> bool:
     rate_limiter[ip] = timestamps
     return True
 
-def increase_suspicion(ip: str, amount: int, reason: str):
+async def increase_suspicion(ip: str, amount: int, reason: str):
     score = ip_suspicion_score.get(ip, 0) + amount
     ip_suspicion_score[ip] = score
     security_logger.info(f"Suspicion {score}/{SUSPICIOUS_SCORE_THRESHOLD} for {ip} — {reason}")
     if score >= SUSPICIOUS_SCORE_THRESHOLD:
-        # default: make permanent ban if configured
-        asyncio.create_task(ban_ip(ip, f"suspicious behavior (score={score})", permanent=PERMANENT_BAN_ON_THRESHOLD))
+        await ban_ip(ip, f"suspicious behavior (score={score})", permanent=PERMANENT_BAN_ON_THRESHOLD)
+
+# def increase_suspicion(ip: str, amount: int, reason: str):
+#     score = ip_suspicion_score.get(ip, 0) + amount
+#     ip_suspicion_score[ip] = score
+#     security_logger.info(f"Suspicion {score}/{SUSPICIOUS_SCORE_THRESHOLD} for {ip} — {reason}")
+#     if score >= SUSPICIOUS_SCORE_THRESHOLD:
+#         # default: make permanent ban if configured
+#         asyncio.create_task(ban_ip(ip, f"suspicious behavior (score={score})", permanent=PERMANENT_BAN_ON_THRESHOLD))
 
 def add_trusted_worker_ip(ip: str):
     """Mark an IP trusted for some TTL (used when a worker registers)."""
@@ -290,8 +301,10 @@ def is_trusted_worker_ip(ip: str) -> bool:
 # Paths behavior:
 # - WORKER_PATHS: endpoints used by workers (register_worker, heartbeat) -> exempt from UA/permanent banning
 # - TRUSTED_API_PATHS: endpoints that may require Authorization Bearer to skip deep body inspection (/submit, /job_complete)
+# - PUBLIC_PATHS: endpoints open to public (like /download) -> no checks apply
 WORKER_PATHS = ["/register_worker", "/heartbeat"]
-TRUSTED_API_PATHS = ["/submit", "/job_complete"]
+TRUSTED_API_PATHS = ["/submit", "/job_complete", "/job_status"]
+PUBLIC_PATHS = ["/download"] 
 
 # ---------- Middleware ----------
 @app.middleware("http")
@@ -338,8 +351,8 @@ async def aggressive_security_middleware(request: Request, call_next):
 
     # Trusted API paths (like /submit, /job_complete) require Authorization: Bearer to skip deep body scan
     if any(path.startswith(p) for p in TRUSTED_API_PATHS):
-        if not auth_header.startswith("Bearer "):
-            increase_suspicion(ip, 3, "trusted endpoint without auth")
+        if not (auth_header.startswith("Bearer ") or request.headers.get("x-fingerprint")):
+            await increase_suspicion(ip, 3, "trusted endpoint without auth")
             return Response("Forbidden", status_code=403)
         try:
             return await call_next(request)
@@ -347,12 +360,19 @@ async def aggressive_security_middleware(request: Request, call_next):
             security_logger.exception(f"Trusted API path exception from {ip} path={path}: {e}")
             return Response("Internal Server Error", status_code=500)
 
+    # ✅ Public safe paths (no auth needed, like /download)
+    if any(path.startswith(p) for p in PUBLIC_PATHS):
+        try:
+            return await call_next(request)
+        except Exception as e:
+            security_logger.exception(f"Public path exception from {ip} path={path}: {e}")
+            return Response("Internal Server Error", status_code=500)
+    
     # From here on, we apply aggressive checks to public/untrusted endpoints
-
     # Suspicious path detection -> permanent ban
     for pattern in SUSPICIOUS_PATHS:
         if re.search(pattern, path, re.IGNORECASE):
-            increase_suspicion(ip, 2, f"scanner path: {path}")
+            await increase_suspicion(ip, 2, f"scanner path: {path}")
             await ban_ip(ip, f"scanner path matched: {pattern}", permanent=True)
             return Response("Forbidden", status_code=403)
 
@@ -387,9 +407,9 @@ async def aggressive_security_middleware(request: Request, call_next):
 
     # heuristic anomalies -> increase suspicion (may lead to ban)
     if len(path) > 200 or path.count("/") > 20:
-        increase_suspicion(ip, 1, "path anomaly")
+        await increase_suspicion(ip, 1, "path anomaly")
     if re.search(r"[<>{}\"';]", path):
-        increase_suspicion(ip, 1, "path character anomaly")
+        await increase_suspicion(ip, 1, "path character anomaly")
 
     # Normal request flow
     try:
@@ -411,8 +431,10 @@ async def reject_unknown_paths(request: Request, call_next):
         "/health",
         "/submit",
         "/job_complete",
+        "/job_status",
         "/register_worker",
         "/heartbeat",
+        "/download",
     ]
 
     # Allow FastAPI's built-in /docs or /openapi.json only if DEBUG is set
@@ -636,50 +658,130 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
 # ------------------------
 # Background Tasks
 # ------------------------
+# async def idle_worker_reaper_task():
+#     logger.info("Starting idle worker reaper")
+#     while True:
+#         db = SessionLocal()
+#         try:
+#             threshold = datetime.utcnow() - timedelta(seconds=WORKER_IDLE_TIMEOUT)
+#             idle_workers = (
+#                 db.query(Worker)
+#                 .filter(
+#                     Worker.last_active < threshold,
+#                     Worker.status == "ready"   # only reap ready, not dispatching
+#                 )
+#                 .all()
+#             )
+#             print("IDLE WORKERS", idle_workers)
+#             for w in idle_workers:
+#                 try:
+#                     if w.is_warm_pod:
+                    
+#                         # check if any jobs tied to this warm pod are still dispatching
+#                         active_jobs = (
+#                             db.query(Job)
+#                             .filter(
+#                                 Job.worker_id == w.worker_id,
+#                                 Job.status.in_([JobState.QUEUED.value, JobState.RUNNING.value, JobState.DISPATCHING.value]),
+#                             )
+#                             .count()
+#                         )
+#                         print("active_jobs ", active_jobs)
+
+#                         if active_jobs == 0:
+#                             await pod_manager.stop_warm_pod(w.container_id)
+#                             w.status = "offline"
+#                     else:
+#                         if w.container_id:
+#                             await asyncio.sleep(300) 
+#                             logger.info(f"Reaping idle individual pod {w.container_id}")
+#                             await pod_manager.destroy_individual_pod(w.container_id)
+#                         w.status = "offline"
+#                     db.commit()
+#                 except Exception as e:
+#                     logger.error(f"Failed to stop worker {w.worker_id}: {e}")
+
+#                 # fail any jobs tied to this worker
+#                 running_jobs = (
+#                     db.query(Job)
+#                     .filter(
+#                         Job.worker_id == w.worker_id,
+#                         Job.status == JobState.RUNNING.value,
+#                     )
+#                     .all()
+#                 )
+#                 for job in running_jobs:
+#                     job_manager.update_job_state(
+#                         job.job_id, JobState.FAILED, "Worker went offline"
+#                     )
+#         finally:
+#             db.close()
+#         await asyncio.sleep(max(1, WORKER_IDLE_TIMEOUT // 2))
+
 async def idle_worker_reaper_task():
     logger.info("Starting idle worker reaper")
     while True:
         db = SessionLocal()
         try:
             threshold = datetime.utcnow() - timedelta(seconds=WORKER_IDLE_TIMEOUT)
+            # Include ready and busy pods — they can both be reaped if idle *and* job-free
             idle_workers = (
                 db.query(Worker)
                 .filter(
                     Worker.last_active < threshold,
-                    Worker.status == "ready"   # only reap ready, not dispatching
+                    Worker.status.in_(["ready", "busy"]),
                 )
                 .all()
             )
-            print("IDLE WORKERS", idle_workers)
+            logger.info("IDLE WORKERS %s", [w.worker_id for w in idle_workers])
+
             for w in idle_workers:
                 try:
-                    if w.is_warm_pod:
-                    
-                        # check if any jobs tied to this warm pod are still dispatching
-                        active_jobs = (
-                            db.query(Job)
-                            .filter(
-                                Job.worker_id == w.worker_id,
-                                Job.status.in_([JobState.QUEUED.value, JobState.RUNNING.value, JobState.DISPATCHING.value]),
-                            )
-                            .count()
+                    # 1️⃣ Check if this worker still has active jobs
+                    active_jobs = (
+                        db.query(Job)
+                        .filter(
+                            Job.worker_id == w.worker_id,
+                            Job.status.in_([
+                                JobState.QUEUED.value,
+                                JobState.RUNNING.value,
+                                JobState.DISPATCHING.value,
+                            ]),
                         )
-                        print("active_jobs ", active_jobs)
+                        .count()
+                    )
 
-                        if active_jobs == 0:
-                            await pod_manager.stop_warm_pod(w.container_id)
-                            w.status = "offline"
+                    if active_jobs > 0:
+                        logger.info(
+                            f"Skipping reaper for worker {w.worker_id} "
+                            f"(has {active_jobs} active jobs)"
+                        )
+                        continue  # skip reaping
+
+                    # 2️⃣ No active jobs — safe to reap
+                    if w.is_warm_pod:
+                        logger.info(
+                            f"Reaping idle warm pod {w.container_id} (no active jobs)"
+                        )
+                        await pod_manager.stop_warm_pod(w.container_id)
+                        w.status = "offline"
                     else:
                         if w.container_id:
-                            await asyncio.sleep(300) 
-                            logger.info(f"Reaping idle individual pod {w.container_id}")
+                            logger.info(
+                                f"Reaping idle individual pod {w.container_id} (no active jobs)"
+                            )
+                            # optional grace period to allow for late registration/polling
+                            await asyncio.sleep(5)
                             await pod_manager.destroy_individual_pod(w.container_id)
                         w.status = "offline"
+
                     db.commit()
+
                 except Exception as e:
                     logger.error(f"Failed to stop worker {w.worker_id}: {e}")
+                    db.rollback()
 
-                # fail any jobs tied to this worker
+                # 3️⃣ Fail any jobs that were left in RUNNING state (just in case)
                 running_jobs = (
                     db.query(Job)
                     .filter(
@@ -692,9 +794,12 @@ async def idle_worker_reaper_task():
                     job_manager.update_job_state(
                         job.job_id, JobState.FAILED, "Worker went offline"
                     )
+
         finally:
             db.close()
-        await asyncio.sleep(max(1, WORKER_IDLE_TIMEOUT // 2))
+
+        # Check more frequently for responsiveness
+        await asyncio.sleep(max(5, WORKER_IDLE_TIMEOUT // 2))
 
 
 async def pod_cleanup_task():
@@ -761,7 +866,18 @@ async def startup_event():
             asyncio.create_task(pod_manager.autoscaler_loop())
         else:
             logger.info("Autoscaler disabled")
-            
+
+        if not BANS_FILE.exists():
+            async def create_empty_ban_file():
+                async with ban_lock:
+                    with open(BANS_FILE, "w") as f:
+                        json.dump({}, f)
+            asyncio.create_task(create_empty_ban_file())
+            logger.info("Created IP bans file")
+        
+        await load_bans()
+        logger.info(f"Loaded {len(banned_ips)} IP bans on startup")
+        
         logger.info("Controller startup complete")
     except Exception as e:
         logger.error(f"Error during startup: {e}")
@@ -775,74 +891,153 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/download/{job_id}")
+async def download(job_id: str, request: Request):
+    """
+    Streams image/video from Cloudflare R2 with full Range (HTTP 206) support.
+    Memory-safe and optimized for concurrent users & large files.
+    """
+    db = SessionLocal()
+    try:
+        # 1️⃣ Find job entry
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if not job or not job.output_key:
+            raise HTTPException(status_code=404, detail="Job not found or output missing")
+
+        key = job.output_key
+
+        # 2️⃣ Retrieve metadata (content length, type)
+        try:
+            head = s3_client.head_object(Bucket=R2_BUCKET, Key=key)
+            total_size = head["ContentLength"]
+            content_type = head.get("ContentType") or mimetypes.guess_type(key)[0] or "application/octet-stream"
+        except ClientError as e:
+            logger.error(f"R2 head_object failed for {key}: {e}")
+            raise HTTPException(status_code=404, detail="File not found in R2")
+
+        # 3️⃣ Check if client sent a Range header (e.g., for video seeking)
+        range_header = request.headers.get("range")
+        start = 0
+        end = total_size - 1
+        status_code = 200
+        headers = {}
+
+        if range_header:
+            # Parse header like: bytes=1000-2000
+            try:
+                match = range_header.strip().lower().replace("bytes=", "").split("-")
+                if match[0]:
+                    start = int(match[0])
+                if len(match) > 1 and match[1]:
+                    end = int(match[1])
+                if end >= total_size:
+                    end = total_size - 1
+                if start > end:
+                    raise ValueError("Invalid range")
+                status_code = 206  # Partial content
+                headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+                headers["Accept-Ranges"] = "bytes"
+                headers["Content-Length"] = str(end - start + 1)
+            except Exception as e:
+                logger.warning(f"Invalid Range header {range_header}: {e}")
+                start, end = 0, total_size - 1
+
+        else:
+            headers["Content-Length"] = str(total_size)
+            headers["Accept-Ranges"] = "bytes"
+
+        # 4️⃣ Fetch from R2 with Range (for partial downloads)
+        range_param = f"bytes={start}-{end}"
+        try:
+            s3_obj = s3_client.get_object(Bucket=R2_BUCKET, Key=key, Range=range_param)
+            stream = s3_obj["Body"]
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code == "InvalidRange":
+                raise HTTPException(status_code=416, detail="Requested Range Not Satisfiable")
+            logger.error(f"Error fetching range {range_param} for {key}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to fetch file from R2")
+
+        # 5️⃣ Async generator to yield chunks
+        async def file_iterator():
+            try:
+                while True:
+                    chunk = stream.read(1024 * 1024)  # 1MB
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                stream.close()
+
+        # 6️⃣ Set final headers
+        headers.update({
+            "Content-Type": content_type,
+            "Cache-Control": "public, max-age=86400, immutable",
+            "Content-Disposition": f'inline; filename="{os.path.basename(key)}"',
+        })
+
+        # 7️⃣ Return StreamingResponse with 200 or 206
+        return StreamingResponse(file_iterator(), status_code=status_code, headers=headers)
+
+    finally:
+        db.close()
+
+
 @app.post("/job_complete")
 async def job_complete(payload: JobCompletePayload):
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.job_id == payload.job_id).first()
         if not job:
-            # 🧩 Detect auto-test job IDs
             if payload.job_id.startswith("autotest-"):
-                logger.info(f"Auto-test job {payload.job_id} reported completion. Skipping DB update.")
-                return {
-                    "status": "ok",
-                    "message": "Auto-test job acknowledged (no DB record needed)."
-                }
+                logger.info(f"Auto-test job {payload.job_id} completed.")
+                return {"status": "ok"}
             raise HTTPException(status_code=404, detail="Job not found")
 
-        # Update job status
         if payload.failed:
-            job_manager.update_job_state(
-                job.job_id, JobState.FAILED, payload.error or "Worker reported failure"
-            )
+            job_manager.update_job_state(job.job_id, JobState.FAILED, payload.error or "Worker reported failure")
         else:
             job_manager.update_job_state(job.job_id, JobState.COMPLETED)
             job.result_r2_key = payload.result_r2_key
+            job.output_key = payload.result_r2_key
+            job.output_url = f"{CONTROLLER_PUBLIC_URL}/download/{job.job_id}"
 
-        # Fetch associated worker
         worker = db.query(Worker).filter(Worker.worker_id == job.worker_id).first()
+
         if worker:
-            # Remove job from pending tracking
             await pod_manager.remove_pending_job(job.job_id, job.model)
 
-            if worker.is_warm_pod:
-                worker.status = "ready"
+            # 🔍 Check if there are still active jobs tied to this worker
+            active_jobs = (
+                db.query(Job)
+                .filter(
+                    Job.worker_id == worker.worker_id,
+                    Job.status.in_([
+                        JobState.RUNNING.value,
+                        JobState.DISPATCHING.value,
+                        JobState.QUEUED.value
+                    ])
+                )
+                .count()
+            )
+
+            if active_jobs > 0:
+                logger.info(
+                    f"Worker {worker.worker_id} still has {active_jobs} active jobs — keeping pod alive."
+                )
+                worker.status = "ready" if worker.is_warm_pod else "busy"
             else:
-                pod_info = pod_manager.individual_pods.get(worker.container_id)
-                if pod_info and await pod_manager.should_keep_pod_alive(pod_info):
-                    worker.status = "ready"
-                    logger.info(f"Keeping pod {worker.container_id} alive for pending jobs")
-                else:
-                    worker.status = "terminated"
-                    logger.info(f"Marking pod {worker.container_id} as terminated (no pending jobs)")
-                    # Schedule cleanup
-                    if worker.container_id:
-                        try:
-                            asyncio.create_task(pod_manager.destroy_individual_pod(worker.container_id))
-                            logger.info(f"Scheduled destroy_individual_pod for machine_based pod {worker.container_id}")
-                        except Exception:
-                            logger.exception("Failed to schedule immediate pod destruction for %s", worker.container_id)
+                worker.status = "ready" if worker.is_warm_pod else "terminated"
+                logger.info(f"Worker {worker.worker_id} has no active jobs — marking {'ready' if worker.is_warm_pod else 'terminated'}.")
 
             worker.last_active = datetime.utcnow()
-        db.commit()
-
-        # ✅ Generate browser-friendly GET URL (for viewing)
-        download_url = None
-        if job.result_r2_key:
-            try:
-                download_url = s3_client.generate_presigned_url(
-                    "get_object",
-                    Params={"Bucket": R2_BUCKET, "Key": job.result_r2_key},
-                    ExpiresIn=3600,
-                )
-            except Exception as e:
-                logger.error(f"Failed to generate GET URL for job {job.job_id}: {e}")
+            db.commit()
 
         return {
             "status": "ok",
             "job_id": job.job_id,
             "result_key": job.result_r2_key,
-            "download_url": download_url,
+            "download_url": job.output_url,  # ✅ always return controller redirect URL
         }
 
     finally:
@@ -959,6 +1154,39 @@ async def register_worker(request: Request):
     return {"status": "ok"}
 
 
+@app.get("/job_status")
+async def job_status(job_id: str = Query(..., description="Job ID to check status"),
+                         auth=Depends(require_any_auth),
+):
+    """
+    Client polls this endpoint with job_id to get current job status.
+    Returns the job's current state and metadata.
+    """
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        response = {
+            "job_id": job.job_id,
+            "status": job.status,
+            "model": job.model,
+            "created_at": job.created_at.isoformat(),
+            "updated_at": job.updated_at.isoformat(),
+        }
+
+        # If failed, include error info for debugging
+        if job.status == JobState.FAILED.value:
+            response["error"] = job.error
+            response["error_log"] = job.error_log or []
+
+        return response
+
+    finally:
+        db.close()
+
+
 @app.post("/submit")
 async def submit(
     req: SubmitRequest,
@@ -968,7 +1196,9 @@ async def submit(
     job_id = str(uuid.uuid4())
     db = SessionLocal()
     result_key = f"{IMAGE_PREFIX}{job_id}.png"
+
     try:
+        # Create new job record
         job = Job(
             job_id=job_id,
             model=req.model,
@@ -977,50 +1207,39 @@ async def submit(
             status=JobState.QUEUED.value,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
-            timeout_at=datetime.utcnow()
-            + timedelta(seconds=req.params.get("timeout", 3600)),
+            timeout_at=datetime.utcnow() + timedelta(seconds=req.params.get("timeout", 3600)),
             result_r2_key=result_key,
+            output_key=result_key,
+            output_url=f"{CONTROLLER_PUBLIC_URL}/download/{job_id}",  # ✅ controller-managed redirect URL
         )
         db.add(job)
         db.commit()
     finally:
         db.close()
 
-    # Generate presigned PUT URL for this job
+    # ✅ Generate presigned PUT URL for worker upload (unchanged)
     presigned_url = create_presigned_put_url(result_key)
     if not presigned_url:
         raise HTTPException(status_code=500, detail="Failed to generate upload URL")
 
     try:
-        # Track job as pending before dispatch
+        # Track job as pending and dispatch to a worker
         await pod_manager.add_pending_job(job_id, req.model)
-        
-        worker_id = await pod_manager.dispatch_job(
-            job_id, req.model, req.params.get("mode")
-        )
-        background_tasks.add_task(
-            assign_job_to_worker, job_id, worker_id, presigned_url
-        )
-        # ✅ Generate presigned GET URL (client-friendly download link)
-        download_url = None
-        if s3_client and result_key:
-            try:
-                download_url = s3_client.generate_presigned_url(
-                    "get_object",
-                    Params={"Bucket": R2_BUCKET, "Key": result_key},
-                    ExpiresIn=3600,
-                )
-            except Exception as e:
-                logger.error(f"Failed to generate presigned GET URL for key {result_key}: {e}")
+        worker_id = await pod_manager.dispatch_job(job_id, req.model, req.params.get("mode"))
+        background_tasks.add_task(assign_job_to_worker, job_id, worker_id, presigned_url)
+
+        # ✅ Simplified: always return controller /download endpoint (no presigned GET)
+        download_url = f"{CONTROLLER_PUBLIC_URL}/download/{job_id}"
 
         return {
             "job_id": job_id,
             "status": "dispatched",
             "routed_to_worker": worker_id,
-            "upload_url": presigned_url,
+            "upload_url": presigned_url,   # ✅ worker uploads here
             "result_key": result_key,
-            "download_url": download_url
+            "download_url": download_url,  # ✅ app fetches from here (controller redirect)
         }
+
     except Exception as e:
         logger.error("Failed to dispatch job %s: %s", job_id, e)
         db = SessionLocal()

@@ -22,6 +22,8 @@ class PodStrategyType(str, enum.Enum):
 
 MACHINE_PRIORITY_LIST: List[Tuple[str, str]] = [
     ("562", "4x 5090"),
+    ("14790", "4x 5090"),
+    ("14780", "6x 5090"),
     ("14762", "1x 5090"),
     ("275", "1x 5090"),
     ("14774", "4x 4090"),
@@ -200,12 +202,32 @@ class PodManager:
         """Detect fallback frequency and trigger warm pod spin-up."""
         FALLBACK_THRESHOLD = int(os.getenv("FALLBACK_THRESHOLD", "5"))
         QUEUE_MIN_FOR_SCALE = int(os.getenv("QUEUE_MIN_FOR_SCALE", "3"))
+        LOAD_SCALE_THRESHOLD = int(os.getenv("LOAD_SCALE_THRESHOLD", "15")) 
         while True:
             try:
                 now = time.time()
                 if now - self.last_autoscale_ts < self.autoscale_cooldown:
                     await asyncio.sleep(5)
                     continue
+
+                # 🔹 Load-based autoscaling
+                async with self._lock:
+                    model_pods = {}
+                    for pod_uuid, info in self.individual_pods.items():
+                        if info.status in ("ready", "starting"):
+                            model_pods.setdefault(info.model, []).append(info)
+
+                for model, jobs in list(self.pending_jobs.items()):
+                    pending_count = len(jobs)
+                    active_pods = model_pods.get(model, [])
+                    no_ready = all(p.status != "ready" for p in active_pods)
+                    if pending_count >= LOAD_SCALE_THRESHOLD and no_ready:
+                        logger.info(
+                            f"⚡ Load autoscaler trigger: model={model}, pending={pending_count}, pods={len(active_pods)}"
+                        )
+                        self.last_autoscale_ts = now
+                        await self.scale_up_unified_warm_pod_for_model(model)
+                        break
 
                 counts: Dict[str, int] = {}
                 for ts, model, mid in self.fallback_events:
@@ -218,6 +240,7 @@ class PodManager:
                         # call scaler (simple implementation; queue checks can be added later)
                         await self.scale_up_unified_warm_pod_for_model(model)
                         break
+
             except Exception:
                 logger.exception("Autoscaler loop error")
             await asyncio.sleep(5)

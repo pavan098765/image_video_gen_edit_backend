@@ -86,6 +86,8 @@ class Job(Base):
     retry_count = Column(Integer, default=0)
     max_retries = Column(Integer, default=3)
     result_r2_key = Column(String, nullable=True)
+    output_key = Column(String, nullable=True)
+    output_url = Column(String, nullable=True)
     error = Column(Text, nullable=True)
     error_log = Column(JSON, nullable=True, default=list)
 

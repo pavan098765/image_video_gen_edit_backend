@@ -20,7 +20,7 @@ CONTROLLER_URL = os.getenv("CONTROLLER_URL", "https://genedit.mooo.com")
 CONTROLLER_API_KEY = os.getenv("CONTROLLER_API_KEY", "SECRETKEY")
 CONTROLLER_SHARED_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "SECRET")  # must match worker/controller env
 
-MODEL_NAME = "qwen_image_edit"  # must match worker model name
+MODEL_NAME = "flux_kontext_dev"  # must match worker model name
 PROMPT = "Change her body orientation so that she is facing the camera directly, with her upper body visible from the front. Her arms should be relaxed and resting on her sides naturally."
 NEGATIVE_PROMPT = "blurry, distorted, lowres"
 
