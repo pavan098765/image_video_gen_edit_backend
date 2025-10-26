@@ -181,7 +181,6 @@ class QuickPodManager:
     # Machine Listing + Pod Creation
     # ---------------------------
 
-
     def get_best_offer(self, preferred_machine_id: Optional[int] = None) -> Optional[Tuple[int, int]]:
         """
         Fetch rentable machines and return (offer_id, machine_id) tuple for the best available match.
@@ -201,7 +200,10 @@ class QuickPodManager:
         if not offers:
             return None, None
 
-        def extract_offer_id(o): return o.get("offer_id") or o.get("id")
+        # --- Helpers ---
+        def extract_offer_id(o): 
+            return o.get("offer_id") or o.get("id")
+
         def extract_machine_id(o):
             for key in ("machines_id", "machine_id", "machineId"):
                 if key in o and o[key] is not None:
@@ -222,10 +224,20 @@ class QuickPodManager:
             except Exception:
                 return 1e9
 
+        def has_valid_tflops(o):
+            try:
+                return float(o.get("tflops", 0)) > 0
+            except Exception:
+                return False
+
         # --- 1️⃣ Preferred machine ---
         if preferred_machine_id:
-            filtered = [o for o in offers if extract_machine_id(o) == int(preferred_machine_id)]
-            filtered = [o for o in filtered if not is_multi_gpu_offer(o)]
+            filtered = [
+                o for o in offers 
+                if extract_machine_id(o) == int(preferred_machine_id)
+                and not is_multi_gpu_offer(o)
+                and has_valid_tflops(o)
+            ]
             if filtered:
                 oid = extract_offer_id(filtered[0])
                 mid = extract_machine_id(filtered[0])
@@ -238,7 +250,12 @@ class QuickPodManager:
         for env_key in ("MACHINE_ID", "WARM_MACHINE_ID"):
             env_val = os.getenv(env_key)
             if env_val:
-                filtered = [o for o in offers if extract_machine_id(o) == int(env_val) and not is_multi_gpu_offer(o)]
+                filtered = [
+                    o for o in offers
+                    if extract_machine_id(o) == int(env_val)
+                    and not is_multi_gpu_offer(o)
+                    and has_valid_tflops(o)
+                ]
                 if filtered:
                     oid = extract_offer_id(filtered[0])
                     mid = extract_machine_id(filtered[0])
@@ -252,6 +269,7 @@ class QuickPodManager:
                 o for o in offers
                 if tier in str(o.get("offer_name", "")).upper()
                 and not is_multi_gpu_offer(o)
+                and has_valid_tflops(o)
             ]
             tier_offers.sort(key=extract_price)
             if tier_offers:
@@ -259,11 +277,11 @@ class QuickPodManager:
                 oid = extract_offer_id(cheapest)
                 mid = extract_machine_id(cheapest)
                 logger.info(
-                    f"⚙️ Using fallback offer_id={oid} (GPU={tier}, price={extract_price(cheapest):.3f}) machine_id={mid}"
+                    f"⚙️ Using fallback offer_id={oid} (GPU={tier}, price={extract_price(cheapest):.3f}, tflops={cheapest.get('tflops')}) machine_id={mid}"
                 )
                 return oid, mid
 
-        logger.error("❌ No suitable offers found.")
+        logger.error("❌ No suitable offers found with tflops > 0.")
         return None, None
 
 

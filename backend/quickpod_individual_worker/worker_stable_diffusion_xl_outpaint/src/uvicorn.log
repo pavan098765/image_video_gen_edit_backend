@@ -1,0 +1,53 @@
+🔍 Scanning for .safetensors.part-* files...
+🔍 Scanning for .safetensors.part-* in /app/models
+🔍 Found 10 part files for /app/models/flux_kontext_dev/text_encoder_2/model-00001-of-00002.safetensors
+✅ Merged into /app/models/flux_kontext_dev/text_encoder_2/model-00001-of-00002.safetensors (4763.20 MB)
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00001-of-00002.safetensors.part-aa
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00001-of-00002.safetensors.part-ab
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00001-of-00002.safetensors.part-ac
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00001-of-00002.safetensors.part-ad
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00001-of-00002.safetensors.part-ae
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00001-of-00002.safetensors.part-af
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00001-of-00002.safetensors.part-ag
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00001-of-00002.safetensors.part-ah
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00001-of-00002.safetensors.part-ai
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00001-of-00002.safetensors.part-aj
+🔍 Found 9 part files for /app/models/flux_kontext_dev/text_encoder_2/model-00002-of-00002.safetensors
+✅ Merged into /app/models/flux_kontext_dev/text_encoder_2/model-00002-of-00002.safetensors (4320.21 MB)
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00002-of-00002.safetensors.part-aa
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00002-of-00002.safetensors.part-ab
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00002-of-00002.safetensors.part-ac
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00002-of-00002.safetensors.part-ad
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00002-of-00002.safetensors.part-ae
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00002-of-00002.safetensors.part-af
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00002-of-00002.safetensors.part-ag
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00002-of-00002.safetensors.part-ah
+🗑️ Deleted /app/models/flux_kontext_dev/text_encoder_2/model-00002-of-00002.safetensors.part-ai
+🔍 Found 14 part files for /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors
+✅ Merged into /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors (6712.63 MB)
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-aa
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-ab
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-ac
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-ad
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-ae
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-af
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-ag
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-ah
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-ai
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-aj
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-ak
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-al
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-am
+🗑️ Deleted /app/models/nunchaku_flux/svdq-fp4_r32-flux.1-kontext-dev.safetensors.part-an
+INFO:     68.233.100.42:40676 - "POST /run HTTP/1.1" 200 OK
+[2025-10-25 19:18:01.893] [info] Initializing QuantizedFluxModel on device 0
+[2025-10-25 19:18:02.052] [info] Loading partial weights from pytorch
+[2025-10-25 19:18:05.691] [info] Done.
+🧩 Starting inference job: 4eaaf1b5-ccc8-4969-b821-53806f68674c
+🧠 Loading Nunchaku Transformer...
+Injecting quantized module
+✅ Transformer loaded and cached.
+[LoRA] Skipped (apply_lora is False)
+🚀 Loading Flux-Kontext pipeline...
+✅ Pipeline loaded and cached.
+⚙️ Running pipeline at 1152x832 | Steps=28 | CFG=1.5
