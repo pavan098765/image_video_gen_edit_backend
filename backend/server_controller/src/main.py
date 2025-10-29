@@ -1409,6 +1409,7 @@ async def submit(
 
     except Exception as e:
         logger.error("Failed to dispatch job %s: %s", job_id, e)
+        print()
         db = SessionLocal()
         try:
             job = db.query(Job).filter(Job.job_id == job_id).first()
