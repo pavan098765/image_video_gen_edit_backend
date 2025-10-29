@@ -6,6 +6,7 @@ import uuid
 import asyncio
 import logging
 import json
+import aiohttp
 from fastapi.responses import StreamingResponse
 import requests
 from datetime import datetime, timedelta
@@ -52,10 +53,9 @@ IMAGE_PREFIX = os.getenv("IMAGE_PREFIX", "quickpod/")
 CONTROLLER_PUBLIC_URL = os.getenv("CONTROLLER_PUBLIC_URL", "")
 CONTROLLER_SHARED_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "")
 HEARTBEAT_INTERVAL = 10           # how often the worker actually pings
-HEARTBEAT_GRACE_MULTIPLIER = 3    # allow 3 missed pings before reaping
+HEARTBEAT_GRACE_MULTIPLIER = 2    # allow 2 missed pings before reaping
 WORKER_IDLE_TIMEOUT = HEARTBEAT_INTERVAL * HEARTBEAT_GRACE_MULTIPLIER
-# WORKER_IDLE_TIMEOUT = int(os.getenv("WORKER_IDLE_TIMEOUT", "30"))
-WORKER_REGISTRATION_TIMEOUT = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "180"))
+WORKER_REGISTRATION_TIMEOUT = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "60"))
 
 # R2
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
@@ -459,6 +459,7 @@ class SubmitRequest(BaseModel):
     model: str
     prompt: Optional[str] = ""
     params: Optional[Dict[str, Any]] = {}
+    fcm_token: Optional[str] = None
 
 
 class RegisterPayload(BaseModel):
@@ -1145,6 +1146,19 @@ async def job_complete(payload: JobCompletePayload):
             worker.last_active = datetime.utcnow()
             db.commit()
 
+        # ✅ Notify user via FCM if token exists
+        try:
+            fcm_token = job.params.get("fcm_token")
+            if fcm_token:
+                asyncio.create_task(send_fcm_notification(
+                    token=fcm_token,
+                    title=f"Processing Complete.",
+                    body=f"Tap to view your result.",
+                    data={"job_id": job.job_id}
+                ))
+        except Exception as e:
+            logger.error(f"FCM push failed for job {job.job_id}: {e}")
+
         return {
             "status": "ok",
             "job_id": job.job_id,
@@ -1154,7 +1168,6 @@ async def job_complete(payload: JobCompletePayload):
 
     finally:
         db.close()
-
 
 @app.post("/heartbeat")
 async def heartbeat(request: Request):
@@ -1298,6 +1311,41 @@ async def job_status(job_id: str = Query(..., description="Job ID to check statu
     finally:
         db.close()
 
+async def send_fcm_notification(token: str, title: str, body: str, data: dict):
+    """Send FCM push notification to a specific device token."""
+    fcm_key = os.getenv("FCM_SERVER_KEY")
+    if not fcm_key:
+        logger.warning("⚠️ FCM_SERVER_KEY missing, skipping push notification")
+        return
+
+    headers = {
+        "Authorization": f"key={fcm_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "to": token,
+        "notification": {
+            "title": title,
+            "body": body,
+        },
+        "data": data,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://fcm.googleapis.com/fcm/send",
+                headers=headers,
+                json=payload,
+            ) as resp:
+                text = await resp.text()
+                if resp.status == 200:
+                    logger.info(f"✅ Sent FCM notification: {text}")
+                else:
+                    logger.error(f"❌ FCM failed {resp.status}: {text}")
+    except Exception as e:
+        logger.error(f"Failed to send FCM notification: {e}")
+        
 
 @app.post("/submit")
 async def submit(
@@ -1308,6 +1356,8 @@ async def submit(
     job_id = str(uuid.uuid4())
     db = SessionLocal()
     result_key = f"{IMAGE_PREFIX}{job_id}.png"
+    with open("req_param.json", "w", encoding="utf-8") as f:
+        json.dump(req.params, f, indent=4)
 
     try:
         # Create new job record
@@ -1326,6 +1376,11 @@ async def submit(
         )
         db.add(job)
         db.commit()
+
+        # ✅ Store FCM token temporarily in params for notification
+        if req.fcm_token:
+            job.params["fcm_token"] = req.fcm_token
+            db.commit()
     finally:
         db.close()
 

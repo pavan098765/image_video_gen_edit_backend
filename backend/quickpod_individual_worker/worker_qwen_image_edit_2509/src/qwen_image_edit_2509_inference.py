@@ -141,7 +141,8 @@ def _get_dynamic_size_for_images(images: List[Image.Image], max_dim: int = 1152)
             w, h = max_dim, int(max_dim / aspect)
         else:
             h, w = max_dim, int(max_dim * aspect)
-    w, h = max(64, (w // 64) * 64), max(64, (h // 64) * 64)
+    w = (w // 64) * 64
+    h = (h // 64) * 64
     return w, h
 
 
@@ -190,11 +191,13 @@ def run_inference_qwen_image_edit_2509(job_id: str, prompt: str, params: Dict[st
         "image": images if len(images) > 1 else images[0],
         "prompt": prompt,
         "true_cfg_scale": float(params.get("cfg_scale", 1.0)),
-        # "negative_prompt": params.get("negative_prompt", ""),
         "num_inference_steps": int(params.get("num_inference_steps", NUM_INFERENCE_STEPS)),
-        "width": width,
-        "height": height,
     }
+
+    # Only include width/height if *no init image* is provided
+    if not params.get("init_image") and not params.get("images"):
+        inputs["width"] = width
+        inputs["height"] = height
 
     print(f"🧪 Running pipeline job {job_id} | {len(images)} images, steps={inputs['num_inference_steps']}")
     result = pipeline(**inputs)

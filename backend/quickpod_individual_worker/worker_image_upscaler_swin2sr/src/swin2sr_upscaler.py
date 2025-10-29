@@ -22,8 +22,8 @@ os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 # -------------------------
 MODEL_MAP = {
     "swin2sr_x2": os.environ.get("SWIN2SR_X2_LOCAL_PATH"),
-    "swin2sr_x4": os.environ.get("SWIN2SR_X4_LOCAL_PATH"),
-    "swin2sr_x4_classic": os.environ.get("SWIN2SR_X4_CLASSIC_LOCAL_PATH"),
+    "swin2sr_x4_real": os.environ.get("SWIN2SR_X4_LOCAL_PATH"),
+    "swin2sr_x4": os.environ.get("SWIN2SR_X4_CLASSIC_LOCAL_PATH"),
 }
 
 # Cache loaded models

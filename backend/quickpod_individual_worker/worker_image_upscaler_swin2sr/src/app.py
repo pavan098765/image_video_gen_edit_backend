@@ -22,15 +22,51 @@ from contextlib import asynccontextmanager
 # -----------------------
 # GPU cleanup
 # -----------------------
-def cleanup_gpu():
-    """Free GPU memory completely (stateless safe mode)."""
+def cleanup_gpu(verbose: bool = False):
+    """
+    Fully frees GPU memory and CUDA context.
+    Use this between model loads to ensure a clean slate.
+    """
+    import torch
     try:
-        import torch
+        if verbose:
+            allocated = torch.cuda.memory_allocated() / 1024**2
+            reserved = torch.cuda.memory_reserved() / 1024**2
+            print(f"[GPU] Before cleanup: {allocated:.2f} MB allocated, {reserved:.2f} MB reserved")
+
+        # 1️⃣ Delete all PyTorch GPU tensors
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj):
+                    del obj
+            except Exception:
+                pass
+
+        # 2️⃣ Run Python garbage collector
+        gc.collect()
+
+        # 3️⃣ Clear PyTorch cache and IPC handles
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-    except Exception:
+
+        # 4️⃣ Synchronize and reset memory stats
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_accumulated_memory_stats()
+
+        # 5️⃣ Reset CUDA device context (complete teardown)
+        torch.cuda.reset()
+
+        # 6️⃣ Final garbage collection
+        gc.collect()
+
+        if verbose:
+            torch.cuda._lazy_init()  # reinit context to check stats safely
+            print(f"[GPU] After cleanup: {torch.cuda.memory_allocated()/1024**2:.2f} MB allocated")
+            print("[GPU] CUDA context successfully reset.")
+    except Exception as e:
+        print(f"[GPU] Cleanup warning: {e}")
         pass
-    gc.collect()
 
 # -----------------------
 # Import inference function
