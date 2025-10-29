@@ -13,10 +13,22 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 import time
 
-from fastapi import FastAPI, BackgroundTasks, Query, Request, HTTPException, Depends, Header, Response
+from fastapi import (
+    FastAPI,
+    BackgroundTasks,
+    Query,
+    Request,
+    HTTPException,
+    Depends,
+    Header,
+    Response,
+)
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
+import firebase_admin
+from firebase_admin import credentials, messaging
+
 
 from db import init_db, SessionLocal, Worker, Job
 from pod_manager import PodManager
@@ -46,14 +58,21 @@ init_db()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("controller")
 
+# 🔹 Initialize Firebase Admin using Application Default Credentials
+try:
+    firebase_admin.initialize_app()
+    logger.info("✅ Firebase Admin initialized using GOOGLE_APPLICATION_CREDENTIALS")
+except Exception as e:
+    logger.warning(f"⚠️ Firebase Admin already initialized or failed: {e}")
+
 email_quickpod = os.getenv("QUICKPOD_EMAIL", "None")
 password_quickpod = os.getenv("QUICKPOD_PASSWORD", "None")
 warm_pod_uuid = os.getenv("QUICKPOD_POD_UUID")
 IMAGE_PREFIX = os.getenv("IMAGE_PREFIX", "quickpod/")
 CONTROLLER_PUBLIC_URL = os.getenv("CONTROLLER_PUBLIC_URL", "")
 CONTROLLER_SHARED_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "")
-HEARTBEAT_INTERVAL = 10           # how often the worker actually pings
-HEARTBEAT_GRACE_MULTIPLIER = 2    # allow 2 missed pings before reaping
+HEARTBEAT_INTERVAL = 10  # how often the worker actually pings
+HEARTBEAT_GRACE_MULTIPLIER = 2  # allow 2 missed pings before reaping
 WORKER_IDLE_TIMEOUT = HEARTBEAT_INTERVAL * HEARTBEAT_GRACE_MULTIPLIER
 WORKER_REGISTRATION_TIMEOUT = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "60"))
 
@@ -78,7 +97,9 @@ if R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY:
 POD_STRATEGY = os.getenv("POD_STRATEGY", "machine_based").lower()
 # interpret a few aliases
 if POD_STRATEGY in ("individual", "machine", "machine_based"):
-    pod_strategy_env = "machine_based"  # use our machine-based logic for individual-pod only flow
+    pod_strategy_env = (
+        "machine_based"  # use our machine-based logic for individual-pod only flow
+    )
 elif POD_STRATEGY in ("warm", "warm_and_individual", "default"):
     pod_strategy_env = "warm_and_individual"
 else:
@@ -94,7 +115,9 @@ else:
 # also tell pod_manager about selected strategy via env (it already reads POD_STRATEGY itself)
 os.environ["POD_STRATEGY"] = pod_strategy_env
 ENABLE_AUTOTEST = os.getenv("ENABLE_AUTOTEST", "true").lower() == "true"
-logger.info(f"Pod strategy: {pod_strategy_env}, AUTOTEST mode: {'ON' if ENABLE_AUTOTEST else 'OFF'}")
+logger.info(
+    f"Pod strategy: {pod_strategy_env}, AUTOTEST mode: {'ON' if ENABLE_AUTOTEST else 'OFF'}"
+)
 job_manager: Optional[JobManager] = None
 
 app = FastAPI(title="Server Controller")
@@ -114,35 +137,80 @@ BANS_FILE = Path(Path(__file__).parent, "banned_ips.json")
 # --- Core Protection Configuration (tuneable) ---
 BLOCKED_METHODS = {"PROPFIND", "CONNECT", "TRACE", "TRACK", "PRI"}
 BLOCK_EMPTY_UA = True
-BAN_DURATION = 300           # seconds (temporary ban default)
-RATE_LIMIT = 20              # requests per minute per IP
-MAX_BODY_SIZE = 10_000_000   # 10 MB
+BAN_DURATION = 300  # seconds (temporary ban default)
+RATE_LIMIT = 20  # requests per minute per IP
+MAX_BODY_SIZE = 10_000_000  # 10 MB
 SUSPICIOUS_SCORE_THRESHOLD = 5  # heuristic ban trigger
-PERMANENT_BAN_ON_THRESHOLD = True  # if suspicion score passes threshold, ban permanently
+PERMANENT_BAN_ON_THRESHOLD = (
+    True  # if suspicion score passes threshold, ban permanently
+)
 
 # Trust / whitelist
 TRUSTED_IPS = set()  # add any static IPs here if you want them always safe
-TRUSTED_WORKER_IP_TTL_SECONDS = 60 * 60 * 24  # 24 hours trust for newly-registered worker IPs
+TRUSTED_WORKER_IP_TTL_SECONDS = (
+    60 * 60 * 24
+)  # 24 hours trust for newly-registered worker IPs
 
 # Known malicious user-agents and scanners (keep lowercase)
 BLOCKED_USER_AGENTS = [
-    "curl", "wget", "python-requests", "sqlmap", "nmap", "nikto",
-    "masscan", "scrapy", "libwww-perl", "zgrab", "httpclient", "scanbot",
-    "nessus", "dirbuster", "acunetix", "wpscan", "whatweb", "httprobe",
-    "bot", "go-http-client"
+    "curl",
+    "wget",
+    "python-requests",
+    "sqlmap",
+    "nmap",
+    "nikto",
+    "masscan",
+    "scrapy",
+    "libwww-perl",
+    "zgrab",
+    "httpclient",
+    "scanbot",
+    "nessus",
+    "dirbuster",
+    "acunetix",
+    "wpscan",
+    "whatweb",
+    "httprobe",
+    "bot",
+    "go-http-client",
 ]
 
 # Known exploit or reconnaissance path patterns
 SUSPICIOUS_PATHS = [
-    r"\.\./", r"etc/passwd", r"wp-admin", r"phpmyadmin", r"\.env", r"\.git",
-    r"/owa/", r"/solr/", r"/admin", r"/console", r"/status\.php", r"/login",
-    r"/jasperserver", r"/owncloud", r"/zabbix", r"/WebInterface", r"/sitecore",
-    r"/cgi-bin", r"/index\.jsp", r"/OA_HTML", r"/Telerik", r"cf_scripts"
+    r"\.\./",
+    r"etc/passwd",
+    r"wp-admin",
+    r"phpmyadmin",
+    r"\.env",
+    r"\.git",
+    r"/owa/",
+    r"/solr/",
+    r"/admin",
+    r"/console",
+    r"/status\.php",
+    r"/login",
+    r"/jasperserver",
+    r"/owncloud",
+    r"/zabbix",
+    r"/WebInterface",
+    r"/sitecore",
+    r"/cgi-bin",
+    r"/index\.jsp",
+    r"/OA_HTML",
+    r"/Telerik",
+    r"cf_scripts",
 ]
 
 # Suspicious header keys and payload keywords
 SUSPICIOUS_HEADERS = ["X-Original-URL", "X-Rewrite-URL", "Forwarded"]
-INJECTION_KEYWORDS = [b"<script", b"<?php", b"union select", b"drop table", b"--", b"alert("]
+INJECTION_KEYWORDS = [
+    b"<script",
+    b"<?php",
+    b"union select",
+    b"drop table",
+    b"--",
+    b"alert(",
+]
 
 # In-memory IP tracking
 # For persistent bans use structure: banned_ips[ip] = {"expiry": <float|None>, "permanent": bool, "reason": str, "created_at": float}
@@ -156,6 +224,7 @@ trusted_worker_ips: Dict[str, float] = {}
 # async lock for persistence-safe operations
 ban_lock = asyncio.Lock()
 
+
 # ---------- Persistence helpers ----------
 async def persist_bans():
     """Write banned_ips to disk (atomic rename)."""
@@ -163,14 +232,17 @@ async def persist_bans():
         try:
             data = banned_ips.copy()
             tmp = BANS_FILE.with_suffix(".tmp")
+
             def _write():
-                print(f"🟢 Writing bans file to {tmp}") 
+                print(f"🟢 Writing bans file to {tmp}")
                 with open(tmp, "w") as f:
                     json.dump(data, f)
                 tmp.replace(BANS_FILE)
+
             await asyncio.to_thread(_write)
         except Exception:
             security_logger.exception("Failed to persist banned_ips to disk")
+
 
 async def load_bans():
     """Load banned_ips from disk at startup."""
@@ -178,9 +250,11 @@ async def load_bans():
         if not BANS_FILE.exists():
             return
         try:
+
             def _read():
                 with open(BANS_FILE, "r") as f:
                     return json.load(f)
+
             loaded = await asyncio.to_thread(_read)
             # loaded is ip -> dict
             for ip, info in loaded.items():
@@ -194,9 +268,11 @@ async def load_bans():
         except Exception:
             security_logger.exception("Failed to load banned_ips from disk")
 
+
 # ---------- Helpers ----------
 def _now_ts() -> float:
     return time.time()
+
 
 def is_banned(ip: str) -> bool:
     # skip trusted ips
@@ -222,7 +298,10 @@ def is_banned(ip: str) -> bool:
         pass
     return False
 
-async def ban_ip(ip: str, reason: str, duration: Optional[int] = None, permanent: bool = False):
+
+async def ban_ip(
+    ip: str, reason: str, duration: Optional[int] = None, permanent: bool = False
+):
     """Ban IP. If permanent=True, set permanent, otherwise set expiry."""
     async with ban_lock:
         if permanent:
@@ -248,6 +327,7 @@ async def ban_ip(ip: str, reason: str, duration: Optional[int] = None, permanent
         except Exception:
             security_logger.exception("Failed to persist bans after ban_ip")
 
+
 async def unban_ip(ip: str):
     async with ban_lock:
         if ip in banned_ips:
@@ -256,6 +336,7 @@ async def unban_ip(ip: str):
             security_logger.info(f"IP unbanned: {ip}")
             return True
         return False
+
 
 def check_rate_limit(ip: str) -> bool:
     now = _now_ts()
@@ -268,12 +349,20 @@ def check_rate_limit(ip: str) -> bool:
     rate_limiter[ip] = timestamps
     return True
 
+
 async def increase_suspicion(ip: str, amount: int, reason: str):
     score = ip_suspicion_score.get(ip, 0) + amount
     ip_suspicion_score[ip] = score
-    security_logger.info(f"Suspicion {score}/{SUSPICIOUS_SCORE_THRESHOLD} for {ip} — {reason}")
+    security_logger.info(
+        f"Suspicion {score}/{SUSPICIOUS_SCORE_THRESHOLD} for {ip} — {reason}"
+    )
     if score >= SUSPICIOUS_SCORE_THRESHOLD:
-        await ban_ip(ip, f"suspicious behavior (score={score})", permanent=PERMANENT_BAN_ON_THRESHOLD)
+        await ban_ip(
+            ip,
+            f"suspicious behavior (score={score})",
+            permanent=PERMANENT_BAN_ON_THRESHOLD,
+        )
+
 
 # def increase_suspicion(ip: str, amount: int, reason: str):
 #     score = ip_suspicion_score.get(ip, 0) + amount
@@ -283,10 +372,14 @@ async def increase_suspicion(ip: str, amount: int, reason: str):
 #         # default: make permanent ban if configured
 #         asyncio.create_task(ban_ip(ip, f"suspicious behavior (score={score})", permanent=PERMANENT_BAN_ON_THRESHOLD))
 
+
 def add_trusted_worker_ip(ip: str):
     """Mark an IP trusted for some TTL (used when a worker registers)."""
     trusted_worker_ips[ip] = _now_ts() + TRUSTED_WORKER_IP_TTL_SECONDS
-    security_logger.info(f"Added trusted worker IP {ip} for {TRUSTED_WORKER_IP_TTL_SECONDS}s")
+    security_logger.info(
+        f"Added trusted worker IP {ip} for {TRUSTED_WORKER_IP_TTL_SECONDS}s"
+    )
+
 
 def is_trusted_worker_ip(ip: str) -> bool:
     exp = trusted_worker_ips.get(ip)
@@ -301,13 +394,15 @@ def is_trusted_worker_ip(ip: str) -> bool:
         pass
     return False
 
+
 # Paths behavior:
 # - WORKER_PATHS: endpoints used by workers (register_worker, heartbeat) -> exempt from UA/permanent banning
 # - TRUSTED_API_PATHS: endpoints that may require Authorization Bearer to skip deep body inspection (/submit, /job_complete)
 # - PUBLIC_PATHS: endpoints open to public (like /download) -> no checks apply
 WORKER_PATHS = ["/register_worker", "/heartbeat"]
 TRUSTED_API_PATHS = ["/submit", "/job_complete", "/job_status"]
-PUBLIC_PATHS = ["/download"] 
+PUBLIC_PATHS = ["/download"]
+
 
 # ---------- Middleware ----------
 @app.middleware("http")
@@ -318,7 +413,7 @@ async def aggressive_security_middleware(request: Request, call_next):
         # pick left-most IP (original client)
         ip = ip_header.split(",")[0].strip()
     else:
-        ip = (request.client.host or "unknown")
+        ip = request.client.host or "unknown"
     path = request.url.path.lower()
     ua = request.headers.get("user-agent", "").lower()
     auth_header = request.headers.get("authorization", "")
@@ -349,18 +444,24 @@ async def aggressive_security_middleware(request: Request, call_next):
         try:
             return await call_next(request)
         except Exception as e:
-            security_logger.exception(f"Worker path exception from {ip} path={path}: {e}")
+            security_logger.exception(
+                f"Worker path exception from {ip} path={path}: {e}"
+            )
             return Response("Internal Server Error", status_code=500)
 
     # Trusted API paths (like /submit, /job_complete) require Authorization: Bearer to skip deep body scan
     if any(path.startswith(p) for p in TRUSTED_API_PATHS):
-        if not (auth_header.startswith("Bearer ") or request.headers.get("x-fingerprint")):
+        if not (
+            auth_header.startswith("Bearer ") or request.headers.get("x-fingerprint")
+        ):
             await increase_suspicion(ip, 3, "trusted endpoint without auth")
             return Response("Forbidden", status_code=403)
         try:
             return await call_next(request)
         except Exception as e:
-            security_logger.exception(f"Trusted API path exception from {ip} path={path}: {e}")
+            security_logger.exception(
+                f"Trusted API path exception from {ip} path={path}: {e}"
+            )
             return Response("Internal Server Error", status_code=500)
 
     # ✅ Public safe paths (no auth needed, like /download)
@@ -368,9 +469,11 @@ async def aggressive_security_middleware(request: Request, call_next):
         try:
             return await call_next(request)
         except Exception as e:
-            security_logger.exception(f"Public path exception from {ip} path={path}: {e}")
+            security_logger.exception(
+                f"Public path exception from {ip} path={path}: {e}"
+            )
             return Response("Internal Server Error", status_code=500)
-    
+
     # From here on, we apply aggressive checks to public/untrusted endpoints
     # Suspicious path detection -> permanent ban
     for pattern in SUSPICIOUS_PATHS:
@@ -422,6 +525,7 @@ async def aggressive_security_middleware(request: Request, call_next):
         security_logger.exception(f"Unhandled exception from {ip} path={path}: {e}")
         return Response("Internal Server Error", status_code=500)
 
+
 @app.middleware("http")
 async def reject_unknown_paths(request: Request, call_next):
     """
@@ -467,8 +571,8 @@ class RegisterPayload(BaseModel):
     models: list
     endpoint: str = ""  # keep optional-equivalent behavior by allowing empty string
     container_id: Optional[str] = None
-    pod_uuid: Optional[str] = None          # Preferred canonical pod identifier (QuickPod)
-    public_ip: Optional[str] = None         # Optional public IP of the pod (if available)
+    pod_uuid: Optional[str] = None  # Preferred canonical pod identifier (QuickPod)
+    public_ip: Optional[str] = None  # Optional public IP of the pod (if available)
     info: Optional[Dict[str, Any]] = None
 
 
@@ -477,6 +581,7 @@ class JobCompletePayload(BaseModel):
     result_r2_key: Optional[str] = None
     failed: Optional[bool] = False
     error: Optional[str] = None  # also capture error message if sent
+
 
 # ------------------------
 # Auth Dependencies
@@ -568,7 +673,9 @@ def upsert_worker(
     w = db.query(Worker).filter(Worker.worker_id == worker_id).first()
     now = datetime.utcnow()
     # Use equality for warm pod detection
-    is_warm = (container_id == warm_pod_uuid) if container_id and warm_pod_uuid else False
+    is_warm = (
+        (container_id == warm_pod_uuid) if container_id and warm_pod_uuid else False
+    )
     if not w:
         w = Worker(
             worker_id=worker_id,
@@ -616,7 +723,7 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
             "upload_url": presigned_url,  # <-- worker gets this
             "result_key": job.result_r2_key,  # optional, for reference
         }
-       
+
         url = f"{worker.endpoint.rstrip('/')}/run"
         max_attempts = 5
         for attempt in range(max_attempts):
@@ -643,7 +750,7 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
                         worker.status = "terminated"
                         db.commit()
                     return
-                
+
         job.worker_id = worker.worker_id
         job_manager.update_job_state(job.job_id, JobState.RUNNING)
         if worker.is_warm_pod:
@@ -683,7 +790,7 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
 #             for w in idle_workers:
 #                 try:
 #                     if w.is_warm_pod:
-                    
+
 #                         # check if any jobs tied to this warm pod are still dispatching
 #                         active_jobs = (
 #                             db.query(Job)
@@ -700,7 +807,7 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
 #                             w.status = "offline"
 #                     else:
 #                         if w.container_id:
-#                             await asyncio.sleep(300) 
+#                             await asyncio.sleep(300)
 #                             logger.info(f"Reaping idle individual pod {w.container_id}")
 #                             await pod_manager.destroy_individual_pod(w.container_id)
 #                         w.status = "offline"
@@ -808,6 +915,7 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
 #         # Check more frequently for responsiveness
 #         await asyncio.sleep(max(5, WORKER_IDLE_TIMEOUT // 2))
 
+
 async def idle_worker_reaper_task():
     logger.info("Starting idle worker reaper (enhanced)")
     while True:
@@ -840,7 +948,9 @@ async def idle_worker_reaper_task():
             )
 
             # Merge both sets (avoid duplicates)
-            all_targets = {w.worker_id: w for w in stale_workers + idle_workers}.values()
+            all_targets = {
+                w.worker_id: w for w in stale_workers + idle_workers
+            }.values()
 
             for w in all_targets:
                 try:
@@ -849,11 +959,13 @@ async def idle_worker_reaper_task():
                         db.query(Job)
                         .filter(
                             Job.worker_id == w.worker_id,
-                            Job.status.in_([
-                                JobState.QUEUED.value,
-                                JobState.RUNNING.value,
-                                JobState.DISPATCHING.value,
-                            ]),
+                            Job.status.in_(
+                                [
+                                    JobState.QUEUED.value,
+                                    JobState.RUNNING.value,
+                                    JobState.DISPATCHING.value,
+                                ]
+                            ),
                         )
                         .all()
                     )
@@ -861,8 +973,10 @@ async def idle_worker_reaper_task():
                     if active_jobs:
                         # Check if they are stale jobs (no update for a long time)
                         stale_jobs = [
-                            j for j in active_jobs
-                            if (now - j.updated_at) > timedelta(seconds=WORKER_IDLE_TIMEOUT)
+                            j
+                            for j in active_jobs
+                            if (now - j.updated_at)
+                            > timedelta(seconds=WORKER_IDLE_TIMEOUT)
                         ]
                         if stale_jobs:
                             logger.warning(
@@ -919,7 +1033,10 @@ async def pod_cleanup_task():
         try:
             pods_to_cleanup = (
                 db.query(Worker)
-                .filter(Worker.status.in_(["terminated", "offline", "error"]), Worker.is_warm_pod == False)
+                .filter(
+                    Worker.status.in_(["terminated", "offline", "error"]),
+                    Worker.is_warm_pod == False,
+                )
                 .all()
             )
             if pods_to_cleanup:
@@ -966,13 +1083,13 @@ async def startup_event():
         await pod_manager.initialize()
         asyncio.create_task(idle_worker_reaper_task())
         asyncio.create_task(pod_cleanup_task())
-        
+
         if JOB_AUTO_RECOVER:
             logger.info("Job Recovery mode ON")
             asyncio.create_task(job_recovery_task())
         else:
             logger.info("Job Recovery mode OFF")
-        
+
         # Start autoscaler if enabled
         if ENABLE_AUTOSCALER:
             logger.info("Autoscaler enabled — starting background loop")
@@ -981,16 +1098,18 @@ async def startup_event():
             logger.info("Autoscaler disabled")
 
         if not BANS_FILE.exists():
+
             async def create_empty_ban_file():
                 async with ban_lock:
                     with open(BANS_FILE, "w") as f:
                         json.dump({}, f)
+
             asyncio.create_task(create_empty_ban_file())
             logger.info("Created IP bans file")
-        
+
         await load_bans()
         logger.info(f"Loaded {len(banned_ips)} IP bans on startup")
-        
+
         logger.info("Controller startup complete")
     except Exception as e:
         logger.error(f"Error during startup: {e}")
@@ -1015,7 +1134,9 @@ async def download(job_id: str, request: Request):
         # 1️⃣ Find job entry
         job = db.query(Job).filter(Job.job_id == job_id).first()
         if not job or not job.output_key:
-            raise HTTPException(status_code=404, detail="Job not found or output missing")
+            raise HTTPException(
+                status_code=404, detail="Job not found or output missing"
+            )
 
         key = job.output_key
 
@@ -1023,7 +1144,11 @@ async def download(job_id: str, request: Request):
         try:
             head = s3_client.head_object(Bucket=R2_BUCKET, Key=key)
             total_size = head["ContentLength"]
-            content_type = head.get("ContentType") or mimetypes.guess_type(key)[0] or "application/octet-stream"
+            content_type = (
+                head.get("ContentType")
+                or mimetypes.guess_type(key)[0]
+                or "application/octet-stream"
+            )
         except ClientError as e:
             logger.error(f"R2 head_object failed for {key}: {e}")
             raise HTTPException(status_code=404, detail="File not found in R2")
@@ -1067,7 +1192,9 @@ async def download(job_id: str, request: Request):
         except ClientError as e:
             code = e.response["Error"]["Code"]
             if code == "InvalidRange":
-                raise HTTPException(status_code=416, detail="Requested Range Not Satisfiable")
+                raise HTTPException(
+                    status_code=416, detail="Requested Range Not Satisfiable"
+                )
             logger.error(f"Error fetching range {range_param} for {key}: {e}")
             raise HTTPException(status_code=500, detail="Failed to fetch file from R2")
 
@@ -1083,14 +1210,18 @@ async def download(job_id: str, request: Request):
                 stream.close()
 
         # 6️⃣ Set final headers
-        headers.update({
-            "Content-Type": content_type,
-            "Cache-Control": "public, max-age=86400, immutable",
-            "Content-Disposition": f'inline; filename="{os.path.basename(key)}"',
-        })
+        headers.update(
+            {
+                "Content-Type": content_type,
+                "Cache-Control": "public, max-age=86400, immutable",
+                "Content-Disposition": f'inline; filename="{os.path.basename(key)}"',
+            }
+        )
 
         # 7️⃣ Return StreamingResponse with 200 or 206
-        return StreamingResponse(file_iterator(), status_code=status_code, headers=headers)
+        return StreamingResponse(
+            file_iterator(), status_code=status_code, headers=headers
+        )
 
     finally:
         db.close()
@@ -1108,7 +1239,9 @@ async def job_complete(payload: JobCompletePayload):
             raise HTTPException(status_code=404, detail="Job not found")
 
         if payload.failed:
-            job_manager.update_job_state(job.job_id, JobState.FAILED, payload.error or "Worker reported failure")
+            job_manager.update_job_state(
+                job.job_id, JobState.FAILED, payload.error or "Worker reported failure"
+            )
         else:
             job_manager.update_job_state(job.job_id, JobState.COMPLETED)
             job.result_r2_key = payload.result_r2_key
@@ -1125,11 +1258,13 @@ async def job_complete(payload: JobCompletePayload):
                 db.query(Job)
                 .filter(
                     Job.worker_id == worker.worker_id,
-                    Job.status.in_([
-                        JobState.RUNNING.value,
-                        JobState.DISPATCHING.value,
-                        JobState.QUEUED.value
-                    ])
+                    Job.status.in_(
+                        [
+                            JobState.RUNNING.value,
+                            JobState.DISPATCHING.value,
+                            JobState.QUEUED.value,
+                        ]
+                    ),
                 )
                 .count()
             )
@@ -1141,7 +1276,9 @@ async def job_complete(payload: JobCompletePayload):
                 worker.status = "ready" if worker.is_warm_pod else "busy"
             else:
                 worker.status = "ready" if worker.is_warm_pod else "terminated"
-                logger.info(f"Worker {worker.worker_id} has no active jobs — marking {'ready' if worker.is_warm_pod else 'terminated'}.")
+                logger.info(
+                    f"Worker {worker.worker_id} has no active jobs — marking {'ready' if worker.is_warm_pod else 'terminated'}."
+                )
 
             worker.last_active = datetime.utcnow()
             db.commit()
@@ -1150,12 +1287,15 @@ async def job_complete(payload: JobCompletePayload):
         try:
             fcm_token = job.params.get("fcm_token")
             if fcm_token:
-                asyncio.create_task(send_fcm_notification(
-                    token=fcm_token,
-                    title=f"Processing Complete.",
-                    body=f"Tap to view your result.",
-                    data={"job_id": job.job_id}
-                ))
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        send_fcm_notification,
+                        fcm_token,
+                        "Processing Complete.",
+                        f"Tap to view your result.",
+                        {"job_id": job.job_id},
+                    )
+                )
         except Exception as e:
             logger.error(f"FCM push failed for job {job.job_id}: {e}")
 
@@ -1168,6 +1308,7 @@ async def job_complete(payload: JobCompletePayload):
 
     finally:
         db.close()
+
 
 @app.post("/heartbeat")
 async def heartbeat(request: Request):
@@ -1211,10 +1352,14 @@ async def register_worker(request: Request):
     payload = RegisterPayload(**data)
 
     if not payload.models:
-        raise HTTPException(status_code=400, detail="Worker must declare at least one model")
+        raise HTTPException(
+            status_code=400, detail="Worker must declare at least one model"
+        )
 
     container_id_received = payload.pod_uuid or payload.container_id
-    endpoint = payload.endpoint or (f"http://{payload.public_ip}" if payload.public_ip else "")
+    endpoint = payload.endpoint or (
+        f"http://{payload.public_ip}" if payload.public_ip else ""
+    )
     pod_uuid = container_id_received or "unknown"
 
     # ---- VALIDATION LOGIC ----
@@ -1223,7 +1368,10 @@ async def register_worker(request: Request):
     expiry_window = 5  # seconds
 
     # 1️⃣ Reject pods destroyed recently (always enforced)
-    if pod_uuid in recently_destroyed and time.time() - recently_destroyed[pod_uuid] < expiry_window:
+    if (
+        pod_uuid in recently_destroyed
+        and time.time() - recently_destroyed[pod_uuid] < expiry_window
+    ):
         logger.warning(
             f"⚠️ Ignoring re-registration from recently destroyed pod {pod_uuid} "
             f"(IP={endpoint}) — within expiry window."
@@ -1245,7 +1393,6 @@ async def register_worker(request: Request):
             # fire-and-forget async destroy
             asyncio.create_task(pod_manager.destroy_unexpected_pod(pod_uuid))
             return Response(status_code=403, content="Unrequested pod destroyed")
-
 
     # ---- NORMAL REGISTRATION FLOW ----
     with SessionLocal() as db:
@@ -1272,7 +1419,9 @@ async def register_worker(request: Request):
         if container_id_received:
             pod_info = pod_manager.individual_pods.get(container_id_received)
             if pod_info and pod_info.machine_id:
-                await pod_manager.mark_image_cached_on_machine(pod_info.machine_id, payload.models[0])
+                await pod_manager.mark_image_cached_on_machine(
+                    pod_info.machine_id, payload.models[0]
+                )
     except Exception as e:
         logger.warning(f"Cache sync error for {container_id_received}: {e}")
 
@@ -1280,8 +1429,9 @@ async def register_worker(request: Request):
 
 
 @app.get("/job_status")
-async def job_status(job_id: str = Query(..., description="Job ID to check status"),
-                         auth=Depends(require_any_auth),
+async def job_status(
+    job_id: str = Query(..., description="Job ID to check status"),
+    auth=Depends(require_any_auth),
 ):
     """
     Client polls this endpoint with job_id to get current job status.
@@ -1311,41 +1461,25 @@ async def job_status(job_id: str = Query(..., description="Job ID to check statu
     finally:
         db.close()
 
-async def send_fcm_notification(token: str, title: str, body: str, data: dict):
-    """Send FCM push notification to a specific device token."""
-    fcm_key = os.getenv("FCM_SERVER_KEY")
-    if not fcm_key:
-        logger.warning("⚠️ FCM_SERVER_KEY missing, skipping push notification")
-        return
 
-    headers = {
-        "Authorization": f"key={fcm_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "to": token,
-        "notification": {
-            "title": title,
-            "body": body,
-        },
-        "data": data,
-    }
-
+def send_fcm_notification(token: str, title: str, body: str, data: dict):
+    """Send a push notification to a device via FCM."""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://fcm.googleapis.com/fcm/send",
-                headers=headers,
-                json=payload,
-            ) as resp:
-                text = await resp.text()
-                if resp.status == 200:
-                    logger.info(f"✅ Sent FCM notification: {text}")
-                else:
-                    logger.error(f"❌ FCM failed {resp.status}: {text}")
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            data={str(k): str(v) for k, v in data.items()},
+            token=token,
+        )
+        response = messaging.send(message)
+        logger.info(f"✅ Sent FCM notification: {response}")
+        return True
     except Exception as e:
-        logger.error(f"Failed to send FCM notification: {e}")
-        
+        logger.error(f"❌ Failed to send FCM notification: {e}")
+        return False
+
 
 @app.post("/submit")
 async def submit(
@@ -1369,7 +1503,8 @@ async def submit(
             status=JobState.QUEUED.value,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
-            timeout_at=datetime.utcnow() + timedelta(seconds=req.params.get("timeout", 3600)),
+            timeout_at=datetime.utcnow()
+            + timedelta(seconds=req.params.get("timeout", 3600)),
             result_r2_key=result_key,
             output_key=result_key,
             output_url=f"{CONTROLLER_PUBLIC_URL}/download/{job_id}",  # ✅ controller-managed redirect URL
@@ -1392,8 +1527,12 @@ async def submit(
     try:
         # Track job as pending and dispatch to a worker
         await pod_manager.add_pending_job(job_id, req.model)
-        worker_id = await pod_manager.dispatch_job(job_id, req.model, req.params.get("mode"))
-        background_tasks.add_task(assign_job_to_worker, job_id, worker_id, presigned_url)
+        worker_id = await pod_manager.dispatch_job(
+            job_id, req.model, req.params.get("mode")
+        )
+        background_tasks.add_task(
+            assign_job_to_worker, job_id, worker_id, presigned_url
+        )
 
         # ✅ Simplified: always return controller /download endpoint (no presigned GET)
         download_url = f"{CONTROLLER_PUBLIC_URL}/download/{job_id}"
@@ -1402,7 +1541,7 @@ async def submit(
             "job_id": job_id,
             "status": "dispatched",
             "routed_to_worker": worker_id,
-            "upload_url": presigned_url,   # ✅ worker uploads here
+            "upload_url": presigned_url,  # ✅ worker uploads here
             "result_key": result_key,
             "download_url": download_url,  # ✅ app fetches from here (controller redirect)
         }
