@@ -57,11 +57,15 @@ class JobManager:
             JobState.CANCELLED: [],
         }
 
-    def _validate_transition(self, current_state: JobState, new_state: JobState):
+    def _validate_transition(self, current_state: JobState, new_state: JobState, force: bool = False):
+        if force:
+            logger.warning(f"⚠️ Forced transition override: {current_state} → {new_state}")
+            return
         if new_state not in self.allowed_transitions[current_state]:
             raise JobStateError(
                 f"Invalid state transition from {current_state} to {new_state}"
             )
+
 
     def _reset_worker_if_dispatching(self, db: Session, worker_id: Optional[str]):
         """Ensure worker doesn't stay stuck in 'dispatching' if job fails/cancels."""
@@ -76,11 +80,11 @@ class JobManager:
             worker.last_active = datetime.utcnow()
 
     def update_job_state(
-        self,
-        job_id: str,
-        new_state: JobState,
-        error_message: Optional[str] = None,
-        force: bool = False,
+    self,
+    job_id: str,
+    new_state: JobState,
+    error_message: Optional[str] = None,
+    force: bool = False,
     ) -> Job:
         with self.session_factory() as db:
             job = db.query(Job).filter(Job.job_id == job_id).first()
@@ -90,10 +94,9 @@ class JobManager:
             try:
                 current_state = JobState(job.status)
             except Exception:
-                # Unexpected stored state; fallback to QUEUED
                 current_state = JobState.QUEUED
 
-            # idempotent no-op
+            # Idempotent no-op
             if current_state == new_state:
                 logger.debug(f"Job {job_id} already in state {new_state}. No-op.")
                 if error_message:
@@ -108,21 +111,29 @@ class JobManager:
                     db.refresh(job)
                 return job
 
-            if not force:
-                self._validate_transition(current_state, new_state)
+            # ✅ NEW: relax validation when force=True
+            if force:
+                logger.warning(
+                    f"⚠️ Forced job state change {job_id}: {current_state.name} → {new_state.name}"
+                )
+                # allow overriding FAILED → RUNNING or FAILED → COMPLETED transitions safely
+                if current_state in (JobState.FAILED, JobState.TIMEOUT) and new_state in (
+                    JobState.RUNNING,
+                    JobState.COMPLETED,
+                    JobState.RECOVERED,
+                    JobState.QUEUED,
+                ):
+                    pass  # explicitly allowed forced transitions
+                else:
+                    # fallback: skip validation entirely
+                    self._validate_transition(current_state, new_state, force=True)
             else:
-                # allow only some forced transitions, to avoid arbitrary jumps
-                allowed_forced = {JobState.FAILED, JobState.COMPLETED, JobState.TIMEOUT}
-                if new_state not in allowed_forced:
-                    logger.warning(
-                        f"Forced transition to {new_state} not permitted. Falling back to validation."
-                    )
-                    self._validate_transition(current_state, new_state)
+                self._validate_transition(current_state, new_state)
 
             job.status = new_state.value
             job.updated_at = datetime.utcnow()
 
-            # If job failed/cancelled/timeout, free up worker
+            # Reset worker if failed/cancelled/timeout
             if new_state in [JobState.FAILED, JobState.TIMEOUT, JobState.CANCELLED]:
                 self._reset_worker_if_dispatching(db, job.worker_id)
 

@@ -857,10 +857,36 @@ class PodManager:
             await self._call_with_retry(pod_manager.destroy_pod)
         except Exception as e:
             logger.warning("destroy_pod failed: %s", e)
+
+        # Remove from internal caches and also clear DB worker rows referencing this pod_uuid
         async with self._lock:
             self.individual_pods.pop(pod_uuid, None)
             self.individual_pod_managers.pop(pod_uuid, None)
-        logger.info("Pod %s cleaned up", pod_uuid)
+        # mark recently destroyed
+        self.recently_destroyed[pod_uuid] = time.time()
+
+        # best-effort DB cleanup: clear container_id on any worker row that referenced this pod_uuid
+        try:
+            from db import SessionLocal, Worker
+            db = SessionLocal()
+            try:
+                affected = db.query(Worker).filter(Worker.container_id == pod_uuid).all()
+                for w in affected:
+                    logger.info("DB sync: clearing container_id for worker %s after stop_individual_pod(%s)", w.worker_id, pod_uuid)
+                    w.container_id = None
+                    w.status = "offline"
+                    w.last_active = datetime.utcnow()
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("DB cleanup failed in stop_individual_pod for pod %s", pod_uuid)
+            finally:
+                db.close()
+        except Exception:
+            logger.exception("Failed to import DB for cleanup in stop_individual_pod")
+
+        logger.info("Pod %s cleaned up (stop_individual_pod)", pod_uuid)
+
 
     async def destroy_individual_pod(self, pod_uuid: str) -> None:
         await self._ensure_global_login()
@@ -869,6 +895,9 @@ class PodManager:
             exists = pod_uuid in self.individual_pods
 
         if not exists:
+            # still mark recently_destroyed to avoid immediate re-register
+            self.recently_destroyed[pod_uuid] = time.time()
+            logger.debug("destroy_individual_pod: pod %s not tracked in individual_pods", pod_uuid)
             return
 
         try:
@@ -885,10 +914,34 @@ class PodManager:
         except Exception as e:
             logger.warning("destroy_individual_pod failed: %s", e)
 
+        # Remove from internal structures
         async with self._lock:
             self.individual_pods.pop(pod_uuid, None)
             self.individual_pod_managers.pop(pod_uuid, None)
-        logger.info("Individual pod %s destroyed", pod_uuid)
+        # record recently destroyed timestamp
+        self.recently_destroyed[pod_uuid] = time.time()
+
+        # best-effort DB sync: clear container_id on workers that referenced this pod_uuid
+        try:
+            from db import SessionLocal, Worker
+            db = SessionLocal()
+            try:
+                affected = db.query(Worker).filter(Worker.container_id == pod_uuid).all()
+                for w in affected:
+                    logger.info("DB sync: clearing container_id for worker %s after destroy_individual_pod(%s)", w.worker_id, pod_uuid)
+                    w.container_id = None
+                    w.status = "terminated"
+                    w.last_active = datetime.utcnow()
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("DB cleanup failed in destroy_individual_pod for pod %s", pod_uuid)
+            finally:
+                db.close()
+        except Exception:
+            logger.exception("Failed to import DB for cleanup in destroy_individual_pod")
+
+        logger.info("Individual pod %s destroyed (db worker rows cleared)", pod_uuid)
 
     # --------------------------------------------------------------------------
     # HELPERS

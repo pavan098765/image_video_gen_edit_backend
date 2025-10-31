@@ -795,7 +795,7 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
                     return
 
         job.worker_id = worker.worker_id
-        job_manager.update_job_state(job.job_id, JobState.RUNNING)
+        job_manager.update_job_state(job.job_id, JobState.RUNNING, force=True)
         if worker.is_warm_pod:
             worker.status = "processing"
         else:
@@ -1249,36 +1249,85 @@ async def job_complete(payload: JobCompletePayload):
 
         # ------------------ SUCCESS PATH ------------------
         # ✅ Now that validation passed, mark COMPLETED
-        job_manager.update_job_state(job.job_id, JobState.COMPLETED)
+        job_manager.update_job_state(job.job_id, JobState.COMPLETED, force=True)
         job.result_r2_key = payload.result_r2_key
         job.output_key = payload.result_r2_key
         job.output_url = f"{CONTROLLER_PUBLIC_URL}/download/{job.job_id}"
         db.commit()
 
         if worker:
-            await pod_manager.remove_pending_job(job.job_id, job.model)
-            active = db.query(Job).filter(
-                Job.worker_id == worker.worker_id,
-                Job.status.in_([
-                    JobState.RUNNING.value,
-                    JobState.DISPATCHING.value,
-                    JobState.QUEUED.value
-                ]),
-            ).count()
+            try:
+                await pod_manager.remove_pending_job(job.job_id, job.model)
+            except Exception as e:
+                logger.error(f"❌ Failed to remove pending job {job.job_id}: {e}")
 
-            worker.status = "ready" if (worker.is_warm_pod or active == 0) else "busy"
-            worker.last_active = datetime.utcnow()
-            db.commit()
+            try:
+                active = db.query(Job).filter(
+                    Job.worker_id == worker.worker_id,
+                    Job.status.in_([
+                        JobState.RUNNING.value,
+                        JobState.DISPATCHING.value,
+                        JobState.QUEUED.value
+                    ]),
+                ).count()
+            except Exception as e:
+                logger.error(f"❌ Failed to count active jobs for worker {worker.worker_id}: {e}")
+                active = 0
+            
+            container_id = getattr(worker, "container_id", None)
+            try:
+                if container_id:
+                    # If this is a warm pod we usually keep it alive, otherwise destroy ephemeral pods
+                    if not worker.is_warm_pod:
+                        logger.info("Destroying ephemeral pod %s for worker %s after successful completion of job %s", container_id, worker.worker_id, job.job_id)
+                        # Destroy pod (this also clears DB worker rows courtesy of pod_manager)
+                        try:
+                            await pod_manager.destroy_individual_pod(container_id)
+                        except Exception as e:
+                            logger.exception("Failed to destroy individual pod %s: %s", container_id, e)
+                        # Ensure DB worker row updated if pod_manager couldn't update it
+                        try:
+                            # reload worker from session to avoid stale obj
+                            db.refresh(worker)
+                        except Exception:
+                            pass
+                        # If worker still has container_id set, clear it
+                        if getattr(worker, "container_id", None):
+                            worker.container_id = None
+                            worker.status = "terminated"
+                    else:
+                        # warm pod: keep running but mark ready if no active jobs
+                        worker.status = "ready" if active == 0 else "busy"
+                        logger.info("Keeping warm pod %s (worker=%s) alive; active jobs=%d", container_id, worker.worker_id, active)
+                else:
+                    # No container id present; mark readiness based on activity
+                    worker.status = "ready" if active == 0 else "busy"
+            except Exception as e:
+                logger.warning("Error handling pod lifecycle for worker %s: %s", getattr(worker, "worker_id", None), e)
+
+            # Update last_active and commit DB state so reaper sees correct info
+            try:
+                worker.last_active = datetime.utcnow()
+                db.commit()
+                logger.info("Worker %s updated in DB (status=%s, container_id=%s)", worker.worker_id, worker.status, worker.container_id)
+            except Exception as e:
+                db.rollback()
+                logger.error("Failed to commit worker update for %s: %s", getattr(worker, "worker_id", None), e)
 
         # send FCM
         if job.params.get("fcm_token"):
+            data = {
+                "job_id": job.job_id,
+                "status": "completed",
+                "download_url": job.output_url,
+            }
             asyncio.create_task(
                 asyncio.to_thread(
                     send_fcm_notification,
                     job.params["fcm_token"],
                     "Processing Complete.",
                     "Tap to view your result.",
-                    {"job_id": job.job_id},
+                    data,
                 )
             )
 
@@ -1443,6 +1492,9 @@ async def job_status(
 def send_fcm_notification(token: str, title: str, body: str, data: dict):
     """Send a push notification to a device via FCM."""
     try:
+        if "job_id" not in data:
+            raise ValueError("data must include job_id")
+        data.setdefault("status", "completed")
         message = messaging.Message(
             notification=messaging.Notification(
                 title=title,
