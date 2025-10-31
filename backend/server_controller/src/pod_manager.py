@@ -494,15 +494,6 @@ class PodManager:
     # CREATE MACHINE-BASED POD (updated for caching & fallback tracking)
     # --------------------------------------------------------------------------
 
-    def _is_4090_allowed_model(self, model: str) -> bool:
-        """Return True if this model is allowed to run on 4090 machines."""
-        model_lower = model.lower()
-        allowed_keywords = [
-            "upscale", "aurasr", "esrgan", "swin",
-            "diffuser", "sdxl", "outpaint", "sd35", "sd15", "diffusion"
-        ]
-        return any(k in model_lower for k in allowed_keywords)
-
     async def create_machine_based_pod(
         self, model: str, mode: Optional[str] = None
     ) -> Optional[str]:
@@ -519,24 +510,10 @@ class PodManager:
         # Build candidate machine list (str ids), preserving order:
         candidates: List[Tuple[str, Optional[str]]] = []
 
-        # ✅ Filter machine candidates based on model type
-        use_4090 = self._is_4090_allowed_model(model)
-        filtered_priority_list = []
-
+        # 1) machines from MACHINE_PRIORITY_LIST first (as strings)
         for mid, desc in MACHINE_PRIORITY_LIST:
-            if "4090" in desc and not use_4090:
-                logger.info(f"⛔ Skipping 4090 machine {mid} for model {model} (not allowed)")
-                continue
-            if "5090" in desc and use_4090:
-                # Still allow 5090 as backup for 4090 models, optional
-                filtered_priority_list.append((mid, desc))
-                continue
-            filtered_priority_list.append((mid, desc))
-
-        # 1) replace MACHINE_PRIORITY_LIST with filtered one
-        for mid, desc in filtered_priority_list:
             candidates.append((str(mid), desc))
-        
+
         # 2) machines from machine_cache that either have this model cached or are marked priority
         try:
             async with self._machine_cache_lock:

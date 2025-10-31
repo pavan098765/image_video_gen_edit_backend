@@ -273,7 +273,6 @@ async def run_autotest():
 # -----------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cleanup_gpu()
     logger.info("✅ Starting worker registration...")
     try:
         register_with_controller()
