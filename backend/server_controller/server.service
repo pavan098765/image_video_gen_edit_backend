@@ -1,0 +1,30 @@
+/etc/systemd/system/orchestrator.service file, paste below this line to create service file to start server_controller
+sudo systemctl restart orchestrator = cmd to restart server
+sudo tail -f /var/log/orchestrator.log | ts '%Y-%m-%d %H:%M:%S' = cmd to view logs
+
+######################--PASTE BELOW LINES--######################
+
+[Unit]
+Description=FastAPI Orchestrator (HTTPS)
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/home/ubuntu/python_projects/img_gen_orchestrator/server_controller/src
+ExecStart=/usr/local/bin/uvicorn main:app \
+  --host 0.0.0.0 \
+  --port 443 \
+  --ssl-keyfile /etc/letsencrypt/live/genedit.mooo.com/privkey.pem \
+  --ssl-certfile /etc/letsencrypt/live/genedit.mooo.com/fullchain.pem \
+  --log-level info
+Restart=always
+RestartSec=5
+Environment="PYTHONPATH=/home/ubuntu/python_projects/img_gen_orchestrator/server_controller/src"
+
+
+StandardOutput=append:/var/log/orchestrator.log
+StandardError=append:/var/log/orchestrator.log
+
+[Install]
+WantedBy=multi-user.target
+

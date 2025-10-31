@@ -68,12 +68,17 @@ class PodManager:
         self.pending_jobs: Dict[str, set] = {}
         self._jobs_lock = asyncio.Lock()
         self.recently_destroyed: Dict[str, float] = {}
+        # Track machines that failed outputs recently
+        self.bad_machines: Dict[str, float] = {}
+        self.bad_machine_cooldown = int(
+            os.getenv("BAD_MACHINE_COOLDOWN", "600")
+        )  # 10 min
 
         self.pod_strategy = PodStrategyType(
             os.getenv("POD_STRATEGY", PodStrategyType.WARM_AND_INDIVIDUAL.value)
         )
-        self.max_individual_pods = int(os.getenv("MAX_INDIVIDUAL_PODS", "3"))
-        self.pod_startup_timeout = int(os.getenv("POD_STARTUP_TIMEOUT", "180"))
+        self.max_individual_pods = int(os.getenv("MAX_INDIVIDUAL_PODS", "10"))
+        self.pod_startup_timeout = int(os.getenv("POD_STARTUP_TIMEOUT", "60"))
         self.template_uuids = {
             "sd15": os.getenv("SD15_TEMPLATE_UUID"),
             "sd35": os.getenv("SD35_TEMPLATE_UUID"),
@@ -113,7 +118,10 @@ class PodManager:
 
         # 🔹 Machine cache persistence
         self.machine_cache_path = os.getenv("MACHINE_CACHE_PATH", "machine_cache.json")
-        self.machine_cache = {"machines": {}, "meta": {"version": 1, "updated_at": None}}
+        self.machine_cache = {
+            "machines": {},
+            "meta": {"version": 1, "updated_at": None},
+        }
         self._machine_cache_lock = asyncio.Lock()
 
         # 🔹 Fallback event tracking (for autoscaler)
@@ -150,7 +158,10 @@ class PodManager:
             try:
                 with open(self.machine_cache_path, "r") as f:
                     self.machine_cache = json.load(f)
-                    logger.info("Loaded machine cache with %d machines", len(self.machine_cache.get("machines", {})))
+                    logger.info(
+                        "Loaded machine cache with %d machines",
+                        len(self.machine_cache.get("machines", {})),
+                    )
             except Exception:
                 logger.exception("Failed to load machine cache file")
 
@@ -163,22 +174,28 @@ class PodManager:
                     os.makedirs(cache_dir, exist_ok=True)
                 # write to a temp file in same directory (avoid cross-device rename issues)
                 tmp_path = f"{self.machine_cache_path}.tmp"
+
                 def _write():
                     with open(tmp_path, "w") as f:
                         json.dump(self.machine_cache, f, indent=2)
                     os.replace(tmp_path, self.machine_cache_path)
+
                 await asyncio.to_thread(_write)
                 logger.debug("Persisted machine cache to %s", self.machine_cache_path)
             except Exception:
                 # include path in logs for easier debugging
-                logger.exception("Failed to persist machine cache (path=%s)", self.machine_cache_path)
+                logger.exception(
+                    "Failed to persist machine cache (path=%s)", self.machine_cache_path
+                )
 
     async def mark_image_cached_on_machine(self, machine_id: str, image_name: str):
         """Mark an image as cached on a given machine."""
         async with self._machine_cache_lock:
             now = datetime.utcnow().isoformat() + "Z"
             mc = self.machine_cache.setdefault("machines", {})
-            m = mc.setdefault(str(machine_id), {"cached_images": {}, "is_priority": False})
+            m = mc.setdefault(
+                str(machine_id), {"cached_images": {}, "is_priority": False}
+            )
             m["cached_images"][image_name] = {
                 "added_at": now,
                 "score": m["cached_images"].get(image_name, {}).get("score", 0.0) + 1.0,
@@ -202,7 +219,7 @@ class PodManager:
         """Detect fallback frequency and trigger warm pod spin-up."""
         FALLBACK_THRESHOLD = int(os.getenv("FALLBACK_THRESHOLD", "5"))
         QUEUE_MIN_FOR_SCALE = int(os.getenv("QUEUE_MIN_FOR_SCALE", "3"))
-        LOAD_SCALE_THRESHOLD = int(os.getenv("LOAD_SCALE_THRESHOLD", "15")) 
+        LOAD_SCALE_THRESHOLD = int(os.getenv("LOAD_SCALE_THRESHOLD", "15"))
         while True:
             try:
                 now = time.time()
@@ -235,7 +252,9 @@ class PodManager:
 
                 for model, cnt in counts.items():
                     if cnt >= FALLBACK_THRESHOLD:
-                        logger.info(f"Autoscaler trigger: model={model}, fallback_count={cnt}")
+                        logger.info(
+                            f"Autoscaler trigger: model={model}, fallback_count={cnt}"
+                        )
                         self.last_autoscale_ts = now
                         # call scaler (simple implementation; queue checks can be added later)
                         await self.scale_up_unified_warm_pod_for_model(model)
@@ -318,7 +337,9 @@ class PodManager:
     # --------------------------------------------------------------------------
     # JOB DISPATCH (entry)
     # --------------------------------------------------------------------------
-    async def dispatch_job(self, job_id: str, model: str, mode: Optional[str] = None) -> str:
+    async def dispatch_job(
+        self, job_id: str, model: str, mode: Optional[str] = None
+    ) -> str:
         if self.pod_strategy == PodStrategyType.WARM_AND_INDIVIDUAL:
             return await self._dispatch_job_warm_and_individual(job_id, model, mode)
         else:
@@ -327,7 +348,9 @@ class PodManager:
     # --------------------------------------------------------------------------
     # WARM + INDIVIDUAL DISPATCH
     # --------------------------------------------------------------------------
-    async def _dispatch_job_warm_and_individual(self, job_id: str, model: str, mode: Optional[str] = None) -> str:
+    async def _dispatch_job_warm_and_individual(
+        self, job_id: str, model: str, mode: Optional[str] = None
+    ) -> str:
         """Dispatch flow when running warm+individual strategy.
 
         Prefer the warm pod worker if available; otherwise create an individual pod.
@@ -341,7 +364,11 @@ class PodManager:
         with SessionLocal() as db:
             w = (
                 db.query(Worker)
-                .filter(Worker.is_warm_pod == True, Worker.model == model, Worker.status == "ready")
+                .filter(
+                    Worker.is_warm_pod == True,
+                    Worker.model == model,
+                    Worker.status == "ready",
+                )
                 .order_by(Worker.last_active.desc())
                 .first()
             )
@@ -369,7 +396,11 @@ class PodManager:
             while time.time() - start < timeout:
                 w = (
                     db.query(Worker)
-                    .filter(Worker.container_id == pod_uuid, Worker.model == model, Worker.status == "ready")
+                    .filter(
+                        Worker.container_id == pod_uuid,
+                        Worker.model == model,
+                        Worker.status == "ready",
+                    )
                     .first()
                 )
                 if w:
@@ -389,7 +420,9 @@ class PodManager:
     # --------------------------------------------------------------------------
     # MACHINE-BASED DISPATCH
     # --------------------------------------------------------------------------
-    async def _dispatch_job_machine_based(self, job_id: str, model: str, mode: Optional[str] = None) -> str:
+    async def _dispatch_job_machine_based(
+        self, job_id: str, model: str, mode: Optional[str] = None
+    ) -> str:
         from db import SessionLocal, Worker, Job
         from job_manager import JobState
 
@@ -397,14 +430,26 @@ class PodManager:
 
         async with self._lock:
             for pod_uuid, info in self.individual_pods.items():
-                if info.model == model and info.status == "ready" and self.can_reuse_pod(info, job_id):
+                if info.machine_id and self.is_machine_bad(info.machine_id):
+                    continue  # don't reuse pods on blacklisted machine
+                if (
+                    info.model == model
+                    and info.status == "ready"
+                    and self.can_reuse_pod(info, job_id)
+                ):
                     info.last_active = datetime.utcnow()
                     self.update_pod_job_counts(info, job_id)
-                    logger.info("Reusing machine-based pod %s for job %s", pod_uuid, job_id)
+                    logger.info(
+                        "Reusing machine-based pod %s for job %s", pod_uuid, job_id
+                    )
                     with SessionLocal() as db:
-                        w = db.query(Worker).filter(
-                            Worker.container_id == pod_uuid, Worker.model == model
-                        ).first()
+                        w = (
+                            db.query(Worker)
+                            .filter(
+                                Worker.container_id == pod_uuid, Worker.model == model
+                            )
+                            .first()
+                        )
                         if w:
                             w.status = "dispatching"
                             w.last_active = datetime.utcnow()
@@ -424,13 +469,18 @@ class PodManager:
         start = time.time()
         timeout = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "180"))
         from db import SessionLocal
+
         while time.time() - start < timeout:
             with SessionLocal() as db:
-                w = db.query(Worker).filter(
-                    Worker.container_id == pod_uuid,
-                    Worker.model == model,
-                    Worker.status == "ready",
-                ).first()
+                w = (
+                    db.query(Worker)
+                    .filter(
+                        Worker.container_id == pod_uuid,
+                        Worker.model == model,
+                        Worker.status == "ready",
+                    )
+                    .first()
+                )
                 if w:
                     w.status = "dispatching"
                     w.last_active = datetime.utcnow()
@@ -444,10 +494,12 @@ class PodManager:
     # CREATE MACHINE-BASED POD (updated for caching & fallback tracking)
     # --------------------------------------------------------------------------
 
-    async def create_machine_based_pod(self, model: str, mode: Optional[str] = None) -> Optional[str]:
-        """Create a new machine-based pod, trying priority machines first,
-        then automatically falling back to the best global offer via QuickPod's tier logic."""
-        
+    async def create_machine_based_pod(
+        self, model: str, mode: Optional[str] = None
+    ) -> Optional[str]:
+        """Create a new machine-based pod, trying priority machines, then cached machines,
+        then global fallback. Blacklists machines on certain failures to avoid immediate retries.
+        """
         await self._ensure_global_login()
 
         template_id = self._get_template_for_model(model)
@@ -455,36 +507,119 @@ class PodManager:
             logger.error(f"No template found for model {model}")
             return None
 
-        # 🔹 Try preferred machines first
-        for machine_id, desc in MACHINE_PRIORITY_LIST:
+        # Build candidate machine list (str ids), preserving order:
+        candidates: List[Tuple[str, Optional[str]]] = []
+
+        # 1) machines from MACHINE_PRIORITY_LIST first (as strings)
+        for mid, desc in MACHINE_PRIORITY_LIST:
+            candidates.append((str(mid), desc))
+
+        # 2) machines from machine_cache that either have this model cached or are marked priority
+        try:
+            async with self._machine_cache_lock:
+                mc = (
+                    self.machine_cache.get("machines", {}) if self.machine_cache else {}
+                )
+                # sort cached machines by (is_priority, score of model if exists, last_seen) descending
+                scored = []
+                for mid, info in mc.items():
+                    is_pr = info.get("is_priority", False)
+                    cached_images = info.get("cached_images", {})
+                    model_info = cached_images.get(model, {})
+                    score = model_info.get("score", 0.0)
+                    last_seen = info.get("last_seen") or ""
+                    scored.append((mid, is_pr, score, last_seen))
+                # prefer is_priority, then higher score, then recent last_seen
+                scored.sort(key=lambda x: (not x[1], -x[2], x[3]))
+                for mid, is_pr, score, last_seen in scored:
+                    # don't duplicate
+                    if str(mid) not in {c[0] for c in candidates}:
+                        candidates.append((str(mid), "cached"))
+        except Exception:
+            logger.exception(
+                "Error while reading machine cache; proceeding with defaults"
+            )
+
+        # dedupe while preserving order
+        seen = set()
+        candidate_list = []
+        for mid, desc in candidates:
+            if mid in seen:
+                continue
+            seen.add(mid)
+            candidate_list.append((mid, desc))
+
+        logger.info(
+            "Machine candidates for model %s: %s", model, [c[0] for c in candidate_list]
+        )
+
+        # Try each candidate machine using QuickPod global API asking for offer for a specific machine (if supported)
+        for candidate_mid, desc in candidate_list:
+            mid = str(candidate_mid)
+            # skip bad machines
+            if self.is_machine_bad(mid):
+                logger.info(f"⛔ Skipping blacklisted machine {mid}")
+                continue
+
             try:
-                offer_id, actual_machine_id = await self._call_with_retry(self.global_qp.get_best_offer, machine_id)
-                if not offer_id:
-                    logger.warning(f"No offer available on preferred machine {machine_id}")
+                # get best offer specifically for this machine (some implementations return tuple)
+                offer_result = await self._call_with_retry(
+                    self.global_qp.get_best_offer, mid
+                )
+                # offer_result may be (offer_id, actual_machine_id) or just offer_id
+                if not offer_result:
+                    logger.debug("No offer for machine %s", mid)
                     continue
+                if isinstance(offer_result, tuple):
+                    offer_id, actual_machine_id = offer_result
+                    actual_mid = str(actual_machine_id)
+                else:
+                    offer_id = offer_result
+                    actual_mid = mid
 
-                if str(actual_machine_id) != str(machine_id):
-                    logger.warning(f"⚠️ Preferred machine {machine_id} unavailable — using fallback machine {actual_machine_id}.")
-                    machine_id = actual_machine_id
+                # if QuickPod returned a different actual machine, normalize that too
+                if actual_mid != mid:
+                    logger.warning(
+                        f"Preferred machine {mid} unavailable; QuickPod suggests {actual_mid} instead"
+                    )
+                    # skip if suggested machine is blacklisted
+                    if self.is_machine_bad(actual_mid):
+                        logger.info(
+                            f"⛔ QuickPod's suggested machine {actual_mid} is blacklisted; skipping"
+                        )
+                        continue
+                    chosen_machine = actual_mid
+                else:
+                    chosen_machine = mid
 
-                logger.info(f"🚀 Creating pod for {model} on preferred machine {machine_id} ({desc})")
+                logger.info(
+                    f"🚀 Creating pod for {model} on machine {chosen_machine} (candidate {mid}, desc={desc})"
+                )
                 pod_data = await self._call_with_retry(
                     self.global_qp.create_pod,
                     offer_id,
                     template_id,
                     self.template_disk_size.get(model, 100),
                 )
-
                 if not isinstance(pod_data, dict):
-                    logger.warning(f"Unexpected response type when creating pod on machine {machine_id}")
+                    logger.warning(
+                        "create_pod returned unexpected type for machine %s",
+                        chosen_machine,
+                    )
                     continue
 
-                pod_uuid = pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
+                pod_uuid = (
+                    pod_data.get("pod_uuid")
+                    or pod_data.get("uuid")
+                    or pod_data.get("id")
+                )
                 if not pod_uuid:
-                    logger.warning(f"No pod UUID returned for machine {machine_id}")
+                    logger.warning(
+                        "No pod uuid returned for machine %s", chosen_machine
+                    )
                     continue
 
-                # Register pod internally
+                # register pod
                 async with self._lock:
                     self.individual_pods[pod_uuid] = PodInfo(
                         pod_uuid=pod_uuid,
@@ -493,43 +628,95 @@ class PodManager:
                         status="starting",
                         created_at=datetime.utcnow(),
                         last_active=datetime.utcnow(),
-                        machine_id=str(machine_id),
+                        machine_id=str(chosen_machine),
                     )
-                    self.individual_pod_managers[pod_uuid] = QuickPodManager(self.email, self.password, pod_uuid)
+                    self.individual_pod_managers[pod_uuid] = QuickPodManager(
+                        self.email, self.password, pod_uuid
+                    )
 
-                # Wait until worker registers (ready)
+                # wait for worker registration
                 start_time = time.time()
                 while time.time() - start_time < self.pod_startup_timeout:
                     if await self.check_pod_ready(pod_uuid):
                         async with self._lock:
                             self.individual_pods[pod_uuid].status = "ready"
-                        await self.mark_image_cached_on_machine(machine_id, model)
-                        logger.info(f"✅ Pod {pod_uuid} ready on machine {machine_id} for {model}")
+                        # record cache that image is on this machine (best-effort)
+                        try:
+                            await self.mark_image_cached_on_machine(
+                                str(chosen_machine), model
+                            )
+                        except Exception:
+                            logger.debug(
+                                "mark_image_cached_on_machine failed, continuing"
+                            )
+                        logger.info(
+                            "✅ Pod %s ready on machine %s for %s",
+                            pod_uuid,
+                            chosen_machine,
+                            model,
+                        )
                         return pod_uuid
                     await asyncio.sleep(5)
 
-                logger.error(f"Pod {pod_uuid} startup timeout on machine {machine_id}")
-                await self.destroy_individual_pod(pod_uuid)
+                # startup timeout: destroy and mark machine bad to avoid immediate retry
+                logger.error(
+                    "Pod %s startup timeout on machine %s; destroying pod and marking machine bad",
+                    pod_uuid,
+                    chosen_machine,
+                )
+                try:
+                    await self.destroy_individual_pod(pod_uuid)
+                except Exception:
+                    logger.exception("Failed to destroy timed out pod %s", pod_uuid)
+
+                # mark machine bad on startup timeout
+                try:
+                    self.mark_machine_bad(chosen_machine)
+                except Exception:
+                    logger.exception(
+                        "Failed to mark machine bad after timeout: %s", chosen_machine
+                    )
 
             except RuntimeError as re:
                 msg = str(re).lower()
-                if "database query failed" in msg or "database" in msg:
-                    logger.warning(f"QuickPod DB error on machine {machine_id}: {re} — skipping.")
-                    await asyncio.sleep(2)
-                    continue
-                else:
-                    logger.exception(f"Runtime error creating pod on machine {machine_id}: {re}")
-                    continue
+                logger.exception(
+                    "Runtime error creating pod on candidate %s: %s", mid, re
+                )
+                # if DB or transient error - skip candidate; if repeated errors occur we will fallback
+                # Optionally mark machine bad for non-transient errors
+                continue
             except Exception as e:
-                logger.exception(f"Unexpected error creating pod on machine {machine_id}: {e}")
+                logger.exception(
+                    "Unexpected error creating pod on candidate %s: %s", mid, e
+                )
+                # mark candidate as bad to avoid retrying aggressively
+                try:
+                    self.mark_machine_bad(mid)
+                except Exception:
+                    pass
                 continue
 
-        # 🔹 All priority machines failed → rely on QuickPodManager global fallback logic
+        # Global fallback: ask for the best offer without preferred machine
         try:
-            logger.warning(f"⚠️ All preferred machines unavailable for {model}. Trying global fallback offer...")
-            global_offer_id = await self._call_with_retry(self.global_qp.get_best_offer)
-            if not global_offer_id:
-                logger.error(f"❌ No global fallback offer available for {model}.")
+            logger.warning(
+                "⚠️ All preferred/cached machines exhausted. Trying global fallback offer..."
+            )
+            offer = await self._call_with_retry(self.global_qp.get_best_offer)
+            if not offer:
+                logger.error("❌ No global fallback offer available.")
+                return None
+
+            if isinstance(offer, tuple):
+                global_offer_id, fallback_machine_id = offer
+                fallback_mid = str(fallback_machine_id) if fallback_machine_id else None
+            else:
+                global_offer_id = offer
+                fallback_mid = None
+
+            if fallback_mid and self.is_machine_bad(fallback_mid):
+                logger.error(
+                    f"❌ Global fallback machine {fallback_mid} is blacklisted. Aborting fallback."
+                )
                 return None
 
             pod_data = await self._call_with_retry(
@@ -538,16 +725,17 @@ class PodManager:
                 template_id,
                 self.template_disk_size.get(model, 100),
             )
-
             if not isinstance(pod_data, dict):
                 logger.error("Invalid fallback pod creation response.")
                 return None
-
-            pod_uuid = pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
+            pod_uuid = (
+                pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
+            )
             if not pod_uuid:
                 logger.error("No pod UUID returned for fallback pod creation.")
                 return None
 
+            chosen_mid = fallback_mid or "fallback"
             async with self._lock:
                 self.individual_pods[pod_uuid] = PodInfo(
                     pod_uuid=pod_uuid,
@@ -556,25 +744,32 @@ class PodManager:
                     status="starting",
                     created_at=datetime.utcnow(),
                     last_active=datetime.utcnow(),
-                    machine_id="fallback",
+                    machine_id=str(chosen_mid),
                 )
-                self.individual_pod_managers[pod_uuid] = QuickPodManager(self.email, self.password, pod_uuid)
+                self.individual_pod_managers[pod_uuid] = QuickPodManager(
+                    self.email, self.password, pod_uuid
+                )
 
             start_time = time.time()
             while time.time() - start_time < self.pod_startup_timeout:
                 if await self.check_pod_ready(pod_uuid):
                     async with self._lock:
                         self.individual_pods[pod_uuid].status = "ready"
-                    logger.info(f"✅ Fallback pod {pod_uuid} ready for {model}")
+                    logger.info("✅ Fallback pod %s ready for %s", pod_uuid, model)
                     return pod_uuid
                 await asyncio.sleep(5)
 
-            logger.error(f"⚠️ Fallback pod {pod_uuid} startup timeout for {model}")
-            await self.destroy_individual_pod(pod_uuid)
+            logger.error("⚠️ Fallback pod %s startup timeout for %s", pod_uuid, model)
+            try:
+                await self.destroy_individual_pod(pod_uuid)
+            except Exception:
+                pass
+            if fallback_mid:
+                self.mark_machine_bad(fallback_mid)
             return None
 
         except Exception as e:
-            logger.exception(f"⚠️ Global fallback path failed for {model}: {e}")
+            logger.exception("⚠️ Global fallback path failed for %s: %s", model, e)
             return None
 
     async def destroy_unexpected_pod(self, pod_uuid: str):
@@ -599,7 +794,9 @@ class PodManager:
     # --------------------------------------------------------------------------
     # INDIVIDUAL POD (WARM+INDIVIDUAL)
     # --------------------------------------------------------------------------
-    async def create_individual_pod(self, model: str, mode: Optional[str] = None) -> Optional[str]:
+    async def create_individual_pod(
+        self, model: str, mode: Optional[str] = None
+    ) -> Optional[str]:
         await self._ensure_global_login()
         async with self._lock:
             if len(self.individual_pods) >= self.max_individual_pods:
@@ -611,9 +808,16 @@ class PodManager:
                 raise RuntimeError("No offer returned by QuickPod")
 
             template_uuid = self._get_template_for_model(model)
-            pod_data = await self._call_with_retry(self.global_qp.create_pod, offer_id, template_uuid, self.template_disk_size.get(model, 100))
+            pod_data = await self._call_with_retry(
+                self.global_qp.create_pod,
+                offer_id,
+                template_uuid,
+                self.template_disk_size.get(model, 100),
+            )
 
-            pod_uuid = pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
+            pod_uuid = (
+                pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
+            )
             if not pod_uuid:
                 raise RuntimeError("No pod UUID returned")
 
@@ -626,7 +830,9 @@ class PodManager:
                     created_at=datetime.utcnow(),
                     last_active=datetime.utcnow(),
                 )
-                self.individual_pod_managers[pod_uuid] = QuickPodManager(self.email, self.password, pod_uuid)
+                self.individual_pod_managers[pod_uuid] = QuickPodManager(
+                    self.email, self.password, pod_uuid
+                )
             return pod_uuid
         except Exception as e:
             logger.exception("Failed to create individual pod: %s", e)
@@ -704,6 +910,7 @@ class PodManager:
 
     async def check_pod_ready(self, pod_uuid: str) -> bool:
         from db import SessionLocal, Worker
+
         with SessionLocal() as db:
             w = db.query(Worker).filter(Worker.container_id == pod_uuid).first()
             if w and w.status in ("ready", "processing"):
@@ -738,9 +945,9 @@ class PodManager:
         async with self._lock:
             for pod_uuid, info in list(self.individual_pods.items()):
                 inactive = (now - info.last_active) > timedelta(minutes=30)
-                starting_timed_out = (
-                    info.status == "starting" and (now - info.created_at) > timedelta(minutes=10)
-                )
+                starting_timed_out = info.status == "starting" and (
+                    now - info.created_at
+                ) > timedelta(minutes=10)
                 if info.error_count >= 3 or inactive or starting_timed_out:
                     to_stop.append(pod_uuid)
         if not to_stop:
@@ -761,3 +968,26 @@ class PodManager:
             self.own_warm_pod = False
         except Exception:
             logger.exception("Error stopping warm pod %s", pod_uuid)
+
+    def mark_machine_bad(self, machine_id: str):
+        """Mark machine bad using normalized str keys and log clearly."""
+        if not machine_id:
+            return
+        mid = str(machine_id)
+        expiry = time.time() + self.bad_machine_cooldown
+        self.bad_machines[mid] = expiry
+        logger.warning(
+            f"⚠️ Marking machine {mid} as bad until {expiry} (cooldown {self.bad_machine_cooldown}s)"
+        )
+
+    def is_machine_bad(self, machine_id: str) -> bool:
+        """Normalize key to str and check expiry; remove stale entries."""
+        if not machine_id:
+            return False
+        mid = str(machine_id)
+        expiry = self.bad_machines.get(mid, 0)
+        if expiry < time.time():
+            # expired or non-existent
+            self.bad_machines.pop(mid, None)
+            return False
+        return True

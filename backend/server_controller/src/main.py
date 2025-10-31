@@ -1,5 +1,3 @@
-# server_controller/main.py
-
 import os
 import re
 import uuid
@@ -58,12 +56,43 @@ init_db()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("controller")
 
-# 🔹 Initialize Firebase Admin using Application Default Credentials
-try:
-    firebase_admin.initialize_app()
-    logger.info("✅ Firebase Admin initialized using GOOGLE_APPLICATION_CREDENTIALS")
-except Exception as e:
-    logger.warning(f"⚠️ Firebase Admin already initialized or failed: {e}")
+# --- Firebase Admin explicit init with projectId + good diagnostics ---
+def _init_firebase_admin():
+    try:
+        sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        logger.info("Initializing Firebase Admin SDK...")
+        logger.info(f"sa_path : {sa_path}")
+        if not sa_path:
+            raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS not set")
+
+        exists = os.path.exists(sa_path)
+        logger.info("Firebase SA path: %s (exists=%s)", sa_path, exists)
+        if not exists:
+            raise FileNotFoundError(f"Service account file not found at {sa_path}")
+
+        with open(sa_path, "r", encoding="utf-8") as f:
+            sa_json = json.load(f)
+
+        project_id = (
+            sa_json.get("project_id")
+            or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("GCLOUD_PROJECT")
+        )
+        if not project_id:
+            # let user override via env if their SA lacks project_id
+            raise RuntimeError(
+                "No project_id found in service account JSON and GOOGLE_CLOUD_PROJECT not set"
+            )
+
+        cred = credentials.Certificate(sa_json)
+        firebase_admin.initialize_app(cred, {"projectId": project_id})
+        logger.info("✅ Firebase Admin initialized with projectId=%s", project_id)
+    except Exception as e:
+        logger.exception("🔥 Firebase Admin init failed: %s", e)
+        raise
+
+# call once at module load (where your current init is)
+_init_firebase_admin()
 
 email_quickpod = os.getenv("QUICKPOD_EMAIL", "None")
 password_quickpod = os.getenv("QUICKPOD_PASSWORD", "None")
@@ -744,11 +773,25 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
                         f"❌ Failed to push job {job_id} to worker {worker_id} after {max_attempts} attempts: {e}"
                     )
                     job_manager.update_job_state(
-                        job.job_id, JobState.FAILED, f"Dispatch error: {e}"
+                        job.job_id, JobState.FAILED, f"Dispatch error: {e}", force=True
                     )
                     if worker:
                         worker.status = "terminated"
                         db.commit()
+                        try:
+                            machine_id = getattr(worker, "machine_id", None)
+                            if machine_id:
+                                logger.warning("Marking machine %s bad due to repeated dispatch failures", machine_id)
+                                # pod_manager is available in module scope
+                                pod_manager.mark_machine_bad(str(machine_id))
+                        except Exception:
+                            logger.exception("Failed to mark machine bad after dispatch failure")
+                        # also try to destroy the pod to avoid re-registration
+                        try:
+                            if getattr(worker, "container_id", None):
+                                asyncio.create_task(pod_manager.destroy_individual_pod(worker.container_id))
+                        except Exception:
+                            logger.exception("Failed to destroy pod after dispatch failure")
                     return
 
         job.worker_id = worker.worker_id
@@ -772,150 +815,6 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
 # ------------------------
 # Background Tasks
 # ------------------------
-# async def idle_worker_reaper_task():
-#     logger.info("Starting idle worker reaper")
-#     while True:
-#         db = SessionLocal()
-#         try:
-#             threshold = datetime.utcnow() - timedelta(seconds=WORKER_IDLE_TIMEOUT)
-#             idle_workers = (
-#                 db.query(Worker)
-#                 .filter(
-#                     Worker.last_active < threshold,
-#                     Worker.status == "ready"   # only reap ready, not dispatching
-#                 )
-#                 .all()
-#             )
-#             print("IDLE WORKERS", idle_workers)
-#             for w in idle_workers:
-#                 try:
-#                     if w.is_warm_pod:
-
-#                         # check if any jobs tied to this warm pod are still dispatching
-#                         active_jobs = (
-#                             db.query(Job)
-#                             .filter(
-#                                 Job.worker_id == w.worker_id,
-#                                 Job.status.in_([JobState.QUEUED.value, JobState.RUNNING.value, JobState.DISPATCHING.value]),
-#                             )
-#                             .count()
-#                         )
-#                         print("active_jobs ", active_jobs)
-
-#                         if active_jobs == 0:
-#                             await pod_manager.stop_warm_pod(w.container_id)
-#                             w.status = "offline"
-#                     else:
-#                         if w.container_id:
-#                             await asyncio.sleep(300)
-#                             logger.info(f"Reaping idle individual pod {w.container_id}")
-#                             await pod_manager.destroy_individual_pod(w.container_id)
-#                         w.status = "offline"
-#                     db.commit()
-#                 except Exception as e:
-#                     logger.error(f"Failed to stop worker {w.worker_id}: {e}")
-
-#                 # fail any jobs tied to this worker
-#                 running_jobs = (
-#                     db.query(Job)
-#                     .filter(
-#                         Job.worker_id == w.worker_id,
-#                         Job.status == JobState.RUNNING.value,
-#                     )
-#                     .all()
-#                 )
-#                 for job in running_jobs:
-#                     job_manager.update_job_state(
-#                         job.job_id, JobState.FAILED, "Worker went offline"
-#                     )
-#         finally:
-#             db.close()
-#         await asyncio.sleep(max(1, WORKER_IDLE_TIMEOUT // 2))
-
-# async def idle_worker_reaper_task():
-#     logger.info("Starting idle worker reaper")
-#     while True:
-#         db = SessionLocal()
-#         try:
-#             threshold = datetime.utcnow() - timedelta(seconds=WORKER_IDLE_TIMEOUT)
-#             # Include ready and busy pods — they can both be reaped if idle *and* job-free
-#             idle_workers = (
-#                 db.query(Worker)
-#                 .filter(
-#                     Worker.last_active < threshold,
-#                     Worker.status.in_(["ready", "busy"]),
-#                 )
-#                 .all()
-#             )
-#             logger.info("IDLE WORKERS %s", [w.worker_id for w in idle_workers])
-
-#             for w in idle_workers:
-#                 try:
-#                     # 1️⃣ Check if this worker still has active jobs
-#                     active_jobs = (
-#                         db.query(Job)
-#                         .filter(
-#                             Job.worker_id == w.worker_id,
-#                             Job.status.in_([
-#                                 JobState.QUEUED.value,
-#                                 JobState.RUNNING.value,
-#                                 JobState.DISPATCHING.value,
-#                             ]),
-#                         )
-#                         .count()
-#                     )
-
-#                     if active_jobs > 0:
-#                         logger.info(
-#                             f"Skipping reaper for worker {w.worker_id} "
-#                             f"(has {active_jobs} active jobs)"
-#                         )
-#                         continue  # skip reaping
-
-#                     # 2️⃣ No active jobs — safe to reap
-#                     if w.is_warm_pod:
-#                         logger.info(
-#                             f"Reaping idle warm pod {w.container_id} (no active jobs)"
-#                         )
-#                         await pod_manager.stop_warm_pod(w.container_id)
-#                         w.status = "offline"
-#                     else:
-#                         if w.container_id:
-#                             logger.info(
-#                                 f"Reaping idle individual pod {w.container_id} (no active jobs)"
-#                             )
-#                             # optional grace period to allow for late registration/polling
-#                             await asyncio.sleep(5)
-#                             await pod_manager.destroy_individual_pod(w.container_id)
-#                         w.status = "offline"
-
-#                     db.commit()
-
-#                 except Exception as e:
-#                     logger.error(f"Failed to stop worker {w.worker_id}: {e}")
-#                     db.rollback()
-
-#                 # 3️⃣ Fail any jobs that were left in RUNNING state (just in case)
-#                 running_jobs = (
-#                     db.query(Job)
-#                     .filter(
-#                         Job.worker_id == w.worker_id,
-#                         Job.status == JobState.RUNNING.value,
-#                     )
-#                     .all()
-#                 )
-#                 for job in running_jobs:
-#                     job_manager.update_job_state(
-#                         job.job_id, JobState.FAILED, "Worker went offline"
-#                     )
-
-#         finally:
-#             db.close()
-
-#         # Check more frequently for responsiveness
-#         await asyncio.sleep(max(5, WORKER_IDLE_TIMEOUT // 2))
-
-
 async def idle_worker_reaper_task():
     logger.info("Starting idle worker reaper (enhanced)")
     while True:
@@ -1238,73 +1137,152 @@ async def job_complete(payload: JobCompletePayload):
                 return {"status": "ok"}
             raise HTTPException(status_code=404, detail="Job not found")
 
-        if payload.failed:
-            job_manager.update_job_state(
-                job.job_id, JobState.FAILED, payload.error or "Worker reported failure"
-            )
-        else:
-            job_manager.update_job_state(job.job_id, JobState.COMPLETED)
-            job.result_r2_key = payload.result_r2_key
-            job.output_key = payload.result_r2_key
-            job.output_url = f"{CONTROLLER_PUBLIC_URL}/download/{job.job_id}"
-
         worker = db.query(Worker).filter(Worker.worker_id == job.worker_id).first()
+
+        # ------------------ HANDLE EXPLICIT FAILURE ------------------
+        if payload.failed:
+            reason = payload.error or "Worker reported failure"
+            logger.warning(f"❌ Worker failed job {job.job_id}: {reason}")
+
+            job_manager.update_job_state(job.job_id, JobState.FAILED, reason, force=True)
+            job.error = reason
+            job.output_url = None
+            db.commit()
+
+            # Terminate pod + mark machine bad
+            if worker:
+                try:
+                    await pod_manager.remove_pending_job(job.job_id, job.model)
+                except Exception:
+                    pass
+
+                if getattr(worker, "machine_id", None):
+                    pod_manager.mark_machine_bad(worker.machine_id)
+
+                if getattr(worker, "container_id", None):
+                    try:
+                        await pod_manager.destroy_individual_pod(worker.container_id)
+                        logger.error(f"🔥 Destroyed failed pod {worker.container_id}")
+                    except Exception as e:
+                        logger.error(f"⚠️ Failed destroy {worker.container_id}: {e}")
+
+            # Retry job on new machine
+            try:
+                logger.info(f"♻️ Requeueing job {job.job_id} on NEW machine...")
+                await pod_manager.add_pending_job(job.job_id, job.model)
+                new_worker = await pod_manager.dispatch_job(job.job_id, job.model, job.params.get("mode"))
+                new_presigned = create_presigned_put_url(job.result_r2_key)
+                asyncio.create_task(
+                    asyncio.to_thread(assign_job_to_worker, job.job_id, new_worker, new_presigned)
+                )
+                return {"status": "requeued", "job_id": job.job_id, "worker": new_worker}
+            except Exception as e:
+                logger.error(f"❌ Failed requeue {job.job_id}: {e}")
+                return {"status": "failed_final", "job_id": job.job_id}
+
+        # ------------------ CHECK OOM IN ERROR LOG ------------------
+        oom_detected = False
+        try:
+            if job.error_log:
+                for entry in job.error_log:
+                    err = (entry.get("error") or "").lower()
+                    if any(tok in err for tok in ["cuda out of memory", "oom", "cublas", "no memory"]):
+                        oom_detected = True
+                        logger.warning(f"⚠️ OOM detected in {job.job_id}")
+                        break
+        except Exception as e:
+            logger.warning(f"OOM scan error for job {job.job_id}: {e}")
+
+        # ------------------ VERIFY R2 UPLOAD BEFORE MARKING COMPLETED ------------------
+        key = payload.result_r2_key
+        file_found = False
+        if key:
+            for attempt in range(3):
+                try:
+                    s3_client.head_object(Bucket=R2_BUCKET, Key=key)
+                    file_found = True
+                    logger.info(f"✅ R2 verified for {key}")
+                    break
+                except Exception:
+                    await asyncio.sleep(5)
+
+        failed_validation = oom_detected or (not file_found)
+
+        if failed_validation:
+            # ------------------ FAILED VALIDATION PATH ------------------
+            reason = "OOM" if oom_detected else "R2 missing"
+            logger.error(f"🚨 Post-run validation failed {job.job_id}: {reason}")
+
+            job_manager.update_job_state(job.job_id, JobState.FAILED, reason, force=True)
+            job.error = reason
+            job.output_url = None
+            db.commit()
+
+            if worker:
+                try:
+                    await pod_manager.remove_pending_job(job.job_id, job.model)
+                except Exception:
+                    pass
+
+                if getattr(worker, "machine_id", None):
+                    pod_manager.mark_machine_bad(worker.machine_id)
+
+                if getattr(worker, "container_id", None):
+                    try:
+                        await pod_manager.destroy_individual_pod(worker.container_id)
+                        logger.error(f"🔥 Destroyed pod {worker.container_id} after invalid output")
+                    except Exception as e:
+                        logger.error(f"⚠️ Pod destroy failed: {e}")
+
+            # requeue
+            try:
+                await pod_manager.add_pending_job(job.job_id, job.model)
+                new_worker = await pod_manager.dispatch_job(job.job_id, job.model, job.params.get("mode"))
+                new_presigned = create_presigned_put_url(key)
+                asyncio.create_task(
+                    asyncio.to_thread(assign_job_to_worker, job.job_id, new_worker, new_presigned)
+                )
+                return {"status": "requeued", "job_id": job.job_id, "worker": new_worker}
+            except Exception as e:
+                logger.error(f"❌ requeue failed {job.job_id}: {e}")
+                return {"status": "failed_no_output", "job_id": job.job_id}
+
+        # ------------------ SUCCESS PATH ------------------
+        # ✅ Now that validation passed, mark COMPLETED
+        job_manager.update_job_state(job.job_id, JobState.COMPLETED)
+        job.result_r2_key = payload.result_r2_key
+        job.output_key = payload.result_r2_key
+        job.output_url = f"{CONTROLLER_PUBLIC_URL}/download/{job.job_id}"
+        db.commit()
 
         if worker:
             await pod_manager.remove_pending_job(job.job_id, job.model)
+            active = db.query(Job).filter(
+                Job.worker_id == worker.worker_id,
+                Job.status.in_([
+                    JobState.RUNNING.value,
+                    JobState.DISPATCHING.value,
+                    JobState.QUEUED.value
+                ]),
+            ).count()
 
-            # 🔍 Check if there are still active jobs tied to this worker
-            active_jobs = (
-                db.query(Job)
-                .filter(
-                    Job.worker_id == worker.worker_id,
-                    Job.status.in_(
-                        [
-                            JobState.RUNNING.value,
-                            JobState.DISPATCHING.value,
-                            JobState.QUEUED.value,
-                        ]
-                    ),
-                )
-                .count()
-            )
-
-            if active_jobs > 0:
-                logger.info(
-                    f"Worker {worker.worker_id} still has {active_jobs} active jobs — keeping pod alive."
-                )
-                worker.status = "ready" if worker.is_warm_pod else "busy"
-            else:
-                worker.status = "ready" if worker.is_warm_pod else "terminated"
-                logger.info(
-                    f"Worker {worker.worker_id} has no active jobs — marking {'ready' if worker.is_warm_pod else 'terminated'}."
-                )
-
+            worker.status = "ready" if (worker.is_warm_pod or active == 0) else "busy"
             worker.last_active = datetime.utcnow()
             db.commit()
 
-        # ✅ Notify user via FCM if token exists
-        try:
-            fcm_token = job.params.get("fcm_token")
-            if fcm_token:
-                asyncio.create_task(
-                    asyncio.to_thread(
-                        send_fcm_notification,
-                        fcm_token,
-                        "Processing Complete.",
-                        f"Tap to view your result.",
-                        {"job_id": job.job_id},
-                    )
+        # send FCM
+        if job.params.get("fcm_token"):
+            asyncio.create_task(
+                asyncio.to_thread(
+                    send_fcm_notification,
+                    job.params["fcm_token"],
+                    "Processing Complete.",
+                    "Tap to view your result.",
+                    {"job_id": job.job_id},
                 )
-        except Exception as e:
-            logger.error(f"FCM push failed for job {job.job_id}: {e}")
+            )
 
-        return {
-            "status": "ok",
-            "job_id": job.job_id,
-            "result_key": job.result_r2_key,
-            "download_url": job.output_url,  # ✅ always return controller redirect URL
-        }
+        return {"status": "ok", "job_id": job.job_id, "download_url": job.output_url}
 
     finally:
         db.close()
@@ -1491,7 +1469,7 @@ async def submit(
     db = SessionLocal()
     result_key = f"{IMAGE_PREFIX}{job_id}.png"
     with open("req_param.json", "w", encoding="utf-8") as f:
-        json.dump(req.params, f, indent=4)
+        json.dump(req.dict(), f, indent=4)
 
     try:
         # Create new job record
@@ -1514,6 +1492,7 @@ async def submit(
 
         # ✅ Store FCM token temporarily in params for notification
         if req.fcm_token:
+            logger.info(f"Storing FCM token {req.fcm_token} for job {job_id}")
             job.params["fcm_token"] = req.fcm_token
             db.commit()
     finally:

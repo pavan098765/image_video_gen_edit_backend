@@ -25,7 +25,6 @@ class JobState(Enum):
     DISPATCHING = "dispatching"
 
 
-
 class JobStateError(Exception):
     pass
 
@@ -38,8 +37,18 @@ class JobManager:
 
         self.allowed_transitions = {
             JobState.PENDING: [JobState.QUEUED, JobState.CANCELLED],
-            JobState.QUEUED: [JobState.RUNNING, JobState.CANCELLED, JobState.TIMEOUT, JobState.FAILED],
-            JobState.RUNNING: [JobState.COMPLETED, JobState.FAILED, JobState.TIMEOUT, JobState.RECOVERED],
+            JobState.QUEUED: [
+                JobState.RUNNING,
+                JobState.CANCELLED,
+                JobState.TIMEOUT,
+                JobState.FAILED,
+            ],
+            JobState.RUNNING: [
+                JobState.COMPLETED,
+                JobState.FAILED,
+                JobState.TIMEOUT,
+                JobState.RECOVERED,
+            ],
             JobState.COMPLETED: [],
             JobState.DISPATCHING: [JobState.RUNNING, JobState.FAILED],
             JobState.FAILED: [JobState.RECOVERED],
@@ -50,7 +59,9 @@ class JobManager:
 
     def _validate_transition(self, current_state: JobState, new_state: JobState):
         if new_state not in self.allowed_transitions[current_state]:
-            raise JobStateError(f"Invalid state transition from {current_state} to {new_state}")
+            raise JobStateError(
+                f"Invalid state transition from {current_state} to {new_state}"
+            )
 
     def _reset_worker_if_dispatching(self, db: Session, worker_id: Optional[str]):
         """Ensure worker doesn't stay stuck in 'dispatching' if job fails/cancels."""
@@ -58,18 +69,55 @@ class JobManager:
             return
         worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
         if worker and worker.status == "dispatching":
-            logger.info(f"Resetting worker {worker.worker_id} from 'dispatching' → 'ready'")
+            logger.info(
+                f"Resetting worker {worker.worker_id} from 'dispatching' → 'ready'"
+            )
             worker.status = "ready"
             worker.last_active = datetime.utcnow()
 
-    def update_job_state(self, job_id: str, new_state: JobState, error_message: Optional[str] = None) -> Job:
+    def update_job_state(
+        self,
+        job_id: str,
+        new_state: JobState,
+        error_message: Optional[str] = None,
+        force: bool = False,
+    ) -> Job:
         with self.session_factory() as db:
             job = db.query(Job).filter(Job.job_id == job_id).first()
             if not job:
                 raise JobStateError(f"Job {job_id} not found")
 
-            current_state = JobState(job.status)
-            self._validate_transition(current_state, new_state)
+            try:
+                current_state = JobState(job.status)
+            except Exception:
+                # Unexpected stored state; fallback to QUEUED
+                current_state = JobState.QUEUED
+
+            # idempotent no-op
+            if current_state == new_state:
+                logger.debug(f"Job {job_id} already in state {new_state}. No-op.")
+                if error_message:
+                    job.error_log = (job.error_log or []) + [
+                        {
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "state": new_state.value,
+                            "error": error_message,
+                        }
+                    ]
+                    db.commit()
+                    db.refresh(job)
+                return job
+
+            if not force:
+                self._validate_transition(current_state, new_state)
+            else:
+                # allow only some forced transitions, to avoid arbitrary jumps
+                allowed_forced = {JobState.FAILED, JobState.COMPLETED, JobState.TIMEOUT}
+                if new_state not in allowed_forced:
+                    logger.warning(
+                        f"Forced transition to {new_state} not permitted. Falling back to validation."
+                    )
+                    self._validate_transition(current_state, new_state)
 
             job.status = new_state.value
             job.updated_at = datetime.utcnow()
@@ -79,17 +127,21 @@ class JobManager:
                 self._reset_worker_if_dispatching(db, job.worker_id)
 
             if error_message:
-                job.error_log = (job.error_log or []) + [{
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "state": new_state.value,
-                    "error": error_message,
-                }]
+                job.error_log = (job.error_log or []) + [
+                    {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "state": new_state.value,
+                        "error": error_message,
+                    }
+                ]
 
             db.commit()
             db.refresh(job)
             return job
 
-    async def assign_job(self, job_id: str, model: str, mode: Optional[str] = None) -> str:
+    async def assign_job(
+        self, job_id: str, model: str, mode: Optional[str] = None
+    ) -> str:
         with self.session_factory() as db:
             job = db.query(Job).filter(Job.job_id == job_id).first()
             if not job:
@@ -109,12 +161,16 @@ class JobManager:
         timeout_threshold = now - self.job_timeout
 
         with self.session_factory() as db:
-            stuck_jobs = db.query(Job).filter(
-                and_(
-                    Job.status.in_([JobState.RUNNING.value, JobState.QUEUED.value]),
-                    Job.updated_at < timeout_threshold,
+            stuck_jobs = (
+                db.query(Job)
+                .filter(
+                    and_(
+                        Job.status.in_([JobState.RUNNING.value, JobState.QUEUED.value]),
+                        Job.updated_at < timeout_threshold,
+                    )
                 )
-            ).all()
+                .all()
+            )
 
             for job in stuck_jobs:
                 try:
@@ -177,7 +233,9 @@ class JobManager:
                 db.commit()
 
                 worker_id = await self.assign_job(job_id, job.model)
-                logger.info(f"Successfully recovered and reassigned job {job_id} to worker {worker_id}")
+                logger.info(
+                    f"Successfully recovered and reassigned job {job_id} to worker {worker_id}"
+                )
 
             except Exception as e:
                 logger.error(f"Failed to recover job {job_id}: {e}")
