@@ -365,7 +365,6 @@ async def run_autotest():
 # -----------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cleanup_gpu()
     # uvicorn will bind sockets first, then this runs
     logger.info("✅ Application fully started, registering worker now")
 
