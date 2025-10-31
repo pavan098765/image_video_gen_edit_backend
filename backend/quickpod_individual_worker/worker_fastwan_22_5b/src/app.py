@@ -423,6 +423,7 @@ async def run_autotest():
 # -----------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    cleanup_gpu()
     logger.info("✅ Application fully started, registering worker now")
 
     try:

@@ -264,6 +264,7 @@ class QuickPodManager:
 
         # --- 3️⃣ Fallback by GPU tier & cheapest ---
         gpu_tiers = ["5090", "4090", "4080TI", "4080"]
+        
         for tier in gpu_tiers:
             tier_offers = [
                 o for o in offers

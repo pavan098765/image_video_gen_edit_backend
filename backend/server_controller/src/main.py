@@ -56,6 +56,7 @@ init_db()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("controller")
 
+
 # --- Firebase Admin explicit init with projectId + good diagnostics ---
 def _init_firebase_admin():
     try:
@@ -91,6 +92,7 @@ def _init_firebase_admin():
         logger.exception("🔥 Firebase Admin init failed: %s", e)
         raise
 
+
 # call once at module load (where your current init is)
 _init_firebase_admin()
 
@@ -100,7 +102,7 @@ warm_pod_uuid = os.getenv("QUICKPOD_POD_UUID")
 IMAGE_PREFIX = os.getenv("IMAGE_PREFIX", "quickpod/")
 CONTROLLER_PUBLIC_URL = os.getenv("CONTROLLER_PUBLIC_URL", "")
 CONTROLLER_SHARED_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "")
-HEARTBEAT_INTERVAL = 10  # how often the worker actually pings
+HEARTBEAT_INTERVAL = 20  # how often the worker actually pings
 HEARTBEAT_GRACE_MULTIPLIER = 2  # allow 2 missed pings before reaping
 WORKER_IDLE_TIMEOUT = HEARTBEAT_INTERVAL * HEARTBEAT_GRACE_MULTIPLIER
 WORKER_REGISTRATION_TIMEOUT = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "60"))
@@ -781,17 +783,28 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
                         try:
                             machine_id = getattr(worker, "machine_id", None)
                             if machine_id:
-                                logger.warning("Marking machine %s bad due to repeated dispatch failures", machine_id)
+                                logger.warning(
+                                    "Marking machine %s bad due to repeated dispatch failures",
+                                    machine_id,
+                                )
                                 # pod_manager is available in module scope
                                 pod_manager.mark_machine_bad(str(machine_id))
                         except Exception:
-                            logger.exception("Failed to mark machine bad after dispatch failure")
+                            logger.exception(
+                                "Failed to mark machine bad after dispatch failure"
+                            )
                         # also try to destroy the pod to avoid re-registration
                         try:
                             if getattr(worker, "container_id", None):
-                                asyncio.create_task(pod_manager.destroy_individual_pod(worker.container_id))
+                                asyncio.create_task(
+                                    pod_manager.destroy_individual_pod(
+                                        worker.container_id
+                                    )
+                                )
                         except Exception:
-                            logger.exception("Failed to destroy pod after dispatch failure")
+                            logger.exception(
+                                "Failed to destroy pod after dispatch failure"
+                            )
                     return
 
         job.worker_id = worker.worker_id
@@ -815,53 +828,76 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
 # ------------------------
 # Background Tasks
 # ------------------------
+
 async def idle_worker_reaper_task():
-    logger.info("Starting idle worker reaper (enhanced)")
+    """
+    Robust reaper:
+    - Destroys stale pods (no heartbeat for HEARTBEAT_STALE_SECS)
+    - Destroys pods with no active jobs for IDLE_TIMEOUT_SECS
+    - Ignores busy/processing status if jobs are actually gone or stale
+    """
+    # Prefer env-driven values or keep these defaults
+    HEARTBEAT_STALE_SECS = int(os.getenv("HEARTBEAT_STALE_SECS", "90"))
+    IDLE_TIMEOUT_SECS = int(os.getenv("IDLE_TIMEOUT_SECS", "120"))
+    SWEEP_INTERVAL_SECS = int(os.getenv("REAPER_SWEEP_INTERVAL_SECS", "30"))
+
+    # Include any worker statuses your system uses that should be considered by the reaper
+    STATUSES_TO_CONSIDER = ["ready", "busy", "processing"]
+
+    logger.info(
+        f"Starting idle worker reaper (stale>{HEARTBEAT_STALE_SECS}s, idle>{IDLE_TIMEOUT_SECS}s, sweep={SWEEP_INTERVAL_SECS}s)"
+    )
+
     while True:
+        await asyncio.sleep(SWEEP_INTERVAL_SECS)
+
         db = SessionLocal()
+        now = datetime.utcnow()
+        stale_cutoff = now - timedelta(seconds=HEARTBEAT_STALE_SECS)
+        idle_cutoff = now - timedelta(seconds=IDLE_TIMEOUT_SECS)
+        stale_count = 0
+        idle_count = 0
+
         try:
-            now = datetime.utcnow()
-            heartbeat_threshold = now - timedelta(seconds=WORKER_IDLE_TIMEOUT)
-
-            # 🔹 Find workers that haven't heartbeated recently (stale)
-            stale_workers = (
+            workers = (
                 db.query(Worker)
-                .filter(Worker.last_heartbeat < heartbeat_threshold)
+                .filter(Worker.status.in_(STATUSES_TO_CONSIDER))
                 .all()
             )
 
-            # 🔹 Find workers idle and not busy
-            idle_workers = (
-                db.query(Worker)
-                .filter(
-                    Worker.last_active < heartbeat_threshold,
-                    Worker.status.in_(["ready", "busy"]),
-                )
-                .all()
-            )
-
-            logger.info(
-                "Reaper sweep: %d stale, %d idle",
-                len(stale_workers),
-                len(idle_workers),
-            )
-
-            # Merge both sets (avoid duplicates)
-            all_targets = {
-                w.worker_id: w for w in stale_workers + idle_workers
-            }.values()
-
-            for w in all_targets:
+            for w in workers:
                 try:
-                    # 1️⃣ Check if this worker still has active jobs
+                    # STALE: no heartbeat recently => destroy immediately
+                    if not w.last_heartbeat or w.last_heartbeat < stale_cutoff:
+                        logger.warning(
+                            "⚠️ Worker %s stale (last_heartbeat=%s) → destroying pod %s",
+                            w.worker_id,
+                            w.last_heartbeat,
+                            getattr(w, "container_id", None),
+                        )
+                        if getattr(w, "container_id", None):
+                            try:
+                                await pod_manager.destroy_individual_pod(w.container_id)
+                                stale_count += 1
+                            except Exception as e:
+                                logger.error("Destroy failed for stale pod %s: %s", w.container_id, e)
+                        # mark offline and commit safely
+                        w.status = "offline"
+                        try:
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                        continue
+
+                    # IDLE: find any active jobs attached to this worker
                     active_jobs = (
                         db.query(Job)
                         .filter(
                             Job.worker_id == w.worker_id,
                             Job.status.in_(
                                 [
-                                    JobState.QUEUED.value,
                                     JobState.RUNNING.value,
+                                    JobState.QUEUED.value,
                                     JobState.DISPATCHING.value,
                                 ]
                             ),
@@ -869,60 +905,56 @@ async def idle_worker_reaper_task():
                         .all()
                     )
 
-                    if active_jobs:
-                        # Check if they are stale jobs (no update for a long time)
-                        stale_jobs = [
-                            j
-                            for j in active_jobs
-                            if (now - j.updated_at)
-                            > timedelta(seconds=WORKER_IDLE_TIMEOUT)
-                        ]
-                        if stale_jobs:
-                            logger.warning(
-                                f"Worker {w.worker_id} has stale jobs ({len(stale_jobs)}). "
-                                f"Marking offline and failing them."
-                            )
-                            for job in stale_jobs:
-                                job_manager.update_job_state(
-                                    job.job_id,
-                                    JobState.FAILED,
-                                    "Worker heartbeat lost; job failed",
-                                )
-                            if w.container_id:
-                                await pod_manager.destroy_individual_pod(w.container_id)
-                            w.status = "offline"
-                            db.commit()
+                    # If there are active jobs, treat them as "recent" only if updated_at is recent.
+                    recent_jobs = []
+                    for j in active_jobs:
+                        j_time = j.updated_at or j.created_at or datetime(1970, 1, 1)
+                        if (now - j_time) < timedelta(seconds=IDLE_TIMEOUT_SECS):
+                            recent_jobs.append(j)
+
+                    # If there are zero active jobs OR all active jobs are stale -> reap/stop
+                    if (not active_jobs) or (active_jobs and not recent_jobs):
+                        # safe to reap/stop this worker/pod
+                        if getattr(w, "is_warm_pod", False):
+                            logger.info("💤 Idle warm pod %s (worker=%s) → stopping", w.container_id, w.worker_id)
+                            try:
+                                await pod_manager.stop_warm_pod(w.container_id)
+                            except Exception as e:
+                                logger.warning("Failed to stop warm pod %s: %s", w.container_id, e)
                         else:
-                            logger.info(
-                                f"Skipping worker {w.worker_id}: still active jobs updating."
-                            )
-                            continue
-                    else:
-                        # No active jobs, safe to reap pod
-                        if w.is_warm_pod:
-                            logger.info(
-                                f"Reaping idle warm pod {w.container_id} (no active jobs)"
-                            )
-                            await pod_manager.stop_warm_pod(w.container_id)
-                        else:
-                            if w.container_id:
-                                logger.info(
-                                    f"Reaping idle individual pod {w.container_id} (no active jobs)"
-                                )
-                                await asyncio.sleep(2)
-                                await pod_manager.destroy_individual_pod(w.container_id)
+                            # machine-based or individual pod: destroy
+                            if getattr(w, "container_id", None):
+                                logger.info("💤 Idle pod %s (worker=%s) → destroying", w.container_id, w.worker_id)
+                                try:
+                                    await pod_manager.destroy_individual_pod(w.container_id)
+                                    idle_count += 1
+                                except Exception as e:
+                                    logger.warning("Destroy failed for idle pod %s: %s", w.container_id, e)
+
+                        # update state in DB
                         w.status = "offline"
-                        db.commit()
+                        try:
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                    else:
+                        logger.debug(
+                            "Skipping worker %s: %d active jobs (%d recent)",
+                            w.worker_id,
+                            len(active_jobs),
+                            len(recent_jobs),
+                        )
 
                 except Exception as e:
-                    logger.error(f"Failed to process worker {w.worker_id}: {e}")
+                    logger.error("Reaper error on worker %s: %s", getattr(w, "worker_id", None), e)
                     db.rollback()
 
+            logger.info("Reaper sweep complete → %d stale, %d idle reaped", stale_count, idle_count)
+
+        except Exception as e:
+            logger.error("Reaper loop error: %s", e)
         finally:
             db.close()
-
-        # 🕒 Run every half of idle timeout (e.g. every 15s if timeout=30s)
-        await asyncio.sleep(max(5, WORKER_IDLE_TIMEOUT // 2))
 
 
 async def pod_cleanup_task():
@@ -1144,7 +1176,9 @@ async def job_complete(payload: JobCompletePayload):
             reason = payload.error or "Worker reported failure"
             logger.warning(f"❌ Worker failed job {job.job_id}: {reason}")
 
-            job_manager.update_job_state(job.job_id, JobState.FAILED, reason, force=True)
+            job_manager.update_job_state(
+                job.job_id, JobState.FAILED, reason, force=True
+            )
             job.error = reason
             job.output_url = None
             db.commit()
@@ -1170,12 +1204,20 @@ async def job_complete(payload: JobCompletePayload):
             try:
                 logger.info(f"♻️ Requeueing job {job.job_id} on NEW machine...")
                 await pod_manager.add_pending_job(job.job_id, job.model)
-                new_worker = await pod_manager.dispatch_job(job.job_id, job.model, job.params.get("mode"))
+                new_worker = await pod_manager.dispatch_job(
+                    job.job_id, job.model, job.params.get("mode")
+                )
                 new_presigned = create_presigned_put_url(job.result_r2_key)
                 asyncio.create_task(
-                    asyncio.to_thread(assign_job_to_worker, job.job_id, new_worker, new_presigned)
+                    asyncio.to_thread(
+                        assign_job_to_worker, job.job_id, new_worker, new_presigned
+                    )
                 )
-                return {"status": "requeued", "job_id": job.job_id, "worker": new_worker}
+                return {
+                    "status": "requeued",
+                    "job_id": job.job_id,
+                    "worker": new_worker,
+                }
             except Exception as e:
                 logger.error(f"❌ Failed requeue {job.job_id}: {e}")
                 return {"status": "failed_final", "job_id": job.job_id}
@@ -1186,7 +1228,10 @@ async def job_complete(payload: JobCompletePayload):
             if job.error_log:
                 for entry in job.error_log:
                     err = (entry.get("error") or "").lower()
-                    if any(tok in err for tok in ["cuda out of memory", "oom", "cublas", "no memory"]):
+                    if any(
+                        tok in err
+                        for tok in ["cuda out of memory", "oom", "cublas", "no memory"]
+                    ):
                         oom_detected = True
                         logger.warning(f"⚠️ OOM detected in {job.job_id}")
                         break
@@ -1213,7 +1258,9 @@ async def job_complete(payload: JobCompletePayload):
             reason = "OOM" if oom_detected else "R2 missing"
             logger.error(f"🚨 Post-run validation failed {job.job_id}: {reason}")
 
-            job_manager.update_job_state(job.job_id, JobState.FAILED, reason, force=True)
+            job_manager.update_job_state(
+                job.job_id, JobState.FAILED, reason, force=True
+            )
             job.error = reason
             job.output_url = None
             db.commit()
@@ -1230,25 +1277,35 @@ async def job_complete(payload: JobCompletePayload):
                 if getattr(worker, "container_id", None):
                     try:
                         await pod_manager.destroy_individual_pod(worker.container_id)
-                        logger.error(f"🔥 Destroyed pod {worker.container_id} after invalid output")
+                        logger.error(
+                            f"🔥 Destroyed pod {worker.container_id} after invalid output"
+                        )
                     except Exception as e:
                         logger.error(f"⚠️ Pod destroy failed: {e}")
 
             # requeue
             try:
                 await pod_manager.add_pending_job(job.job_id, job.model)
-                new_worker = await pod_manager.dispatch_job(job.job_id, job.model, job.params.get("mode"))
+                new_worker = await pod_manager.dispatch_job(
+                    job.job_id, job.model, job.params.get("mode")
+                )
                 new_presigned = create_presigned_put_url(key)
                 asyncio.create_task(
-                    asyncio.to_thread(assign_job_to_worker, job.job_id, new_worker, new_presigned)
+                    asyncio.to_thread(
+                        assign_job_to_worker, job.job_id, new_worker, new_presigned
+                    )
                 )
-                return {"status": "requeued", "job_id": job.job_id, "worker": new_worker}
+                return {
+                    "status": "requeued",
+                    "job_id": job.job_id,
+                    "worker": new_worker,
+                }
             except Exception as e:
                 logger.error(f"❌ requeue failed {job.job_id}: {e}")
                 return {"status": "failed_no_output", "job_id": job.job_id}
 
         # ------------------ SUCCESS PATH ------------------
-        # ✅ Now that validation passed, mark COMPLETED
+        # ✅ Validation passed — mark COMPLETED
         job_manager.update_job_state(job.job_id, JobState.COMPLETED, force=True)
         job.result_r2_key = payload.result_r2_key
         job.output_key = payload.result_r2_key
@@ -1261,60 +1318,105 @@ async def job_complete(payload: JobCompletePayload):
             except Exception as e:
                 logger.error(f"❌ Failed to remove pending job {job.job_id}: {e}")
 
+            # --- Count active jobs still running on the same worker ---
             try:
-                active = db.query(Job).filter(
-                    Job.worker_id == worker.worker_id,
-                    Job.status.in_([
-                        JobState.RUNNING.value,
-                        JobState.DISPATCHING.value,
-                        JobState.QUEUED.value
-                    ]),
-                ).count()
+                active_jobs = (
+                    db.query(Job)
+                    .filter(
+                        Job.worker_id == worker.worker_id,
+                        Job.status.in_(
+                            [
+                                JobState.RUNNING.value,
+                                JobState.DISPATCHING.value,
+                                JobState.QUEUED.value,
+                            ]
+                        ),
+                    )
+                    .count()
+                )
             except Exception as e:
-                logger.error(f"❌ Failed to count active jobs for worker {worker.worker_id}: {e}")
-                active = 0
-            
+                logger.error(
+                    f"❌ Failed to count active jobs for worker {worker.worker_id}: {e}"
+                )
+                active_jobs = 0
+
             container_id = getattr(worker, "container_id", None)
             try:
                 if container_id:
-                    # If this is a warm pod we usually keep it alive, otherwise destroy ephemeral pods
-                    if not worker.is_warm_pod:
-                        logger.info("Destroying ephemeral pod %s for worker %s after successful completion of job %s", container_id, worker.worker_id, job.job_id)
-                        # Destroy pod (this also clears DB worker rows courtesy of pod_manager)
-                        try:
-                            await pod_manager.destroy_individual_pod(container_id)
-                        except Exception as e:
-                            logger.exception("Failed to destroy individual pod %s: %s", container_id, e)
-                        # Ensure DB worker row updated if pod_manager couldn't update it
-                        try:
-                            # reload worker from session to avoid stale obj
-                            db.refresh(worker)
-                        except Exception:
-                            pass
-                        # If worker still has container_id set, clear it
-                        if getattr(worker, "container_id", None):
-                            worker.container_id = None
-                            worker.status = "terminated"
+                    # ✅ Only destroy pod if truly no other active jobs exist
+                    if active_jobs > 0:
+                        logger.info(
+                            "Keeping pod %s alive for worker %s — %d other active jobs remain",
+                            container_id,
+                            worker.worker_id,
+                            active_jobs,
+                        )
+                        worker.status = "busy"
                     else:
-                        # warm pod: keep running but mark ready if no active jobs
-                        worker.status = "ready" if active == 0 else "busy"
-                        logger.info("Keeping warm pod %s (worker=%s) alive; active jobs=%d", container_id, worker.worker_id, active)
+                        # No active jobs — decide if we destroy or keep alive
+                        if (
+                            not worker.is_warm_pod
+                            and pod_manager.pod_strategy != "machine_based"
+                        ):
+                            logger.info(
+                                "Destroying ephemeral pod %s for worker %s after successful completion of job %s (no active jobs left)",
+                                container_id,
+                                worker.worker_id,
+                                job.job_id,
+                            )
+                            try:
+                                await pod_manager.destroy_individual_pod(container_id)
+                            except Exception as e:
+                                logger.exception(
+                                    "Failed to destroy individual pod %s: %s",
+                                    container_id,
+                                    e,
+                                )
+                            # Update worker state
+                            try:
+                                db.refresh(worker)
+                            except Exception:
+                                pass
+                            if getattr(worker, "container_id", None):
+                                worker.container_id = None
+                            worker.status = "terminated"
+                        else:
+                            # Machine-based or warm pod → keep alive
+                            worker.status = "ready"
+                            logger.info(
+                                "Keeping machine-based/warm pod %s (worker=%s) alive for reuse",
+                                container_id,
+                                worker.worker_id,
+                            )
                 else:
                     # No container id present; mark readiness based on activity
-                    worker.status = "ready" if active == 0 else "busy"
+                    worker.status = "ready" if active_jobs == 0 else "busy"
             except Exception as e:
-                logger.warning("Error handling pod lifecycle for worker %s: %s", getattr(worker, "worker_id", None), e)
+                logger.warning(
+                    "Error handling pod lifecycle for worker %s: %s",
+                    getattr(worker, "worker_id", None),
+                    e,
+                )
 
-            # Update last_active and commit DB state so reaper sees correct info
+            # Update last_active and commit DB state
             try:
                 worker.last_active = datetime.utcnow()
                 db.commit()
-                logger.info("Worker %s updated in DB (status=%s, container_id=%s)", worker.worker_id, worker.status, worker.container_id)
+                logger.info(
+                    "Worker %s updated in DB (status=%s, container_id=%s)",
+                    worker.worker_id,
+                    worker.status,
+                    worker.container_id,
+                )
             except Exception as e:
                 db.rollback()
-                logger.error("Failed to commit worker update for %s: %s", getattr(worker, "worker_id", None), e)
+                logger.error(
+                    "Failed to commit worker update for %s: %s",
+                    getattr(worker, "worker_id", None),
+                    e,
+                )
 
-        # send FCM
+        # ------------------ SEND FCM NOTIFICATION ------------------
         if job.params.get("fcm_token"):
             data = {
                 "job_id": job.job_id,
@@ -1337,6 +1439,29 @@ async def job_complete(payload: JobCompletePayload):
         db.close()
 
 
+# @app.post("/heartbeat")
+# async def heartbeat(request: Request):
+#     body = await request.body()
+#     sig = request.headers.get("X-Signature", "")
+#     if not verify_signature(sig, body):
+#         raise HTTPException(status_code=401, detail="Invalid signature")
+
+#     data = json.loads(body)
+#     worker_id = data.get("worker_id")
+#     if not worker_id:
+#         raise HTTPException(status_code=400, detail="Missing worker_id")
+
+#     with SessionLocal() as db:
+#         w = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+#         if not w:
+#             raise HTTPException(status_code=404, detail="Worker not found")
+#         w.last_heartbeat = datetime.utcnow()
+#         w.last_active = datetime.utcnow()
+#         db.commit()
+
+#     return {"status": "ok"}
+
+
 @app.post("/heartbeat")
 async def heartbeat(request: Request):
     body = await request.body()
@@ -1349,13 +1474,20 @@ async def heartbeat(request: Request):
     if not worker_id:
         raise HTTPException(status_code=400, detail="Missing worker_id")
 
+    # Only update last_heartbeat here. Do NOT touch last_active.
+    # last_active should be updated on real job-related events (dispatch/job_complete).
     with SessionLocal() as db:
         w = db.query(Worker).filter(Worker.worker_id == worker_id).first()
         if not w:
             raise HTTPException(status_code=404, detail="Worker not found")
         w.last_heartbeat = datetime.utcnow()
-        w.last_active = datetime.utcnow()
-        db.commit()
+        # DO NOT update last_active here
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed committing heartbeat update for %s", worker_id)
+            raise HTTPException(status_code=500, detail="DB commit failed")
 
     return {"status": "ok"}
 
