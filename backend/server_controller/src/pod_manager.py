@@ -99,6 +99,7 @@ class PodManager:
             "sd35": 40,
             "sdxl": 30,
             "diffusers_outpaint": 50,
+            "qwen_image": 80,
             "qwen_image_edit": 80,
             "qwen_image_edit_2509": 85,
             "flux_kontext_dev": 45,
