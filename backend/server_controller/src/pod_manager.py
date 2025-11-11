@@ -21,7 +21,7 @@ class PodStrategyType(str, enum.Enum):
 
 
 MACHINE_PRIORITY_LIST: List[Tuple[str, str]] = [
-    ("562", "4x 5090"),
+    # ("562", "4x 5090"),
     ("14790", "4x 5090"),
     ("14780", "6x 5090"),
     ("14762", "1x 5090"),
@@ -64,6 +64,9 @@ class PodManager:
         self.individual_pods: Dict[str, PodInfo] = {}
         self.individual_pod_managers: Dict[str, QuickPodManager] = {}
         self._lock = asyncio.Lock()
+
+        # NEW: per-pod locks to serialize lifecycle operations per pod_uuid
+        self._pod_locks: Dict[str, asyncio.Lock] = {}
 
         self.pending_jobs: Dict[str, set] = {}
         self._jobs_lock = asyncio.Lock()
@@ -147,6 +150,30 @@ class PodManager:
                 last_active=datetime.utcnow(),
             )
         return pods
+
+    # ---------------------------
+    # Pod-lock helpers
+    # ---------------------------
+    def _get_pod_lock(self, pod_uuid: str) -> asyncio.Lock:
+        """
+        Returns or creates a lock for the given pod UUID in a thread-safe way.
+        Uses double-checked locking to avoid races.
+        """
+        lock = self._pod_locks.get(pod_uuid)
+        if lock:
+            return lock
+
+        # Create synchronously but register inside event loop thread
+        new_lock = asyncio.Lock()
+        existing = self._pod_locks.setdefault(pod_uuid, new_lock)
+        return existing
+
+    async def _remove_pod_lock(self, pod_uuid: str) -> None:
+        """
+        Remove the pod lock entry. Call this after the pod has been fully removed.
+        """
+        async with self._lock:
+            self._pod_locks.pop(pod_uuid, None)
 
     # --------------------------------------------------------------------------
     # MACHINE CACHE HELPERS
@@ -621,6 +648,7 @@ class PodManager:
                     continue
 
                 # register pod
+                # create pod-info and its pod-lock while holding self._lock to avoid races
                 async with self._lock:
                     self.individual_pods[pod_uuid] = PodInfo(
                         pod_uuid=pod_uuid,
@@ -634,6 +662,8 @@ class PodManager:
                     self.individual_pod_managers[pod_uuid] = QuickPodManager(
                         self.email, self.password, pod_uuid
                     )
+                    # Create the per-pod lock synchronously here (safe because we hold self._lock)
+                    self._pod_locks[pod_uuid] = asyncio.Lock()
 
                 # wait for worker registration
                 start_time = time.time()
@@ -750,6 +780,8 @@ class PodManager:
                 self.individual_pod_managers[pod_uuid] = QuickPodManager(
                     self.email, self.password, pod_uuid
                 )
+                # Create per-pod lock while holding self._lock
+                self._pod_locks[pod_uuid] = asyncio.Lock()
 
             start_time = time.time()
             while time.time() - start_time < self.pod_startup_timeout:
@@ -773,24 +805,83 @@ class PodManager:
             logger.exception("⚠️ Global fallback path failed for %s: %s", model, e)
             return None
 
+    # --------------------------------------------------------------------------
+    # DISPATCH PENDING JOBS WHEN WORKER REGISTERS
+    # --------------------------------------------------------------------------
+    async def dispatch_pending_jobs_for_model(self, model: str):
+        """Called after a new worker registers for a model.
+        Immediately dispatches queued jobs for that model if any exist.
+        """
+        from db import SessionLocal, Job, Worker
+        from job_manager import JobState
+        from main import assign_job_to_worker  # import lazily to avoid circular
+
+        async with self._jobs_lock:
+            pending_jobs = list(self.pending_jobs.get(model, []))
+            if not pending_jobs:
+                logger.info(f"No pending jobs for {model} upon worker registration")
+                return
+
+        with SessionLocal() as db:
+            ready_worker = (
+                db.query(Worker)
+                .filter(Worker.model == model, Worker.status == "ready")
+                .order_by(Worker.last_active.desc())
+                .first()
+            )
+            if not ready_worker:
+                logger.info(f"No ready worker found for {model} during dispatch")
+                return
+
+            for job_id in pending_jobs:
+                job = db.query(Job).filter(Job.job_id == job_id).first()
+                if not job or job.status not in (
+                    JobState.PENDING.value,
+                    JobState.QUEUED.value,
+                ):
+                    continue
+                try:
+                    # You can generate a presigned_url here if not already set
+                    presigned_url = (
+                        getattr(job, "upload_url", None)
+                        or getattr(job, "result_upload_url", None)
+                        or getattr(job, "presigned_url", None)
+                        or ""
+                    )
+
+                    assign_job_to_worker(job_id, ready_worker.worker_id, presigned_url)
+                    await self.remove_pending_job(job_id, model)
+                except Exception:
+                    logger.exception(
+                        f"Failed to dispatch pending job {job_id} for {model}"
+                    )
+
     async def destroy_unexpected_pod(self, pod_uuid: str):
         """Force-stop and destroy a pod that was not requested by the orchestrator."""
-        try:
-            logger.warning(f"💣 Destroying unexpected pod {pod_uuid} to prevent cost.")
+        # Acquire the pod lock for full serialization with other lifecycle ops
+        pod_lock = self._get_pod_lock(pod_uuid)
+        async with pod_lock:
+            try:
+                logger.warning(
+                    f"💣 Destroying unexpected pod {pod_uuid} to prevent cost."
+                )
 
-            # Create a temporary QuickPodManager bound to this specific pod UUID
-            temp_manager = QuickPodManager(self.email, self.password, pod_uuid)
+                # Create a temporary QuickPodManager bound to this specific pod UUID
+                temp_manager = QuickPodManager(self.email, self.password, pod_uuid)
 
-            # Stop and destroy via proper calls (each manager knows its pod_uuid)
-            await asyncio.to_thread(temp_manager.stop_pod)
-            await asyncio.sleep(2)  # small grace period
-            await asyncio.to_thread(temp_manager.destroy_pod)
+                # Stop and destroy via proper calls (each manager knows its pod_uuid)
+                await asyncio.to_thread(temp_manager.stop_pod)
+                await asyncio.sleep(2)  # small grace period
+                await asyncio.to_thread(temp_manager.destroy_pod)
 
-            logger.info(f"✅ Unexpected pod {pod_uuid} stopped and destroyed.")
-        except Exception as e:
-            logger.error(f"❌ Failed to destroy unexpected pod {pod_uuid}: {e}")
-        finally:
-            self.recently_destroyed[pod_uuid] = time.time()
+                logger.info(f"✅ Unexpected pod {pod_uuid} stopped and destroyed.")
+            except Exception as e:
+                logger.error(f"❌ Failed to destroy unexpected pod {pod_uuid}: {e}")
+            finally:
+                # Mark recently destroyed inside the pod lock to ensure re-registers are blocked
+                self.recently_destroyed[pod_uuid] = time.time()
+                # Clean up any pod lock entry (best-effort)
+                await self._remove_pod_lock(pod_uuid)
 
     # --------------------------------------------------------------------------
     # INDIVIDUAL POD (WARM+INDIVIDUAL)
@@ -822,6 +913,7 @@ class PodManager:
             if not pod_uuid:
                 raise RuntimeError("No pod UUID returned")
 
+            # register pod and create per-pod lock while holding self._lock
             async with self._lock:
                 self.individual_pods[pod_uuid] = PodInfo(
                     pod_uuid=pod_uuid,
@@ -834,6 +926,8 @@ class PodManager:
                 self.individual_pod_managers[pod_uuid] = QuickPodManager(
                     self.email, self.password, pod_uuid
                 )
+                # create lock for this pod
+                self._pod_locks[pod_uuid] = asyncio.Lock()
             return pod_uuid
         except Exception as e:
             logger.exception("Failed to create individual pod: %s", e)
@@ -843,106 +937,147 @@ class PodManager:
     # CLEANUP
     # --------------------------------------------------------------------------
     async def stop_individual_pod(self, pod_uuid: str) -> None:
-        await self._ensure_global_login()
-        async with self._lock:
-            pod_manager = self.individual_pod_managers.get(pod_uuid) or self.global_qp
-            exists = pod_uuid in self.individual_pods
-        if not exists:
-            return
-        try:
-            await self._call_with_retry(pod_manager.stop_pod)
-        except Exception as e:
-            logger.warning("stop_individual_pod failed: %s", e)
-        await asyncio.sleep(1)
-        try:
-            await self._call_with_retry(pod_manager.destroy_pod)
-        except Exception as e:
-            logger.warning("destroy_pod failed: %s", e)
-
-        # Remove from internal caches and also clear DB worker rows referencing this pod_uuid
-        async with self._lock:
-            self.individual_pods.pop(pod_uuid, None)
-            self.individual_pod_managers.pop(pod_uuid, None)
-        # mark recently destroyed
-        self.recently_destroyed[pod_uuid] = time.time()
-
-        # best-effort DB cleanup: clear container_id on any worker row that referenced this pod_uuid
-        try:
-            from db import SessionLocal, Worker
-            db = SessionLocal()
+        # Acquire pod-specific lock to serialize with destroy/create/register
+        pod_lock = self._get_pod_lock(pod_uuid)
+        async with pod_lock:
+            await self._ensure_global_login()
+            async with self._lock:
+                pod_manager = (
+                    self.individual_pod_managers.get(pod_uuid) or self.global_qp
+                )
+                exists = pod_uuid in self.individual_pods
+            if not exists:
+                return
             try:
-                affected = db.query(Worker).filter(Worker.container_id == pod_uuid).all()
-                for w in affected:
-                    logger.info("DB sync: clearing container_id for worker %s after stop_individual_pod(%s)", w.worker_id, pod_uuid)
-                    w.container_id = None
-                    w.status = "offline"
-                    w.last_active = datetime.utcnow()
-                db.commit()
+                await self._call_with_retry(pod_manager.stop_pod)
+            except Exception as e:
+                logger.warning("stop_individual_pod failed: %s", e)
+            await asyncio.sleep(1)
+            try:
+                await self._call_with_retry(pod_manager.destroy_pod)
+            except Exception as e:
+                logger.warning("destroy_pod failed: %s", e)
+
+            # Remove from internal caches and also clear DB worker rows referencing this pod_uuid
+            async with self._lock:
+                self.individual_pods.pop(pod_uuid, None)
+                self.individual_pod_managers.pop(pod_uuid, None)
+            # mark recently destroyed
+            self.recently_destroyed[pod_uuid] = time.time()
+
+            # best-effort DB cleanup: clear container_id on any worker row that referenced this pod_uuid
+            try:
+                from db import SessionLocal, Worker
+
+                db = SessionLocal()
+                try:
+                    affected = (
+                        db.query(Worker).filter(Worker.container_id == pod_uuid).all()
+                    )
+                    for w in affected:
+                        logger.info(
+                            "DB sync: clearing container_id for worker %s after stop_individual_pod(%s)",
+                            w.worker_id,
+                            pod_uuid,
+                        )
+                        w.container_id = None
+                        w.status = "offline"
+                        w.last_active = datetime.utcnow()
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.exception(
+                        "DB cleanup failed in stop_individual_pod for pod %s", pod_uuid
+                    )
+                finally:
+                    db.close()
             except Exception:
-                db.rollback()
-                logger.exception("DB cleanup failed in stop_individual_pod for pod %s", pod_uuid)
-            finally:
-                db.close()
-        except Exception:
-            logger.exception("Failed to import DB for cleanup in stop_individual_pod")
+                logger.exception(
+                    "Failed to import DB for cleanup in stop_individual_pod"
+                )
 
-        logger.info("Pod %s cleaned up (stop_individual_pod)", pod_uuid)
-
+            logger.info("Pod %s cleaned up (stop_individual_pod)", pod_uuid)
+            # remove per-pod lock
+            await self._remove_pod_lock(pod_uuid)
 
     async def destroy_individual_pod(self, pod_uuid: str) -> None:
-        await self._ensure_global_login()
-        async with self._lock:
-            manager = self.individual_pod_managers.get(pod_uuid)
-            exists = pod_uuid in self.individual_pods
+        # Acquire pod-specific lock to serialize lifecycle operations
+        pod_lock = self._get_pod_lock(pod_uuid)
+        async with pod_lock:
+            await self._ensure_global_login()
+            async with self._lock:
+                manager = self.individual_pod_managers.get(pod_uuid)
+                exists = pod_uuid in self.individual_pods
 
-        if not exists:
-            # still mark recently_destroyed to avoid immediate re-register
-            self.recently_destroyed[pod_uuid] = time.time()
-            logger.debug("destroy_individual_pod: pod %s not tracked in individual_pods", pod_uuid)
-            return
+            if not exists:
+                # still mark recently_destroyed to avoid immediate re-register
+                self.recently_destroyed[pod_uuid] = time.time()
+                logger.debug(
+                    "destroy_individual_pod: pod %s not tracked in individual_pods",
+                    pod_uuid,
+                )
+                # ensure no stale lock left
+                await self._remove_pod_lock(pod_uuid)
+                return
 
-        try:
-            use_temp = True
-            if manager and getattr(manager, "pod_uuid", None) == pod_uuid:
-                use_temp = False
-
-            if use_temp:
-                # create a temporary manager bound to correct pod_uuid
-                tmp_mgr = QuickPodManager(self.email, self.password, pod_uuid)
-                await self._call_with_retry(tmp_mgr.destroy_pod)
-            else:
-                await self._call_with_retry(manager.destroy_pod)
-        except Exception as e:
-            logger.warning("destroy_individual_pod failed: %s", e)
-
-        # Remove from internal structures
-        async with self._lock:
-            self.individual_pods.pop(pod_uuid, None)
-            self.individual_pod_managers.pop(pod_uuid, None)
-        # record recently destroyed timestamp
-        self.recently_destroyed[pod_uuid] = time.time()
-
-        # best-effort DB sync: clear container_id on workers that referenced this pod_uuid
-        try:
-            from db import SessionLocal, Worker
-            db = SessionLocal()
             try:
-                affected = db.query(Worker).filter(Worker.container_id == pod_uuid).all()
-                for w in affected:
-                    logger.info("DB sync: clearing container_id for worker %s after destroy_individual_pod(%s)", w.worker_id, pod_uuid)
-                    w.container_id = None
-                    w.status = "terminated"
-                    w.last_active = datetime.utcnow()
-                db.commit()
-            except Exception:
-                db.rollback()
-                logger.exception("DB cleanup failed in destroy_individual_pod for pod %s", pod_uuid)
-            finally:
-                db.close()
-        except Exception:
-            logger.exception("Failed to import DB for cleanup in destroy_individual_pod")
+                # record recently destroyed timestamp (inside pod lock)
+                self.recently_destroyed[pod_uuid] = time.time()
+                use_temp = True
+                if manager and getattr(manager, "pod_uuid", None) == pod_uuid:
+                    use_temp = False
 
-        logger.info("Individual pod %s destroyed (db worker rows cleared)", pod_uuid)
+                if use_temp:
+                    # create a temporary manager bound to correct pod_uuid
+                    tmp_mgr = QuickPodManager(self.email, self.password, pod_uuid)
+                    await self._call_with_retry(tmp_mgr.destroy_pod)
+                else:
+                    await self._call_with_retry(manager.destroy_pod)
+            except Exception as e:
+                logger.warning("destroy_individual_pod failed: %s", e)
+
+            # Remove from internal structures
+            async with self._lock:
+                pod_info = self.individual_pods.pop(pod_uuid, None)
+                self.individual_pod_managers.pop(pod_uuid, None)
+
+            # best-effort DB sync: clear container_id on workers that referenced this pod_uuid
+            try:
+                from db import SessionLocal, Worker
+
+                db = SessionLocal()
+                try:
+                    affected = (
+                        db.query(Worker).filter(Worker.container_id == pod_uuid).all()
+                    )
+                    for w in affected:
+                        logger.info(
+                            "DB sync: clearing container_id for worker %s after destroy_individual_pod(%s)",
+                            w.worker_id,
+                            pod_uuid,
+                        )
+                        w.container_id = None
+                        w.status = "terminated"
+                        w.last_active = datetime.utcnow()
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.exception(
+                        "DB cleanup failed in destroy_individual_pod for pod %s",
+                        pod_uuid,
+                    )
+                finally:
+                    db.close()
+            except Exception:
+                logger.exception(
+                    "Failed to import DB for cleanup in destroy_individual_pod"
+                )
+
+            logger.info(
+                "Individual pod %s destroyed (db worker rows cleared)", pod_uuid
+            )
+            # remove per-pod lock
+            await self._remove_pod_lock(pod_uuid)
 
     # --------------------------------------------------------------------------
     # HELPERS
