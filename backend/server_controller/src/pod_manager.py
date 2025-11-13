@@ -21,7 +21,6 @@ class PodStrategyType(str, enum.Enum):
 
 
 MACHINE_PRIORITY_LIST: List[Tuple[str, str]] = [
-    # ("562", "4x 5090"),
     ("14790", "4x 5090"),
     ("14780", "6x 5090"),
     ("14762", "1x 5090"),
