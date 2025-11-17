@@ -432,7 +432,7 @@ def is_trusted_worker_ip(ip: str) -> bool:
 # - PUBLIC_PATHS: endpoints open to public (like /download) -> no checks apply
 WORKER_PATHS = ["/register_worker", "/heartbeat"]
 TRUSTED_API_PATHS = ["/submit", "/job_complete", "/job_status"]
-PUBLIC_PATHS = ["/download"]
+PUBLIC_PATHS = ["/download", "/job_status"]
 
 
 # ---------- Middleware ----------
