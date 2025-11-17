@@ -1,0 +1,171 @@
+{
+    "qwen_image_edit": {
+        "preferred_variant": "fp4",
+        "fallback_variants": [
+            "int4"
+        ],
+        "min_tflops": 100,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "variant_template_key": {
+            "fp4": "qwen_image_edit",
+            "int4": "qwen_image_edit_int4"
+        },
+        "variant_disk_size": {
+            "fp4": 80,
+            "int4": 80
+        }
+    },
+    "flux_kontext_dev": {
+        "preferred_variant": "fp4",
+        "fallback_variants": [
+            "int4"
+        ],
+        "min_tflops": 100,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "variant_template_key": {
+            "fp4": "flux_kontext_dev",
+            "int4": "flux_kontext_dev_int4"
+        },
+        "variant_disk_size": {
+            "fp4": 45,
+            "int4": 45
+        }
+    },
+    "qwen_image": {
+        "preferred_variant": "fp4",
+        "fallback_variants": [
+            "int4"
+        ],
+        "min_tflops": 100,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "variant_template_key": {
+            "fp4": "qwen_image",
+            "int4": "qwen_image_int4"
+        },
+        "variant_disk_size": {
+            "fp4": 80,
+            "int4": 80
+        }
+    },
+    "qwen_image_edit_2509": {
+        "preferred_variant": "fp4",
+        "fallback_variants": [
+            "int4"
+        ],
+        "min_tflops": 100,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "variant_template_key": {
+            "fp4": "qwen_image_edit_2509",
+            "int4": "qwen_image_edit_2509_int4"
+        },
+        "variant_disk_size": {
+            "fp4": 85,
+            "int4": 85
+        }
+    },
+    "sdxl": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 60,
+        "allowed_gpu_names": [
+            "4080",
+            "4090",
+            "5090"
+        ],
+        "min_gpu_count": 1
+    },
+    "basic_utils": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 30,
+        "allowed_gpu_names": [
+            "4070",
+            "4080",
+            "4090"
+        ]
+    },
+    "diffusers_outpaint": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 60,
+        "allowed_gpu_names": [
+            "4080",
+            "4090",
+            "5090"
+        ],
+        "min_gpu_count": 1
+    },
+    "fastwan_21_1b": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 95,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "fastwan_22_5b": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 95,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "aurasrv2": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 30,
+        "allowed_gpu_names": [
+            "4070",
+            "4080",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "realesrgan": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 30,
+        "allowed_gpu_names": [
+            "4070",
+            "4080",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "swin2sr": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 30,
+        "allowed_gpu_names": [
+            "4070",
+            "4080",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "default": {
+        "preferred_variant": null,
+        "fallback_variants": []
+    }
+}

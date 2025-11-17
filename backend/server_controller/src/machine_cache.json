@@ -1,0 +1,176 @@
+{
+  "machines": {
+    "275": {
+      "cached_images": {
+        "flux_kontext_dev": {
+          "added_at": "2025-10-26T21:06:21.560385Z",
+          "score": 4.0
+        },
+        "qwen_image_edit": {
+          "added_at": "2025-10-27T13:52:47.041290Z",
+          "score": 2.0
+        },
+        "qwen_image_edit_2509": {
+          "added_at": "2025-11-17T05:44:09.555724Z",
+          "score": 65.0
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-11-17T05:44:09.555724Z",
+      "gpu_name": "5090",
+      "gpu_type": "NVIDIA GeForce RTX 5090",
+      "gpu_count": 1,
+      "tflops": 134,
+      "capability": {},
+      "capability_cached_at": "2025-11-13T12:59:21Z"
+    },
+    "14762": {
+      "cached_images": {
+        "qwen_image_edit": {
+          "added_at": "2025-10-31T22:34:26.975551Z",
+          "score": 8.0
+        },
+        "qwen_image_edit_2509": {
+          "added_at": "2025-11-09T05:48:18.074942Z",
+          "score": 81.0
+        },
+        "flux_kontext_dev": {
+          "added_at": "2025-10-28T17:19:10.904933Z",
+          "score": 2.0
+        },
+        "aurasrv2": {
+          "added_at": "2025-11-07T17:45:06.063071Z",
+          "score": 6.0
+        },
+        "diffusers_outpaint": {
+          "added_at": "2025-11-08T20:49:32.015763Z",
+          "score": 4.0
+        },
+        "basic_utils": {
+          "added_at": "2025-11-09T05:55:35.882449Z",
+          "score": 6.0
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-11-13T12:59:21Z",
+      "gpu_name": "5090",
+      "gpu_type": "NVIDIA RTX 5090",
+      "gpu_count": 1,
+      "tflops": 135,
+      "capability": {},
+      "capability_cached_at": "2025-11-13T12:59:21Z"
+    },
+    "14790": {
+      "cached_images": {
+        "flux_kontext_dev": {
+          "added_at": "2025-10-26T09:13:11.589486Z",
+          "score": 2.0
+        },
+        "qwen_image_edit_2509": {
+          "added_at": "2025-11-17T19:05:49.291189Z",
+          "score": 49.0
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-11-17T19:05:49.291189Z",
+      "gpu_name": "5090",
+      "gpu_type": "NVIDIA RTX 5090",
+      "gpu_count": 1,
+      "tflops": 135,
+      "capability": {},
+      "capability_cached_at": "2025-11-13T12:59:21Z"
+    },
+    "14751": {
+      "cached_images": {
+        "flux_kontext_dev": {
+          "added_at": "2025-10-31T22:36:56.065472Z",
+          "score": 4.0
+        },
+        "qwen_image_edit_2509": {
+          "added_at": "2025-11-17T19:26:07.338816Z",
+          "score": 117.0
+        },
+        "qwen_image_edit": {
+          "added_at": "2025-10-31T22:34:16.784751Z",
+          "score": 2.0
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-11-17T19:26:07.338816Z",
+      "gpu_name": "5090",
+      "gpu_type": "NVIDIA RTX 5090",
+      "gpu_count": 1,
+      "tflops": 135,
+      "capability": {},
+      "capability_cached_at": "2025-11-13T12:59:21Z"
+    },
+    "416": {
+      "cached_images": {
+        "aurasrv2": {
+          "added_at": "2025-11-07T17:45:24.124715Z",
+          "score": 2.0
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-11-13T12:59:21Z",
+      "gpu_name": "4090",
+      "gpu_type": "NVIDIA RTX 4090",
+      "gpu_count": 1,
+      "tflops": 101,
+      "capability": {},
+      "capability_cached_at": "2025-11-13T12:59:21Z"
+    },
+    "14795": {
+      "cached_images": {
+        "aurasrv2": {
+          "added_at": "2025-11-07T17:45:24.124715Z",
+          "score": 2.0
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-11-13T12:59:21Z",
+      "gpu_name": "4090",
+      "gpu_type": "NVIDIA RTX 4090",
+      "gpu_count": 1,
+      "tflops": 101,
+      "capability": {},
+      "capability_cached_at": "2025-11-13T12:59:21Z"
+    },
+    "14774": {
+      "cached_images": {
+        "aurasrv2": {
+          "added_at": "2025-11-07T17:45:24.124715Z",
+          "score": 2.0
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-11-13T12:59:21Z",
+      "gpu_name": "4090",
+      "gpu_type": "NVIDIA RTX 4090",
+      "gpu_count": 1,
+      "tflops": 101,
+      "capability": {},
+      "capability_cached_at": "2025-11-13T12:59:21Z"
+    },
+    "266": {
+      "cached_images": {
+        "aurasrv2": {
+          "added_at": "2025-11-07T17:45:24.124715Z",
+          "score": 2.0
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-11-13T12:59:21Z",
+      "gpu_name": "4090",
+      "gpu_type": "NVIDIA RTX 4090",
+      "gpu_count": 1,
+      "tflops": 101,
+      "capability": {},
+      "capability_cached_at": "2025-11-13T12:59:21Z"
+    }
+  },
+  "meta": {
+    "version": 1,
+    "updated_at": "2025-11-17T19:26:07.338816Z"
+  }
+}

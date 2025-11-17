@@ -2,8 +2,9 @@
 import os
 import time
 import json
-import tempfile
 import logging
+import requests
+
 import asyncio
 import enum
 from typing import Dict, Optional, Any, List, Tuple
@@ -113,6 +114,20 @@ class PodManager:
             "basic_utils": 30,
         }
 
+        # Load model requirements
+        self.model_requirements_path = os.getenv(
+            "MODEL_REQUIREMENTS_PATH", "model_requirements.json"
+        )
+        self.model_requirements = {}
+        try:
+            with open(self.model_requirements_path, "r") as f:
+                self.model_requirements = json.load(f)
+            logger.info(
+                "Loaded model requirements for %d models", len(self.model_requirements)
+            )
+        except Exception:
+            logger.exception("Failed to load model_requirements.json")
+
         # 🔹 Shared global QuickPodManager
         self.global_qp = QuickPodManager(email, password)
         self._global_qp_lock = asyncio.Lock()
@@ -153,6 +168,87 @@ class PodManager:
     # ---------------------------
     # Pod-lock helpers
     # ---------------------------
+    async def _try_create_pod_on_machine(
+        self,
+        mid: str,
+        model: str,
+        mode: Optional[str],
+        variant: Optional[str],
+        offer_id: int,
+        template_id: str,
+        disk_size: int,
+    ):
+        """
+        Encapsulates create_pod + wait + cleanup behavior.
+        Mark machine bad on ANY failure.
+        Returns pod_uuid on success, else None.
+        """
+
+        logger.info(
+            f"🚀 [try_create] model={model} variant={variant} machine={mid} template={template_id}"
+        )
+
+        try:
+            pod_data = await self._call_with_retry(
+                self.global_qp.create_pod,
+                offer_id,
+                template_id,
+                disk_size,
+            )
+        except Exception as e:
+            logger.warning(f"💥 create_pod failed on {mid}: {e}")
+            self.mark_machine_bad(mid)
+            return None
+
+        # validate response
+        if not isinstance(pod_data, dict):
+            logger.warning(f"⚠️ Invalid pod_data from {mid}, marking bad.")
+            self.mark_machine_bad(mid)
+            return None
+
+        pod_uuid = (
+            pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
+        )
+        if not pod_uuid:
+            logger.warning(f"⚠️ Missing pod_uuid from {mid}, marking bad.")
+            self.mark_machine_bad(mid)
+            return None
+
+        # Register pod locally
+        async with self._lock:
+            self.individual_pods[pod_uuid] = PodInfo(
+                pod_uuid=pod_uuid,
+                model=model,
+                mode=mode,
+                status="starting",
+                created_at=datetime.utcnow(),
+                last_active=datetime.utcnow(),
+                machine_id=mid,
+                meta={"variant": variant},
+            )
+            self.individual_pod_managers[pod_uuid] = QuickPodManager(
+                self.email, self.password, pod_uuid
+            )
+            self._pod_locks[pod_uuid] = asyncio.Lock()
+
+        # Wait for ready
+        start_time = time.time()
+        while time.time() - start_time < self.pod_startup_timeout:
+            if await self.check_pod_ready(pod_uuid):
+                async with self._lock:
+                    self.individual_pods[pod_uuid].status = "ready"
+                await self.mark_image_cached_on_machine(mid, model)
+                logger.info(f"✅ [try_create] pod={pod_uuid} ready on {mid}")
+                return pod_uuid
+
+            await asyncio.sleep(5)
+
+        # Timeout: destroy & blacklist machine
+        logger.error(f"⏳ Startup timeout for {pod_uuid} on {mid}. Destroying pod.")
+        await self.destroy_individual_pod(pod_uuid)
+        self.mark_machine_bad(mid)
+        return None
+
     def _get_pod_lock(self, pod_uuid: str) -> asyncio.Lock:
         """
         Returns or creates a lock for the given pod UUID in a thread-safe way.
@@ -177,6 +273,33 @@ class PodManager:
     # --------------------------------------------------------------------------
     # MACHINE CACHE HELPERS
     # --------------------------------------------------------------------------
+
+    def verify_worker_network_ready(self, worker):
+        """
+        Synchronous reachability check.
+        Uses worker.endpoint exactly as stored in DB.
+        Ensures the worker is alive before dispatching any job.
+        """
+
+        try:
+            base = (worker.endpoint or "").rstrip("/")
+            if not base.startswith("http"):
+                # extremely defensive
+                return False
+
+            url = f"{base}/health"
+            resp = requests.get(url, timeout=5)
+            ok = resp.status_code == 200
+
+            if not ok:
+                logger.debug(f"[verify-network] {url} returned {resp.status_code}")
+
+            return ok
+        except Exception:
+            logger.debug(f"[verify-network] {url} unreachable: {e}")
+
+            return False
+
     async def load_machine_cache(self):
         """Load machine_cache.json from disk (if exists)."""
         async with self._machine_cache_lock:
@@ -520,34 +643,44 @@ class PodManager:
     # --------------------------------------------------------------------------
     # CREATE MACHINE-BASED POD (updated for caching & fallback tracking)
     # --------------------------------------------------------------------------
-
     async def create_machine_based_pod(
         self, model: str, mode: Optional[str] = None
     ) -> Optional[str]:
-        """Create a new machine-based pod, trying priority machines, then cached machines,
-        then global fallback. Blacklists machines on certain failures to avoid immediate retries.
         """
+        Create a new machine-based pod using:
+        1) Preferred machines (MACHINE_PRIORITY_LIST)
+        2) Cached machines sorted by priority & score
+        3) Variant fallback (fp4 → int4, etc.)
+        4) Machine fallback (next preferred)
+        5) Global offer fallback
+
+        Uses _try_create_pod_on_machine() for all attempts.
+        """
+
         await self._ensure_global_login()
 
-        template_id = self._get_template_for_model(model)
-        if not template_id:
-            logger.error(f"No template found for model {model}")
-            return None
+        # -------------------------------
+        # 1) Resolve variant plan
+        # -------------------------------
+        variant_plan = self.get_variant_plan(model)
+        # Example: [("fp4", ["5090"]), ("int4", ["4090"])]
 
-        # Build candidate machine list (str ids), preserving order:
+        # -------------------------------
+        # 2) Build candidate machine list
+        # -------------------------------
         candidates: List[Tuple[str, Optional[str]]] = []
 
-        # 1) machines from MACHINE_PRIORITY_LIST first (as strings)
+        # 2A — priority machines first
         for mid, desc in MACHINE_PRIORITY_LIST:
             candidates.append((str(mid), desc))
 
-        # 2) machines from machine_cache that either have this model cached or are marked priority
+        # 2B — merge cached machines
         try:
             async with self._machine_cache_lock:
                 mc = (
                     self.machine_cache.get("machines", {}) if self.machine_cache else {}
                 )
-                # sort cached machines by (is_priority, score of model if exists, last_seen) descending
+
                 scored = []
                 for mid, info in mc.items():
                     is_pr = info.get("is_priority", False)
@@ -556,252 +689,181 @@ class PodManager:
                     score = model_info.get("score", 0.0)
                     last_seen = info.get("last_seen") or ""
                     scored.append((mid, is_pr, score, last_seen))
-                # prefer is_priority, then higher score, then recent last_seen
+
                 scored.sort(key=lambda x: (not x[1], -x[2], x[3]))
+
                 for mid, is_pr, score, last_seen in scored:
-                    # don't duplicate
                     if str(mid) not in {c[0] for c in candidates}:
                         candidates.append((str(mid), "cached"))
         except Exception:
-            logger.exception(
-                "Error while reading machine cache; proceeding with defaults"
-            )
+            logger.exception("Error reading machine cache; using defaults")
 
-        # dedupe while preserving order
+        # Remove duplicates preserving order
         seen = set()
         candidate_list = []
         for mid, desc in candidates:
-            if mid in seen:
-                continue
-            seen.add(mid)
-            candidate_list.append((mid, desc))
+            if mid not in seen:
+                seen.add(mid)
+                candidate_list.append((mid, desc))
 
         logger.info(
             "Machine candidates for model %s: %s", model, [c[0] for c in candidate_list]
         )
 
-        # Try each candidate machine using QuickPod global API asking for offer for a specific machine (if supported)
-        for candidate_mid, desc in candidate_list:
-            mid = str(candidate_mid)
-            # skip bad machines
-            if self.is_machine_bad(mid):
-                logger.info(f"⛔ Skipping blacklisted machine {mid}")
-                continue
+        # Load metadata snapshot
+        async with self._machine_cache_lock:
+            machine_meta = self.machine_cache.get("machines", {})
 
-            try:
-                # get best offer specifically for this machine (some implementations return tuple)
-                offer_result = await self._call_with_retry(
-                    self.global_qp.get_best_offer, mid
-                )
-                # offer_result may be (offer_id, actual_machine_id) or just offer_id
-                if not offer_result:
-                    logger.debug("No offer for machine %s", mid)
+        # -------------------------------
+        # 3) Variant loop (fp4 → int4 → …)
+        # -------------------------------
+        for variant, allowed_gpus in variant_plan:
+
+            logger.info(f"🔎 Trying variant={variant} for model={model}")
+
+            for candidate_mid, desc in candidate_list:
+                mid = str(candidate_mid)
+
+                # Skip blacklisted
+                if self.is_machine_bad(mid):
                     continue
-                if isinstance(offer_result, tuple):
-                    offer_id, actual_machine_id = offer_result
-                    actual_mid = str(actual_machine_id)
-                else:
-                    offer_id = offer_result
-                    actual_mid = mid
 
-                # if QuickPod returned a different actual machine, normalize that too
-                if actual_mid != mid:
-                    logger.warning(
-                        f"Preferred machine {mid} unavailable; QuickPod suggests {actual_mid} instead"
-                    )
-                    # skip if suggested machine is blacklisted
-                    if self.is_machine_bad(actual_mid):
-                        logger.info(
-                            f"⛔ QuickPod's suggested machine {actual_mid} is blacklisted; skipping"
-                        )
-                        continue
-                    chosen_machine = actual_mid
-                else:
-                    chosen_machine = mid
+                # Meta checks
+                meta = machine_meta.get(mid, {})
+                gpu_name = meta.get("gpu_name", "")
+                gpu_count = meta.get("gpu_count", 1)
+                tflops = meta.get("tflops", 0)
+
+                req = self.model_requirements.get(model, {})
+                min_tflops = req.get("min_tflops", 0)
+                min_gpu_count = req.get("min_gpu_count", 1)
+
+                # GPU name match
+                gpu_name_normal = str(gpu_name).upper()
+                allowed_tokens = [g.upper() for g in (allowed_gpus or [])]
+
+                if allowed_tokens and not any(
+                    tok in gpu_name_normal for tok in allowed_tokens
+                ):
+                    continue
+
+                # Resource checks
+                if tflops < min_tflops or gpu_count < min_gpu_count:
+                    continue
 
                 logger.info(
-                    f"🚀 Creating pod for {model} on machine {chosen_machine} (candidate {mid}, desc={desc})"
+                    f"📌 Candidate {mid} matches variant={variant}, model={model}"
                 )
-                pod_data = await self._call_with_retry(
-                    self.global_qp.create_pod,
+
+                # ---- get best offer for this machine ----
+                try:
+                    offer = await self._call_with_retry(
+                        self.global_qp.get_best_offer, mid
+                    )
+                except Exception as e:
+                    logger.warning(f"Offer fetch failed on {mid}: {e}")
+                    continue
+
+                if not offer:
+                    continue
+
+                if isinstance(offer, tuple):
+                    offer_id, actual_mid = offer
+                    actual_mid = str(actual_mid)
+                else:
+                    offer_id = offer
+                    actual_mid = mid
+
+                # ---- template & disk for this variant ----
+                template_id = self.get_template_for_variant(model, variant)
+                disk_size = self.get_disk_size_for_variant(model, variant)
+
+                if not template_id:
+                    logger.warning(
+                        "Skipping machine %s because template for variant=%s not found",
+                        actual_mid,
+                        variant,
+                    )
+                    continue
+
+                # ---- Attempt pod creation using helper ----
+                pod_uuid = await self._try_create_pod_on_machine(
+                    actual_mid,
+                    model,
+                    mode,
+                    variant,
                     offer_id,
                     template_id,
-                    self.template_disk_size.get(model, 100),
+                    disk_size,
                 )
-                if not isinstance(pod_data, dict):
-                    logger.warning(
-                        "create_pod returned unexpected type for machine %s",
-                        chosen_machine,
-                    )
-                    continue
 
-                pod_uuid = (
-                    pod_data.get("pod_uuid")
-                    or pod_data.get("uuid")
-                    or pod_data.get("id")
-                )
-                if not pod_uuid:
-                    logger.warning(
-                        "No pod uuid returned for machine %s", chosen_machine
-                    )
-                    continue
+                if pod_uuid:
+                    return pod_uuid
 
-                # register pod
-                # create pod-info and its pod-lock while holding self._lock to avoid races
-                async with self._lock:
-                    self.individual_pods[pod_uuid] = PodInfo(
-                        pod_uuid=pod_uuid,
-                        model=model,
-                        mode=mode,
-                        status="starting",
-                        created_at=datetime.utcnow(),
-                        last_active=datetime.utcnow(),
-                        machine_id=str(chosen_machine),
-                    )
-                    self.individual_pod_managers[pod_uuid] = QuickPodManager(
-                        self.email, self.password, pod_uuid
-                    )
-                    # Create the per-pod lock synchronously here (safe because we hold self._lock)
-                    self._pod_locks[pod_uuid] = asyncio.Lock()
-
-                # wait for worker registration
-                start_time = time.time()
-                while time.time() - start_time < self.pod_startup_timeout:
-                    if await self.check_pod_ready(pod_uuid):
-                        async with self._lock:
-                            self.individual_pods[pod_uuid].status = "ready"
-                        # record cache that image is on this machine (best-effort)
-                        try:
-                            await self.mark_image_cached_on_machine(
-                                str(chosen_machine), model
-                            )
-                        except Exception:
-                            logger.debug(
-                                "mark_image_cached_on_machine failed, continuing"
-                            )
-                        logger.info(
-                            "✅ Pod %s ready on machine %s for %s",
-                            pod_uuid,
-                            chosen_machine,
-                            model,
-                        )
-                        return pod_uuid
-                    await asyncio.sleep(5)
-
-                # startup timeout: destroy and mark machine bad to avoid immediate retry
-                logger.error(
-                    "Pod %s startup timeout on machine %s; destroying pod and marking machine bad",
-                    pod_uuid,
-                    chosen_machine,
-                )
-                try:
-                    await self.destroy_individual_pod(pod_uuid)
-                except Exception:
-                    logger.exception("Failed to destroy timed out pod %s", pod_uuid)
-
-                # mark machine bad on startup timeout
-                try:
-                    self.mark_machine_bad(chosen_machine)
-                except Exception:
-                    logger.exception(
-                        "Failed to mark machine bad after timeout: %s", chosen_machine
-                    )
-
-            except RuntimeError as re:
-                msg = str(re).lower()
-                logger.exception(
-                    "Runtime error creating pod on candidate %s: %s", mid, re
-                )
-                # if DB or transient error - skip candidate; if repeated errors occur we will fallback
-                # Optionally mark machine bad for non-transient errors
-                continue
-            except Exception as e:
-                logger.exception(
-                    "Unexpected error creating pod on candidate %s: %s", mid, e
-                )
-                # mark candidate as bad to avoid retrying aggressively
-                try:
-                    self.mark_machine_bad(mid)
-                except Exception:
-                    pass
-                continue
-
-        # Global fallback: ask for the best offer without preferred machine
+        # -------------------------------
+        # 4) GLOBAL FALLBACK
+        # -------------------------------
         try:
             logger.warning(
-                "⚠️ All preferred/cached machines exhausted. Trying global fallback offer..."
+                "⚠️ All preferred machines exhausted. Trying global fallback offer..."
             )
-            offer = await self._call_with_retry(self.global_qp.get_best_offer)
-            if not offer:
+            global_offer = await self._call_with_retry(self.global_qp.get_best_offer)
+
+            if not global_offer:
                 logger.error("❌ No global fallback offer available.")
                 return None
 
-            if isinstance(offer, tuple):
-                global_offer_id, fallback_machine_id = offer
-                fallback_mid = str(fallback_machine_id) if fallback_machine_id else None
+            if isinstance(global_offer, tuple):
+                offer_id, fallback_mid = global_offer
+                fallback_mid = str(fallback_mid)
             else:
-                global_offer_id = offer
+                offer_id = global_offer
                 fallback_mid = None
 
             if fallback_mid and self.is_machine_bad(fallback_mid):
                 logger.error(
-                    f"❌ Global fallback machine {fallback_mid} is blacklisted. Aborting fallback."
+                    f"❌ Global fallback machine {fallback_mid} is blacklisted."
                 )
                 return None
 
-            pod_data = await self._call_with_retry(
-                self.global_qp.create_pod,
-                global_offer_id,
+            # Choose template using preferred variant (first in plan)
+            if variant_plan:
+                primary_variant = variant_plan[0][0]
+                template_id = self.get_template_for_variant(model, primary_variant)
+                disk_size = self.get_disk_size_for_variant(model, primary_variant)
+            else:
+                template_id = self._get_template_for_model(model)
+                disk_size = self.template_disk_size.get(model, 100)
+
+            if not template_id:
+                template_id = self._get_template_for_model(model)
+                if not template_id:
+                    logger.error("No fallback template for model %s", model)
+                    return None
+
+            final_mid = fallback_mid or "fallback"
+
+            pod_uuid = await self._try_create_pod_on_machine(
+                final_mid,
+                model,
+                mode,
+                primary_variant if variant_plan else None,
+                offer_id,
                 template_id,
-                self.template_disk_size.get(model, 100),
+                disk_size,
             )
-            if not isinstance(pod_data, dict):
-                logger.error("Invalid fallback pod creation response.")
-                return None
-            pod_uuid = (
-                pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
-            )
-            if not pod_uuid:
-                logger.error("No pod UUID returned for fallback pod creation.")
-                return None
 
-            chosen_mid = fallback_mid or "fallback"
-            async with self._lock:
-                self.individual_pods[pod_uuid] = PodInfo(
-                    pod_uuid=pod_uuid,
-                    model=model,
-                    mode=mode,
-                    status="starting",
-                    created_at=datetime.utcnow(),
-                    last_active=datetime.utcnow(),
-                    machine_id=str(chosen_mid),
-                )
-                self.individual_pod_managers[pod_uuid] = QuickPodManager(
-                    self.email, self.password, pod_uuid
-                )
-                # Create per-pod lock while holding self._lock
-                self._pod_locks[pod_uuid] = asyncio.Lock()
+            if pod_uuid:
+                logger.info("✅ Fallback pod %s ready for %s", pod_uuid, model)
+                return pod_uuid
 
-            start_time = time.time()
-            while time.time() - start_time < self.pod_startup_timeout:
-                if await self.check_pod_ready(pod_uuid):
-                    async with self._lock:
-                        self.individual_pods[pod_uuid].status = "ready"
-                    logger.info("✅ Fallback pod %s ready for %s", pod_uuid, model)
-                    return pod_uuid
-                await asyncio.sleep(5)
-
-            logger.error("⚠️ Fallback pod %s startup timeout for %s", pod_uuid, model)
-            try:
-                await self.destroy_individual_pod(pod_uuid)
-            except Exception:
-                pass
+            logger.error("⚠️ Global fallback pod startup failed.")
             if fallback_mid:
                 self.mark_machine_bad(fallback_mid)
             return None
 
         except Exception as e:
-            logger.exception("⚠️ Global fallback path failed for %s: %s", model, e)
+            logger.exception("⚠️ Global fallback failed for %s: %s", model, e)
             return None
 
     # --------------------------------------------------------------------------
@@ -894,9 +956,15 @@ class PodManager:
                 raise RuntimeError("Maximum number of individual pods reached")
 
         try:
-            offer_id = await self._call_with_retry(self.global_qp.get_best_offer)
-            if not offer_id:
+            offer = await self._call_with_retry(self.global_qp.get_best_offer)
+            if not offer:
                 raise RuntimeError("No offer returned by QuickPod")
+
+            # handle either (offer_id, machine_id) tuple or scalar
+            if isinstance(offer, tuple):
+                offer_id = offer[0]
+            else:
+                offer_id = offer
 
             template_uuid = self._get_template_for_model(model)
             pod_data = await self._call_with_retry(
@@ -1081,6 +1149,62 @@ class PodManager:
     # --------------------------------------------------------------------------
     # HELPERS
     # --------------------------------------------------------------------------
+
+    def get_template_for_variant(self, model: str, variant: str):
+        """
+        Reads variant->template mapping from model_requirements.json
+        """
+        req = self.model_requirements.get(model)
+        if not req:
+            return self._get_template_for_model(model)
+
+        mapping = req.get("variant_template_key", {})
+        key = mapping.get(variant)
+        if not key:
+            return self._get_template_for_model(model)
+
+        template_id = self.template_uuids.get(key)
+        if not template_id:
+            logger.error(f"Template UUID not found for key {key}")
+        return template_id
+
+    def get_disk_size_for_variant(self, model: str, variant: str):
+        req = self.model_requirements.get(model)
+        if not req:
+            return self.template_disk_size.get(model, 60)
+
+        vmap = req.get("variant_disk_size", {})
+        return vmap.get(variant, self.template_disk_size.get(model, 60))
+
+    def get_variant_plan(self, model: str):
+        """
+        Returns ordered list of variant steps.
+        Example:
+        [
+            ("fp4", ["5090"]),
+            ("int4", ["4090"])
+        ]
+        """
+        req = self.model_requirements.get(model)
+        if not req:
+            return [(None, None)]  # model has no variants
+
+        preferred = req.get("preferred_variant")
+        fallbacks = req.get("fallback_variants", [])
+        allowed_gpus = req.get("allowed_gpu_names", [])
+
+        plan = []
+
+        if preferred:
+            # Preferred GPUs for preferred variant
+            plan.append((preferred, allowed_gpus))
+
+        # Fallback variants—each uses allowed_gpus list
+        for fb in fallbacks:
+            plan.append((fb, allowed_gpus))
+
+        return plan
+
     def _get_template_for_model(self, model: str) -> Optional[str]:
         return self.template_uuids.get(model) or self.template_uuids.get("default")
 
@@ -1096,14 +1220,19 @@ class PodManager:
         pod_info.unique_job_ids.add(job_id)
         pod_info.job_id_counts[job_id] = pod_info.job_id_counts.get(job_id, 0) + 1
 
-    async def check_pod_ready(self, pod_uuid: str) -> bool:
+    async def check_pod_ready(self, pod_uuid):
         from db import SessionLocal, Worker
 
         with SessionLocal() as db:
             w = db.query(Worker).filter(Worker.container_id == pod_uuid).first()
-            if w and w.status in ("ready", "processing"):
-                return True
-        return False
+            if not w:
+                return False
+
+            # NEW: deep readiness check
+            if not await asyncio.to_thread(self.verify_worker_network_ready, w):
+                return False
+
+            return True
 
     async def add_pending_job(self, job_id: str, model: str):
         async with self._jobs_lock:

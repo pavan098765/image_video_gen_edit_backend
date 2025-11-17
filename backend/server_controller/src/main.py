@@ -4,7 +4,7 @@ import uuid
 import asyncio
 import logging
 import json
-import aiohttp
+import anyio
 from fastapi.responses import StreamingResponse
 import requests
 from datetime import datetime, timedelta
@@ -169,7 +169,7 @@ BANS_FILE = Path(Path(__file__).parent, "banned_ips.json")
 BLOCKED_METHODS = {"PROPFIND", "CONNECT", "TRACE", "TRACK", "PRI"}
 BLOCK_EMPTY_UA = True
 BAN_DURATION = 300  # seconds (temporary ban default)
-RATE_LIMIT = 20  # requests per minute per IP
+RATE_LIMIT = 40  # requests per minute per IP
 MAX_BODY_SIZE = 10_000_000  # 10 MB
 SUSPICIOUS_SCORE_THRESHOLD = 5  # heuristic ban trigger
 PERMANENT_BAN_ON_THRESHOLD = (
@@ -394,16 +394,6 @@ async def increase_suspicion(ip: str, amount: int, reason: str):
             permanent=PERMANENT_BAN_ON_THRESHOLD,
         )
 
-
-# def increase_suspicion(ip: str, amount: int, reason: str):
-#     score = ip_suspicion_score.get(ip, 0) + amount
-#     ip_suspicion_score[ip] = score
-#     security_logger.info(f"Suspicion {score}/{SUSPICIOUS_SCORE_THRESHOLD} for {ip} — {reason}")
-#     if score >= SUSPICIOUS_SCORE_THRESHOLD:
-#         # default: make permanent ban if configured
-#         asyncio.create_task(ban_ip(ip, f"suspicious behavior (score={score})", permanent=PERMANENT_BAN_ON_THRESHOLD))
-
-
 def add_trusted_worker_ip(ip: str):
     """Mark an IP trusted for some TTL (used when a worker registers)."""
     trusted_worker_ips[ip] = _now_ts() + TRUSTED_WORKER_IP_TTL_SECONDS
@@ -459,7 +449,7 @@ async def aggressive_security_middleware(request: Request, call_next):
         return Response("Access Denied", status_code=403)
 
     # Rate limiting applies to everyone (including workers)
-    if not check_rate_limit(ip):
+    if not path.startswith("/job_status") and not check_rate_limit(ip):
         # temporary ban for rate limit abuse
         await ban_ip(ip, "rate limit exceeded", duration=BAN_DURATION, permanent=False)
         return Response("Too Many Requests", status_code=429)
@@ -739,6 +729,7 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
     try:
         job = db.query(Job).filter(Job.job_id == job_id).first()
         worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+
         if not job or not worker:
             logger.error(
                 "Job or Worker not found (job=%s, worker=%s)", job_id, worker_id
@@ -751,12 +742,16 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
             "model": job.model,
             "mode": job.params.get("mode"),
             "params": job.params,
-            "upload_url": presigned_url,  # <-- worker gets this
-            "result_key": job.result_r2_key,  # optional, for reference
+            "upload_url": presigned_url,
+            "result_key": job.result_r2_key,
         }
 
         url = f"{worker.endpoint.rstrip('/')}/run"
         max_attempts = 5
+
+        # ----------------------------------------------------
+        # DISPATCH LOOP (retry 5 times)
+        # ----------------------------------------------------
         for attempt in range(max_attempts):
             try:
                 resp = requests.post(url, json=run_payload, timeout=10)
@@ -766,61 +761,86 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
                 if attempt < max_attempts - 1:
                     wait = 3 * (attempt + 1)
                     logger.warning(
-                        f"Attempt {attempt+1}/{max_attempts} failed to push job {job_id} to {url}: {e}. Retrying in {wait}s..."
+                        f"Attempt {attempt+1}/{max_attempts} failed to push job {job_id} "
+                        f"to {url}: {e}. Retrying in {wait}s..."
                     )
                     time.sleep(wait)
                     continue
-                else:
-                    logger.error(
-                        f"❌ Failed to push job {job_id} to worker {worker_id} after {max_attempts} attempts: {e}"
-                    )
-                    job_manager.update_job_state(
-                        job.job_id, JobState.FAILED, f"Dispatch error: {e}", force=True
-                    )
-                    if worker:
-                        worker.status = "terminated"
-                        db.commit()
-                        try:
-                            machine_id = getattr(worker, "machine_id", None)
-                            if machine_id:
-                                logger.warning(
-                                    "Marking machine %s bad due to repeated dispatch failures",
-                                    machine_id,
-                                )
-                                # pod_manager is available in module scope
-                                pod_manager.mark_machine_bad(str(machine_id))
-                        except Exception:
-                            logger.exception(
-                                "Failed to mark machine bad after dispatch failure"
-                            )
-                        # also try to destroy the pod to avoid re-registration
-                        try:
-                            if getattr(worker, "container_id", None):
-                                asyncio.create_task(
-                                    pod_manager.destroy_individual_pod(
-                                        worker.container_id
-                                    )
-                                )
-                        except Exception:
-                            logger.exception(
-                                "Failed to destroy pod after dispatch failure"
-                            )
-                    return
 
+                # ------------------------------------------------
+                # FINAL FAILURE AFTER RETRIES
+                # ------------------------------------------------
+                logger.error(
+                    f"❌ Failed to push job {job_id} to worker {worker_id} after {max_attempts} attempts: {e}"
+                )
+
+                # Force job into FAILED
+                job_manager.update_job_state(
+                    job.job_id,
+                    JobState.FAILED,
+                    f"Dispatch error: {e}",
+                    force=True
+                )
+
+                # ------------------------------------------------
+                # MARK MACHINE BAD
+                # ------------------------------------------------
+                machine_id = getattr(worker, "machine_id", None)
+                if machine_id:
+                    try:
+                        logger.warning(
+                            "⚠️ Marking machine %s bad due to repeated dispatch failures",
+                            machine_id,
+                        )
+                        pod_manager.mark_machine_bad(str(machine_id))
+                    except Exception:
+                        logger.exception("Failed to mark machine bad")
+
+                # ------------------------------------------------
+                # SAFELY DESTROY POD (even in AnyIO worker thread)
+                # ------------------------------------------------
+                container_id = getattr(worker, "container_id", None)
+                if container_id:
+                    try:
+                        anyio.from_thread.run(
+                            pod_manager.destroy_individual_pod,
+                            container_id
+                        )
+                        logger.info(
+                            "Scheduled destroy_individual_pod via anyio.from_thread.run "
+                            f"(container_id={container_id})"
+                        )
+                    except Exception:
+                        logger.exception("Failed to schedule destroy_individual_pod")
+
+                # DO NOT mark worker terminated here; reaper handles cleanup
+                return
+
+        # ----------------------------------------------------
+        # SUCCESSFUL DISPATCH
+        # ----------------------------------------------------
         job.worker_id = worker.worker_id
         job_manager.update_job_state(job.job_id, JobState.RUNNING, force=True)
-        if worker.is_warm_pod:
-            worker.status = "processing"
-        else:
-            worker.status = "busy"
+
+        worker.status = "processing" if worker.is_warm_pod else "busy"
         worker.last_active = datetime.utcnow()
+
         db.commit()
+
         logger.info(
-            "Dispatched job %s to worker %s (%s)", job_id, worker_id, worker.endpoint
+            "Dispatched job %s to worker %s (%s)",
+            job_id,
+            worker_id,
+            worker.endpoint,
         )
+
     except Exception:
         db.rollback()
-        logger.exception("Error assigning job %s to worker %s", job_id, worker_id)
+        logger.exception(
+            "Error assigning job %s to worker %s",
+            job_id,
+            worker_id
+        )
     finally:
         db.close()
 
@@ -828,6 +848,7 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
 # ------------------------
 # Background Tasks
 # ------------------------
+
 
 async def idle_worker_reaper_task():
     """
@@ -860,9 +881,7 @@ async def idle_worker_reaper_task():
 
         try:
             workers = (
-                db.query(Worker)
-                .filter(Worker.status.in_(STATUSES_TO_CONSIDER))
-                .all()
+                db.query(Worker).filter(Worker.status.in_(STATUSES_TO_CONSIDER)).all()
             )
 
             for w in workers:
@@ -880,7 +899,11 @@ async def idle_worker_reaper_task():
                                 await pod_manager.destroy_individual_pod(w.container_id)
                                 stale_count += 1
                             except Exception as e:
-                                logger.error("Destroy failed for stale pod %s: %s", w.container_id, e)
+                                logger.error(
+                                    "Destroy failed for stale pod %s: %s",
+                                    w.container_id,
+                                    e,
+                                )
                         # mark offline and commit safely
                         w.status = "offline"
                         try:
@@ -916,20 +939,36 @@ async def idle_worker_reaper_task():
                     if (not active_jobs) or (active_jobs and not recent_jobs):
                         # safe to reap/stop this worker/pod
                         if getattr(w, "is_warm_pod", False):
-                            logger.info("💤 Idle warm pod %s (worker=%s) → stopping", w.container_id, w.worker_id)
+                            logger.info(
+                                "💤 Idle warm pod %s (worker=%s) → stopping",
+                                w.container_id,
+                                w.worker_id,
+                            )
                             try:
                                 await pod_manager.stop_warm_pod(w.container_id)
                             except Exception as e:
-                                logger.warning("Failed to stop warm pod %s: %s", w.container_id, e)
+                                logger.warning(
+                                    "Failed to stop warm pod %s: %s", w.container_id, e
+                                )
                         else:
                             # machine-based or individual pod: destroy
                             if getattr(w, "container_id", None):
-                                logger.info("💤 Idle pod %s (worker=%s) → destroying", w.container_id, w.worker_id)
+                                logger.info(
+                                    "💤 Idle pod %s (worker=%s) → destroying",
+                                    w.container_id,
+                                    w.worker_id,
+                                )
                                 try:
-                                    await pod_manager.destroy_individual_pod(w.container_id)
+                                    await pod_manager.destroy_individual_pod(
+                                        w.container_id
+                                    )
                                     idle_count += 1
                                 except Exception as e:
-                                    logger.warning("Destroy failed for idle pod %s: %s", w.container_id, e)
+                                    logger.warning(
+                                        "Destroy failed for idle pod %s: %s",
+                                        w.container_id,
+                                        e,
+                                    )
 
                         # update state in DB
                         w.status = "offline"
@@ -946,10 +985,18 @@ async def idle_worker_reaper_task():
                         )
 
                 except Exception as e:
-                    logger.error("Reaper error on worker %s: %s", getattr(w, "worker_id", None), e)
+                    logger.error(
+                        "Reaper error on worker %s: %s",
+                        getattr(w, "worker_id", None),
+                        e,
+                    )
                     db.rollback()
 
-            logger.info("Reaper sweep complete → %d stale, %d idle reaped", stale_count, idle_count)
+            logger.info(
+                "Reaper sweep complete → %d stale, %d idle reaped",
+                stale_count,
+                idle_count,
+            )
 
         except Exception as e:
             logger.error("Reaper loop error: %s", e)
