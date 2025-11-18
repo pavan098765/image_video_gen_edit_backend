@@ -1,5 +1,6 @@
 import os
 import re
+import traceback
 import uuid
 import asyncio
 import logging
@@ -394,6 +395,7 @@ async def increase_suspicion(ip: str, amount: int, reason: str):
             permanent=PERMANENT_BAN_ON_THRESHOLD,
         )
 
+
 def add_trusted_worker_ip(ip: str):
     """Mark an IP trusted for some TTL (used when a worker registers)."""
     trusted_worker_ips[ip] = _now_ts() + TRUSTED_WORKER_IP_TTL_SECONDS
@@ -776,10 +778,7 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
 
                 # Force job into FAILED
                 job_manager.update_job_state(
-                    job.job_id,
-                    JobState.FAILED,
-                    f"Dispatch error: {e}",
-                    force=True
+                    job.job_id, JobState.FAILED, f"Dispatch error: {e}", force=True
                 )
 
                 # ------------------------------------------------
@@ -803,8 +802,7 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
                 if container_id:
                     try:
                         anyio.from_thread.run(
-                            pod_manager.destroy_individual_pod,
-                            container_id
+                            pod_manager.destroy_individual_pod, container_id
                         )
                         logger.info(
                             "Scheduled destroy_individual_pod via anyio.from_thread.run "
@@ -834,13 +832,9 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
             worker.endpoint,
         )
 
-    except Exception:
+    except Exception as e:
         db.rollback()
-        logger.exception(
-            "Error assigning job %s to worker %s",
-            job_id,
-            worker_id
-        )
+        logger.exception(f"Error assigning job {job_id} to worker {worker_id}: {e}")
     finally:
         db.close()
 
@@ -859,9 +853,9 @@ async def idle_worker_reaper_task():
     """
     # Prefer env-driven values or keep these defaults
     HEARTBEAT_STALE_SECS = int(os.getenv("HEARTBEAT_STALE_SECS", "90"))
-    IDLE_TIMEOUT_SECS = int(os.getenv("IDLE_TIMEOUT_SECS", "120"))
+    IDLE_TIMEOUT_SECS = int(os.getenv("IDLE_TIMEOUT_SECS", "10"))
     SWEEP_INTERVAL_SECS = int(os.getenv("REAPER_SWEEP_INTERVAL_SECS", "30"))
-
+    logger.info(f"IDLE_TIMEOUT_SECS {IDLE_TIMEOUT_SECS}")
     # Include any worker statuses your system uses that should be considered by the reaper
     STATUSES_TO_CONSIDER = ["ready", "busy", "processing"]
 
@@ -875,7 +869,6 @@ async def idle_worker_reaper_task():
         db = SessionLocal()
         now = datetime.utcnow()
         stale_cutoff = now - timedelta(seconds=HEARTBEAT_STALE_SECS)
-        idle_cutoff = now - timedelta(seconds=IDLE_TIMEOUT_SECS)
         stale_count = 0
         idle_count = 0
 
@@ -912,6 +905,79 @@ async def idle_worker_reaper_task():
                             db.rollback()
                         continue
 
+                    # ---------------------------------------------
+                    # READY → IDLE / DESTROY LOGIC (CORRECTED)
+                    # ---------------------------------------------
+                    if w.status == "ready":
+
+                        # 1. If any pending jobs exist for this model → keep alive
+                        pending_jobs = (
+                            db.query(Job)
+                            .filter(
+                                Job.model == w.model,
+                                Job.status.in_([JobState.QUEUED.value, JobState.DISPATCHING.value])
+                            )
+                            .count()
+                        )
+
+                        if pending_jobs > 0:
+                            logger.debug(
+                                "READY worker %s kept alive: pending jobs exist for model=%s",
+                                w.worker_id, w.model
+                            )
+                            continue
+
+                        # 2. Compute real idle time based on last completed job
+                        last_done = (
+                            w.last_job_finished_at or
+                            w.created_at or
+                            w.last_active
+                        )
+                        idle_for = (now - last_done).total_seconds()
+
+                        # 3. If idle_for exceeds timeout → destroy pod
+                        if idle_for > IDLE_TIMEOUT_SECS:
+                            logger.info(
+                                "💤 READY worker %s idle for %.1f seconds (limit=%s) → destroying pod %s",
+                                w.worker_id, idle_for, IDLE_TIMEOUT_SECS, w.container_id
+                            )
+                            try:
+                                if getattr(w, "container_id", None):
+                                    await pod_manager.destroy_individual_pod(w.container_id)
+                                    w.status = "offline"
+                                    db.commit()
+                                    idle_count += 1
+                            except Exception as e:
+                                logger.error(
+                                    "Destroy failed for READY-idle pod %s: %s",
+                                    w.container_id, e
+                                )
+                                db.rollback()
+                            continue
+
+                        # 4. Otherwise, still within idle window → keep alive
+                        logger.debug(
+                            "READY worker %s idle_for=%.1f < timeout=%s → keeping",
+                            w.worker_id, idle_for, IDLE_TIMEOUT_SECS
+                        )
+                        continue
+
+                    # Worker must explicitly be idle to be reaped
+                    if w.status != "idle":
+                        logger.debug(
+                            "Worker %s not idle (status=%s) → skip idle check",
+                            w.worker_id,
+                            w.status,
+                        )
+                        continue
+
+                    # Grace window before destroying
+                    if (now - w.last_active).total_seconds() < 5:
+                        logger.debug(
+                            "Worker %s recently active → skip destroy", w.worker_id
+                        )
+                        continue
+
                     # IDLE: find any active jobs attached to this worker
                     active_jobs = (
                         db.query(Job)
@@ -927,6 +993,27 @@ async def idle_worker_reaper_task():
                         )
                         .all()
                     )
+
+                    # Pending ANY jobs for this model (unassigned jobs)
+                    pending_jobs = (
+                        db.query(Job)
+                        .filter(
+                            Job.model == w.model,
+                            Job.status.in_(
+                                [JobState.QUEUED.value, JobState.DISPATCHING.value]
+                            ),
+                        )
+                        .count()
+                    )
+
+                    # If pending jobs exist → keep pod alive
+                    if pending_jobs > 0:
+                        logger.debug(
+                            "Worker %s skipped — pending jobs exist for model=%s",
+                            w.worker_id,
+                            w.model,
+                        )
+                        continue
 
                     # If there are active jobs, treat them as "recent" only if updated_at is recent.
                     recent_jobs = []
@@ -1430,6 +1517,7 @@ async def job_complete(payload: JobCompletePayload):
                         else:
                             # Machine-based or warm pod → keep alive
                             worker.status = "ready"
+                            worker.last_job_finished_at = datetime.utcnow()
                             logger.info(
                                 "Keeping machine-based/warm pod %s (worker=%s) alive for reuse",
                                 container_id,
@@ -1484,29 +1572,6 @@ async def job_complete(payload: JobCompletePayload):
 
     finally:
         db.close()
-
-
-# @app.post("/heartbeat")
-# async def heartbeat(request: Request):
-#     body = await request.body()
-#     sig = request.headers.get("X-Signature", "")
-#     if not verify_signature(sig, body):
-#         raise HTTPException(status_code=401, detail="Invalid signature")
-
-#     data = json.loads(body)
-#     worker_id = data.get("worker_id")
-#     if not worker_id:
-#         raise HTTPException(status_code=400, detail="Missing worker_id")
-
-#     with SessionLocal() as db:
-#         w = db.query(Worker).filter(Worker.worker_id == worker_id).first()
-#         if not w:
-#             raise HTTPException(status_code=404, detail="Worker not found")
-#         w.last_heartbeat = datetime.utcnow()
-#         w.last_active = datetime.utcnow()
-#         db.commit()
-
-#     return {"status": "ok"}
 
 
 @app.post("/heartbeat")
@@ -1758,6 +1823,7 @@ async def submit(
 
     except Exception as e:
         logger.error("Failed to dispatch job %s: %s", job_id, e)
+        logger.error(traceback.format_exc())
         print()
         db = SessionLocal()
         try:

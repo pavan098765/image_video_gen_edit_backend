@@ -295,7 +295,7 @@ class PodManager:
                 logger.debug(f"[verify-network] {url} returned {resp.status_code}")
 
             return ok
-        except Exception:
+        except Exception as e:
             logger.debug(f"[verify-network] {url} unreachable: {e}")
 
             return False

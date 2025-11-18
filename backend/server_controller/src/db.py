@@ -44,6 +44,7 @@ class Worker(Base):
     last_active = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_job_finished_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Resource/metrics fields
     resource_metrics = Column(JSON, nullable=True)  # JSON dict of metrics
