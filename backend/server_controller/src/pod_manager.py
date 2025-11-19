@@ -20,6 +20,10 @@ class PodStrategyType(str, enum.Enum):
     WARM_AND_INDIVIDUAL = "warm_and_individual"
     MACHINE_BASED = "machine_based"
 
+class QuickPodAPIFatalError(Exception):
+    """Raised when QuickPod API returned an unrecoverable error (e.g., 406 DB error)."""
+    pass
+
 
 MACHINE_PRIORITY_LIST: List[Tuple[str, str]] = [
     ("14790", "4x 5090"),
@@ -90,6 +94,13 @@ class PodManager:
             "qwen_image_edit": os.getenv("QWEN_IMAGE_EDIT_TEMPLATE_UUID"),
             "qwen_image_edit_2509": os.getenv("QWEN_IMAGE_EDIT_2509_TEMPLATE_UUID"),
             "flux_kontext_dev": os.getenv("FLUX_KONTEXT_DEV_TEMPLATE_UUID"),
+            "qwen_image": os.getenv("QWEN_IMAGE_TEMPLATE_UUID"),
+            "qwen_image_edit_int4": os.getenv("QWEN_IMAGE_INT4_TEMPLATE_UUID"),
+            "qwen_image_edit_2509_int4": os.getenv(
+                "QWEN_IMAGE_EDIT_2509_INT4_TEMPLATE_UUID"
+            ),
+            "flux_kontext_dev_int4": os.getenv("FLUX_KONTEXT_DEV_INT4_TEMPLATE_UUID"),
+            "qwen_image_edit_int4": os.getenv("QWEN_IMAGE_EDIT_INT4_TEMPLATE_UUID"),
             "fastwan_21_1b": os.getenv("FASTWAN_21_1B_TEMPLATE_UUID"),
             "fastwan_22_5b": os.getenv("FASTWAN_22_5B_TEMPLATE_UUID"),
             "aurasrv2": os.getenv("AURASRV2_TEMPLATE_UUID"),
@@ -106,6 +117,10 @@ class PodManager:
             "qwen_image_edit": 80,
             "qwen_image_edit_2509": 85,
             "flux_kontext_dev": 45,
+            "qwen_imag_int4e": 80,
+            "qwen_image_edit_int4": 80,
+            "qwen_image_edit_2509_int4": 85,
+            "flux_kontext_dev_int4": 45,
             "fastwan_21_1b": 60,
             "fastwan_22_5b": 60,
             "aurasrv2": 30,
@@ -180,7 +195,9 @@ class PodManager:
     ):
         """
         Encapsulates create_pod + wait + cleanup behavior.
-        Mark machine bad on ANY failure.
+        For QuickPod fatal errors (406) do NOT mark machine bad, return None.
+        On other failures, mark machine bad.
+        On startup timeout: check DB for a registered worker for this pod_uuid BEFORE destroying.
         Returns pod_uuid on success, else None.
         """
 
@@ -188,6 +205,7 @@ class PodManager:
             f"🚀 [try_create] model={model} variant={variant} machine={mid} template={template_id}"
         )
 
+        # create pod
         try:
             pod_data = await self._call_with_retry(
                 self.global_qp.create_pod,
@@ -195,9 +213,20 @@ class PodManager:
                 template_id,
                 disk_size,
             )
+        except QuickPodAPIFatalError as e:
+            logger.error(
+                "QuickPod fatal error while creating pod on %s (not marking machine bad): %s",
+                mid,
+                e,
+            )
+            return None
         except Exception as e:
             logger.warning(f"💥 create_pod failed on {mid}: {e}")
-            self.mark_machine_bad(mid)
+            # conservative: mark machine bad for general failures
+            try:
+                self.mark_machine_bad(mid)
+            except Exception:
+                logger.exception("Failed to mark machine bad for %s", mid)
             return None
 
         # validate response
@@ -206,15 +235,13 @@ class PodManager:
             self.mark_machine_bad(mid)
             return None
 
-        pod_uuid = (
-            pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
-        )
+        pod_uuid = pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
         if not pod_uuid:
             logger.warning(f"⚠️ Missing pod_uuid from {mid}, marking bad.")
             self.mark_machine_bad(mid)
             return None
 
-        # Register pod locally
+        # Register pod locally (starting)
         async with self._lock:
             self.individual_pods[pod_uuid] = PodInfo(
                 pod_uuid=pod_uuid,
@@ -231,23 +258,66 @@ class PodManager:
             )
             self._pod_locks[pod_uuid] = asyncio.Lock()
 
-        # Wait for ready
+        # Wait for ready with checks. If startup timeout elapses, verify DB to avoid race.
         start_time = time.time()
         while time.time() - start_time < self.pod_startup_timeout:
-            if await self.check_pod_ready(pod_uuid):
-                async with self._lock:
-                    self.individual_pods[pod_uuid].status = "ready"
-                await self.mark_image_cached_on_machine(mid, model)
-                logger.info(f"✅ [try_create] pod={pod_uuid} ready on {mid}")
-                return pod_uuid
+            try:
+                if await self.check_pod_ready(pod_uuid):
+                    async with self._lock:
+                        self.individual_pods[pod_uuid].status = "ready"
+                    # cache that the image/template is present on machine
+                    await self.mark_image_cached_on_machine(mid, model)
+                    logger.info(f"✅ [try_create] pod={pod_uuid} ready on {mid}")
+                    return pod_uuid
+            except Exception as e:
+                logger.warning("Error during pod readiness check for %s: %s", pod_uuid, e)
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
 
-        # Timeout: destroy & blacklist machine
-        logger.error(f"⏳ Startup timeout for {pod_uuid} on {mid}. Destroying pod.")
-        await self.destroy_individual_pod(pod_uuid)
-        self.mark_machine_bad(mid)
+        # Startup timeout reached — BEFORE destroying, check DB for worker registration (race protection)
+        logger.error(f"⏳ Startup timeout for {pod_uuid} on {mid}. Verifying registration before destroying.")
+        try:
+            from db import SessionLocal, Worker
+
+            with SessionLocal() as db:
+                w = db.query(Worker).filter(Worker.container_id == pod_uuid).first()
+                if w:
+                    # A worker row exists for this pod_uuid — don't destroy immediately.
+                    # If worker has reported a heartbeat very recently, treat as registered/healthy.
+                    age = (datetime.utcnow() - (w.last_heartbeat or w.last_active or datetime.utcnow())).total_seconds()
+                    logger.warning(
+                        "Worker row found for pod %s (worker=%s) despite startup timeout, last_heartbeat_age=%.1fs — keeping pod for now",
+                        pod_uuid,
+                        w.worker_id,
+                        age,
+                    )
+                    # mark pod ready locally and return pod_uuid (controller's registration will follow)
+                    async with self._lock:
+                        pi = self.individual_pods.get(pod_uuid)
+                        if pi:
+                            pi.status = "ready"
+                            pi.last_active = datetime.utcnow()
+                    # also update machine cached image
+                    await self.mark_image_cached_on_machine(mid, model)
+                    return pod_uuid
+        except Exception:
+            logger.exception("Failed to inspect DB for worker registration for pod %s", pod_uuid)
+
+        # No worker registered -> safe to destroy and mark machine bad
+        logger.error(f"⏳ No registration found for {pod_uuid} on {mid}. Destroying pod and marking machine bad.")
+        try:
+            await self.destroy_individual_pod(pod_uuid)
+        except Exception as e:
+            logger.exception("Failed to destroy timed-out pod %s: %s", pod_uuid, e)
+
+        # Mark machine bad for startup-time failures (this is a hardware/template problem)
+        try:
+            self.mark_machine_bad(mid)
+        except Exception:
+            logger.exception("Failed to mark machine bad for %s", mid)
+
         return None
+
 
     def _get_pod_lock(self, pod_uuid: str) -> asyncio.Lock:
         """
@@ -453,13 +523,38 @@ class PodManager:
                     raise
 
     async def _call_with_retry(self, func, *args, **kwargs):
+        """
+        Call a synchronous QuickPodManager function in a thread and retry once.
+        If the underlying QuickPod API returned a fatal error (e.g. 406 Database query failed)
+        we raise QuickPodAPIFatalError so callers can make an informed decision (don't mark machine bad).
+        """
+        def _call():
+            return func(*args, **kwargs)
+
         try:
-            return await asyncio.to_thread(func, *args, **kwargs)
+            return await asyncio.to_thread(_call)
         except Exception as e:
+            # Inspect message for fatal QuickPod API conditions (observed in logs: "Database query failed" / 406)
+            msg = str(e).lower()
+            if "database query failed" in msg or "status=406" in msg or "406" in msg:
+                logger.error("QuickPod API fatal error (no automatic retry): %s", e)
+                # Raise a dedicated exception so the caller can avoid marking machine bad indiscriminately
+                raise QuickPodAPIFatalError(e)
+
+            # Otherwise, do one retry after ensuring global login refreshed
             logger.warning("QuickPod API call failed (%s); retrying once...", e)
-            await asyncio.sleep(2)
-            await self._ensure_global_login(force_refresh=True)
-            return await asyncio.to_thread(func, *args, **kwargs)
+            try:
+                await asyncio.sleep(2)
+                await self._ensure_global_login(force_refresh=True)
+                return await asyncio.to_thread(_call)
+            except QuickPodAPIFatalError:
+                # propagate fatal marker
+                raise
+            except Exception as e2:
+                # bubble up the second error
+                logger.error("QuickPod API retry failed: %s", e2)
+                raise
+
 
     # --------------------------------------------------------------------------
     # INITIALIZATION
@@ -807,7 +902,11 @@ class PodManager:
             logger.warning(
                 "⚠️ All preferred machines exhausted. Trying global fallback offer..."
             )
-            global_offer = await self._call_with_retry(self.global_qp.get_best_offer)
+            try:
+                global_offer = await self._call_with_retry(self.global_qp.get_best_offer)
+            except QuickPodAPIFatalError as e:
+                logger.error("QuickPod global-offer fatal error: %s", e)
+                return None
 
             if not global_offer:
                 logger.error("❌ No global fallback offer available.")
@@ -862,6 +961,9 @@ class PodManager:
                 self.mark_machine_bad(fallback_mid)
             return None
 
+        except QuickPodAPIFatalError as e:
+            logger.error("Global fallback fatal QuickPod error: %s", e)
+            return None
         except Exception as e:
             logger.exception("⚠️ Global fallback failed for %s: %s", model, e)
             return None
