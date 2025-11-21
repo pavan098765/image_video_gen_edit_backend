@@ -32,11 +32,11 @@ MACHINE_PRIORITY_LIST: List[Tuple[str, str]] = [
     ("275", "1x 5090"),
     ("14774", "4x 4090"),
     ("266", "4x 4090"),
-    ("416", "2x 4090"),
+
 ]
 
-MAX_JOBS_PER_POD = 100
-MAX_SAME_JOB_PER_POD = 100
+MAX_JOBS_PER_POD = 3
+MAX_SAME_JOB_PER_POD = 3
 
 
 @dataclass
@@ -61,6 +61,8 @@ class PodManager:
         self.email = email
         self.password = password
         self.warm_pod_uuid = warm_pod_uuid
+        self._model_locks: Dict[str, asyncio.Lock] = {}
+
         self.warm_pod_manager = (
             QuickPodManager(email, password, warm_pod_uuid) if warm_pod_uuid else None
         )
@@ -85,7 +87,7 @@ class PodManager:
             os.getenv("POD_STRATEGY", PodStrategyType.WARM_AND_INDIVIDUAL.value)
         )
         self.max_individual_pods = int(os.getenv("MAX_INDIVIDUAL_PODS", "10"))
-        self.pod_startup_timeout = int(os.getenv("POD_STARTUP_TIMEOUT", "60"))
+        self.pod_startup_timeout = int(os.getenv("POD_STARTUP_TIMEOUT", "120"))
         self.template_uuids = {
             "sd15": os.getenv("SD15_TEMPLATE_UUID"),
             "sd35": os.getenv("SD35_TEMPLATE_UUID"),
@@ -183,6 +185,15 @@ class PodManager:
     # ---------------------------
     # Pod-lock helpers
     # ---------------------------
+
+    def _get_model_lock(self, model: str) -> asyncio.Lock:
+        lock = self._model_locks.get(model)
+        if lock:
+            return lock
+        new = asyncio.Lock()
+        existing = self._model_locks.setdefault(model, new)
+        return existing
+
     async def _try_create_pod_on_machine(
         self,
         mid: str,
@@ -435,9 +446,41 @@ class PodManager:
         while self.fallback_events and now - self.fallback_events[0][0] > window:
             self.fallback_events.popleft()
 
+    async def reserve_slot_on_pod(self, pod_uuid: str, job_id: str) -> bool:
+        """
+        Atomically reserve a slot on the pod (increment queue_size and update job counts).
+        Returns True on success; False if pod is at capacity or not tracked.
+        Uses pod-specific lock to serialize.
+        """
+        pod_lock = self._get_pod_lock(pod_uuid)
+        async with pod_lock:
+            pi = self.individual_pods.get(pod_uuid)
+            if not pi:
+                return False
+            if pi.queue_size >= MAX_JOBS_PER_POD:
+                return False
+            # increment and book
+            pi.queue_size += 1
+            self.update_pod_job_counts(pi, job_id)
+            pi.last_active = datetime.utcnow()
+            return True
+
+    async def release_slot_on_pod(self, pod_uuid: str, job_id: str) -> None:
+        """
+        Decrement queue_size and update last_active. Safe to call even if pod not tracked.
+        """
+        pod_lock = self._get_pod_lock(pod_uuid)
+        async with pod_lock:
+            pi = self.individual_pods.get(pod_uuid)
+            if not pi:
+                return
+            # decrement but not below zero
+            pi.queue_size = max(0, pi.queue_size - 1)
+            pi.last_active = datetime.utcnow()
+
     async def autoscaler_loop(self):
         """Detect fallback frequency and trigger warm pod spin-up."""
-        FALLBACK_THRESHOLD = int(os.getenv("FALLBACK_THRESHOLD", "5"))
+        FALLBACK_THRESHOLD = int(os.getenv("FALLBACK_THRESHOLD", "3"))
         QUEUE_MIN_FOR_SCALE = int(os.getenv("QUEUE_MIN_FOR_SCALE", "3"))
         LOAD_SCALE_THRESHOLD = int(os.getenv("LOAD_SCALE_THRESHOLD", "15"))
         while True:
@@ -674,36 +717,34 @@ class PodManager:
         await self.add_pending_job(job_id, model)
 
         async with self._lock:
-            for pod_uuid, info in self.individual_pods.items():
+            candidates = list(self.individual_pods.items())
+        for pod_uuid, info in candidates:
                 if info.machine_id and self.is_machine_bad(info.machine_id):
                     continue  # don't reuse pods on blacklisted machine
                 if (
                     info.model == model
                     and info.status == "ready"
-                    and self.can_reuse_pod(info, job_id)
                 ):
-                    info.last_active = datetime.utcnow()
-                    self.update_pod_job_counts(info, job_id)
-                    logger.info(
-                        "Reusing machine-based pod %s for job %s", pod_uuid, job_id
-                    )
+                    # try to reserve slot on pod atomically
+                    reserved = await self.reserve_slot_on_pod(pod_uuid, job_id)
+                    if not reserved:
+                        continue  # pod full
+                    # now update DB & return
                     with SessionLocal() as db:
                         w = (
                             db.query(Worker)
-                            .filter(
-                                Worker.container_id == pod_uuid, Worker.model == model
-                            )
+                            .filter(Worker.container_id == pod_uuid, Worker.model == model)
                             .first()
                         )
                         if w:
                             w.status = "dispatching"
                             w.last_active = datetime.utcnow()
-                            job = db.query(Job).filter(Job.job_id == job_id).first()
-                            if job:
-                                job.status = JobState.DISPATCHING.value
-                                job.updated_at = datetime.utcnow()
                             db.commit()
+                            logger.info("Reusing machine-based pod %s for job %s", pod_uuid, job_id)
                             return w.worker_id
+                        else:
+                            # rollback reservation if DB link missing
+                            await self.release_slot_on_pod(pod_uuid, job_id)
 
         # Attempt to create on priority machines
         pod_uuid = await self.create_machine_based_pod(model, mode)
@@ -751,222 +792,223 @@ class PodManager:
 
         Uses _try_create_pod_on_machine() for all attempts.
         """
+        model_lock = self._get_model_lock(model)
+        async with model_lock:
+            await self._ensure_global_login()
 
-        await self._ensure_global_login()
+            # -------------------------------
+            # 1) Resolve variant plan
+            # -------------------------------
+            variant_plan = self.get_variant_plan(model)
+            # Example: [("fp4", ["5090"]), ("int4", ["4090"])]
 
-        # -------------------------------
-        # 1) Resolve variant plan
-        # -------------------------------
-        variant_plan = self.get_variant_plan(model)
-        # Example: [("fp4", ["5090"]), ("int4", ["4090"])]
+            # -------------------------------
+            # 2) Build candidate machine list
+            # -------------------------------
+            candidates: List[Tuple[str, Optional[str]]] = []
 
-        # -------------------------------
-        # 2) Build candidate machine list
-        # -------------------------------
-        candidates: List[Tuple[str, Optional[str]]] = []
+            # 2A — priority machines first
+            for mid, desc in MACHINE_PRIORITY_LIST:
+                candidates.append((str(mid), desc))
 
-        # 2A — priority machines first
-        for mid, desc in MACHINE_PRIORITY_LIST:
-            candidates.append((str(mid), desc))
-
-        # 2B — merge cached machines
-        try:
-            async with self._machine_cache_lock:
-                mc = (
-                    self.machine_cache.get("machines", {}) if self.machine_cache else {}
-                )
-
-                scored = []
-                for mid, info in mc.items():
-                    is_pr = info.get("is_priority", False)
-                    cached_images = info.get("cached_images", {})
-                    model_info = cached_images.get(model, {})
-                    score = model_info.get("score", 0.0)
-                    last_seen = info.get("last_seen") or ""
-                    scored.append((mid, is_pr, score, last_seen))
-
-                scored.sort(key=lambda x: (not x[1], -x[2], x[3]))
-
-                for mid, is_pr, score, last_seen in scored:
-                    if str(mid) not in {c[0] for c in candidates}:
-                        candidates.append((str(mid), "cached"))
-        except Exception:
-            logger.exception("Error reading machine cache; using defaults")
-
-        # Remove duplicates preserving order
-        seen = set()
-        candidate_list = []
-        for mid, desc in candidates:
-            if mid not in seen:
-                seen.add(mid)
-                candidate_list.append((mid, desc))
-
-        logger.info(
-            "Machine candidates for model %s: %s", model, [c[0] for c in candidate_list]
-        )
-
-        # Load metadata snapshot
-        async with self._machine_cache_lock:
-            machine_meta = self.machine_cache.get("machines", {})
-
-        # -------------------------------
-        # 3) Variant loop (fp4 → int4 → …)
-        # -------------------------------
-        for variant, allowed_gpus in variant_plan:
-
-            logger.info(f"🔎 Trying variant={variant} for model={model}")
-
-            for candidate_mid, desc in candidate_list:
-                mid = str(candidate_mid)
-
-                # Skip blacklisted
-                if self.is_machine_bad(mid):
-                    continue
-
-                # Meta checks
-                meta = machine_meta.get(mid, {})
-                gpu_name = meta.get("gpu_name", "")
-                gpu_count = meta.get("gpu_count", 1)
-                tflops = meta.get("tflops", 0)
-
-                req = self.model_requirements.get(model, {})
-                min_tflops = req.get("min_tflops", 0)
-                min_gpu_count = req.get("min_gpu_count", 1)
-
-                # GPU name match
-                gpu_name_normal = str(gpu_name).upper()
-                allowed_tokens = [g.upper() for g in (allowed_gpus or [])]
-
-                if allowed_tokens and not any(
-                    tok in gpu_name_normal for tok in allowed_tokens
-                ):
-                    continue
-
-                # Resource checks
-                if tflops < min_tflops or gpu_count < min_gpu_count:
-                    continue
-
-                logger.info(
-                    f"📌 Candidate {mid} matches variant={variant}, model={model}"
-                )
-
-                # ---- get best offer for this machine ----
-                try:
-                    offer = await self._call_with_retry(
-                        self.global_qp.get_best_offer, mid
+            # 2B — merge cached machines
+            try:
+                async with self._machine_cache_lock:
+                    mc = (
+                        self.machine_cache.get("machines", {}) if self.machine_cache else {}
                     )
-                except Exception as e:
-                    logger.warning(f"Offer fetch failed on {mid}: {e}")
-                    continue
 
-                if not offer:
-                    continue
+                    scored = []
+                    for mid, info in mc.items():
+                        is_pr = info.get("is_priority", False)
+                        cached_images = info.get("cached_images", {})
+                        model_info = cached_images.get(model, {})
+                        score = model_info.get("score", 0.0)
+                        last_seen = info.get("last_seen") or ""
+                        scored.append((mid, is_pr, score, last_seen))
 
-                if isinstance(offer, tuple):
-                    offer_id, actual_mid = offer
-                    actual_mid = str(actual_mid)
+                    scored.sort(key=lambda x: (not x[1], -x[2], x[3]))
+
+                    for mid, is_pr, score, last_seen in scored:
+                        if str(mid) not in {c[0] for c in candidates}:
+                            candidates.append((str(mid), "cached"))
+            except Exception:
+                logger.exception("Error reading machine cache; using defaults")
+
+            # Remove duplicates preserving order
+            seen = set()
+            candidate_list = []
+            for mid, desc in candidates:
+                if mid not in seen:
+                    seen.add(mid)
+                    candidate_list.append((mid, desc))
+
+            logger.info(
+                "Machine candidates for model %s: %s", model, [c[0] for c in candidate_list]
+            )
+
+            # Load metadata snapshot
+            async with self._machine_cache_lock:
+                machine_meta = self.machine_cache.get("machines", {})
+
+            # -------------------------------
+            # 3) Variant loop (fp4 → int4 → …)
+            # -------------------------------
+            for variant, allowed_gpus in variant_plan:
+
+                logger.info(f"🔎 Trying variant={variant} for model={model}")
+
+                for candidate_mid, desc in candidate_list:
+                    mid = str(candidate_mid)
+
+                    # Skip blacklisted
+                    if self.is_machine_bad(mid):
+                        continue
+
+                    # Meta checks
+                    meta = machine_meta.get(mid, {})
+                    gpu_name = meta.get("gpu_name", "")
+                    gpu_count = meta.get("gpu_count", 1)
+                    tflops = meta.get("tflops", 0)
+
+                    req = self.model_requirements.get(model, {})
+                    min_tflops = req.get("min_tflops", 0)
+                    min_gpu_count = req.get("min_gpu_count", 1)
+
+                    # GPU name match
+                    gpu_name_normal = str(gpu_name).upper()
+                    allowed_tokens = [g.upper() for g in (allowed_gpus or [])]
+
+                    if allowed_tokens and not any(
+                        tok in gpu_name_normal for tok in allowed_tokens
+                    ):
+                        continue
+
+                    # Resource checks
+                    if tflops < min_tflops or gpu_count < min_gpu_count:
+                        continue
+
+                    logger.info(
+                        f"📌 Candidate {mid} matches variant={variant}, model={model}"
+                    )
+
+                    # ---- get best offer for this machine ----
+                    try:
+                        offer = await self._call_with_retry(
+                            self.global_qp.get_best_offer, mid
+                        )
+                    except Exception as e:
+                        logger.warning(f"Offer fetch failed on {mid}: {e}")
+                        continue
+
+                    if not offer:
+                        continue
+
+                    if isinstance(offer, tuple):
+                        offer_id, actual_mid = offer
+                        actual_mid = str(actual_mid)
+                    else:
+                        offer_id = offer
+                        actual_mid = mid
+
+                    # ---- template & disk for this variant ----
+                    template_id = self.get_template_for_variant(model, variant)
+                    disk_size = self.get_disk_size_for_variant(model, variant)
+
+                    if not template_id:
+                        logger.warning(
+                            "Skipping machine %s because template for variant=%s not found",
+                            actual_mid,
+                            variant,
+                        )
+                        continue
+
+                    # ---- Attempt pod creation using helper ----
+                    pod_uuid = await self._try_create_pod_on_machine(
+                        actual_mid,
+                        model,
+                        mode,
+                        variant,
+                        offer_id,
+                        template_id,
+                        disk_size,
+                    )
+
+                    if pod_uuid:
+                        return pod_uuid
+
+            # -------------------------------
+            # 4) GLOBAL FALLBACK
+            # -------------------------------
+            try:
+                logger.warning(
+                    "⚠️ All preferred machines exhausted. Trying global fallback offer..."
+                )
+                try:
+                    global_offer = await self._call_with_retry(self.global_qp.get_best_offer)
+                except QuickPodAPIFatalError as e:
+                    logger.error("QuickPod global-offer fatal error: %s", e)
+                    return None
+
+                if not global_offer:
+                    logger.error("❌ No global fallback offer available.")
+                    return None
+
+                if isinstance(global_offer, tuple):
+                    offer_id, fallback_mid = global_offer
+                    fallback_mid = str(fallback_mid)
                 else:
-                    offer_id = offer
-                    actual_mid = mid
+                    offer_id = global_offer
+                    fallback_mid = None
 
-                # ---- template & disk for this variant ----
-                template_id = self.get_template_for_variant(model, variant)
-                disk_size = self.get_disk_size_for_variant(model, variant)
+                if fallback_mid and self.is_machine_bad(fallback_mid):
+                    logger.error(
+                        f"❌ Global fallback machine {fallback_mid} is blacklisted."
+                    )
+                    return None
+
+                # Choose template using preferred variant (first in plan)
+                if variant_plan:
+                    primary_variant = variant_plan[0][0]
+                    template_id = self.get_template_for_variant(model, primary_variant)
+                    disk_size = self.get_disk_size_for_variant(model, primary_variant)
+                else:
+                    template_id = self._get_template_for_model(model)
+                    disk_size = self.template_disk_size.get(model, 100)
 
                 if not template_id:
-                    logger.warning(
-                        "Skipping machine %s because template for variant=%s not found",
-                        actual_mid,
-                        variant,
-                    )
-                    continue
+                    template_id = self._get_template_for_model(model)
+                    if not template_id:
+                        logger.error("No fallback template for model %s", model)
+                        return None
 
-                # ---- Attempt pod creation using helper ----
+                final_mid = fallback_mid or "fallback"
+
                 pod_uuid = await self._try_create_pod_on_machine(
-                    actual_mid,
+                    final_mid,
                     model,
                     mode,
-                    variant,
+                    primary_variant if variant_plan else None,
                     offer_id,
                     template_id,
                     disk_size,
                 )
 
                 if pod_uuid:
+                    logger.info("✅ Fallback pod %s ready for %s", pod_uuid, model)
                     return pod_uuid
 
-        # -------------------------------
-        # 4) GLOBAL FALLBACK
-        # -------------------------------
-        try:
-            logger.warning(
-                "⚠️ All preferred machines exhausted. Trying global fallback offer..."
-            )
-            try:
-                global_offer = await self._call_with_retry(self.global_qp.get_best_offer)
+                logger.error("⚠️ Global fallback pod startup failed.")
+                if fallback_mid:
+                    self.mark_machine_bad(fallback_mid)
+                return None
+
             except QuickPodAPIFatalError as e:
-                logger.error("QuickPod global-offer fatal error: %s", e)
+                logger.error("Global fallback fatal QuickPod error: %s", e)
                 return None
-
-            if not global_offer:
-                logger.error("❌ No global fallback offer available.")
+            except Exception as e:
+                logger.exception("⚠️ Global fallback failed for %s: %s", model, e)
                 return None
-
-            if isinstance(global_offer, tuple):
-                offer_id, fallback_mid = global_offer
-                fallback_mid = str(fallback_mid)
-            else:
-                offer_id = global_offer
-                fallback_mid = None
-
-            if fallback_mid and self.is_machine_bad(fallback_mid):
-                logger.error(
-                    f"❌ Global fallback machine {fallback_mid} is blacklisted."
-                )
-                return None
-
-            # Choose template using preferred variant (first in plan)
-            if variant_plan:
-                primary_variant = variant_plan[0][0]
-                template_id = self.get_template_for_variant(model, primary_variant)
-                disk_size = self.get_disk_size_for_variant(model, primary_variant)
-            else:
-                template_id = self._get_template_for_model(model)
-                disk_size = self.template_disk_size.get(model, 100)
-
-            if not template_id:
-                template_id = self._get_template_for_model(model)
-                if not template_id:
-                    logger.error("No fallback template for model %s", model)
-                    return None
-
-            final_mid = fallback_mid or "fallback"
-
-            pod_uuid = await self._try_create_pod_on_machine(
-                final_mid,
-                model,
-                mode,
-                primary_variant if variant_plan else None,
-                offer_id,
-                template_id,
-                disk_size,
-            )
-
-            if pod_uuid:
-                logger.info("✅ Fallback pod %s ready for %s", pod_uuid, model)
-                return pod_uuid
-
-            logger.error("⚠️ Global fallback pod startup failed.")
-            if fallback_mid:
-                self.mark_machine_bad(fallback_mid)
-            return None
-
-        except QuickPodAPIFatalError as e:
-            logger.error("Global fallback fatal QuickPod error: %s", e)
-            return None
-        except Exception as e:
-            logger.exception("⚠️ Global fallback failed for %s: %s", model, e)
-            return None
 
     # --------------------------------------------------------------------------
     # DISPATCH PENDING JOBS WHEN WORKER REGISTERS
@@ -1012,8 +1054,13 @@ class PodManager:
                         or ""
                     )
 
-                    assign_job_to_worker(job_id, ready_worker.worker_id, presigned_url)
-                    await self.remove_pending_job(job_id, model)
+                    success = await asyncio.to_thread(assign_job_to_worker, job_id, ready_worker.worker_id, presigned_url)
+
+                    if success:
+                        await self.remove_pending_job(job_id, model)
+                    else:
+                        logger.warning(f"Pending job {job_id} failed dispatch to worker {ready_worker.worker_id}, keeping in pending queue")
+
                 except Exception:
                     logger.exception(
                         f"Failed to dispatch pending job {job_id} for {model}"
@@ -1052,55 +1099,58 @@ class PodManager:
     async def create_individual_pod(
         self, model: str, mode: Optional[str] = None
     ) -> Optional[str]:
-        await self._ensure_global_login()
-        async with self._lock:
-            if len(self.individual_pods) >= self.max_individual_pods:
-                raise RuntimeError("Maximum number of individual pods reached")
-
-        try:
-            offer = await self._call_with_retry(self.global_qp.get_best_offer)
-            if not offer:
-                raise RuntimeError("No offer returned by QuickPod")
-
-            # handle either (offer_id, machine_id) tuple or scalar
-            if isinstance(offer, tuple):
-                offer_id = offer[0]
-            else:
-                offer_id = offer
-
-            template_uuid = self._get_template_for_model(model)
-            pod_data = await self._call_with_retry(
-                self.global_qp.create_pod,
-                offer_id,
-                template_uuid,
-                self.template_disk_size.get(model, 100),
-            )
-
-            pod_uuid = (
-                pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
-            )
-            if not pod_uuid:
-                raise RuntimeError("No pod UUID returned")
-
-            # register pod and create per-pod lock while holding self._lock
+        
+        model_lock = self._get_model_lock(model)
+        async with model_lock:
+            await self._ensure_global_login()
             async with self._lock:
-                self.individual_pods[pod_uuid] = PodInfo(
-                    pod_uuid=pod_uuid,
-                    model=model,
-                    mode=mode,
-                    status="starting",
-                    created_at=datetime.utcnow(),
-                    last_active=datetime.utcnow(),
+                if len(self.individual_pods) >= self.max_individual_pods:
+                    raise RuntimeError("Maximum number of individual pods reached")
+
+            try:
+                offer = await self._call_with_retry(self.global_qp.get_best_offer)
+                if not offer:
+                    raise RuntimeError("No offer returned by QuickPod")
+
+                # handle either (offer_id, machine_id) tuple or scalar
+                if isinstance(offer, tuple):
+                    offer_id = offer[0]
+                else:
+                    offer_id = offer
+
+                template_uuid = self._get_template_for_model(model)
+                pod_data = await self._call_with_retry(
+                    self.global_qp.create_pod,
+                    offer_id,
+                    template_uuid,
+                    self.template_disk_size.get(model, 100),
                 )
-                self.individual_pod_managers[pod_uuid] = QuickPodManager(
-                    self.email, self.password, pod_uuid
+
+                pod_uuid = (
+                    pod_data.get("pod_uuid") or pod_data.get("uuid") or pod_data.get("id")
                 )
-                # create lock for this pod
-                self._pod_locks[pod_uuid] = asyncio.Lock()
-            return pod_uuid
-        except Exception as e:
-            logger.exception("Failed to create individual pod: %s", e)
-        return None
+                if not pod_uuid:
+                    raise RuntimeError("No pod UUID returned")
+
+                # register pod and create per-pod lock while holding self._lock
+                async with self._lock:
+                    self.individual_pods[pod_uuid] = PodInfo(
+                        pod_uuid=pod_uuid,
+                        model=model,
+                        mode=mode,
+                        status="starting",
+                        created_at=datetime.utcnow(),
+                        last_active=datetime.utcnow(),
+                    )
+                    self.individual_pod_managers[pod_uuid] = QuickPodManager(
+                        self.email, self.password, pod_uuid
+                    )
+                    # create lock for this pod
+                    self._pod_locks[pod_uuid] = asyncio.Lock()
+                return pod_uuid
+            except Exception as e:
+                logger.exception("Failed to create individual pod: %s", e)
+            return None
 
     # --------------------------------------------------------------------------
     # CLEANUP

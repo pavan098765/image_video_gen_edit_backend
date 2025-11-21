@@ -725,18 +725,44 @@ def upsert_worker(
     db.commit()
     return w
 
-
-def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
+def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str) -> bool:
+    """
+    Atomically reserve job for worker (DISPATCHING) using SELECT FOR UPDATE.
+    Returns True on successful dispatch, False otherwise.
+    """
     db = SessionLocal()
     try:
-        job = db.query(Job).filter(Job.job_id == job_id).first()
-        worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+        # Lock row
+        job = (
+            db.query(Job)
+            .filter(Job.job_id == job_id)
+            .with_for_update(nowait=True)
+            .first()
+        )
+        if not job:
+            logger.error("assign_job_to_worker: job not found %s", job_id)
+            return False
 
-        if not job or not worker:
-            logger.error(
-                "Job or Worker not found (job=%s, worker=%s)", job_id, worker_id
+        # Only allow dispatch from QUEUED
+        if job.status != JobState.QUEUED.value:
+            logger.info(
+                "assign_job_to_worker: job %s not QUEUED (state=%s) -> skip",
+                job_id, job.status,
             )
-            return
+            return False
+
+        # reserve
+        job.worker_id = worker_id
+        job.status = JobState.DISPATCHING.value
+        job.updated_at = datetime.utcnow()
+        db.commit()
+
+        worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+        if not worker:
+            job.status = JobState.QUEUED.value
+            job.worker_id = None
+            db.commit()
+            return False
 
         run_payload = {
             "job_id": job.job_id,
@@ -749,95 +775,66 @@ def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
         }
 
         url = f"{worker.endpoint.rstrip('/')}/run"
-        max_attempts = 5
+        last_exc = None
 
-        # ----------------------------------------------------
-        # DISPATCH LOOP (retry 5 times)
-        # ----------------------------------------------------
-        for attempt in range(max_attempts):
+        for attempt in range(5):
             try:
                 resp = requests.post(url, json=run_payload, timeout=10)
                 resp.raise_for_status()
-                break  # success
+                last_exc = None
+                break
             except Exception as e:
-                if attempt < max_attempts - 1:
-                    wait = 3 * (attempt + 1)
-                    logger.warning(
-                        f"Attempt {attempt+1}/{max_attempts} failed to push job {job_id} "
-                        f"to {url}: {e}. Retrying in {wait}s..."
-                    )
-                    time.sleep(wait)
-                    continue
+                last_exc = e
+                if attempt < 4:
+                    time.sleep(3 * (attempt + 1))
+                continue
 
-                # ------------------------------------------------
-                # FINAL FAILURE AFTER RETRIES
-                # ------------------------------------------------
-                logger.error(
-                    f"❌ Failed to push job {job_id} to worker {worker_id} after {max_attempts} attempts: {e}"
-                )
+        if last_exc:
+            # revert job to QUEUED
+            j = (
+                db.query(Job)
+                .filter(Job.job_id == job_id)
+                .with_for_update()
+                .first()
+            )
+            if j:
+                j.status = JobState.QUEUED.value
+                j.worker_id = None
+                j.updated_at = datetime.utcnow()
+                db.commit()
 
-                # Force job into FAILED
-                job_manager.update_job_state(
-                    job.job_id, JobState.FAILED, f"Dispatch error: {e}", force=True
-                )
+            # mark machine bad
+            machine_id = getattr(worker, "machine_id", None)
+            if machine_id:
+                pod_manager.mark_machine_bad(str(machine_id))
 
-                # ------------------------------------------------
-                # MARK MACHINE BAD
-                # ------------------------------------------------
-                machine_id = getattr(worker, "machine_id", None)
-                if machine_id:
-                    try:
-                        logger.warning(
-                            "⚠️ Marking machine %s bad due to repeated dispatch failures",
-                            machine_id,
-                        )
-                        pod_manager.mark_machine_bad(str(machine_id))
-                    except Exception:
-                        logger.exception("Failed to mark machine bad")
+            # destroy pod
+            container_id = getattr(worker, "container_id", None)
+            if container_id:
+                anyio.from_thread.run(pod_manager.destroy_individual_pod, container_id)
+                asyncio.create_task(pod_manager.release_slot_on_pod(container_id, job_id))
 
-                # ------------------------------------------------
-                # SAFELY DESTROY POD (even in AnyIO worker thread)
-                # ------------------------------------------------
-                container_id = getattr(worker, "container_id", None)
-                if container_id:
-                    try:
-                        anyio.from_thread.run(
-                            pod_manager.destroy_individual_pod, container_id
-                        )
-                        logger.info(
-                            "Scheduled destroy_individual_pod via anyio.from_thread.run "
-                            f"(container_id={container_id})"
-                        )
-                    except Exception:
-                        logger.exception("Failed to schedule destroy_individual_pod")
+            return False
 
-                # DO NOT mark worker terminated here; reaper handles cleanup
-                return
+        # Success -> mark RUNNING
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        job.status = JobState.RUNNING.value
+        job.updated_at = datetime.utcnow()
 
-        # ----------------------------------------------------
-        # SUCCESSFUL DISPATCH
-        # ----------------------------------------------------
-        job.worker_id = worker.worker_id
-        job_manager.update_job_state(job.job_id, JobState.RUNNING, force=True)
-
-        worker.status = "processing" if worker.is_warm_pod else "busy"
-        worker.last_active = datetime.utcnow()
+        job_worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+        if job_worker:
+            job_worker.status = "processing" if job_worker.is_warm_pod else "busy"
+            job_worker.last_active = datetime.utcnow()
 
         db.commit()
+        logger.info("Dispatched job %s to worker %s", job_id, worker_id)
+        return True
 
-        logger.info(
-            "Dispatched job %s to worker %s (%s)",
-            job_id,
-            worker_id,
-            worker.endpoint,
-        )
-
-    except Exception as e:
-        db.rollback()
-        logger.exception(f"Error assigning job {job_id} to worker {worker_id}: {e}")
+    except Exception:
+        logger.exception("assign_job_to_worker unexpected error")
+        return False
     finally:
         db.close()
-
 
 # ------------------------
 # Background Tasks
@@ -1303,6 +1300,11 @@ async def job_complete(payload: JobCompletePayload):
                 return {"status": "ok"}
             raise HTTPException(status_code=404, detail="Job not found")
 
+        # --- IDEMPOTENCY GUARD ---
+        if job.status == JobState.COMPLETED.value:
+            logger.info("job_complete called but job %s already COMPLETED — ignoring duplicate", job.job_id)
+            return {"status": "ok", "job_id": job.job_id}
+
         worker = db.query(Worker).filter(Worker.worker_id == job.worker_id).first()
 
         # ------------------ HANDLE EXPLICIT FAILURE ------------------
@@ -1330,6 +1332,8 @@ async def job_complete(payload: JobCompletePayload):
                 if getattr(worker, "container_id", None):
                     try:
                         await pod_manager.destroy_individual_pod(worker.container_id)
+                        # release pod queue slot as result arrived
+                        asyncio.create_task(pod_manager.release_slot_on_pod(container_id, job.job_id))
                         logger.error(f"🔥 Destroyed failed pod {worker.container_id}")
                     except Exception as e:
                         logger.error(f"⚠️ Failed destroy {worker.container_id}: {e}")
@@ -1411,6 +1415,8 @@ async def job_complete(payload: JobCompletePayload):
                 if getattr(worker, "container_id", None):
                     try:
                         await pod_manager.destroy_individual_pod(worker.container_id)
+                        # release pod queue slot as result arrived
+                        asyncio.create_task(pod_manager.release_slot_on_pod(container_id, job.job_id))
                         logger.error(
                             f"🔥 Destroyed pod {worker.container_id} after invalid output"
                         )
@@ -1500,6 +1506,8 @@ async def job_complete(payload: JobCompletePayload):
                             )
                             try:
                                 await pod_manager.destroy_individual_pod(container_id)
+                                # release pod queue slot as result arrived
+                                asyncio.create_task(pod_manager.release_slot_on_pod(container_id, job.job_id))
                             except Exception as e:
                                 logger.exception(
                                     "Failed to destroy individual pod %s: %s",
