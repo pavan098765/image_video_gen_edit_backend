@@ -1,1724 +1,682 @@
+# main.py
+"""
+Application Entry Point
+
+Provides:
+- FastAPI application factory
+- Startup/shutdown lifecycle management
+- Background task initialization
+- Graceful shutdown handling
+"""
+
 import os
-import re
-import uuid
 import asyncio
 import logging
-import json
-import aiohttp
-from fastapi.responses import StreamingResponse
-import requests
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
-import time
-
-from fastapi import (
-    FastAPI,
-    BackgroundTasks,
-    Query,
-    Request,
-    HTTPException,
-    Depends,
-    Header,
-    Response,
-)
-from pydantic import BaseModel
-from dotenv import load_dotenv
-from sqlalchemy.orm import Session
-import firebase_admin
-from firebase_admin import credentials, messaging
-
-
-from db import init_db, SessionLocal, Worker, Job
-from pod_manager import PodManager
-from job_manager import JobManager, JobState
-from security import (
-    verify_signature,
-    verify_api_key,
-    hash_fingerprint,
-    register_or_update_device,
-    validate_device_signature,
-    time_datetime_now,
-)
-
-# Optional R2 client
-import boto3
-from botocore.client import Config
-from botocore.exceptions import ClientError
+import signal
+from contextlib import asynccontextmanager
+from typing import Optional
 from pathlib import Path
-import mimetypes
 
-# ------------------------
-# ENV & INIT
-# ------------------------
-load_dotenv(Path(__file__).parent / "config.env")
-init_db()
+from fastapi import FastAPI
+from dotenv import load_dotenv
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("controller")
-
-
-# --- Firebase Admin explicit init with projectId + good diagnostics ---
-def _init_firebase_admin():
-    try:
-        sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-        logger.info("Initializing Firebase Admin SDK...")
-        logger.info(f"sa_path : {sa_path}")
-        if not sa_path:
-            raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS not set")
-
-        exists = os.path.exists(sa_path)
-        logger.info("Firebase SA path: %s (exists=%s)", sa_path, exists)
-        if not exists:
-            raise FileNotFoundError(f"Service account file not found at {sa_path}")
-
-        with open(sa_path, "r", encoding="utf-8") as f:
-            sa_json = json.load(f)
-
-        project_id = (
-            sa_json.get("project_id")
-            or os.environ.get("GOOGLE_CLOUD_PROJECT")
-            or os.environ.get("GCLOUD_PROJECT")
-        )
-        if not project_id:
-            # let user override via env if their SA lacks project_id
-            raise RuntimeError(
-                "No project_id found in service account JSON and GOOGLE_CLOUD_PROJECT not set"
-            )
-
-        cred = credentials.Certificate(sa_json)
-        firebase_admin.initialize_app(cred, {"projectId": project_id})
-        logger.info("✅ Firebase Admin initialized with projectId=%s", project_id)
-    except Exception as e:
-        logger.exception("🔥 Firebase Admin init failed: %s", e)
-        raise
-
-
-# call once at module load (where your current init is)
-_init_firebase_admin()
-
-email_quickpod = os.getenv("QUICKPOD_EMAIL", "None")
-password_quickpod = os.getenv("QUICKPOD_PASSWORD", "None")
-warm_pod_uuid = os.getenv("QUICKPOD_POD_UUID")
-IMAGE_PREFIX = os.getenv("IMAGE_PREFIX", "quickpod/")
-CONTROLLER_PUBLIC_URL = os.getenv("CONTROLLER_PUBLIC_URL", "")
-CONTROLLER_SHARED_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "")
-HEARTBEAT_INTERVAL = 20  # how often the worker actually pings
-HEARTBEAT_GRACE_MULTIPLIER = 2  # allow 2 missed pings before reaping
-WORKER_IDLE_TIMEOUT = HEARTBEAT_INTERVAL * HEARTBEAT_GRACE_MULTIPLIER
-WORKER_REGISTRATION_TIMEOUT = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "60"))
-
-# R2
-R2_ENDPOINT = os.getenv("R2_ENDPOINT")
-R2_BUCKET = os.getenv("R2_BUCKET")
-R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
-s3_client = None
-if R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY:
-    s3_client = boto3.client(
-        "s3",
-        endpoint_url=R2_ENDPOINT,
-        aws_access_key_id=R2_ACCESS_KEY_ID,
-        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        config=Config(signature_version="s3v4"),
-    )
-
-# Managers
-# pod_manager = PodManager(email_quickpod, password_quickpod, warm_pod_uuid)
-# Managers
-POD_STRATEGY = os.getenv("POD_STRATEGY", "machine_based").lower()
-# interpret a few aliases
-if POD_STRATEGY in ("individual", "machine", "machine_based"):
-    pod_strategy_env = (
-        "machine_based"  # use our machine-based logic for individual-pod only flow
-    )
-elif POD_STRATEGY in ("warm", "warm_and_individual", "default"):
-    pod_strategy_env = "warm_and_individual"
+# Load environment first
+env_path = Path(__file__).parent / "config.env"
+if env_path.exists():
+    load_dotenv(env_path)
 else:
-    pod_strategy_env = POD_STRATEGY  # allow custom values if already exact
+    load_dotenv()
 
-# only pass warm_pod_uuid if warm strategy selected
-if pod_strategy_env == "warm_and_individual":
-    pod_manager = PodManager(email_quickpod, password_quickpod, warm_pod_uuid)
-else:
-    # disable warm pod usage
-    pod_manager = PodManager(email_quickpod, password_quickpod, None)
-
-# also tell pod_manager about selected strategy via env (it already reads POD_STRATEGY itself)
-os.environ["POD_STRATEGY"] = pod_strategy_env
-ENABLE_AUTOTEST = os.getenv("ENABLE_AUTOTEST", "true").lower() == "true"
-logger.info(
-    f"Pod strategy: {pod_strategy_env}, AUTOTEST mode: {'ON' if ENABLE_AUTOTEST else 'OFF'}"
+# Import modules after env load
+from config import ConfigManager, load_config, get_config
+from logging_config import setup_logging, get_logger
+from db import init_db, get_db_manager
+from middleware import setup_middleware
+from routes import (
+    public_router,
+    client_router,
+    worker_router,
+    admin_router,
+    set_dependencies,
+    sync_heartbeat_cache_to_db,  # Background task for heartbeat caching
 )
-job_manager: Optional[JobManager] = None
+from pod_manager import PodManager
+from job_manager import JobManager, job_recovery_task
+from security import ip_ban_manager
 
-app = FastAPI(title="Server Controller")
-
-# === Enhanced Security Configuration ===
-# --- Logging for Security Events ---
-security_logger = logging.getLogger("security")
-security_handler = logging.FileHandler("security.log")
-security_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-security_handler.setFormatter(security_formatter)
-security_logger.addHandler(security_handler)
-security_logger.setLevel(logging.INFO)
-
-# --- Persistence file for bans
-BANS_FILE = Path(Path(__file__).parent, "banned_ips.json")
-
-# --- Core Protection Configuration (tuneable) ---
-BLOCKED_METHODS = {"PROPFIND", "CONNECT", "TRACE", "TRACK", "PRI"}
-BLOCK_EMPTY_UA = True
-BAN_DURATION = 300  # seconds (temporary ban default)
-RATE_LIMIT = 20  # requests per minute per IP
-MAX_BODY_SIZE = 10_000_000  # 10 MB
-SUSPICIOUS_SCORE_THRESHOLD = 5  # heuristic ban trigger
-PERMANENT_BAN_ON_THRESHOLD = (
-    True  # if suspicion score passes threshold, ban permanently
-)
-
-# Trust / whitelist
-TRUSTED_IPS = set()  # add any static IPs here if you want them always safe
-TRUSTED_WORKER_IP_TTL_SECONDS = (
-    60 * 60 * 24
-)  # 24 hours trust for newly-registered worker IPs
-
-# Known malicious user-agents and scanners (keep lowercase)
-BLOCKED_USER_AGENTS = [
-    "curl",
-    "wget",
-    "python-requests",
-    "sqlmap",
-    "nmap",
-    "nikto",
-    "masscan",
-    "scrapy",
-    "libwww-perl",
-    "zgrab",
-    "httpclient",
-    "scanbot",
-    "nessus",
-    "dirbuster",
-    "acunetix",
-    "wpscan",
-    "whatweb",
-    "httprobe",
-    "bot",
-    "go-http-client",
-]
-
-# Known exploit or reconnaissance path patterns
-SUSPICIOUS_PATHS = [
-    r"\.\./",
-    r"etc/passwd",
-    r"wp-admin",
-    r"phpmyadmin",
-    r"\.env",
-    r"\.git",
-    r"/owa/",
-    r"/solr/",
-    r"/admin",
-    r"/console",
-    r"/status\.php",
-    r"/login",
-    r"/jasperserver",
-    r"/owncloud",
-    r"/zabbix",
-    r"/WebInterface",
-    r"/sitecore",
-    r"/cgi-bin",
-    r"/index\.jsp",
-    r"/OA_HTML",
-    r"/Telerik",
-    r"cf_scripts",
-]
-
-# Suspicious header keys and payload keywords
-SUSPICIOUS_HEADERS = ["X-Original-URL", "X-Rewrite-URL", "Forwarded"]
-INJECTION_KEYWORDS = [
-    b"<script",
-    b"<?php",
-    b"union select",
-    b"drop table",
-    b"--",
-    b"alert(",
-]
-
-# In-memory IP tracking
-# For persistent bans use structure: banned_ips[ip] = {"expiry": <float|None>, "permanent": bool, "reason": str, "created_at": float}
-banned_ips: Dict[str, Dict[str, Any]] = {}
-rate_limiter: Dict[str, list] = {}
-ip_suspicion_score: Dict[str, int] = {}
-
-# Trusted worker IPs: trusted_worker_ips[ip] = expiry_ts
-trusted_worker_ips: Dict[str, float] = {}
-
-# async lock for persistence-safe operations
-ban_lock = asyncio.Lock()
+# Initialize logging
+setup_logging()
+logger = get_logger("main")
 
 
-# ---------- Persistence helpers ----------
-async def persist_bans():
-    """Write banned_ips to disk (atomic rename)."""
-    async with ban_lock:
-        try:
-            data = banned_ips.copy()
-            tmp = BANS_FILE.with_suffix(".tmp")
+# =============================================================================
+# Application State
+# =============================================================================
 
-            def _write():
-                print(f"🟢 Writing bans file to {tmp}")
-                with open(tmp, "w") as f:
-                    json.dump(data, f)
-                tmp.replace(BANS_FILE)
-
-            await asyncio.to_thread(_write)
-        except Exception:
-            security_logger.exception("Failed to persist banned_ips to disk")
-
-
-async def load_bans():
-    """Load banned_ips from disk at startup."""
-    async with ban_lock:
-        if not BANS_FILE.exists():
-            return
-        try:
-
-            def _read():
-                with open(BANS_FILE, "r") as f:
-                    return json.load(f)
-
-            loaded = await asyncio.to_thread(_read)
-            # loaded is ip -> dict
-            for ip, info in loaded.items():
-                banned_ips[ip] = {
-                    "expiry": info.get("expiry"),
-                    "permanent": bool(info.get("permanent", False)),
-                    "reason": info.get("reason", ""),
-                    "created_at": info.get("created_at", time.time()),
-                }
-            security_logger.info(f"Loaded {len(banned_ips)} persisted banned IPs")
-        except Exception:
-            security_logger.exception("Failed to load banned_ips from disk")
-
-
-# ---------- Helpers ----------
-def _now_ts() -> float:
-    return time.time()
-
-
-def is_banned(ip: str) -> bool:
-    # skip trusted ips
-    if ip in TRUSTED_IPS:
-        return False
-    info = banned_ips.get(ip)
-    if not info:
-        return False
-    if info.get("permanent"):
-        return True
-    expiry = info.get("expiry")
-    if expiry and expiry > _now_ts():
-        return True
-    # expired
-    try:
-        del banned_ips[ip]
-    except KeyError:
-        pass
-    # persist asynchronously
-    try:
-        asyncio.create_task(persist_bans())
-    except Exception:
-        pass
-    return False
-
-
-async def ban_ip(
-    ip: str, reason: str, duration: Optional[int] = None, permanent: bool = False
-):
-    """Ban IP. If permanent=True, set permanent, otherwise set expiry."""
-    async with ban_lock:
-        if permanent:
-            banned_ips[ip] = {
-                "expiry": None,
-                "permanent": True,
-                "reason": reason,
-                "created_at": _now_ts(),
-            }
-            security_logger.warning(f"IP banned (permanent) ({ip}) — reason: {reason}")
-        else:
-            exp = _now_ts() + (duration or BAN_DURATION)
-            banned_ips[ip] = {
-                "expiry": exp,
-                "permanent": False,
-                "reason": reason,
-                "created_at": _now_ts(),
-            }
-            security_logger.warning(f"IP banned ({ip}) until {exp} — reason: {reason}")
-        # persist immediately
-        try:
-            await persist_bans()
-        except Exception:
-            security_logger.exception("Failed to persist bans after ban_ip")
-
-
-async def unban_ip(ip: str):
-    async with ban_lock:
-        if ip in banned_ips:
-            banned_ips.pop(ip, None)
-            await persist_bans()
-            security_logger.info(f"IP unbanned: {ip}")
-            return True
-        return False
-
-
-def check_rate_limit(ip: str) -> bool:
-    now = _now_ts()
-    timestamps = rate_limiter.get(ip, [])
-    timestamps = [t for t in timestamps if now - t < 60]  # last minute
-    if len(timestamps) >= RATE_LIMIT:
-        rate_limiter[ip] = timestamps
-        return False
-    timestamps.append(now)
-    rate_limiter[ip] = timestamps
-    return True
-
-
-async def increase_suspicion(ip: str, amount: int, reason: str):
-    score = ip_suspicion_score.get(ip, 0) + amount
-    ip_suspicion_score[ip] = score
-    security_logger.info(
-        f"Suspicion {score}/{SUSPICIOUS_SCORE_THRESHOLD} for {ip} — {reason}"
-    )
-    if score >= SUSPICIOUS_SCORE_THRESHOLD:
-        await ban_ip(
-            ip,
-            f"suspicious behavior (score={score})",
-            permanent=PERMANENT_BAN_ON_THRESHOLD,
+class AppState:
+    """Global application state"""
+    
+    def __init__(self):
+        self.config = None
+        self.pod_manager: Optional[PodManager] = None
+        self.job_manager: Optional[JobManager] = None
+        self.s3_client = None
+        self.background_tasks: list = []
+        self.shutdown_event = asyncio.Event()
+    
+    async def initialize(self):
+        """Initialize all application components"""
+        logger.info("=" * 60)
+        logger.info("INITIALIZING APPLICATION")
+        logger.info("=" * 60)
+        
+        # Load configuration
+        self.config = load_config(strict=False)
+        config_manager = ConfigManager.get_instance()
+        config_manager.log_config()
+        
+        # Initialize database
+        logger.info("Initializing database...")
+        init_db()
+        
+        # Initialize Firebase
+        logger.info("Initializing Firebase...")
+        config_manager.initialize_firebase()
+        
+        # Initialize R2 client
+        logger.info("Initializing R2 storage...")
+        self.s3_client = config_manager.get_s3_client()
+        
+        # Initialize Pod Manager
+        logger.info("Initializing Pod Manager...")
+        self.pod_manager = PodManager(
+            email=self.config.quickpod.email,
+            password=self.config.quickpod.password,
+            warm_pod_uuid=self.config.quickpod.warm_pod_uuid if self.config.pod.strategy.value == "warm_and_individual" else None,
         )
-
-
-# def increase_suspicion(ip: str, amount: int, reason: str):
-#     score = ip_suspicion_score.get(ip, 0) + amount
-#     ip_suspicion_score[ip] = score
-#     security_logger.info(f"Suspicion {score}/{SUSPICIOUS_SCORE_THRESHOLD} for {ip} — {reason}")
-#     if score >= SUSPICIOUS_SCORE_THRESHOLD:
-#         # default: make permanent ban if configured
-#         asyncio.create_task(ban_ip(ip, f"suspicious behavior (score={score})", permanent=PERMANENT_BAN_ON_THRESHOLD))
-
-
-def add_trusted_worker_ip(ip: str):
-    """Mark an IP trusted for some TTL (used when a worker registers)."""
-    trusted_worker_ips[ip] = _now_ts() + TRUSTED_WORKER_IP_TTL_SECONDS
-    security_logger.info(
-        f"Added trusted worker IP {ip} for {TRUSTED_WORKER_IP_TTL_SECONDS}s"
-    )
-
-
-def is_trusted_worker_ip(ip: str) -> bool:
-    exp = trusted_worker_ips.get(ip)
-    if not exp:
-        return False
-    if exp > _now_ts():
-        return True
-    # expired
-    try:
-        del trusted_worker_ips[ip]
-    except KeyError:
-        pass
-    return False
-
-
-# Paths behavior:
-# - WORKER_PATHS: endpoints used by workers (register_worker, heartbeat) -> exempt from UA/permanent banning
-# - TRUSTED_API_PATHS: endpoints that may require Authorization Bearer to skip deep body inspection (/submit, /job_complete)
-# - PUBLIC_PATHS: endpoints open to public (like /download) -> no checks apply
-WORKER_PATHS = ["/register_worker", "/heartbeat"]
-TRUSTED_API_PATHS = ["/submit", "/job_complete", "/job_status"]
-PUBLIC_PATHS = ["/download", "/job_status"]
-
-
-# ---------- Middleware ----------
-@app.middleware("http")
-async def aggressive_security_middleware(request: Request, call_next):
-    # Determine client IP, prefer X-Forwarded-For if present (Cloudflare/proxy scenarios)
-    ip_header = request.headers.get("x-forwarded-for", "") or ""
-    if ip_header:
-        # pick left-most IP (original client)
-        ip = ip_header.split(",")[0].strip()
-    else:
-        ip = request.client.host or "unknown"
-    path = request.url.path.lower()
-    ua = request.headers.get("user-agent", "").lower()
-    auth_header = request.headers.get("authorization", "")
-
-    # Allow trusted static IPs immediately
-    if ip in TRUSTED_IPS:
-        return await call_next(request)
-
-    # Banned check
-    if is_banned(ip):
-        security_logger.warning(f"Blocked request from banned IP: {ip} path={path}")
-        return Response("Access Denied", status_code=403)
-
-    # Rate limiting applies to everyone (including workers)
-    if not check_rate_limit(ip):
-        # temporary ban for rate limit abuse
-        await ban_ip(ip, "rate limit exceeded", duration=BAN_DURATION, permanent=False)
-        return Response("Too Many Requests", status_code=429)
-
-    # Block obviously dangerous methods -> permanent ban
-    if request.method.upper() in BLOCKED_METHODS:
-        await ban_ip(ip, f"blocked method {request.method}", permanent=True)
-        return Response("Method Not Allowed", status_code=405)
-
-    # If this is a worker endpoint, skip UA/permanent checks — let handlers verify signatures
-    if any(path.startswith(p) for p in WORKER_PATHS):
-        # Allow worker endpoints to process (they will verify signatures inside handlers)
-        try:
-            return await call_next(request)
-        except Exception as e:
-            security_logger.exception(
-                f"Worker path exception from {ip} path={path}: {e}"
-            )
-            return Response("Internal Server Error", status_code=500)
-
-    # Trusted API paths (like /submit, /job_complete) require Authorization: Bearer to skip deep body scan
-    if any(path.startswith(p) for p in TRUSTED_API_PATHS):
-        if not (
-            auth_header.startswith("Bearer ") or request.headers.get("x-fingerprint")
-        ):
-            await increase_suspicion(ip, 3, "trusted endpoint without auth")
-            return Response("Forbidden", status_code=403)
-        try:
-            return await call_next(request)
-        except Exception as e:
-            security_logger.exception(
-                f"Trusted API path exception from {ip} path={path}: {e}"
-            )
-            return Response("Internal Server Error", status_code=500)
-
-    # ✅ Public safe paths (no auth needed, like /download)
-    if any(path.startswith(p) for p in PUBLIC_PATHS):
-        try:
-            return await call_next(request)
-        except Exception as e:
-            security_logger.exception(
-                f"Public path exception from {ip} path={path}: {e}"
-            )
-            return Response("Internal Server Error", status_code=500)
-
-    # From here on, we apply aggressive checks to public/untrusted endpoints
-    # Suspicious path detection -> permanent ban
-    for pattern in SUSPICIOUS_PATHS:
-        if re.search(pattern, path, re.IGNORECASE):
-            await increase_suspicion(ip, 2, f"scanner path: {path}")
-            await ban_ip(ip, f"scanner path matched: {pattern}", permanent=True)
-            return Response("Forbidden", status_code=403)
-
-    # User-Agent validation -> permanent ban (aggressive)
-    if BLOCK_EMPTY_UA and not ua.strip():
-        await ban_ip(ip, "empty user-agent", permanent=True)
-        return Response("Forbidden", status_code=403)
-
-    if any(bad in ua for bad in BLOCKED_USER_AGENTS):
-        await ban_ip(ip, f"bad user-agent: {ua}", permanent=True)
-        return Response("Forbidden", status_code=403)
-
-    # Suspicious headers -> permanent ban
-    for header in SUSPICIOUS_HEADERS:
-        if header in request.headers:
-            await ban_ip(ip, f"suspicious header {header}", permanent=True)
-            return Response("Forbidden", status_code=403)
-
-    # Payload inspection for public endpoints (not trusted, not workers)
-    if request.method in {"POST", "PUT", "PATCH"}:
-        try:
-            body = await request.body()
-            if len(body) > MAX_BODY_SIZE:
-                await ban_ip(ip, "oversized body", permanent=False)
-                return Response("Payload Too Large", status_code=413)
-            for keyword in INJECTION_KEYWORDS:
-                if keyword in body.lower():
-                    await ban_ip(ip, f"injection pattern {keyword}", permanent=True)
-                    return Response("Forbidden", status_code=403)
-        except Exception:
-            pass
-
-    # heuristic anomalies -> increase suspicion (may lead to ban)
-    if len(path) > 200 or path.count("/") > 20:
-        await increase_suspicion(ip, 1, "path anomaly")
-    if re.search(r"[<>{}\"';]", path):
-        await increase_suspicion(ip, 1, "path character anomaly")
-
-    # Normal request flow
-    try:
-        response = await call_next(request)
-        return response
-    except Exception as e:
-        security_logger.exception(f"Unhandled exception from {ip} path={path}: {e}")
-        return Response("Internal Server Error", status_code=500)
-
-
-@app.middleware("http")
-async def reject_unknown_paths(request: Request, call_next):
-    """
-    Rejects any HTTP request whose path is not part of the allowed API routes.
-    This prevents scanners or bots from probing unlisted paths like /robots.txt or /.
-    """
-    path = request.url.path
-    # Define which paths are actually allowed for public/worker/API use
-    allowed_prefixes = [
-        "/health",
-        "/submit",
-        "/job_complete",
-        "/job_status",
-        "/register_worker",
-        "/heartbeat",
-        "/download",
-    ]
-
-    # Allow FastAPI's built-in /docs or /openapi.json only if DEBUG is set
-    if os.getenv("DEBUG", "false").lower() == "true":
-        allowed_prefixes.extend(["/docs", "/openapi.json", "/redoc"])
-
-    # If path not matching any allowed prefix → reject early
-    if not any(path.startswith(p) for p in allowed_prefixes):
-        return Response("Forbidden", status_code=403)
-
-    # Normal request flow
-    return await call_next(request)
-
-
-# ------------------------
-# Pydantic Models
-# ------------------------
-class SubmitRequest(BaseModel):
-    model: str
-    prompt: Optional[str] = ""
-    params: Optional[Dict[str, Any]] = {}
-    fcm_token: Optional[str] = None
-
-
-class RegisterPayload(BaseModel):
-    worker_id: str
-    models: list
-    endpoint: str = ""  # keep optional-equivalent behavior by allowing empty string
-    container_id: Optional[str] = None
-    pod_uuid: Optional[str] = None  # Preferred canonical pod identifier (QuickPod)
-    public_ip: Optional[str] = None  # Optional public IP of the pod (if available)
-    info: Optional[Dict[str, Any]] = None
-
-
-class JobCompletePayload(BaseModel):
-    job_id: str
-    result_r2_key: Optional[str] = None
-    failed: Optional[bool] = False
-    error: Optional[str] = None  # also capture error message if sent
-
-
-# ------------------------
-# Auth Dependencies
-# ------------------------
-async def require_any_auth(
-    authorization: Optional[str] = Header(None),
-    x_device_uuid: Optional[str] = Header(None),
-    x_fingerprint: Optional[str] = Header(None),
-    x_timestamp: Optional[str] = Header(None),
-    x_signature: Optional[str] = Header(None),
-):
-    if authorization and verify_api_key(authorization):
-        return {"type": "api_key", "key": authorization}
-
-    if not x_fingerprint or not x_timestamp or not x_signature:
-        raise HTTPException(status_code=401, detail="Missing auth headers")
-
-    fingerprint_hash = (
-        x_fingerprint.lower()
-        if len(x_fingerprint) == 64
-        and all(c in "0123456789abcdef" for c in x_fingerprint.lower())
-        else hash_fingerprint(x_fingerprint)
-    )
-
-    if not validate_device_signature(fingerprint_hash, x_timestamp, x_signature):
-        raise HTTPException(
-            status_code=403, detail="Invalid device signature or timestamp"
+        await self.pod_manager.initialize()
+        
+        # Initialize Job Manager
+        logger.info("Initializing Job Manager...")
+        db_manager = get_db_manager()
+        self.job_manager = JobManager(
+            session_factory=db_manager.session_factory,
+            pod_manager=self.pod_manager,
+            max_retries=self.config.job.max_retries,
+            job_timeout_minutes=self.config.job.timeout_minutes,
         )
-
-    rec = register_or_update_device(
-        fingerprint_hash,
-        x_device_uuid,
-        meta={"last_seen_at": time_datetime_now().isoformat()},
-    )
-    return {
-        "type": "device",
-        "fingerprint_hash": fingerprint_hash,
-        "device_uuid": rec.get("device_uuid"),
-    }
-
-
-# ------------------------
-# DB Helpers
-# ------------------------
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-def find_ready_worker(db: Session, model: str) -> Optional[Worker]:
-    return (
-        db.query(Worker)
-        .filter(Worker.model == model, Worker.status == "ready")
-        .order_by(Worker.last_active.desc())
-        .first()
-    )
-
-
-def create_presigned_put_url(key: str, expires_in: int = 3600) -> Optional[str]:
-    """Generate a presigned PUT URL for R2 so worker can upload results directly."""
-    if not s3_client:
-        return None
-    try:
-        return s3_client.generate_presigned_url(
-            "put_object",
-            Params={"Bucket": R2_BUCKET, "Key": key},
-            ExpiresIn=expires_in,
+        
+        # Load IP bans
+        logger.info("Loading IP bans...")
+        await ip_ban_manager.load_from_db()
+        await ip_ban_manager.load_from_file()
+        
+        # Set route dependencies
+        logger.info("Configuring routes...")
+        model_requirements = self.pod_manager.model_requirements if self.pod_manager else {}
+        
+        set_dependencies(
+            pod_manager=self.pod_manager,
+            job_manager=self.job_manager,
+            s3_client=self.s3_client,
+            r2_bucket=self.config.r2.bucket or "",
+            r2_endpoint=self.config.r2.endpoint or "",
+            model_requirements=model_requirements,
+            image_prefix=self.config.image_prefix,
+            controller_url=self.config.public_url,
         )
-    except Exception as e:
-        logger.error(f"Failed to generate presigned URL for key {key}: {e}")
-        return None
-
-
-def upsert_worker(
-    db: Session,
-    worker_id: str,
-    model: str,
-    endpoint: str,
-    container_id: Optional[str],
-    info: Optional[Dict[str, Any]],
-):
-    """
-    NOTE: 'container_id' DB column stores the QuickPod pod_uuid (canonical pod id).
-    We intentionally keep the DB column name as container_id for backward compatibility.
-    """
-    w = db.query(Worker).filter(Worker.worker_id == worker_id).first()
-    now = datetime.utcnow()
-    # Use equality for warm pod detection
-    is_warm = (
-        (container_id == warm_pod_uuid) if container_id and warm_pod_uuid else False
-    )
-    if not w:
-        w = Worker(
-            worker_id=worker_id,
-            model=model,
-            endpoint=endpoint,
-            status="ready",
-            container_id=container_id,
-            last_heartbeat=now,
-            last_active=now,
-            info=info,
-            is_warm_pod=is_warm,
-        )
-        db.add(w)
-    else:
-        w.endpoint = endpoint
-        w.model = model
-        w.container_id = container_id or w.container_id
-        w.status = "ready"
-        w.last_heartbeat = now
-        w.last_active = now
-        w.info = info
-        if container_id:
-            w.is_warm_pod = is_warm
-    db.commit()
-    return w
-
-
-def assign_job_to_worker(job_id: str, worker_id: str, presigned_url: str):
-    db = SessionLocal()
-    try:
-        job = db.query(Job).filter(Job.job_id == job_id).first()
-        worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
-        if not job or not worker:
-            logger.error(
-                "Job or Worker not found (job=%s, worker=%s)", job_id, worker_id
+        
+        logger.info("=" * 60)
+        logger.info("APPLICATION INITIALIZED SUCCESSFULLY")
+        logger.info("=" * 60)
+    
+    async def start_background_tasks(self):
+        """Start all background tasks"""
+        logger.info("Starting background tasks...")
+        
+        # Job recovery task
+        if self.config.job.auto_recover:
+            task = asyncio.create_task(
+                job_recovery_task(self.job_manager, interval=30),
+                name="job_recovery"
             )
-            return
-
-        run_payload = {
-            "job_id": job.job_id,
-            "prompt": job.prompt,
-            "model": job.model,
-            "mode": job.params.get("mode"),
-            "params": job.params,
-            "upload_url": presigned_url,  # <-- worker gets this
-            "result_key": job.result_r2_key,  # optional, for reference
-        }
-
-        url = f"{worker.endpoint.rstrip('/')}/run"
-        max_attempts = 5
-        for attempt in range(max_attempts):
+            self.background_tasks.append(task)
+            logger.info("Started job recovery task")
+        
+        # Idle worker reaper
+        task = asyncio.create_task(
+            self._idle_worker_reaper_task(),
+            name="idle_worker_reaper"
+        )
+        self.background_tasks.append(task)
+        logger.info("Started idle worker reaper task")
+        
+        # Pod cleanup task
+        task = asyncio.create_task(
+            self._pod_cleanup_task(),
+            name="pod_cleanup"
+        )
+        self.background_tasks.append(task)
+        logger.info("Started pod cleanup task")
+        
+        # Autoscaler
+        if self.pod_manager:
+            task = asyncio.create_task(
+                self.pod_manager.autoscaler_loop(),
+                name="autoscaler"
+            )
+            self.background_tasks.append(task)
+            logger.info("Started autoscaler task")
+        
+        # IP ban cleanup
+        task = asyncio.create_task(
+            self._ban_cleanup_task(),
+            name="ban_cleanup"
+        )
+        self.background_tasks.append(task)
+        logger.info("Started ban cleanup task")
+        
+        # Job recovery task (CRITICAL - detects stuck jobs)
+        if self.job_manager:
+            task = asyncio.create_task(
+                self._job_recovery_task(),
+                name="job_recovery"
+            )
+            self.background_tasks.append(task)
+            logger.info("Started job recovery task")
+        
+        # Heartbeat cache sync task (CRITICAL - makes heartbeat endpoint fast)
+        task = asyncio.create_task(
+            sync_heartbeat_cache_to_db(),
+            name="heartbeat_sync"
+        )
+        self.background_tasks.append(task)
+        logger.info("Started heartbeat cache sync task")
+        
+        logger.info(f"Started {len(self.background_tasks)} background tasks")
+    
+    async def shutdown(self):
+        """Graceful shutdown"""
+        logger.info("=" * 60)
+        logger.info("SHUTTING DOWN APPLICATION")
+        logger.info("=" * 60)
+        
+        # Signal shutdown
+        self.shutdown_event.set()
+        
+        # Cancel background tasks
+        logger.info("Cancelling background tasks...")
+        for task in self.background_tasks:
+            task.cancel()
             try:
-                resp = requests.post(url, json=run_payload, timeout=10)
-                resp.raise_for_status()
-                break  # success
-            except Exception as e:
-                if attempt < max_attempts - 1:
-                    wait = 3 * (attempt + 1)
-                    logger.warning(
-                        f"Attempt {attempt+1}/{max_attempts} failed to push job {job_id} to {url}: {e}. Retrying in {wait}s..."
-                    )
-                    time.sleep(wait)
-                    continue
-                else:
-                    logger.error(
-                        f"❌ Failed to push job {job_id} to worker {worker_id} after {max_attempts} attempts: {e}"
-                    )
-                    job_manager.update_job_state(
-                        job.job_id, JobState.FAILED, f"Dispatch error: {e}", force=True
-                    )
-                    if worker:
-                        worker.status = "terminated"
-                        db.commit()
-                        try:
-                            machine_id = getattr(worker, "machine_id", None)
-                            if machine_id:
-                                logger.warning(
-                                    "Marking machine %s bad due to repeated dispatch failures",
-                                    machine_id,
-                                )
-                                # pod_manager is available in module scope
-                                pod_manager.mark_machine_bad(str(machine_id))
-                        except Exception:
-                            logger.exception(
-                                "Failed to mark machine bad after dispatch failure"
-                            )
-                        # also try to destroy the pod to avoid re-registration
-                        try:
-                            if getattr(worker, "container_id", None):
-                                asyncio.create_task(
-                                    pod_manager.destroy_individual_pod(
-                                        worker.container_id
-                                    )
-                                )
-                        except Exception:
-                            logger.exception(
-                                "Failed to destroy pod after dispatch failure"
-                            )
-                    return
-
-        job.worker_id = worker.worker_id
-        job_manager.update_job_state(job.job_id, JobState.RUNNING, force=True)
-        if worker.is_warm_pod:
-            worker.status = "processing"
-        else:
-            worker.status = "busy"
-        worker.last_active = datetime.utcnow()
-        db.commit()
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+        # Allow in-flight requests to complete
+        logger.info("Waiting for in-flight requests...")
+        await asyncio.sleep(2)
+        
+        # Cleanup
+        if self.pod_manager:
+            # Save machine cache
+            await self.pod_manager.machine_cache.save()
+        
+        # Save IP bans
+        await ip_ban_manager.save_to_file()
+        
+        logger.info("=" * 60)
+        logger.info("APPLICATION SHUTDOWN COMPLETE")
+        logger.info("=" * 60)
+    
+    # -------------------------------------------------------------------------
+    # Background Tasks
+    # -------------------------------------------------------------------------
+    
+    async def _idle_worker_reaper_task(self):
+        """Reap idle workers"""
+        from db import SessionLocal, Worker, Job
+        from datetime import datetime, timedelta
+        from job_manager import JobState
+        
+        heartbeat_stale_secs = self.config.worker.heartbeat_stale_seconds
+        idle_timeout_secs = self.config.worker.idle_timeout
+        # INCREASED: 60s interval to reduce load on weak servers (was 30s)
+        sweep_interval = 60
+        
         logger.info(
-            "Dispatched job %s to worker %s (%s)", job_id, worker_id, worker.endpoint
+            f"Idle worker reaper: stale>{heartbeat_stale_secs}s, "
+            f"idle>{idle_timeout_secs}s"
         )
-    except Exception:
-        db.rollback()
-        logger.exception("Error assigning job %s to worker %s", job_id, worker_id)
-    finally:
-        db.close()
-
-
-# ------------------------
-# Background Tasks
-# ------------------------
-
-async def idle_worker_reaper_task():
-    """
-    Robust reaper:
-    - Destroys stale pods (no heartbeat for HEARTBEAT_STALE_SECS)
-    - Destroys pods with no active jobs for IDLE_TIMEOUT_SECS
-    - Ignores busy/processing status if jobs are actually gone or stale
-    """
-    # Prefer env-driven values or keep these defaults
-    HEARTBEAT_STALE_SECS = int(os.getenv("HEARTBEAT_STALE_SECS", "90"))
-    IDLE_TIMEOUT_SECS = int(os.getenv("IDLE_TIMEOUT_SECS", "120"))
-    SWEEP_INTERVAL_SECS = int(os.getenv("REAPER_SWEEP_INTERVAL_SECS", "30"))
-
-    # Include any worker statuses your system uses that should be considered by the reaper
-    STATUSES_TO_CONSIDER = ["ready", "busy", "processing"]
-
-    logger.info(
-        f"Starting idle worker reaper (stale>{HEARTBEAT_STALE_SECS}s, idle>{IDLE_TIMEOUT_SECS}s, sweep={SWEEP_INTERVAL_SECS}s)"
-    )
-
-    while True:
-        await asyncio.sleep(SWEEP_INTERVAL_SECS)
-
-        db = SessionLocal()
-        now = datetime.utcnow()
-        stale_cutoff = now - timedelta(seconds=HEARTBEAT_STALE_SECS)
-        idle_cutoff = now - timedelta(seconds=IDLE_TIMEOUT_SECS)
-        stale_count = 0
-        idle_count = 0
-
-        try:
-            workers = (
-                db.query(Worker)
-                .filter(Worker.status.in_(STATUSES_TO_CONSIDER))
-                .all()
-            )
-
-            for w in workers:
+        
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(sweep_interval)
+                
+                db = SessionLocal()
+                now = datetime.utcnow()
+                stale_cutoff = now - timedelta(seconds=heartbeat_stale_secs)
+                
                 try:
-                    # STALE: no heartbeat recently => destroy immediately
-                    if not w.last_heartbeat or w.last_heartbeat < stale_cutoff:
-                        logger.warning(
-                            "⚠️ Worker %s stale (last_heartbeat=%s) → destroying pod %s",
-                            w.worker_id,
-                            w.last_heartbeat,
-                            getattr(w, "container_id", None),
-                        )
-                        if getattr(w, "container_id", None):
-                            try:
-                                await pod_manager.destroy_individual_pod(w.container_id)
-                                stale_count += 1
-                            except Exception as e:
-                                logger.error("Destroy failed for stale pod %s: %s", w.container_id, e)
-                        # mark offline and commit safely
-                        w.status = "offline"
+                    workers = db.query(Worker).filter(
+                        Worker.status.in_(["ready", "busy", "processing"])
+                    ).all()
+                    
+                    for w in workers:
                         try:
-                            db.commit()
-                        except Exception:
-                            db.rollback()
-                        continue
-
-                    # IDLE: find any active jobs attached to this worker
-                    active_jobs = (
-                        db.query(Job)
-                        .filter(
-                            Job.worker_id == w.worker_id,
-                            Job.status.in_(
-                                [
-                                    JobState.RUNNING.value,
-                                    JobState.QUEUED.value,
-                                    JobState.DISPATCHING.value,
-                                ]
-                            ),
-                        )
-                        .all()
-                    )
-
-                    # If there are active jobs, treat them as "recent" only if updated_at is recent.
-                    recent_jobs = []
-                    for j in active_jobs:
-                        j_time = j.updated_at or j.created_at or datetime(1970, 1, 1)
-                        if (now - j_time) < timedelta(seconds=IDLE_TIMEOUT_SECS):
-                            recent_jobs.append(j)
-
-                    # If there are zero active jobs OR all active jobs are stale -> reap/stop
-                    if (not active_jobs) or (active_jobs and not recent_jobs):
-                        # safe to reap/stop this worker/pod
-                        if getattr(w, "is_warm_pod", False):
-                            logger.info("💤 Idle warm pod %s (worker=%s) → stopping", w.container_id, w.worker_id)
-                            try:
-                                await pod_manager.stop_warm_pod(w.container_id)
-                            except Exception as e:
-                                logger.warning("Failed to stop warm pod %s: %s", w.container_id, e)
-                        else:
-                            # machine-based or individual pod: destroy
-                            if getattr(w, "container_id", None):
-                                logger.info("💤 Idle pod %s (worker=%s) → destroying", w.container_id, w.worker_id)
-                                try:
-                                    await pod_manager.destroy_individual_pod(w.container_id)
-                                    idle_count += 1
-                                except Exception as e:
-                                    logger.warning("Destroy failed for idle pod %s: %s", w.container_id, e)
-
-                        # update state in DB
-                        w.status = "offline"
-                        try:
-                            db.commit()
-                        except Exception:
-                            db.rollback()
-                    else:
-                        logger.debug(
-                            "Skipping worker %s: %d active jobs (%d recent)",
-                            w.worker_id,
-                            len(active_jobs),
-                            len(recent_jobs),
-                        )
-
-                except Exception as e:
-                    logger.error("Reaper error on worker %s: %s", getattr(w, "worker_id", None), e)
-                    db.rollback()
-
-            logger.info("Reaper sweep complete → %d stale, %d idle reaped", stale_count, idle_count)
-
-        except Exception as e:
-            logger.error("Reaper loop error: %s", e)
-        finally:
-            db.close()
-
-
-async def pod_cleanup_task():
-    logger.info("Starting pod cleanup task (enhanced)")
-    while True:
-        db = SessionLocal()
-        try:
-            pods_to_cleanup = (
-                db.query(Worker)
-                .filter(
-                    Worker.status.in_(["terminated", "offline", "error"]),
-                    Worker.is_warm_pod == False,
-                )
-                .all()
-            )
-            if pods_to_cleanup:
-                logger.info("Cleaning up %d pods", len(pods_to_cleanup))
-            for pod in pods_to_cleanup:
-                try:
-                    if pod.container_id:
-                        await pod_manager.stop_individual_pod(pod.container_id)
-                    db.delete(pod)
-                    db.commit()
-                except Exception as e:
-                    logger.error(f"Failed pod cleanup {pod.worker_id}: {e}")
-                    pod.status = "error"
-                    pod.info = {
-                        "error": str(e),
-                        "cleanup_attempted_at": datetime.utcnow().isoformat(),
-                    }
-                    db.commit()
-        finally:
-            db.close()
-        await asyncio.sleep(15)
-
-
-async def job_recovery_task():
-    while True:
-        try:
-            await job_manager.check_for_stuck_jobs()
-        except Exception:
-            logger.exception("Error in job recovery task")
-        await asyncio.sleep(30)
-
-
-# ------------------------
-# Startup
-# ------------------------
-@app.on_event("startup")
-async def startup_event():
-    global job_manager
-    try:
-        job_manager = JobManager(SessionLocal, pod_manager)
-        JOB_AUTO_RECOVER = os.getenv("JOB_AUTO_RECOVER", "false").lower() == "true"
-        ENABLE_AUTOSCALER = os.getenv("ENABLE_AUTOSCALER", "true").lower() == "true"
-
-        await pod_manager.initialize()
-        asyncio.create_task(idle_worker_reaper_task())
-        asyncio.create_task(pod_cleanup_task())
-
-        if JOB_AUTO_RECOVER:
-            logger.info("Job Recovery mode ON")
-            asyncio.create_task(job_recovery_task())
-        else:
-            logger.info("Job Recovery mode OFF")
-
-        # Start autoscaler if enabled
-        if ENABLE_AUTOSCALER:
-            logger.info("Autoscaler enabled — starting background loop")
-            asyncio.create_task(pod_manager.autoscaler_loop())
-        else:
-            logger.info("Autoscaler disabled")
-
-        if not BANS_FILE.exists():
-
-            async def create_empty_ban_file():
-                async with ban_lock:
-                    with open(BANS_FILE, "w") as f:
-                        json.dump({}, f)
-
-            asyncio.create_task(create_empty_ban_file())
-            logger.info("Created IP bans file")
-
-        await load_bans()
-        logger.info(f"Loaded {len(banned_ips)} IP bans on startup")
-
-        logger.info("Controller startup complete")
-    except Exception as e:
-        logger.error(f"Error during startup: {e}")
-
-
-# ------------------------
-# API Endpoints
-# ------------------------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/download/{job_id}")
-async def download(job_id: str, request: Request):
-    """
-    Streams image/video from Cloudflare R2 with full Range (HTTP 206) support.
-    Memory-safe and optimized for concurrent users & large files.
-    """
-    db = SessionLocal()
-    try:
-        # 1️⃣ Find job entry
-        job = db.query(Job).filter(Job.job_id == job_id).first()
-        if not job or not job.output_key:
-            raise HTTPException(
-                status_code=404, detail="Job not found or output missing"
-            )
-
-        key = job.output_key
-
-        # 2️⃣ Retrieve metadata (content length, type)
-        try:
-            head = s3_client.head_object(Bucket=R2_BUCKET, Key=key)
-            total_size = head["ContentLength"]
-            content_type = (
-                head.get("ContentType")
-                or mimetypes.guess_type(key)[0]
-                or "application/octet-stream"
-            )
-        except ClientError as e:
-            logger.error(f"R2 head_object failed for {key}: {e}")
-            raise HTTPException(status_code=404, detail="File not found in R2")
-
-        # 3️⃣ Check if client sent a Range header (e.g., for video seeking)
-        range_header = request.headers.get("range")
-        start = 0
-        end = total_size - 1
-        status_code = 200
-        headers = {}
-
-        if range_header:
-            # Parse header like: bytes=1000-2000
-            try:
-                match = range_header.strip().lower().replace("bytes=", "").split("-")
-                if match[0]:
-                    start = int(match[0])
-                if len(match) > 1 and match[1]:
-                    end = int(match[1])
-                if end >= total_size:
-                    end = total_size - 1
-                if start > end:
-                    raise ValueError("Invalid range")
-                status_code = 206  # Partial content
-                headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
-                headers["Accept-Ranges"] = "bytes"
-                headers["Content-Length"] = str(end - start + 1)
-            except Exception as e:
-                logger.warning(f"Invalid Range header {range_header}: {e}")
-                start, end = 0, total_size - 1
-
-        else:
-            headers["Content-Length"] = str(total_size)
-            headers["Accept-Ranges"] = "bytes"
-
-        # 4️⃣ Fetch from R2 with Range (for partial downloads)
-        range_param = f"bytes={start}-{end}"
-        try:
-            s3_obj = s3_client.get_object(Bucket=R2_BUCKET, Key=key, Range=range_param)
-            stream = s3_obj["Body"]
-        except ClientError as e:
-            code = e.response["Error"]["Code"]
-            if code == "InvalidRange":
-                raise HTTPException(
-                    status_code=416, detail="Requested Range Not Satisfiable"
-                )
-            logger.error(f"Error fetching range {range_param} for {key}: {e}")
-            raise HTTPException(status_code=500, detail="Failed to fetch file from R2")
-
-        # 5️⃣ Async generator to yield chunks
-        async def file_iterator():
-            try:
-                while True:
-                    chunk = stream.read(1024 * 1024)  # 1MB
-                    if not chunk:
-                        break
-                    yield chunk
-            finally:
-                stream.close()
-
-        # 6️⃣ Set final headers
-        headers.update(
-            {
-                "Content-Type": content_type,
-                "Cache-Control": "public, max-age=86400, immutable",
-                "Content-Disposition": f'inline; filename="{os.path.basename(key)}"',
-            }
-        )
-
-        # 7️⃣ Return StreamingResponse with 200 or 206
-        return StreamingResponse(
-            file_iterator(), status_code=status_code, headers=headers
-        )
-
-    finally:
-        db.close()
-
-
-@app.post("/job_complete")
-async def job_complete(payload: JobCompletePayload):
-    db = SessionLocal()
-    try:
-        job = db.query(Job).filter(Job.job_id == payload.job_id).first()
-        if not job:
-            if payload.job_id.startswith("autotest-"):
-                logger.info(f"Auto-test job {payload.job_id} completed.")
-                return {"status": "ok"}
-            raise HTTPException(status_code=404, detail="Job not found")
-
-        worker = db.query(Worker).filter(Worker.worker_id == job.worker_id).first()
-
-        # ------------------ HANDLE EXPLICIT FAILURE ------------------
-        if payload.failed:
-            reason = payload.error or "Worker reported failure"
-            logger.warning(f"❌ Worker failed job {job.job_id}: {reason}")
-
-            job_manager.update_job_state(
-                job.job_id, JobState.FAILED, reason, force=True
-            )
-            job.error = reason
-            job.output_url = None
-            db.commit()
-
-            # Terminate pod + mark machine bad
-            if worker:
-                try:
-                    await pod_manager.remove_pending_job(job.job_id, job.model)
-                except Exception:
-                    pass
-
-                if getattr(worker, "machine_id", None):
-                    pod_manager.mark_machine_bad(worker.machine_id)
-
-                if getattr(worker, "container_id", None):
-                    try:
-                        await pod_manager.destroy_individual_pod(worker.container_id)
-                        logger.error(f"🔥 Destroyed failed pod {worker.container_id}")
-                    except Exception as e:
-                        logger.error(f"⚠️ Failed destroy {worker.container_id}: {e}")
-
-            # Retry job on new machine
-            try:
-                logger.info(f"♻️ Requeueing job {job.job_id} on NEW machine...")
-                await pod_manager.add_pending_job(job.job_id, job.model)
-                new_worker = await pod_manager.dispatch_job(
-                    job.job_id, job.model, job.params.get("mode")
-                )
-                new_presigned = create_presigned_put_url(job.result_r2_key)
-                asyncio.create_task(
-                    asyncio.to_thread(
-                        assign_job_to_worker, job.job_id, new_worker, new_presigned
-                    )
-                )
-                return {
-                    "status": "requeued",
-                    "job_id": job.job_id,
-                    "worker": new_worker,
-                }
-            except Exception as e:
-                logger.error(f"❌ Failed requeue {job.job_id}: {e}")
-                return {"status": "failed_final", "job_id": job.job_id}
-
-        # ------------------ CHECK OOM IN ERROR LOG ------------------
-        oom_detected = False
-        try:
-            if job.error_log:
-                for entry in job.error_log:
-                    err = (entry.get("error") or "").lower()
-                    if any(
-                        tok in err
-                        for tok in ["cuda out of memory", "oom", "cublas", "no memory"]
-                    ):
-                        oom_detected = True
-                        logger.warning(f"⚠️ OOM detected in {job.job_id}")
-                        break
-        except Exception as e:
-            logger.warning(f"OOM scan error for job {job.job_id}: {e}")
-
-        # ------------------ VERIFY R2 UPLOAD BEFORE MARKING COMPLETED ------------------
-        key = payload.result_r2_key
-        file_found = False
-        if key:
-            for attempt in range(3):
-                try:
-                    s3_client.head_object(Bucket=R2_BUCKET, Key=key)
-                    file_found = True
-                    logger.info(f"✅ R2 verified for {key}")
-                    break
-                except Exception:
-                    await asyncio.sleep(5)
-
-        failed_validation = oom_detected or (not file_found)
-
-        if failed_validation:
-            # ------------------ FAILED VALIDATION PATH ------------------
-            reason = "OOM" if oom_detected else "R2 missing"
-            logger.error(f"🚨 Post-run validation failed {job.job_id}: {reason}")
-
-            job_manager.update_job_state(
-                job.job_id, JobState.FAILED, reason, force=True
-            )
-            job.error = reason
-            job.output_url = None
-            db.commit()
-
-            if worker:
-                try:
-                    await pod_manager.remove_pending_job(job.job_id, job.model)
-                except Exception:
-                    pass
-
-                if getattr(worker, "machine_id", None):
-                    pod_manager.mark_machine_bad(worker.machine_id)
-
-                if getattr(worker, "container_id", None):
-                    try:
-                        await pod_manager.destroy_individual_pod(worker.container_id)
-                        logger.error(
-                            f"🔥 Destroyed pod {worker.container_id} after invalid output"
-                        )
-                    except Exception as e:
-                        logger.error(f"⚠️ Pod destroy failed: {e}")
-
-            # requeue
-            try:
-                await pod_manager.add_pending_job(job.job_id, job.model)
-                new_worker = await pod_manager.dispatch_job(
-                    job.job_id, job.model, job.params.get("mode")
-                )
-                new_presigned = create_presigned_put_url(key)
-                asyncio.create_task(
-                    asyncio.to_thread(
-                        assign_job_to_worker, job.job_id, new_worker, new_presigned
-                    )
-                )
-                return {
-                    "status": "requeued",
-                    "job_id": job.job_id,
-                    "worker": new_worker,
-                }
-            except Exception as e:
-                logger.error(f"❌ requeue failed {job.job_id}: {e}")
-                return {"status": "failed_no_output", "job_id": job.job_id}
-
-        # ------------------ SUCCESS PATH ------------------
-        # ✅ Validation passed — mark COMPLETED
-        job_manager.update_job_state(job.job_id, JobState.COMPLETED, force=True)
-        job.result_r2_key = payload.result_r2_key
-        job.output_key = payload.result_r2_key
-        job.output_url = f"{CONTROLLER_PUBLIC_URL}/download/{job.job_id}"
-        db.commit()
-
-        if worker:
-            try:
-                await pod_manager.remove_pending_job(job.job_id, job.model)
-            except Exception as e:
-                logger.error(f"❌ Failed to remove pending job {job.job_id}: {e}")
-
-            # --- Count active jobs still running on the same worker ---
-            try:
-                active_jobs = (
-                    db.query(Job)
-                    .filter(
-                        Job.worker_id == worker.worker_id,
-                        Job.status.in_(
-                            [
-                                JobState.RUNNING.value,
-                                JobState.DISPATCHING.value,
-                                JobState.QUEUED.value,
-                            ]
-                        ),
-                    )
-                    .count()
-                )
-            except Exception as e:
-                logger.error(
-                    f"❌ Failed to count active jobs for worker {worker.worker_id}: {e}"
-                )
-                active_jobs = 0
-
-            container_id = getattr(worker, "container_id", None)
-            try:
-                if container_id:
-                    # ✅ Only destroy pod if truly no other active jobs exist
-                    if active_jobs > 0:
-                        logger.info(
-                            "Keeping pod %s alive for worker %s — %d other active jobs remain",
-                            container_id,
-                            worker.worker_id,
-                            active_jobs,
-                        )
-                        worker.status = "busy"
-                    else:
-                        # No active jobs — decide if we destroy or keep alive
-                        if (
-                            not worker.is_warm_pod
-                            and pod_manager.pod_strategy != "machine_based"
-                        ):
-                            logger.info(
-                                "Destroying ephemeral pod %s for worker %s after successful completion of job %s (no active jobs left)",
-                                container_id,
-                                worker.worker_id,
-                                job.job_id,
-                            )
-                            try:
-                                await pod_manager.destroy_individual_pod(container_id)
-                            except Exception as e:
-                                logger.exception(
-                                    "Failed to destroy individual pod %s: %s",
-                                    container_id,
-                                    e,
+                            # Stale check
+                            if not w.last_heartbeat or w.last_heartbeat < stale_cutoff:
+                                logger.warning(
+                                    f"Worker {w.worker_id} stale, destroying pod {w.container_id}"
                                 )
-                            # Update worker state
-                            try:
-                                db.refresh(worker)
-                            except Exception:
-                                pass
-                            if getattr(worker, "container_id", None):
-                                worker.container_id = None
-                            worker.status = "terminated"
-                        else:
-                            # Machine-based or warm pod → keep alive
-                            worker.status = "ready"
-                            logger.info(
-                                "Keeping machine-based/warm pod %s (worker=%s) alive for reuse",
-                                container_id,
-                                worker.worker_id,
-                            )
-                else:
-                    # No container id present; mark readiness based on activity
-                    worker.status = "ready" if active_jobs == 0 else "busy"
-            except Exception as e:
-                logger.warning(
-                    "Error handling pod lifecycle for worker %s: %s",
-                    getattr(worker, "worker_id", None),
-                    e,
-                )
-
-            # Update last_active and commit DB state
+                                if w.container_id and self.pod_manager:
+                                    try:
+                                        await self.pod_manager.destroy_individual_pod(
+                                            w.container_id,
+                                            reason="Stale heartbeat"
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Destroy failed: {e}")
+                                
+                                w.status = "offline"
+                                db.commit()
+                                continue
+                            
+                            # NEVER destroy workers that are busy/processing - they have active jobs
+                            if w.status in ("busy", "processing"):
+                                # Double-check: verify there are actually jobs assigned
+                                active_jobs = db.query(Job).filter(
+                                    Job.worker_id == w.worker_id,
+                                    Job.status.in_([
+                                        JobState.RUNNING.value,
+                                        JobState.DISPATCHING.value
+                                    ])
+                                ).count()
+                                
+                                if active_jobs == 0:
+                                    # Worker says busy but no jobs - might be stuck, reset to ready
+                                    logger.warning(
+                                        f"Worker {w.worker_id} status is {w.status} but has no active jobs, "
+                                        f"resetting to ready"
+                                    )
+                                    w.status = "ready"
+                                    db.commit()
+                                else:
+                                    logger.debug(
+                                        f"Worker {w.worker_id} is {w.status} with {active_jobs} job(s), "
+                                        f"skipping idle check"
+                                    )
+                                continue
+                            
+                            # CRITICAL: Handle workers stuck in "starting" state
+                            # Workers in "starting" are loading models - give them time, but not forever
+                            if w.status == "starting":
+                                worker_age = (now - w.created_at).total_seconds() if w.created_at else 0
+                                
+                                # Allow 5 minutes for model loading (models can be large)
+                                max_starting_time = 300  # 5 minutes
+                                
+                                if worker_age > max_starting_time:
+                                    logger.error(
+                                        f"Worker {w.worker_id} stuck in 'starting' state for {worker_age:.1f}s "
+                                        f"(max: {max_starting_time}s). Destroying pod {w.container_id}"
+                                    )
+                                    if w.container_id and self.pod_manager:
+                                        await self.pod_manager.destroy_individual_pod(
+                                            w.container_id,
+                                            reason=f"Stuck in starting state for {worker_age:.0f}s"
+                                        )
+                                    w.status = "offline"
+                                    db.commit()
+                                else:
+                                    logger.debug(
+                                        f"Worker {w.worker_id} is starting ({worker_age:.1f}s), "
+                                        f"giving time to load models (max {max_starting_time}s)"
+                                    )
+                                continue
+                            
+                            # Ready worker idle check
+                            if w.status == "ready":
+                                # CRITICAL: Check if this worker has any active jobs (RUNNING, QUEUED, DISPATCHING)
+                                active_jobs = db.query(Job).filter(
+                                    Job.worker_id == w.worker_id,
+                                    Job.status.in_([
+                                        JobState.RUNNING.value,
+                                        JobState.QUEUED.value,
+                                        JobState.DISPATCHING.value
+                                    ])
+                                ).count()
+                                
+                                if active_jobs > 0:
+                                    logger.debug(
+                                        f"Worker {w.worker_id} has {active_jobs} active job(s), "
+                                        f"skipping idle check"
+                                    )
+                                    continue
+                                
+                                # Also check if pod has queued jobs (from pod_manager tracking)
+                                if w.container_id and self.pod_manager:
+                                    async with self.pod_manager._lock:
+                                        pod_info = self.pod_manager.individual_pods.get(w.container_id)
+                                        if pod_info and pod_info.queue_size > 0:
+                                            logger.debug(
+                                                f"Pod {w.container_id} has {pod_info.queue_size} "
+                                                f"queued job(s), skipping idle check"
+                                            )
+                                            continue
+                                
+                                # Check for pending jobs for this model (but not assigned yet)
+                                pending = db.query(Job).filter(
+                                    Job.model == w.model,
+                                    Job.worker_id.is_(None),  # Not assigned yet
+                                    Job.status.in_([JobState.QUEUED.value, JobState.DISPATCHING.value])
+                                ).count()
+                                
+                                if pending > 0:
+                                    logger.debug(
+                                        f"Model {w.model} has {pending} pending job(s), "
+                                        f"keeping worker {w.worker_id} alive"
+                                    )
+                                    continue
+                                
+                                # Check idle time
+                                last_job = w.last_job_finished_at or w.created_at or w.last_active
+                                idle_for = (now - last_job).total_seconds()
+                                
+                                # Add cooldown period after worker creation to avoid premature destruction
+                                worker_age = (now - w.created_at).total_seconds() if w.created_at else 0
+                                min_worker_age = 120  # 2 minutes minimum lifetime (increased from 60s)
+                                
+                                if worker_age < min_worker_age:
+                                    logger.debug(
+                                        f"Worker {w.worker_id} is only {worker_age:.1f}s old, "
+                                        f"minimum age is {min_worker_age}s, skipping idle check"
+                                    )
+                                    continue
+                                
+                                # CRITICAL: Truly adaptive idle timeout balancing cost vs. readiness
+                                # Goal: Aggressive destruction when no work, patient when work exists
+                                
+                                total_pending_jobs = db.query(Job).filter(
+                                    Job.status.in_([JobState.QUEUED.value, JobState.PENDING.value])
+                                ).count()
+                                
+                                # Check recent job submission rate (jobs created in last 2 minutes)
+                                recent_cutoff = now - timedelta(minutes=2)
+                                recent_jobs = db.query(Job).filter(
+                                    Job.model == w.model,
+                                    Job.created_at >= recent_cutoff
+                                ).count()
+                                
+                                # SMART ADAPTIVE TIMEOUT:
+                                # - No queue + no recent jobs = aggressive (90s) - save money!
+                                # - Pending jobs OR recent activity = patient (300-600s) - avoid startup costs
+                                
+                                if total_pending_jobs > 5:
+                                    # High load: 10 minute idle timeout (worth keeping worker ready)
+                                    adaptive_idle_timeout = 300
+                                    timeout_reason = f"high load ({total_pending_jobs} pending)"
+                                elif total_pending_jobs > 0:
+                                    # Medium load: 5 minute idle timeout
+                                    adaptive_idle_timeout = 100
+                                    timeout_reason = f"pending jobs ({total_pending_jobs})"
+                                elif recent_jobs > 0:
+                                    # Recent activity but no queue: 3 minute timeout
+                                    # Keep worker alive in case more jobs come
+                                    adaptive_idle_timeout = 30
+                                    timeout_reason = f"recent activity ({recent_jobs} jobs in last 2min)"
+                                else:
+                                    # NO LOAD: aggressive timeout to save money
+                                    # 90 seconds = enough for genuine brief gaps, but destroys truly idle
+                                    adaptive_idle_timeout = 20
+                                    timeout_reason = "no load (no pending, no recent)"
+                                
+                                logger.debug(
+                                    f"Worker {w.worker_id} adaptive timeout: {adaptive_idle_timeout}s "
+                                    f"({timeout_reason})"
+                                )
+                                
+                                if idle_for > adaptive_idle_timeout:
+                                    logger.info(
+                                        f"Worker {w.worker_id} idle for {idle_for:.1f}s "
+                                        f"(timeout: {adaptive_idle_timeout}s, pending_jobs: {total_pending_jobs}), "
+                                        f"destroying pod {w.container_id}"
+                                    )
+                                    if w.container_id and self.pod_manager:
+                                        await self.pod_manager.destroy_individual_pod(
+                                            w.container_id,
+                                            reason=f"Idle for {idle_for:.0f}s"
+                                        )
+                                    w.status = "offline"
+                                    db.commit()
+                                else:
+                                    # Every 60 seconds of idleness, do a health check to detect dead pods
+                                    if idle_for > 60 and w.endpoint:
+                                        try:
+                                            import httpx
+                                            async with httpx.AsyncClient() as client:
+                                                health_url = f"{w.endpoint.rstrip('/')}/health"
+                                                resp = await client.get(health_url, timeout=5.0)
+                                                if resp.status_code != 200:
+                                                    logger.warning(
+                                                        f"Worker {w.worker_id} failed health check (status: {resp.status_code}), "
+                                                        f"destroying pod"
+                                                    )
+                                                    if w.container_id and self.pod_manager:
+                                                        await self.pod_manager.destroy_individual_pod(
+                                                            w.container_id,
+                                                            reason=f"Failed health check (status: {resp.status_code})"
+                                                        )
+                                                    w.status = "offline"
+                                                    db.commit()
+                                                    continue
+                                        except Exception as health_err:
+                                            logger.warning(
+                                                f"Worker {w.worker_id} health check failed: {health_err}. "
+                                                f"Destroying unresponsive pod."
+                                            )
+                                            if w.container_id and self.pod_manager:
+                                                await self.pod_manager.destroy_individual_pod(
+                                                    w.container_id,
+                                                    reason=f"Health check failed: {health_err}"
+                                                )
+                                            w.status = "offline"
+                                            db.commit()
+                                            continue
+                                    
+                                    logger.debug(
+                                        f"Worker {w.worker_id} idle for {idle_for:.1f}s, "
+                                        f"but within timeout ({adaptive_idle_timeout}s)"
+                                    )
+                                    
+                        except Exception as e:
+                            logger.exception(f"Error processing worker {w.worker_id}: {e}")
+                            
+                finally:
+                    db.close()
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Idle worker reaper error")
+    
+    async def _pod_cleanup_task(self):
+        """Clean up terminated/offline pods"""
+        from db import SessionLocal, Worker
+        
+        while not self.shutdown_event.is_set():
             try:
-                worker.last_active = datetime.utcnow()
-                db.commit()
-                logger.info(
-                    "Worker %s updated in DB (status=%s, container_id=%s)",
-                    worker.worker_id,
-                    worker.status,
-                    worker.container_id,
-                )
-            except Exception as e:
-                db.rollback()
-                logger.error(
-                    "Failed to commit worker update for %s: %s",
-                    getattr(worker, "worker_id", None),
-                    e,
-                )
-
-        # ------------------ SEND FCM NOTIFICATION ------------------
-        if job.params.get("fcm_token"):
-            data = {
-                "job_id": job.job_id,
-                "status": "completed",
-                "download_url": job.output_url,
-            }
-            asyncio.create_task(
-                asyncio.to_thread(
-                    send_fcm_notification,
-                    job.params["fcm_token"],
-                    "Processing Complete.",
-                    "Tap to view your result.",
-                    data,
-                )
-            )
-
-        return {"status": "ok", "job_id": job.job_id, "download_url": job.output_url}
-
-    finally:
-        db.close()
-
-
-# @app.post("/heartbeat")
-# async def heartbeat(request: Request):
-#     body = await request.body()
-#     sig = request.headers.get("X-Signature", "")
-#     if not verify_signature(sig, body):
-#         raise HTTPException(status_code=401, detail="Invalid signature")
-
-#     data = json.loads(body)
-#     worker_id = data.get("worker_id")
-#     if not worker_id:
-#         raise HTTPException(status_code=400, detail="Missing worker_id")
-
-#     with SessionLocal() as db:
-#         w = db.query(Worker).filter(Worker.worker_id == worker_id).first()
-#         if not w:
-#             raise HTTPException(status_code=404, detail="Worker not found")
-#         w.last_heartbeat = datetime.utcnow()
-#         w.last_active = datetime.utcnow()
-#         db.commit()
-
-#     return {"status": "ok"}
-
-
-@app.post("/heartbeat")
-async def heartbeat(request: Request):
-    body = await request.body()
-    sig = request.headers.get("X-Signature", "")
-    if not verify_signature(sig, body):
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
-    data = json.loads(body)
-    worker_id = data.get("worker_id")
-    if not worker_id:
-        raise HTTPException(status_code=400, detail="Missing worker_id")
-
-    # Only update last_heartbeat here. Do NOT touch last_active.
-    # last_active should be updated on real job-related events (dispatch/job_complete).
-    with SessionLocal() as db:
-        w = db.query(Worker).filter(Worker.worker_id == worker_id).first()
-        if not w:
-            raise HTTPException(status_code=404, detail="Worker not found")
-        w.last_heartbeat = datetime.utcnow()
-        # DO NOT update last_active here
-        try:
-            db.commit()
-        except Exception:
-            db.rollback()
-            logger.exception("Failed committing heartbeat update for %s", worker_id)
-            raise HTTPException(status_code=500, detail="DB commit failed")
-
-    return {"status": "ok"}
-
-
-@app.post("/register_worker")
-async def register_worker(request: Request):
-    """
-    Secure worker registration handler:
-    - Verifies signature
-    - Validates pod_uuid belongs to orchestrator's active pods
-    - Destroys any unexpected pods automatically to prevent cost
-    - Tracks recently destroyed pods to ignore re-registrations
-    """
-
-    body = await request.body()
-    sig = request.headers.get("X-Signature", "")
-    if not verify_signature(sig, body):
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
-    data = json.loads(body)
-    payload = RegisterPayload(**data)
-
-    if not payload.models:
-        raise HTTPException(
-            status_code=400, detail="Worker must declare at least one model"
+                # INCREASED: 45s interval to reduce load on weak servers (was 15s)
+                await asyncio.sleep(45)
+                
+                if not self.pod_manager:
+                    continue
+                
+                db = SessionLocal()
+                try:
+                    # Find workers in terminal states with pods
+                    workers = db.query(Worker).filter(
+                        Worker.status.in_(["terminated", "offline", "error"]),
+                        Worker.container_id != None,
+                    ).all()
+                    
+                    for w in workers:
+                        try:
+                            # Skip warm pods
+                            if w.is_warm_pod:
+                                continue
+                            
+                            logger.info(
+                                f"Cleaning up pod {w.container_id} "
+                                f"(worker {w.worker_id}, status={w.status})"
+                            )
+                            
+                            await self.pod_manager.destroy_individual_pod(
+                                w.container_id,
+                                reason=f"Worker status: {w.status}"
+                            )
+                            
+                            w.container_id = None
+                            db.commit()
+                            
+                        except Exception as e:
+                            logger.debug(f"Pod cleanup error for {w.container_id}: {e}")
+                            
+                finally:
+                    db.close()
+                
+                # Also cleanup lifecycle tracker
+                await self.pod_manager.lifecycle.cleanup_destroyed_tracker()
+                
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Pod cleanup task error")
+    
+    async def _ban_cleanup_task(self):
+        """Clean up expired IP bans"""
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(60)  # Every minute
+                await ip_ban_manager.cleanup_expired()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Ban cleanup task error")
+    
+    async def _job_recovery_task(self):
+        """Check for stuck jobs and recover them"""
+        sweep_interval = 30  # Check every 30 seconds
+        
+        logger.info(
+            f"Job recovery task started (interval={sweep_interval}s, "
+            f"timeout={self.job_manager.job_timeout.total_seconds() / 60:.0f} min)"
         )
+        
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(sweep_interval)
+                
+                if self.job_manager:
+                    await self.job_manager.check_for_stuck_jobs()
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Job recovery task error")
 
-    container_id_received = payload.pod_uuid or payload.container_id
-    endpoint = payload.endpoint or (
-        f"http://{payload.public_ip}" if payload.public_ip else ""
+
+# =============================================================================
+# Application Factory
+# =============================================================================
+
+app_state = AppState()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager"""
+    # Startup
+    await app_state.initialize()
+    await app_state.start_background_tasks()
+    
+    yield
+    
+    # Shutdown
+    await app_state.shutdown()
+
+
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI application"""
+    
+    # Get debug mode from env
+    debug = os.getenv("DEBUG", "false").lower() == "true"
+    
+    # Create app
+    app = FastAPI(
+        title="Server Controller",
+        description="Client-Server-Worker Orchestrator for AI Generation",
+        version=os.getenv("APP_VERSION", "1.0.0"),
+        debug=debug,
+        lifespan=lifespan,
+        # Disable docs in production
+        docs_url="/docs" if debug else None,
+        redoc_url="/redoc" if debug else None,
+        openapi_url="/openapi.json" if debug else None,
     )
-    pod_uuid = container_id_received or "unknown"
+    
+    # Setup middleware
+    setup_middleware(app, debug=debug)
+    
+    # Include routers
+    app.include_router(public_router)
+    app.include_router(client_router)
+    app.include_router(worker_router)
+    app.include_router(admin_router)
+    
+    return app
 
-    # ---- VALIDATION LOGIC ----
-    expected_pods = set(pod_manager.active_pods.keys())
-    recently_destroyed = getattr(pod_manager, "recently_destroyed", {})
-    expiry_window = 5  # seconds
 
-    # 1️⃣ Reject pods destroyed recently (always enforced)
-    if (
-        pod_uuid in recently_destroyed
-        and time.time() - recently_destroyed[pod_uuid] < expiry_window
-    ):
-        logger.warning(
-            f"⚠️ Ignoring re-registration from recently destroyed pod {pod_uuid} "
-            f"(IP={endpoint}) — within expiry window."
-        )
-        return Response(status_code=403, content="Pod was recently destroyed")
+# Create application instance
+app = create_app()
 
-    # 2️⃣ Handle unknown pods based on ENABLE_AUTOTEST
-    if pod_uuid not in expected_pods:
-        if ENABLE_AUTOTEST:
-            logger.warning(
-                f"⚠️ [AUTOTEST MODE] Allowing unknown pod {pod_uuid} to register normally "
-                f"(IP={endpoint})."
-            )
-        else:
-            logger.warning(
-                f"🚫 Unexpected worker registration attempt from pod {pod_uuid} "
-                f"(IP={endpoint}). Initiating forced destroy to prevent cost."
-            )
-            # fire-and-forget async destroy
-            asyncio.create_task(pod_manager.destroy_unexpected_pod(pod_uuid))
-            return Response(status_code=403, content="Unrequested pod destroyed")
 
-    # ---- NORMAL REGISTRATION FLOW ----
-    with SessionLocal() as db:
-        for model in payload.models:
-            upsert_worker(
-                db,
-                payload.worker_id,
-                model,
-                endpoint,
-                container_id_received,
-                payload.info,
-            )
+# =============================================================================
+# Signal Handlers
+# =============================================================================
 
-    logger.info(
-        "✅ Registered worker %s for models %s (pod_uuid=%s, endpoint=%s)",
-        payload.worker_id,
-        payload.models,
-        pod_uuid,
-        endpoint,
+def setup_signal_handlers():
+    """Setup signal handlers for graceful shutdown"""
+    
+    def handle_signal(signum, frame):
+        logger.info(f"Received signal {signum}, initiating shutdown...")
+        app_state.shutdown_event.set()
+    
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    setup_signal_handlers()
+    
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+    workers = int(os.getenv("WORKERS", "1"))
+    
+    logger.info(f"Starting server on {host}:{port}")
+    
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        workers=workers,
+        reload=os.getenv("DEBUG", "false").lower() == "true",
+        log_level="info",
     )
 
-    # Update cache
-    try:
-        if container_id_received:
-            pod_info = pod_manager.individual_pods.get(container_id_received)
-            if pod_info and pod_info.machine_id:
-                await pod_manager.mark_image_cached_on_machine(
-                    pod_info.machine_id, payload.models[0]
-                )
-    except Exception as e:
-        logger.warning(f"Cache sync error for {container_id_received}: {e}")
-
-    return {"status": "ok"}
-
-
-@app.get("/job_status")
-async def job_status(
-    job_id: str = Query(..., description="Job ID to check status"),
-    auth=Depends(require_any_auth),
-):
-    """
-    Client polls this endpoint with job_id to get current job status.
-    Returns the job's current state and metadata.
-    """
-    db = SessionLocal()
-    try:
-        job = db.query(Job).filter(Job.job_id == job_id).first()
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-
-        response = {
-            "job_id": job.job_id,
-            "status": job.status,
-            "model": job.model,
-            "created_at": job.created_at.isoformat(),
-            "updated_at": job.updated_at.isoformat(),
-        }
-
-        # If failed, include error info for debugging
-        if job.status == JobState.FAILED.value:
-            response["error"] = job.error
-            response["error_log"] = job.error_log or []
-
-        return response
-
-    finally:
-        db.close()
-
-
-def send_fcm_notification(token: str, title: str, body: str, data: dict):
-    """Send a push notification to a device via FCM."""
-    try:
-        if "job_id" not in data:
-            raise ValueError("data must include job_id")
-        data.setdefault("status", "completed")
-        message = messaging.Message(
-            notification=messaging.Notification(
-                title=title,
-                body=body,
-            ),
-            data={str(k): str(v) for k, v in data.items()},
-            token=token,
-        )
-        response = messaging.send(message)
-        logger.info(f"✅ Sent FCM notification: {response}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Failed to send FCM notification: {e}")
-        return False
-
-
-@app.post("/submit")
-async def submit(
-    req: SubmitRequest,
-    background_tasks: BackgroundTasks,
-    auth=Depends(require_any_auth),
-):
-    job_id = str(uuid.uuid4())
-    db = SessionLocal()
-    result_key = f"{IMAGE_PREFIX}{job_id}.png"
-    with open("req_param.json", "w", encoding="utf-8") as f:
-        json.dump(req.dict(), f, indent=4)
-
-    try:
-        # Create new job record
-        job = Job(
-            job_id=job_id,
-            model=req.model,
-            prompt=req.prompt,
-            params=req.params or {},
-            status=JobState.QUEUED.value,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-            timeout_at=datetime.utcnow()
-            + timedelta(seconds=req.params.get("timeout", 3600)),
-            result_r2_key=result_key,
-            output_key=result_key,
-            output_url=f"{CONTROLLER_PUBLIC_URL}/download/{job_id}",  # ✅ controller-managed redirect URL
-        )
-        db.add(job)
-        db.commit()
-
-        # ✅ Store FCM token temporarily in params for notification
-        if req.fcm_token:
-            logger.info(f"Storing FCM token {req.fcm_token} for job {job_id}")
-            job.params["fcm_token"] = req.fcm_token
-            db.commit()
-    finally:
-        db.close()
-
-    # ✅ Generate presigned PUT URL for worker upload (unchanged)
-    presigned_url = create_presigned_put_url(result_key)
-    if not presigned_url:
-        raise HTTPException(status_code=500, detail="Failed to generate upload URL")
-
-    try:
-        # Track job as pending and dispatch to a worker
-        await pod_manager.add_pending_job(job_id, req.model)
-        worker_id = await pod_manager.dispatch_job(
-            job_id, req.model, req.params.get("mode")
-        )
-        background_tasks.add_task(
-            assign_job_to_worker, job_id, worker_id, presigned_url
-        )
-
-        # ✅ Simplified: always return controller /download endpoint (no presigned GET)
-        download_url = f"{CONTROLLER_PUBLIC_URL}/download/{job_id}"
-
-        return {
-            "job_id": job_id,
-            "status": "dispatched",
-            "routed_to_worker": worker_id,
-            "upload_url": presigned_url,  # ✅ worker uploads here
-            "result_key": result_key,
-            "download_url": download_url,  # ✅ app fetches from here (controller redirect)
-        }
-
-    except Exception as e:
-        logger.error("Failed to dispatch job %s: %s", job_id, e)
-        print()
-        db = SessionLocal()
-        try:
-            job = db.query(Job).filter(Job.job_id == job_id).first()
-            if job:
-                job.status = JobState.FAILED.value
-                job.error = str(e)
-                db.commit()
-        finally:
-            db.close()
-        raise HTTPException(status_code=500, detail=f"Dispatch failed: {e}")

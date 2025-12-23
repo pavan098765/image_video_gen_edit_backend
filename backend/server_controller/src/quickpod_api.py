@@ -1,275 +1,606 @@
 # quickpod_api.py
-from datetime import datetime, timedelta
-import json
+"""
+QuickPod API Wrapper
+
+Provides:
+- Authentication and token management
+- Pod lifecycle operations (create, start, stop, destroy)
+- Machine listing and offer selection
+- Exponential backoff for retries
+- Better error handling (distinguish fatal vs transient)
+- Logging of API responses
+"""
+
 import os
-import requests
+import json
+import time
 import logging
-from typing import Optional, Dict, Any, Tuple
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, Tuple, List
+from enum import Enum
+
+import requests
+from requests.exceptions import RequestException, Timeout, ConnectionError
+
+from exceptions import (
+    QuickPodAPIError,
+    QuickPodFatalError,
+    PodCreationError,
+    PodDestroyError,
+)
 
 logger = logging.getLogger("quickpod")
-logger.setLevel(logging.INFO)
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
 
 QUICKPOD_BASE = os.getenv("QUICKPOD_BASE", "https://api.quickpod.org")
-
 BASE_URL = "https://api.quickpod.org/update"
 RENTABLE_URL = "https://api.quickpod.org/rentable"
 
+# Retry configuration
+MAX_RETRIES = 3
+INITIAL_RETRY_DELAY = 2.0
+MAX_RETRY_DELAY = 30.0
+RETRY_BACKOFF_FACTOR = 2.0
+
+# Request timeouts
+DEFAULT_TIMEOUT = 30
+LOGIN_TIMEOUT = 15
+POD_OPERATION_TIMEOUT = 60
+
+
+class QuickPodErrorType(str, Enum):
+    """Types of QuickPod errors"""
+    TRANSIENT = "transient"  # Network issues, temporary failures
+    FATAL = "fatal"  # Database errors, invalid requests
+    AUTH = "auth"  # Authentication failures
+    RATE_LIMIT = "rate_limit"  # Too many requests
+    UNKNOWN = "unknown"
+
+
+# =============================================================================
+# Error Classification
+# =============================================================================
+
+def classify_error(error: Exception, response: Optional[requests.Response] = None) -> QuickPodErrorType:
+    """
+    Classify an error as transient or fatal.
+    
+    Args:
+        error: The exception that occurred
+        response: Optional response object
+        
+    Returns:
+        QuickPodErrorType classification
+    """
+    error_msg = str(error).lower()
+    
+    # Check response status code
+    if response is not None:
+        status = response.status_code
+        
+        # Authentication errors
+        if status == 401:
+            return QuickPodErrorType.AUTH
+        
+        # Rate limiting
+        if status == 429:
+            return QuickPodErrorType.RATE_LIMIT
+        
+        # Fatal database/validation errors
+        if status == 406:
+            return QuickPodErrorType.FATAL
+        
+        # Server errors are usually transient
+        if 500 <= status < 600:
+            return QuickPodErrorType.TRANSIENT
+        
+        # Client errors other than auth are usually fatal
+        if 400 <= status < 500:
+            return QuickPodErrorType.FATAL
+    
+    # Check error message for known patterns
+    if "database query failed" in error_msg or "406" in error_msg:
+        return QuickPodErrorType.FATAL
+    
+    if "timeout" in error_msg or "connection" in error_msg:
+        return QuickPodErrorType.TRANSIENT
+    
+    if isinstance(error, (Timeout, ConnectionError)):
+        return QuickPodErrorType.TRANSIENT
+    
+    return QuickPodErrorType.UNKNOWN
+
+
+# =============================================================================
+# Retry Logic
+# =============================================================================
+
+def calculate_retry_delay(attempt: int) -> float:
+    """Calculate delay for retry with exponential backoff"""
+    delay = INITIAL_RETRY_DELAY * (RETRY_BACKOFF_FACTOR ** attempt)
+    return min(delay, MAX_RETRY_DELAY)
+
+
+def should_retry(error_type: QuickPodErrorType, attempt: int) -> bool:
+    """Determine if a request should be retried"""
+    if attempt >= MAX_RETRIES:
+        return False
+    
+    # Only retry transient and unknown errors
+    return error_type in (QuickPodErrorType.TRANSIENT, QuickPodErrorType.UNKNOWN)
+
+
+# =============================================================================
+# QuickPod Manager
+# =============================================================================
 
 class QuickPodManager:
     """
-    Thin wrapper to call QuickPod API. This class is simple and stateless.
-    For operations which target a specific pod, instantiate with pod_uuid.
+    QuickPod API client with improved error handling and retry logic.
+    
+    For pod-specific operations, instantiate with pod_uuid.
     """
-
+    
     def __init__(
         self,
-        email: str,
-        password: str,
+        email: Optional[str] = None,
+        password: Optional[str] = None,
         pod_uuid: Optional[str] = None,
-        api_base: str = None,
+        api_base: Optional[str] = None,
     ):
         self.email = email or os.getenv("QUICKPOD_EMAIL")
         self.password = password or os.getenv("QUICKPOD_PASSWORD")
         self.pod_uuid = pod_uuid
-        self.token = None
-        self.token_acquired_at: Optional[datetime] = None
-        # assume tokens valid for 6 hours unless API tells us otherwise
-        self.token_ttl = timedelta(hours=6)
         self.base = api_base or QUICKPOD_BASE
-        print(f"QuickPodManager initialized for {self.email} with pod_uuid={pod_uuid}")
-
-    def login(self):
+        
+        # Token management
+        self.token: Optional[str] = None
+        self.token_acquired_at: Optional[datetime] = None
+        self.token_ttl = timedelta(hours=6)
+        
+        logger.info(f"QuickPodManager initialized for {self.email} with pod_uuid={pod_uuid}")
+    
+    # -------------------------------------------------------------------------
+    # Authentication
+    # -------------------------------------------------------------------------
+    
+    def login(self) -> str:
+        """
+        Authenticate with QuickPod and acquire a token.
+        
+        Returns:
+            Authentication token
+            
+        Raises:
+            QuickPodAPIError: If login fails
+        """
         url = f"{BASE_URL}/auth/login"
         payload = {"email": self.email, "password": self.password}
-        resp = requests.post(url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        self.token = data.get("authToken") or data.get("token") or data.get("jwt")
-        if not self.token:
-            raise RuntimeError(f"Login failed: {data}")
-        print("Login successful. Token acquired.")
-        self.token_acquired_at = datetime.utcnow()
-        # if response provides expiry, set token_ttl accordingly (best-effort)
-        expires_at = data.get("expires_at") or data.get("expiry")
-        if expires_at:
-            try:
-                # try parse ISO timestamp
-                self.token_ttl = datetime.fromisoformat(expires_at) - datetime.utcnow()
-            except Exception:
-                pass
-        logger.info("Login successful. Token acquired.")
-        return self.token
+        
+        try:
+            resp = requests.post(url, json=payload, timeout=LOGIN_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            self.token = data.get("authToken") or data.get("token") or data.get("jwt")
+            if not self.token:
+                raise QuickPodAPIError("login", reason=f"No token in response: {data}")
+            
+            self.token_acquired_at = datetime.utcnow()
+            
+            # Parse expiry if provided
+            expires_at = data.get("expires_at") or data.get("expiry")
+            if expires_at:
+                try:
+                    self.token_ttl = datetime.fromisoformat(expires_at) - datetime.utcnow()
+                except Exception:
+                    pass
+            
+            logger.info("QuickPod login successful, token acquired")
+            return self.token
+            
+        except RequestException as e:
+            logger.error(f"QuickPod login failed: {e}")
+            raise QuickPodAPIError("login", reason=str(e), cause=e)
     
     def _is_token_valid(self) -> bool:
+        """Check if current token is still valid"""
         if not self.token or not self.token_acquired_at:
             return False
         return (datetime.utcnow() - self.token_acquired_at) < self.token_ttl
-
+    
     def _auth_headers(self, force_refresh: bool = False) -> Dict[str, str]:
-        # reuse token when valid; otherwise login
+        """Get authorization headers, refreshing token if needed"""
         if force_refresh or not self._is_token_valid():
             self.login()
         return {"Authorization": f"Bearer {self.token}"}
-
-
+    
+    # -------------------------------------------------------------------------
+    # Request Helper
+    # -------------------------------------------------------------------------
+    
     def _make_request(
-    self,
-    method: str,
-    endpoint: str,
-    headers: Optional[Dict[str, str]] = None,
-    params: Optional[Dict[str, Any]] = None,
-    retry_on_401: bool = True,
-    **kwargs,
+        self,
+        method: str,
+        endpoint: str,
+        headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        retry_on_401: bool = True,
+        **kwargs,
     ) -> Any:
+        """
+        Make an API request with error handling and retry logic.
+        
+        Args:
+            method: HTTP method
+            endpoint: API endpoint
+            headers: Additional headers
+            params: Query parameters
+            timeout: Request timeout
+            retry_on_401: Whether to retry on 401 with refreshed token
+            **kwargs: Additional arguments for requests
+            
+        Returns:
+            Parsed JSON response
+            
+        Raises:
+            QuickPodAPIError: For transient errors
+            QuickPodFatalError: For non-recoverable errors
+        """
         url = f"{self.base.rstrip('/')}/{endpoint.lstrip('/')}"
-        merged_headers = self._auth_headers() or {}
-        if headers:
-            merged_headers.update(headers)
-        if params is None and self.pod_uuid:
-            params = {"pod_uuid": self.pod_uuid}
-        resp = requests.request(
-            method, url, headers=merged_headers, params=params, timeout=30, **kwargs
-        )
-
-        # if unauthorized, try refresh once
-        if resp.status_code == 401 and retry_on_401:
-            logger.warning("401 returned from QuickPod; forcing token refresh and retrying.")
-            merged_headers = self._auth_headers(force_refresh=True)
-            resp = requests.request(method, url, headers=merged_headers, params=params, timeout=30, **kwargs)
-
-        raw_text = resp.text[:4096]  # short preview
-        try:
-            data = resp.json()
-        except Exception as je:
-            # Log the raw response for easier debugging and re-raise http error
-            logger.error("QuickPod returned non-JSON response (status=%s) for %s %s: %s", resp.status_code, method, endpoint, raw_text)
-            resp.raise_for_status()
-            return {"raw": raw_text}
-
-        # If API returned structured error, include the full body in the exception message
-        if isinstance(data, dict) and "error" in data:
-            logger.error("QuickPod API error (status=%s) endpoint=%s: %s", resp.status_code, endpoint, json.dumps(data))
-            # raise including original payload for easier debugging
-            raise RuntimeError(f"API Error: {data.get('error')} (full_response={json.dumps(data)})")
-        resp.raise_for_status()
-        return data
-
-    # ---------------------------
+        
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                merged_headers = self._auth_headers() or {}
+                if headers:
+                    merged_headers.update(headers)
+                
+                # Add default pod_uuid param if set
+                if params is None and self.pod_uuid:
+                    params = {"pod_uuid": self.pod_uuid}
+                
+                resp = requests.request(
+                    method,
+                    url,
+                    headers=merged_headers,
+                    params=params,
+                    timeout=timeout,
+                    **kwargs
+                )
+                
+                # Handle 401 with token refresh
+                if resp.status_code == 401 and retry_on_401:
+                    logger.warning("401 from QuickPod, refreshing token and retrying")
+                    merged_headers = self._auth_headers(force_refresh=True)
+                    resp = requests.request(
+                        method,
+                        url,
+                        headers=merged_headers,
+                        params=params,
+                        timeout=timeout,
+                        **kwargs
+                    )
+                
+                # Log response preview
+                raw_text = resp.text[:2048]
+                
+                # Try to parse JSON
+                try:
+                    data = resp.json()
+                except Exception:
+                    logger.error(
+                        f"QuickPod non-JSON response (status={resp.status_code}) "
+                        f"for {method} {endpoint}: {raw_text}"
+                    )
+                    resp.raise_for_status()
+                    return {"raw": raw_text}
+                
+                # Check for API error response
+                if isinstance(data, dict) and "error" in data:
+                    error_type = classify_error(
+                        Exception(data.get("error")),
+                        resp
+                    )
+                    
+                    if error_type == QuickPodErrorType.FATAL:
+                        raise QuickPodFatalError(
+                            endpoint,
+                            reason=f"{data.get('error')} (full: {json.dumps(data)})"
+                        )
+                    
+                    raise QuickPodAPIError(
+                        endpoint,
+                        reason=f"{data.get('error')} (full: {json.dumps(data)})"
+                    )
+                
+                resp.raise_for_status()
+                return data
+                
+            except (QuickPodFatalError,):
+                # Don't retry fatal errors
+                raise
+                
+            except Exception as e:
+                error_type = classify_error(e, getattr(e, 'response', None))
+                
+                if error_type == QuickPodErrorType.FATAL:
+                    raise QuickPodFatalError(endpoint, reason=str(e), cause=e)
+                
+                if should_retry(error_type, attempt):
+                    delay = calculate_retry_delay(attempt)
+                    logger.warning(
+                        f"QuickPod request failed (attempt {attempt + 1}/{MAX_RETRIES + 1}), "
+                        f"retrying in {delay:.1f}s: {e}"
+                    )
+                    time.sleep(delay)
+                    continue
+                
+                raise QuickPodAPIError(endpoint, reason=str(e), cause=e)
+    
+    # -------------------------------------------------------------------------
     # Template Management
-    # ---------------------------
-    def get_templates(self):
-        """Fetch available templates from QuickPod API."""
+    # -------------------------------------------------------------------------
+    
+    def get_templates(self) -> List[Dict[str, Any]]:
+        """Fetch available templates from QuickPod API"""
         return self._make_request("GET", "templates")
-
+    
     def get_template_by_name(self, template_name: str) -> Optional[str]:
-        """Return template UUID by template name, or None if not found."""
+        """
+        Get template UUID by name.
+        
+        Args:
+            template_name: Template name to search for
+            
+        Returns:
+            Template UUID if found, None otherwise
+        """
         templates = self.get_templates()
-
         for template in templates:
             if template.get("template_name") == template_name:
                 return template.get("template_uuid")
         return None
-
-    # ---------------------------
-    # Pod Management
-    # ---------------------------
-    def start_pod(self):
-        """Start a pod by UUID (GET with query param)."""
+    
+    # -------------------------------------------------------------------------
+    # Pod Operations
+    # -------------------------------------------------------------------------
+    
+    def start_pod(self) -> Dict[str, Any]:
+        """Start a stopped pod"""
         if not self.pod_uuid:
             raise RuntimeError("No pod_uuid set. Cannot start pod.")
+        
+        logger.info(f"Starting pod {self.pod_uuid}")
         return self._make_request(
-            "GET", "update/startpod", params={"pod_uuid": self.pod_uuid}
+            "GET",
+            "update/startpod",
+            params={"pod_uuid": self.pod_uuid},
+            timeout=POD_OPERATION_TIMEOUT,
         )
-
-    def stop_pod(self):
-        """Stop a pod by UUID."""
+    
+    def stop_pod(self) -> Dict[str, Any]:
+        """Stop a running pod"""
         if not self.pod_uuid:
             raise RuntimeError("No pod_uuid set. Cannot stop pod.")
+        
+        logger.info(f"Stopping pod {self.pod_uuid}")
         return self._make_request(
-            "GET", "update/stoppod", params={"pod_uuid": self.pod_uuid}
+            "GET",
+            "update/stoppod",
+            params={"pod_uuid": self.pod_uuid},
+            timeout=POD_OPERATION_TIMEOUT,
         )
-
-    def restart_pod(self):
-        """Restart a pod by UUID."""
+    
+    def restart_pod(self) -> Dict[str, Any]:
+        """Restart a pod"""
         if not self.pod_uuid:
             raise RuntimeError("No pod_uuid set. Cannot restart pod.")
+        
+        logger.info(f"Restarting pod {self.pod_uuid}")
         return self._make_request(
-            "GET", "update/restartpod", params={"pod_uuid": self.pod_uuid}
+            "GET",
+            "update/restartpod",
+            params={"pod_uuid": self.pod_uuid},
+            timeout=POD_OPERATION_TIMEOUT,
         )
-
-    def destroy_pod(self):
-        """Destroy the current pod (frees resources)."""
+    
+    def destroy_pod(self) -> Dict[str, Any]:
+        """
+        Destroy and release a pod.
+        
+        Returns:
+            API response
+            
+        Raises:
+            PodDestroyError: If destruction fails
+        """
         if not self.pod_uuid:
             raise RuntimeError("No pod_uuid set. Cannot destroy pod.")
-        logger.info("QuickPodManager.destroy_pod called for pod_uuid=%s", self.pod_uuid)
-        return self._make_request(
-            "GET", "update/destroypod", params={"pod_uuid": self.pod_uuid}
-        )
-
-    def delete_pod(self, *args, **kwargs):
-        """Alias for destroy_pod to match main.py expectations."""
+        
+        logger.info(f"Destroying pod {self.pod_uuid}")
+        try:
+            return self._make_request(
+                "GET",
+                "update/destroypod",
+                params={"pod_uuid": self.pod_uuid},
+                timeout=POD_OPERATION_TIMEOUT,
+            )
+        except Exception as e:
+            raise PodDestroyError(self.pod_uuid, reason=str(e), cause=e)
+    
+    def delete_pod(self, *args, **kwargs) -> Dict[str, Any]:
+        """Alias for destroy_pod (backward compatibility)"""
         return self.destroy_pod(*args, **kwargs)
-
-    def get_logs(self):
+    
+    def get_logs(self) -> Dict[str, Any]:
+        """Fetch pod logs for debugging"""
         if not self.pod_uuid:
             raise RuntimeError("No pod_uuid set. Cannot fetch logs.")
+        
         return self._make_request(
-            "GET", "update/podlogs", params={"pod_uuid": self.pod_uuid}
+            "GET",
+            "update/podlogs",
+            params={"pod_uuid": self.pod_uuid},
         )
-
-    # ---------------------------
-    # Machine Listing + Pod Creation
-    # ---------------------------
-
-    def get_best_offer(self, preferred_machine_id: Optional[int] = None) -> Optional[Tuple[int, int]]:
+    
+    # -------------------------------------------------------------------------
+    # Machine & Offer Management
+    # -------------------------------------------------------------------------
+    
+    def get_rentable_machines(self) -> List[Dict[str, Any]]:
         """
-        Fetch rentable machines and return (offer_id, machine_id) tuple for the best available match.
-        Never creates pods. Selection priority:
-        1. Preferred machine (if specified)
-        2. MACHINE_ID env
-        3. WARM_MACHINE_ID env
-        4. Fallback — cheapest offer by GPU tier (e.g. 5090 > 4090 > 4080)
+        Fetch list of available rentable machines.
+        
+        Returns:
+            List of machine offers
         """
         try:
-            resp = requests.get(RENTABLE_URL, timeout=30)
+            resp = requests.get(RENTABLE_URL, timeout=DEFAULT_TIMEOUT)
             resp.raise_for_status()
-            offers = resp.json()
+            return resp.json()
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch offers: {e}")
-
-        if not offers:
+            raise QuickPodAPIError("get_rentable_machines", reason=str(e), cause=e)
+    
+    def get_best_offer(
+        self,
+        preferred_machine_id: Optional[int] = None,
+        min_tflops: float = 0,
+        allowed_gpu_names: Optional[List[str]] = None,
+        min_gpu_count: int = 1,
+        blacklisted_machines: Optional[List[str]] = None,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """
+        Find the best available machine offer.
+        
+        Selection priority:
+        1. Preferred machine (if specified and available)
+        2. MACHINE_ID env variable
+        3. WARM_MACHINE_ID env variable
+        4. Fallback: cheapest offer by GPU tier
+        
+        Args:
+            preferred_machine_id: Preferred machine ID to use
+            min_tflops: Minimum TFLOPS required
+            allowed_gpu_names: List of allowed GPU names (e.g., ["5090", "4090"])
+            min_gpu_count: Minimum GPU count required
+            blacklisted_machines: List of machine IDs to exclude from selection
+            
+        Returns:
+            Tuple of (offer_id, machine_id) or (None, None) if no match
+        """
+        blacklist_set = set(str(m) for m in (blacklisted_machines or []))
+        try:
+            offers = self.get_rentable_machines()
+        except Exception as e:
+            logger.error(f"Failed to fetch offers: {e}")
             return None, None
-
-        # --- Helpers ---
-        def extract_offer_id(o): 
+        
+        if not offers:
+            logger.warning("No offers available")
+            return None, None
+        
+        # Helper functions
+        def extract_offer_id(o: Dict) -> Optional[int]:
             return o.get("offer_id") or o.get("id")
-
-        def extract_machine_id(o):
+        
+        def extract_machine_id(o: Dict) -> Optional[int]:
             for key in ("machines_id", "machine_id", "machineId"):
                 if key in o and o[key] is not None:
-                    return int(o[key])
+                    try:
+                        return int(o[key])
+                    except (ValueError, TypeError):
+                        pass
             return None
-
-        def is_multi_gpu_offer(o):
+        
+        def is_multi_gpu_offer(o: Dict) -> bool:
             name = str(o.get("offer_name", "")).upper()
             if name.startswith(("2X", "3X", "4X")):
                 return True
-            g = str(o.get("gpu_indexes", "") or "")
-            tokens = [t for t in g.split("|") if t.strip()]
+            gpu_indexes = str(o.get("gpu_indexes", "") or "")
+            tokens = [t for t in gpu_indexes.split("|") if t.strip()]
             return len(tokens) > 1
-
-        def extract_price(o):
+        
+        def extract_price(o: Dict) -> float:
             try:
                 return float(o.get("hourly_cost", 1e9))
-            except Exception:
+            except (ValueError, TypeError):
                 return 1e9
-
-        def has_valid_tflops(o):
+        
+        def has_valid_tflops(o: Dict) -> bool:
             try:
-                return float(o.get("tflops", 0)) > 0
-            except Exception:
+                return float(o.get("tflops", 0)) >= min_tflops
+            except (ValueError, TypeError):
                 return False
-
-        # --- 1️⃣ Preferred machine ---
+        
+        def matches_gpu_name(o: Dict) -> bool:
+            if not allowed_gpu_names:
+                return True
+            offer_name = str(o.get("offer_name", "")).upper()
+            for gpu in allowed_gpu_names:
+                if gpu.upper() in offer_name:
+                    return True
+            return False
+        
+        def is_blacklisted(o: Dict) -> bool:
+            mid = extract_machine_id(o)
+            if mid and str(mid) in blacklist_set:
+                return True
+            return False
+        
+        def is_valid_offer(o: Dict) -> bool:
+            return (
+                not is_multi_gpu_offer(o) and
+                has_valid_tflops(o) and
+                matches_gpu_name(o) and
+                not is_blacklisted(o)  # Filter out blacklisted machines
+            )
+        
+        # 1. Try preferred machine
         if preferred_machine_id:
             filtered = [
-                o for o in offers 
+                o for o in offers
                 if extract_machine_id(o) == int(preferred_machine_id)
-                and not is_multi_gpu_offer(o)
-                and has_valid_tflops(o)
+                and is_valid_offer(o)
             ]
             if filtered:
                 oid = extract_offer_id(filtered[0])
                 mid = extract_machine_id(filtered[0])
                 if oid:
-                    logger.info(f"✅ Using preferred machine {mid} offer_id={oid}")
+                    logger.info(f"Using preferred machine {mid}, offer_id={oid}")
                     return oid, mid
-            logger.warning(f"No offers found for preferred machine {preferred_machine_id}")
-
-        # --- 2️⃣ Env machine fallback ---
+            logger.warning(f"Preferred machine {preferred_machine_id} not available")
+        
+        # 2. Try env machine fallback
         for env_key in ("MACHINE_ID", "WARM_MACHINE_ID"):
             env_val = os.getenv(env_key)
             if env_val:
-                filtered = [
-                    o for o in offers
-                    if extract_machine_id(o) == int(env_val)
-                    and not is_multi_gpu_offer(o)
-                    and has_valid_tflops(o)
-                ]
-                if filtered:
-                    oid = extract_offer_id(filtered[0])
-                    mid = extract_machine_id(filtered[0])
-                    logger.info(f"✅ Using {env_key}={mid} offer_id={oid}")
-                    return oid, mid
-
-        # --- 3️⃣ Fallback by GPU tier & cheapest ---
-        gpu_tiers = ["5090", "4090", "4080TI", "4080"]
+                try:
+                    machine_id = int(env_val)
+                    filtered = [
+                        o for o in offers
+                        if extract_machine_id(o) == machine_id
+                        and is_valid_offer(o)
+                    ]
+                    if filtered:
+                        oid = extract_offer_id(filtered[0])
+                        mid = extract_machine_id(filtered[0])
+                        logger.info(f"Using {env_key}={mid}, offer_id={oid}")
+                        return oid, mid
+                except ValueError:
+                    pass
+        
+        # 3. Fallback by GPU tier
+        gpu_tiers = ["5090", "4090", "4080TI", "4080", "4070"]
         for tier in gpu_tiers:
             tier_offers = [
                 o for o in offers
                 if tier in str(o.get("offer_name", "")).upper()
-                and not is_multi_gpu_offer(o)
-                and has_valid_tflops(o)
+                and is_valid_offer(o)
             ]
             tier_offers.sort(key=extract_price)
             if tier_offers:
@@ -277,40 +608,91 @@ class QuickPodManager:
                 oid = extract_offer_id(cheapest)
                 mid = extract_machine_id(cheapest)
                 logger.info(
-                    f"⚙️ Using fallback offer_id={oid} (GPU={tier}, price={extract_price(cheapest):.3f}, tflops={cheapest.get('tflops')}) machine_id={mid}"
+                    f"Using fallback: GPU={tier}, offer_id={oid}, "
+                    f"price={extract_price(cheapest):.3f}, "
+                    f"tflops={cheapest.get('tflops')}, machine_id={mid}"
                 )
                 return oid, mid
-
-        logger.error("❌ No suitable offers found with tflops > 0.")
+        
+        logger.error("No suitable offers found")
         return None, None
-
-
-    def create_pod(self, offer_id: int, template_uuid: str, disk_size: int = 50):
-        """Create a new pod with given offer_id, template_uuid, and disk size."""
+    
+    def create_pod(
+        self,
+        offer_id: int,
+        template_uuid: str,
+        disk_size: int = 50,
+    ) -> Dict[str, Any]:
+        """
+        Create a new pod.
+        
+        Args:
+            offer_id: Offer ID from get_best_offer
+            template_uuid: Template UUID to use
+            disk_size: Disk size in GB
+            
+        Returns:
+            API response including pod_uuid
+            
+        Raises:
+            PodCreationError: If creation fails
+        """
         body = {
             "offers_id": offer_id,
             "disk_size": str(disk_size),
             "template_uuid": template_uuid,
         }
+        
+        logger.info(
+            f"Creating pod: offer={offer_id}, template={template_uuid}, disk={disk_size}GB"
+        )
+        
+        try:
+            data = self._make_request(
+                "POST",
+                "update/createpod",
+                json=body,
+                timeout=POD_OPERATION_TIMEOUT,
+            )
+            
+            if data is None:
+                raise PodCreationError("unknown", reason="No data returned from API")
+            
+            if data.get("status") != "success":
+                raise PodCreationError("unknown", reason=f"API returned: {data}")
+            
+            self.pod_uuid = (
+                data.get("pod_uuid") or 
+                data.get("uuid") or 
+                data.get("id")
+            )
+            
+            logger.info(f"Pod created successfully: {self.pod_uuid}")
+            logger.debug(f"Full response: {json.dumps(data, indent=2)}")
+            
+            return data
+            
+        except (PodCreationError, QuickPodFatalError):
+            raise
+        except Exception as e:
+            raise PodCreationError("unknown", reason=str(e), cause=e)
 
-        # Correct endpoint: /update/createpod
-        data = self._make_request("POST", "update/createpod", json=body)
-        if data is None:
-            raise RuntimeError("No data returned from create_pod API call")
-        if data.get("status") != "success":
-            raise RuntimeError(f"Pod creation failed: {data}")
-        else:
-            logger.info("Pod creation successful.")
-        logger.info(f"QuickPod API response: {json.dumps(data, indent=2)}")
 
-        self.pod_uuid = data.get("pod_uuid") or data.get("uuid") or data.get("id")
-        return data
-    
+# =============================================================================
+# Testing
+# =============================================================================
+
 if __name__ == "__main__":
-        # Create manager instance with environment variables
-        manager = QuickPodManager(email="pavanalur3@gmail.com", password="C@9rw6fxATDm8sM")  # Will use env vars
-        # Get templates and save to file
-        data = manager.get_templates()
-        with open("quickpod_templates.json", "w") as f:
-            json.dump(data, f, indent=2)
-        print("\n✅ QuickPod templates saved to quickpod_templates.json\n")
+    # Quick test
+    manager = QuickPodManager()
+    
+    try:
+        templates = manager.get_templates()
+        print(f"Found {len(templates)} templates")
+        
+        offer_id, machine_id = manager.get_best_offer()
+        print(f"Best offer: {offer_id}, machine: {machine_id}")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+

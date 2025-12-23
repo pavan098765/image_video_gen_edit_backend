@@ -83,7 +83,8 @@ def write_rest(f):
     # Worker setup
     f.write("RUN mkdir -p /app/worker && touch /app/worker/uvicorn.log\n\n")
     f.write("WORKDIR /app/worker\n")
-    f.write("EXPOSE 8000\n")
+    f.write("EXPOSE 8000\n\n")
+    f.write('CMD ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]\n')
 
 
 def main():

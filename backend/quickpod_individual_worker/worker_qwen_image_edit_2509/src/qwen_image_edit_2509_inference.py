@@ -92,12 +92,33 @@ def get_pipeline():
         vram = get_gpu_memory()
     except Exception:
         vram = 8
+    
+    print(f"🔍 Detected GPU VRAM: {vram:.1f} GB")
 
-    if vram > 18:
-        print("🧠 High VRAM → enabling CPU offload")
+    # VRAM thresholds:
+    # - 48GB+ (5090, A100): High VRAM mode with simple CPU offload
+    # - 24-48GB (4090, 3090): Medium VRAM with more aggressive offloading
+    # - <24GB: Low VRAM with sequential offload
+    if vram >= 40:
+        print("🧠 Very High VRAM (>=40GB) → enabling simple CPU offload")
         pipeline.enable_model_cpu_offload()
+    elif vram >= 20:
+        # 24GB cards (4090) need more aggressive memory management
+        print("🧠 Medium VRAM (20-40GB) → enabling aggressive sequential offload")
+        # More blocks on GPU for 24GB, but still use sequential offload
+        num_blocks = 2 if vram >= 24 else 1
+        transformer.set_offload(True, use_pin_memory=True, num_blocks_on_gpu=num_blocks)
+        pipeline._exclude_from_cpu_offload.append("transformer")
+        pipeline.enable_sequential_cpu_offload()
+        
+        # Also enable memory efficient attention if available
+        try:
+            pipeline.enable_xformers_memory_efficient_attention()
+            print("✅ XFormers memory efficient attention enabled")
+        except Exception as e:
+            print(f"ℹ️ XFormers not available: {e}")
     else:
-        print("🧠 Low VRAM → enabling sequential offload")
+        print("🧠 Low VRAM (<20GB) → enabling most aggressive sequential offload")
         transformer.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=1)
         pipeline._exclude_from_cpu_offload.append("transformer")
         pipeline.enable_sequential_cpu_offload()
@@ -186,6 +207,20 @@ def run_inference_qwen_image_edit_2509(job_id: str, prompt: str, params: Dict[st
 
     # Prepare pipeline and inputs
     pipeline = get_pipeline()
+    
+    # CRITICAL: Clear GPU memory before inference to maximize available VRAM
+    # This is especially important for 24GB cards (4090) running int4
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    
+    # Log memory state before inference
+    try:
+        free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+        print(f"🔍 GPU memory before inference: {free_mem / 1024**3:.2f} GB free")
+    except Exception:
+        pass
 
     inputs = {
         "image": images if len(images) > 1 else images[0],
@@ -200,8 +235,18 @@ def run_inference_qwen_image_edit_2509(job_id: str, prompt: str, params: Dict[st
         inputs["height"] = height
 
     print(f"🧪 Running pipeline job {job_id} | {len(images)} images, steps={inputs['num_inference_steps']}")
-    result = pipeline(**inputs)
-    image = result.images[0]
+    
+    # Run inference with automatic mixed precision for memory efficiency
+    try:
+        with torch.inference_mode():
+            result = pipeline(**inputs)
+        image = result.images[0]
+    finally:
+        # CRITICAL: Clean up GPU memory after inference
+        # This prevents OOM on back-to-back jobs, especially on 24GB cards
+        del inputs
+        gc.collect()
+        torch.cuda.empty_cache()
 
     out_path = os.path.join(output_dir, f"qwen_{job_id}.png")
     image.save(out_path)

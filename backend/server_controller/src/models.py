@@ -1,0 +1,575 @@
+# models.py
+"""
+Pydantic Models for API Request/Response Validation
+
+Provides:
+- Request validation with detailed error messages
+- Response serialization
+- Type safety across the application
+"""
+
+from datetime import datetime
+from typing import Optional, Dict, Any, List, Union
+from enum import Enum
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+import re
+
+
+# =============================================================================
+# Enums
+# =============================================================================
+
+class JobStatus(str, Enum):
+    """Job status states"""
+    PENDING = "pending"
+    QUEUED = "queued"
+    DISPATCHING = "dispatching"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+    RECOVERED = "recovered"
+    CANCELLED = "cancelled"
+
+
+class WorkerStatus(str, Enum):
+    """Worker status states"""
+    STARTING = "starting"  # Worker is starting up, model loading
+    READY = "ready"
+    DISPATCHING = "dispatching"
+    BUSY = "busy"
+    PROCESSING = "processing"
+    IDLE = "idle"
+    OFFLINE = "offline"
+    ERROR = "error"
+
+
+class HealthStatus(str, Enum):
+    """Worker health status"""
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+    UNKNOWN = "unknown"
+
+
+class PodStatus(str, Enum):
+    """Pod lifecycle status"""
+    STARTING = "starting"
+    READY = "ready"
+    BUSY = "busy"
+    STOPPING = "stopping"
+    TERMINATED = "terminated"
+    ERROR = "error"
+
+
+class AuditEventType(str, Enum):
+    """Audit log event types"""
+    JOB_CREATED = "job_created"
+    JOB_STARTED = "job_started"
+    JOB_COMPLETED = "job_completed"
+    JOB_FAILED = "job_failed"
+    JOB_TIMEOUT = "job_timeout"
+    JOB_RECOVERED = "job_recovered"
+    JOB_CANCELLED = "job_cancelled"
+    POD_CREATED = "pod_created"
+    POD_STARTED = "pod_started"
+    POD_STOPPED = "pod_stopped"
+    POD_DESTROYED = "pod_destroyed"
+    POD_ERROR = "pod_error"
+    WORKER_REGISTERED = "worker_registered"
+    WORKER_HEARTBEAT = "worker_heartbeat"
+    WORKER_OFFLINE = "worker_offline"
+    AUTH_SUCCESS = "auth_success"
+    AUTH_FAILURE = "auth_failure"
+    IP_BANNED = "ip_banned"
+    IP_UNBANNED = "ip_unbanned"
+    RATE_LIMITED = "rate_limited"
+
+
+# =============================================================================
+# Request Models
+# =============================================================================
+
+class SubmitRequest(BaseModel):
+    """
+    Client job submission request.
+    
+    Example:
+    ```json
+    {
+        "model": "flux_kontext_dev",
+        "prompt": "A beautiful sunset over mountains",
+        "params": {
+            "mode": "txt2img",
+            "width": 1024,
+            "height": 1024,
+            "timeout": 3600
+        },
+        "fcm_token": "device-token-xyz"
+    }
+    ```
+    """
+    model: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="Model identifier to use for generation"
+    )
+    prompt: Optional[str] = Field(
+        default="",
+        max_length=10000,
+        description="Text prompt for generation"
+    )
+    params: Optional[Dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Additional parameters for the model"
+    )
+    fcm_token: Optional[str] = Field(
+        default=None,
+        max_length=512,
+        description="Firebase Cloud Messaging token for push notifications"
+    )
+    
+    @field_validator("model")
+    @classmethod
+    def validate_model_name(cls, v: str) -> str:
+        """Validate model name format"""
+        if not re.match(r'^[a-zA-Z0-9_-]+$', v):
+            raise ValueError("Model name can only contain alphanumeric characters, underscores, and hyphens")
+        return v.lower()
+    
+    @field_validator("params")
+    @classmethod
+    def validate_params(cls, v: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Validate and sanitize params"""
+        if v is None:
+            return {}
+        
+        # Validate timeout if present
+        if "timeout" in v:
+            timeout = v["timeout"]
+            if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 7200:
+                raise ValueError("Timeout must be a positive number up to 7200 seconds")
+        
+        return v
+
+
+class RegisterWorkerRequest(BaseModel):
+    """
+    Worker registration request.
+    
+    Sent by worker pods when they start up and are ready to accept jobs.
+    """
+    worker_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Unique worker identifier"
+    )
+    models: List[str] = Field(
+        ...,
+        min_length=1,
+        description="List of models this worker can handle"
+    )
+    endpoint: str = Field(
+        default="",
+        max_length=512,
+        description="HTTP endpoint where worker accepts job requests"
+    )
+    container_id: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description="Container/pod identifier (legacy)"
+    )
+    pod_uuid: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description="QuickPod pod UUID (preferred)"
+    )
+    public_ip: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Public IP address of the worker"
+    )
+    info: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Additional worker information"
+    )
+    
+    model_config = ConfigDict(str_strip_whitespace=True)
+    
+    @field_validator("endpoint")
+    @classmethod
+    def validate_endpoint(cls, v: str) -> str:
+        """Validate endpoint URL format"""
+        if v and not v.startswith(("http://", "https://")):
+            raise ValueError("Endpoint must be a valid HTTP/HTTPS URL")
+        return v
+    
+    @field_validator("models")
+    @classmethod
+    def validate_models(cls, v: List[str]) -> List[str]:
+        """Normalize model names to lowercase"""
+        return [m.lower().strip() for m in v if m.strip()]
+    
+    @model_validator(mode="after")
+    def validate_pod_identifier(self):
+        """Ensure at least one pod identifier is provided"""
+        if not self.pod_uuid and not self.container_id:
+            raise ValueError("Either pod_uuid or container_id must be provided")
+        return self
+
+
+class HeartbeatRequest(BaseModel):
+    """
+    Worker heartbeat request.
+    
+    Sent periodically by workers to indicate they're still alive.
+    """
+    worker_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Worker identifier"
+    )
+    status: Optional[WorkerStatus] = Field(
+        default=WorkerStatus.READY,
+        description="Current worker status"
+    )
+    metrics: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Resource metrics (CPU, memory, GPU usage)"
+    )
+    current_jobs: Optional[List[str]] = Field(
+        default=None,
+        description="List of currently running job IDs"
+    )
+
+
+class JobCompleteRequest(BaseModel):
+    """
+    Job completion notification from worker.
+    """
+    job_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Completed job ID"
+    )
+    result_r2_key: Optional[str] = Field(
+        default=None,
+        max_length=512,
+        description="R2 storage key for the result file"
+    )
+    failed: Optional[bool] = Field(
+        default=False,
+        description="Whether the job failed"
+    )
+    error: Optional[str] = Field(
+        default=None,
+        max_length=4096,
+        description="Error message if job failed"
+    )
+    metrics: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Job execution metrics (duration, memory usage, etc.)"
+    )
+
+
+class BanIPRequest(BaseModel):
+    """Admin request to ban an IP address"""
+    ip: str = Field(
+        ...,
+        description="IP address to ban"
+    )
+    reason: str = Field(
+        default="Manual ban",
+        max_length=256,
+        description="Reason for the ban"
+    )
+    duration: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=2592000,  # 30 days max
+        description="Ban duration in seconds (None for permanent)"
+    )
+    permanent: bool = Field(
+        default=False,
+        description="Whether this is a permanent ban"
+    )
+    
+    @field_validator("ip")
+    @classmethod
+    def validate_ip(cls, v: str) -> str:
+        """Basic IP validation"""
+        v = v.strip()
+        # Simple validation - more thorough validation can be added
+        parts = v.split(".")
+        if len(parts) == 4:
+            try:
+                if all(0 <= int(p) <= 255 for p in parts):
+                    return v
+            except ValueError:
+                pass
+        # Also allow IPv6
+        if ":" in v:
+            return v
+        raise ValueError("Invalid IP address format")
+
+
+# =============================================================================
+# Response Models
+# =============================================================================
+
+class SubmitResponse(BaseModel):
+    """Response for job submission"""
+    job_id: str = Field(..., description="Unique job identifier")
+    status: JobStatus = Field(..., description="Initial job status")
+    model: str = Field(..., description="Model being used")
+    routed_to_worker: Optional[str] = Field(None, description="Worker ID if immediately dispatched")
+    upload_url: Optional[str] = Field(None, description="Presigned URL for result upload")
+    result_key: Optional[str] = Field(None, description="R2 key where result will be stored")
+    download_url: Optional[str] = Field(None, description="URL to download result when ready")
+    created_at: datetime = Field(..., description="Job creation timestamp")
+
+
+class JobStatusResponse(BaseModel):
+    """Response for job status query"""
+    job_id: str
+    status: JobStatus
+    model: str
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
+    worker_id: Optional[str] = None
+    retry_count: int = 0
+    result_url: Optional[str] = None
+    error: Optional[str] = None
+    error_log: Optional[List[Dict[str, Any]]] = None
+
+
+class WorkerResponse(BaseModel):
+    """Worker information response"""
+    worker_id: str
+    model: str
+    status: WorkerStatus
+    endpoint: Optional[str] = None
+    pod_uuid: Optional[str] = None
+    health_status: HealthStatus = HealthStatus.UNKNOWN
+    last_heartbeat: Optional[datetime] = None
+    last_active: Optional[datetime] = None
+    is_warm_pod: bool = False
+    total_jobs_processed: int = 0
+    error_count: int = 0
+
+
+class WorkerListResponse(BaseModel):
+    """Response for worker list endpoint"""
+    workers: List[WorkerResponse]
+    total: int
+    active: int
+    idle: int
+
+
+class JobListResponse(BaseModel):
+    """Response for job list endpoint"""
+    jobs: List[JobStatusResponse]
+    total: int
+    page: int = 1
+    per_page: int = 50
+
+
+class HealthResponse(BaseModel):
+    """Health check response"""
+    status: str = "ok"
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    version: Optional[str] = None
+    components: Optional[Dict[str, str]] = None
+
+
+class ErrorResponse(BaseModel):
+    """Standard error response"""
+    error: Dict[str, Any] = Field(
+        ...,
+        description="Error details including code and message"
+    )
+
+
+# =============================================================================
+# Worker Metrics Models
+# =============================================================================
+
+class GPUMetrics(BaseModel):
+    """GPU resource metrics"""
+    index: int
+    name: Optional[str] = None
+    memory_total_mb: Optional[int] = None
+    memory_used_mb: Optional[int] = None
+    memory_free_mb: Optional[int] = None
+    utilization_percent: Optional[float] = None
+    temperature_celsius: Optional[float] = None
+
+
+class ResourceMetrics(BaseModel):
+    """Worker resource metrics"""
+    cpu_percent: Optional[float] = Field(None, ge=0, le=100)
+    memory_percent: Optional[float] = Field(None, ge=0, le=100)
+    memory_used_mb: Optional[int] = None
+    memory_total_mb: Optional[int] = None
+    disk_percent: Optional[float] = Field(None, ge=0, le=100)
+    gpus: Optional[List[GPUMetrics]] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class JobMetrics(BaseModel):
+    """Job execution metrics"""
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    duration_seconds: Optional[float] = None
+    peak_memory_mb: Optional[int] = None
+    gpu_memory_peak_mb: Optional[int] = None
+    steps_completed: Optional[int] = None
+    total_steps: Optional[int] = None
+
+
+# =============================================================================
+# Error Log Models
+# =============================================================================
+
+class ErrorLogEntry(BaseModel):
+    """Structured error log entry"""
+    timestamp: datetime
+    state: str
+    error: str
+    worker_id: Optional[str] = None
+    retry_count: Optional[int] = None
+    details: Optional[Dict[str, Any]] = None
+
+
+# =============================================================================
+# Audit Log Models
+# =============================================================================
+
+class AuditLogEntry(BaseModel):
+    """Audit log entry for database storage"""
+    id: Optional[int] = None
+    event_type: AuditEventType
+    actor: Optional[str] = Field(None, description="Worker ID, system, or admin")
+    target: Optional[str] = Field(None, description="Job ID, pod UUID, or IP")
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    details: Optional[Dict[str, Any]] = None
+    source_ip: Optional[str] = None
+
+
+# =============================================================================
+# FCM Notification Models
+# =============================================================================
+
+class FCMNotification(BaseModel):
+    """Firebase Cloud Messaging notification payload"""
+    title: str = Field(..., max_length=100)
+    body: str = Field(..., max_length=500)
+    data: Optional[Dict[str, str]] = None
+
+
+class JobCompletionNotification(FCMNotification):
+    """Notification for job completion"""
+    title: str = "Job Complete"
+    
+    @classmethod
+    def create(cls, job_id: str, model: str, success: bool = True) -> "JobCompletionNotification":
+        if success:
+            return cls(
+                title="Job Complete",
+                body=f"Your {model} job has finished successfully",
+                data={
+                    "job_id": job_id,
+                    "status": "completed",
+                    "model": model,
+                }
+            )
+        else:
+            return cls(
+                title="Job Failed",
+                body=f"Your {model} job has failed",
+                data={
+                    "job_id": job_id,
+                    "status": "failed",
+                    "model": model,
+                }
+            )
+
+
+# =============================================================================
+# Internal Models
+# =============================================================================
+
+class PodInfo(BaseModel):
+    """Internal pod tracking information"""
+    pod_uuid: str
+    model: str
+    mode: Optional[str] = None
+    status: PodStatus = PodStatus.STARTING
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    last_active: datetime = Field(default_factory=datetime.utcnow)
+    queue_size: int = 0
+    error_count: int = 0
+    machine_id: Optional[str] = None
+    total_jobs_processed: int = 0
+    variant: Optional[str] = None
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MachineInfo(BaseModel):
+    """Machine metadata from cache"""
+    machine_id: str
+    gpu_name: Optional[str] = None
+    gpu_count: int = 1
+    tflops: float = 0
+    is_priority: bool = False
+    cached_images: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    last_seen: Optional[datetime] = None
+    success_rate: Optional[float] = None
+
+
+class JobDispatchInfo(BaseModel):
+    """Information needed to dispatch a job to a worker"""
+    job_id: str
+    prompt: Optional[str] = None
+    model: str
+    mode: Optional[str] = None
+    params: Dict[str, Any] = Field(default_factory=dict)
+    upload_url: Optional[str] = None
+    result_key: Optional[str] = None
+
+
+# =============================================================================
+# Validation Helpers
+# =============================================================================
+
+def validate_model_name(model: str, available_models: List[str]) -> str:
+    """
+    Validate that a model name exists in available models.
+    
+    Args:
+        model: Model name to validate
+        available_models: List of available model names
+        
+    Returns:
+        Normalized model name
+        
+    Raises:
+        ValueError: If model is not available
+    """
+    model_lower = model.lower().strip()
+    available_lower = [m.lower() for m in available_models]
+    
+    if model_lower not in available_lower:
+        raise ValueError(
+            f"Model '{model}' not found. Available models: {', '.join(available_models)}"
+        )
+    
+    # Return the original casing from available_models
+    idx = available_lower.index(model_lower)
+    return available_models[idx]
+

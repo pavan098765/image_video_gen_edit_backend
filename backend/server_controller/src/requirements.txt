@@ -1,45 +1,57 @@
-# Web Framework and ASGI Server
-fastapi>=0.100.0
-uvicorn[standard]>=0.23.0
+# Server Controller Dependencies
+# ==============================
+
+# Web Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+starlette>=0.27.0
+
+# Data Validation
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
 
 # Database
 sqlalchemy>=2.0.0
+alembic>=1.13.0
 
 # HTTP Client
 requests>=2.31.0
+httpx>=0.25.0
 
-# Environment and Configuration
+# AWS/R2 Storage
+boto3>=1.34.0
+botocore>=1.34.0
+
+# Firebase
+firebase-admin>=6.2.0
+
+# Environment
 python-dotenv>=1.0.0
 
-# Data Validation and Settings
-pydantic>=2.1.0
-
-# Retry Logic
-tenacity>=8.2.0
-
-# JWT/Token Handling
-python-jose>=3.3.0
-
-# AWS SDK (for R2/S3 operations)
-boto3>=1.28.0
-
-# Date/Time Handling
-python-dateutil>=2.8.2
-
-# Type Hints (for development)
-typing-extensions>=4.7.0
-
-# Logging Enhancements
-structlog>=23.1.0
-
-# Testing (for development)
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
-httpx>=0.24.0  # For async HTTP client in tests
+# Async Support
+anyio>=4.0.0
+aiofiles>=23.2.0
 
 # Security
 cryptography>=41.0.0
+PyJWT>=2.8.0
 
-# Performance Monitoring
-psutil>=5.9.0  # For system resource monitoring
+# Logging
+structlog>=23.2.0
+
+# Utilities
+python-multipart>=0.0.6
+python-dateutil>=2.8.0
+orjson>=3.9.0
+
+# Development (optional)
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+httpx>=0.25.0
+black>=23.0.0
+ruff>=0.1.0
+
+# Type checking (optional)
+mypy>=1.7.0
+types-requests>=2.31.0
 

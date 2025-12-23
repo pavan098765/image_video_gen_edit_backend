@@ -46,7 +46,7 @@ except Exception as e:
 rank = 128
 steps = 8
 filename = (
-    f"svdq-fp4_r{rank}-qwen-image-edit-2509-lightningv2.0-{steps}steps.safetensors"
+    f"svdq-int4_r{rank}-qwen-image-edit-2509-lightningv2.0-{steps}steps.safetensors"
 )
 target_path = os.path.join(NUNCHAKU_DIR, filename)
 
@@ -107,8 +107,8 @@ split_large_safetensors(MODELS_DIR)
 # 5. Generate runtime Dockerfile with per-part COPY
 # ------------------------
 try:
-    print("⚙️ Generating Dockerfile via generate_dockerfile.py ...")
-    subprocess.run(["python3", "generate_dockerfile.py"], check=True)
+    print("⚙️ Generating Dockerfile via generate_dockerfile_int4.py ...")
+    subprocess.run(["python3", "generate_dockerfile_int4.py"], check=True)
     print("✅ Dockerfile generated successfully.")
 except Exception as e:
     print(f"❌ Failed to generate Dockerfile: {e}")
