@@ -16,8 +16,35 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from tenacity import retry, wait_exponential, stop_after_attempt
 from contextlib import asynccontextmanager
+import concurrent.futures
 
 import torch
+
+# -----------------------
+# Dedicated Thread Pool for Inference
+# -----------------------
+# CRITICAL: Use a dedicated executor for inference to avoid blocking FastAPI
+# This ensures /health and /run endpoints always respond, even during heavy GPU work
+# 
+# Why this matters:
+# - Python's GIL can block the event loop during CPU-heavy operations
+# - Default executor has limited workers that get exhausted
+# - A dedicated pool ensures inference has its own threads
+#
+# IMPORTANT: Only 1 worker to prevent OOM on 24GB cards (4090)!
+# Multiple simultaneous inferences will exhaust GPU memory.
+# Jobs are queued internally (job_queue) anyway, so 1 thread is sufficient.
+INFERENCE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="inference"
+)
+
+# IO-bound work (uploads, controller callbacks, HTTP)
+# MUST be separate so inference never blocks networking
+IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="io"
+)
 
 # -----------------------
 # GPU cleanup
@@ -54,16 +81,15 @@ def cleanup_gpu(verbose: bool = False):
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.reset_accumulated_memory_stats()
 
-        # 5️⃣ Reset CUDA device context (complete teardown)
-        torch.cuda.reset()
-
-        # 6️⃣ Final garbage collection
+        # 5️⃣ Final garbage collection (torch.cuda.reset() doesn't exist!)
         gc.collect()
+        
+        # 6️⃣ One more empty_cache after GC
+        torch.cuda.empty_cache()
 
         if verbose:
-            torch.cuda._lazy_init()  # reinit context to check stats safely
             print(f"[GPU] After cleanup: {torch.cuda.memory_allocated()/1024**2:.2f} MB allocated")
-            print("[GPU] CUDA context successfully reset.")
+            print("[GPU] GPU memory cleanup completed.")
     except Exception as e:
         print(f"[GPU] Cleanup warning: {e}")
         pass
@@ -110,12 +136,15 @@ WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
 # -----------------------
-# Job queue
+# Job queue and state management
 # -----------------------
 job_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 job_status: Dict[str, Dict[str, Any]] = {}
+job_status_lock = asyncio.Lock()  # Protect job_status updates
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 last_model_key: Optional[str] = None
+worker_ready = asyncio.Event()  # Signal when worker is fully ready
+startup_completed = False  # Track startup completion
 
 # -----------------------
 # Request Models
@@ -146,20 +175,69 @@ def signed_headers(payload: dict) -> Dict[str, str]:
         headers["Authorization"] = f"Bearer {CONTROLLER_API_KEY}"
     return headers
 
-def post_signed_json(url: str, payload: dict, timeout: int = 10) -> requests.Response:
+def post_signed_json(url: str, payload: dict, timeout: int = 10, max_retries: int = 3) -> requests.Response:
+    """
+    Post signed JSON with retry logic for resilience.
+    
+    Critical for job_complete notifications - must succeed or job stays stuck.
+    """
     headers = signed_headers(payload)
-    resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                backoff = 2 ** attempt  # 1s, 2s, 4s
+                logger.warning(f"POST to {url} timeout (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s...")
+                time.sleep(backoff)
+                continue
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                backoff = 2 ** attempt
+                logger.warning(f"POST to {url} connection error (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s...")
+                time.sleep(backoff)
+                continue
+        except requests.exceptions.HTTPError as e:
+            # Don't retry on 4xx errors (client errors)
+            if e.response and 400 <= e.response.status_code < 500:
+                logger.error(f"POST to {url} failed with {e.response.status_code}: {e}")
+                raise
+            # Retry on 5xx errors (server errors)
+            last_error = e
+            if attempt < max_retries - 1:
+                backoff = 2 ** attempt
+                logger.warning(f"POST to {url} server error (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s...")
+                time.sleep(backoff)
+                continue
+        except Exception as e:
+            last_error = e
+            logger.error(f"POST to {url} unexpected error: {e}")
+            raise
+    
+    # All retries failed
+    logger.error(f"POST to {url} failed after {max_retries} attempts: {last_error}")
+    raise last_error
 
 # -----------------------
 # Controller integration
 # -----------------------
 @retry(wait=wait_exponential(min=2, max=20), stop=stop_after_attempt(6))
 def register_with_controller():
+    """
+    Register worker with controller with retry logic.
+    
+    Critical for worker to be discovered and receive jobs.
+    """
     if not CONTROLLER_URL:
         logger.info("No CONTROLLER_URL configured; skipping registration.")
         return {"skipped": True}
+    
     register_payload = {
         "worker_id": WORKER_ID,
         "models": list(MODEL_REGISTRY.keys()),
@@ -167,21 +245,76 @@ def register_with_controller():
         "container_id": POD_UUID,
         "pod_uuid": POD_UUID,
         "public_ip": PUBLIC_IPADDR,
-        "info": {"started_at": datetime.utcnow().isoformat()},
+        "info": {
+            "started_at": datetime.utcnow().isoformat(),
+            "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
+            "queue_capacity": job_queue.maxsize,
+        },
     }
     url = f"{CONTROLLER_URL.rstrip('/')}/register_worker"
-    logger.info("Registering worker with controller: %s", register_payload)
-    resp = post_signed_json(url, register_payload, timeout=10)
-    return resp.json()
+    
+    logger.info(f"Registering worker with controller at {CONTROLLER_URL}")
+    logger.info(f"Worker endpoint: http://{PUBLIC_IPADDR}:{PORT}")
+    logger.info(f"Worker ID: {WORKER_ID}")
+    logger.info(f"Pod UUID: {POD_UUID}")
+    
+    try:
+        resp = post_signed_json(url, register_payload, timeout=15, max_retries=6)
+        result = resp.json()
+        logger.info(f"✅ Worker registered successfully: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"❌ Worker registration failed: {e}")
+        raise
 
-@retry(wait=wait_exponential(min=2, max=20), stop=stop_after_attempt(6))
+@retry(wait=wait_exponential(min=2, max=20), stop=stop_after_attempt(3))
 def send_heartbeat():
+    """
+    Send heartbeat to controller with retry logic.
+    
+    Includes worker status for server visibility.
+    """
     if not CONTROLLER_URL:
         return {"skipped": True}
-    payload = {"worker_id": WORKER_ID, "pod_uuid": POD_UUID, "timestamp": int(time.time())}
+    
+    # Get current worker status
+    try:
+        queue_size = job_queue.qsize()
+        active_jobs = sum(1 for j in job_status.values() if j.get("status") == "running")
+    except Exception:
+        queue_size = 0
+        active_jobs = 0
+    
+    # Determine status based on model loading state
+    if not _model_loading_complete:
+        status = "starting"  # Model still loading
+    elif startup_completed:
+        status = "ready"
+    else:
+        status = "starting"
+    
+    payload = {
+        "worker_id": WORKER_ID,
+        "pod_uuid": POD_UUID,
+        "timestamp": int(time.time()),
+        "status": status,
+        "model_loaded": _model_loading_complete,
+        "metrics": {
+            "queue_size": queue_size,
+            "active_jobs": active_jobs,
+            "max_concurrent": MAX_CONCURRENT_JOBS,
+        }
+    }
+    
     url = f"{CONTROLLER_URL.rstrip('/')}/heartbeat"
-    resp = post_signed_json(url, payload, timeout=5)
-    return resp.json()
+    
+    try:
+        resp = post_signed_json(url, payload, timeout=8, max_retries=3)
+        return resp.json()
+    except Exception as e:
+        # Don't crash on heartbeat failure - just log
+        logger.debug(f"Heartbeat failed: {e}")
+        return {"error": str(e)}
 
 # -----------------------
 # Inference dispatcher
@@ -194,6 +327,12 @@ def resolve_inference_callable(model: str, mode: Optional[str]):
 async def run_inference_and_save(
     job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]
 ) -> str:
+    """
+    Run inference in a dedicated thread pool to avoid blocking FastAPI endpoints.
+    
+    CRITICAL: This uses INFERENCE_EXECUTOR (dedicated pool) instead of the default executor.
+    This ensures /health and /run endpoints remain responsive during heavy GPU work.
+    """
     global last_model_key
     loop = asyncio.get_event_loop()
     params = params.copy()
@@ -207,7 +346,9 @@ async def run_inference_and_save(
         cleanup_gpu()
 
     try:
-        out_path = await loop.run_in_executor(None, inference_func, job_id, prompt, params)
+        # CRITICAL: Use dedicated INFERENCE_EXECUTOR to avoid blocking FastAPI event loop
+        # This prevents /health timeouts during inference
+        out_path = await loop.run_in_executor(INFERENCE_EXECUTOR, inference_func, job_id, prompt, params)
         return out_path
     finally:
         last_model_key = model_key
@@ -216,6 +357,11 @@ async def run_inference_and_save(
 # Job Processing
 # -----------------------
 async def process_job_item(item: Dict[str, Any]):
+    """
+    Process a single job with comprehensive error handling and recovery.
+    
+    Ensures job always completes (success or failure) and notifies controller.
+    """
     job_id = item["job_id"]
     model = item["model"]
     mode = item.get("mode")
@@ -223,49 +369,260 @@ async def process_job_item(item: Dict[str, Any]):
     params = item.get("params", {})
     upload_url = item["upload_url"]
     result_key = item["result_key"]
-
-    logger.info(f"Processing job {job_id} with model={model}")
-    job_status[job_id] = {"status": "running", "started_at": datetime.utcnow().isoformat()}
+    
+    start_time = datetime.utcnow()
+    logger.info(f"[{job_id}] Processing job with model={model}")
+    
+    # Update status with lock
+    async with job_status_lock:
+        job_status[job_id] = {
+            "status": "running", 
+            "started_at": start_time.isoformat(),
+            "model": model,
+        }
 
     try:
         async with semaphore:
+            # Run inference
+            logger.info(f"[{job_id}] Starting inference...")
             out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
+            logger.info(f"[{job_id}] Inference completed, output: {out_local}")
 
+            # Upload result with retry
             if upload_url.startswith("http://dummy-upload"):
-                logger.info("Skipping upload (dummy). File at %s", out_local)
+                logger.info(f"[{job_id}] Skipping upload (dummy). File at {out_local}")
             else:
-                with open(out_local, "rb") as f:
-                    resp = requests.put(upload_url, data=f)
-                    resp.raise_for_status()
+                logger.info(f"[{job_id}] Uploading result to R2...")
+                upload_success = await _upload_with_retry(out_local, upload_url, job_id)
+                if not upload_success:
+                    raise Exception("Failed to upload result after retries")
+                logger.info(f"[{job_id}] Upload completed successfully")
 
-            if CONTROLLER_URL:
+            # Notify controller with retry (skip for autotest jobs - they're not on the server)
+            is_autotest = job_id.startswith("autotest-")
+            if CONTROLLER_URL and not is_autotest:
+                logger.info(f"[{job_id}] Notifying controller of completion...")
                 payload = {"job_id": job_id, "result_r2_key": result_key}
                 url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
-                post_signed_json(url, payload)
+                try:
+                    # post_signed_json(url, payload, timeout=10, max_retries=5)
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        IO_EXECUTOR,
+                        post_signed_json,
+                        url,
+                        payload,
+                        10,
+                        5,
+                    )
+                    logger.info(f"[{job_id}] Controller notified successfully")
+                except Exception as notify_error:
+                    # CRITICAL: If notification fails, log extensively but don't fail job
+                    # Server will eventually recover via timeout/recovery system
+                    logger.error(
+                        f"[{job_id}] CRITICAL: Failed to notify controller after retries: {notify_error}. "
+                        f"Job completed but server may not know. Result at: {result_key}"
+                    )
+                    # Don't raise - job actually succeeded, just notification failed
+            elif is_autotest:
+                logger.info(f"[{job_id}] Autotest job - skipping controller notification")
 
-            job_status[job_id] = {
-                "status": "completed",
-                "result_r2_key": result_key,
-                "finished_at": datetime.utcnow().isoformat(),
-            }
-            logger.info("Job %s completed", job_id)
+            # Mark as completed
+            completion_time = datetime.utcnow()
+            processing_time = (completion_time - start_time).total_seconds()
+            
+            async with job_status_lock:
+                job_status[job_id] = {
+                    "status": "completed",
+                    "result_r2_key": result_key,
+                    "finished_at": completion_time.isoformat(),
+                    "processing_time": processing_time,
+                }
+            
+            logger.info(f"[{job_id}] Job completed successfully in {processing_time:.1f}s")
+            
+            # Clean up completed job after delay
+            asyncio.create_task(_cleanup_job_status(job_id, delay=30))
+            
+            # Check GPU memory after job
+            _check_gpu_memory(job_id)
+            
     except Exception as e:
-        logger.exception("Job %s failed: %s", job_id, e)
-        job_status[job_id] = {"status": "failed", "error": str(e)}
-        payload = {"job_id": job_id, "result_r2_key": None, "failed": True, "error": str(e)}
+        # Comprehensive error handling
+        error_str = str(e)
+        error_type = type(e).__name__
+        completion_time = datetime.utcnow()
+        processing_time = (completion_time - start_time).total_seconds()
+        
+        logger.exception(f"[{job_id}] Job failed after {processing_time:.1f}s: {error_type}: {error_str}")
+        
+        # Check if it's a GPU OOM error
+        is_oom = "out of memory" in error_str.lower() or "oom" in error_str.lower()
+        if is_oom:
+            logger.error(f"[{job_id}] GPU OOM detected! Cleaning up GPU memory...")
+            cleanup_gpu(verbose=True)
+        
+        # Update status
+        async with job_status_lock:
+            job_status[job_id] = {
+                "status": "failed", 
+                "error": error_str,
+                "error_type": error_type,
+                "is_oom": is_oom,
+                "finished_at": completion_time.isoformat(),
+                "processing_time": processing_time,
+            }
+        
+        # Notify controller with retry (skip for autotest jobs - they're not on the server)
+        is_autotest = job_id.startswith("autotest-")
+        if CONTROLLER_URL and not is_autotest:
+            payload = {
+                "job_id": job_id, 
+                "result_r2_key": None, 
+                "failed": True, 
+                "error": error_str
+            }
+            try:
+                url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
+                # post_signed_json(url, payload, timeout=10, max_retries=5)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    IO_EXECUTOR,
+                    post_signed_json,
+                    url,
+                    payload,
+                    10,
+                    5,
+                )
+                logger.info(f"[{job_id}] Failure notification sent to controller")
+            except Exception as notify_error:
+                logger.error(
+                    f"[{job_id}] CRITICAL: Failed to notify controller of failure: {notify_error}. "
+                    f"Job failed but server may not know."
+                )
+        elif is_autotest:
+            logger.info(f"[{job_id}] Autotest job failed - skipping controller notification")
+        
+        # Clean up failed job after delay
+        asyncio.create_task(_cleanup_job_status(job_id, delay=60))
+
+async def _upload_with_retry(file_path: str, upload_url: str, job_id: str, max_retries: int = 3) -> bool:
+    loop = asyncio.get_running_loop()
+
+    def _upload():
+        with open(file_path, "rb") as f:
+            resp = requests.put(upload_url, data=f, timeout=60)
+            resp.raise_for_status()
+
+    for attempt in range(max_retries):
         try:
-            post_signed_json(f"{CONTROLLER_URL.rstrip('/')}/job_complete", payload)
-        except Exception as e2:
-            logger.error("Failed to notify controller of failure: %s", e2)
+            await loop.run_in_executor(IO_EXECUTOR, _upload)
+            logger.info(f"[{job_id}] Upload succeeded ({attempt + 1}/{max_retries})")
+            return True
+
+        except Exception as e:
+            if attempt < max_retries - 1:
+                backoff = 2 ** attempt
+                logger.warning(
+                    f"[{job_id}] Upload failed ({attempt + 1}/{max_retries}): {e}, retrying in {backoff}s"
+                )
+                await asyncio.sleep(backoff)
+            else:
+                logger.error(f"[{job_id}] Upload failed after {max_retries} attempts: {e}")
+                return False
+
+    return False
+
+
+def _check_gpu_memory(job_id: str):
+    """
+    Check GPU memory usage and log warning if high.
+    Helps detect memory leaks early.
+    """
+    try:
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            
+            if allocated > 20:  # Warning if > 20GB allocated
+                logger.warning(
+                    f"[{job_id}] High GPU memory usage: {allocated:.2f}GB allocated, "
+                    f"{reserved:.2f}GB reserved"
+                )
+            else:
+                logger.debug(
+                    f"[{job_id}] GPU memory: {allocated:.2f}GB allocated, "
+                    f"{reserved:.2f}GB reserved"
+                )
+    except Exception as e:
+        logger.debug(f"[{job_id}] GPU memory check failed: {e}")
+
+
+async def _cleanup_job_status(job_id: str, delay: int = 30):
+    """
+    Clean up job status after a delay to prevent 409 conflicts.
+    Keeps status for a short time to allow status queries from server.
+    """
+    await asyncio.sleep(delay)
+    async with job_status_lock:
+        if job_id in job_status:
+            status = job_status[job_id].get("status")
+            if status in ("completed", "failed"):
+                logger.debug(f"[{job_id}] Cleaning up job_status after {delay}s")
+                del job_status[job_id]
+
 
 async def worker_loop():
+    """
+    Main worker loop with comprehensive error handling.
+    
+    Ensures worker never crashes even if job processing fails catastrophically.
+    """
     logger.info("Starting worker loop")
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    
     while True:
-        item = await job_queue.get()
         try:
-            await process_job_item(item)
-        finally:
-            job_queue.task_done()
+            item = await job_queue.get()
+            job_id = item.get("job_id", "unknown")
+            
+            try:
+                logger.debug(f"[{job_id}] Dequeued job from queue (queue size: {job_queue.qsize()})")
+                await process_job_item(item)
+                consecutive_errors = 0  # Reset on success
+                
+            except Exception as e:
+                consecutive_errors += 1
+                logger.exception(
+                    f"[{job_id}] Critical error processing job "
+                    f"(consecutive errors: {consecutive_errors}/{max_consecutive_errors}): {e}"
+                )
+                
+                # If too many consecutive errors, something is seriously wrong
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.critical(
+                        f"Worker has {consecutive_errors} consecutive errors! "
+                        f"Cleaning up GPU and resetting error counter..."
+                    )
+                    try:
+                        cleanup_gpu(verbose=True)
+                        consecutive_errors = 0
+                        logger.info("GPU cleanup completed, continuing operations")
+                    except Exception as cleanup_error:
+                        logger.error(f"GPU cleanup failed: {cleanup_error}")
+                
+                # Always mark job done even if processing failed
+                # This prevents queue from getting stuck
+                
+            finally:
+                job_queue.task_done()
+                
+        except Exception as outer_error:
+            # Catch-all for any errors in the loop itself
+            logger.exception(f"Critical error in worker loop: {outer_error}")
+            # Don't exit - keep loop running
+            await asyncio.sleep(1)  # Brief pause before continuing
 
 # -----------------------
 # Auto-test
@@ -273,6 +630,16 @@ async def worker_loop():
 async def run_autotest():
     await asyncio.sleep(5)
     logger.info("🚀 Starting Qwen Image Edit 2509 auto-test")
+    
+    # Check GPU VRAM - disable autotest on low-memory cards to avoid OOM
+    try:
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        if vram_gb < 30:
+            logger.info(f"⚠️ Skipping autotest on {vram_gb:.0f}GB GPU (< 30GB) to avoid OOM conflicts with real jobs")
+            return
+    except Exception as e:
+        logger.warning(f"Could not check GPU VRAM for autotest decision: {e}")
+        # Proceed cautiously
 
     img_url = "https://pub-67f874d172874988b5754734cc4fcb7e.r2.dev/Snapinsta.app_262322643_4937545659591345_7487236998017046274_n_1080.jpg"
     headers = {
@@ -298,7 +665,7 @@ async def run_autotest():
         "init_image": img_b64,
         "negative_prompt": " ",
         "num_inference_steps": 4,
-        "scale_image": True,
+        "scale_image": False,  # DISABLED upscaling for autotest to save GPU memory
         "scale_factor": 2,
     }
 
@@ -317,39 +684,260 @@ async def run_autotest():
         logger.info(f"🔥 Auto-test response: {resp.status_code} {resp.text}")
 
 # -----------------------
+# Model Preloading
+# -----------------------
+_model_loading_complete = False
+_model_loading_error: Optional[str] = None
+
+
+def _preload_model_sync():
+    """
+    Preload the model synchronously in a thread.
+    
+    This is called from a background thread during startup to avoid:
+    1. Blocking the FastAPI event loop
+    2. Health check timeouts during model loading
+    
+    The model loading takes 60-120 seconds on first load.
+    After loading, the worker reports "ready" to the controller.
+    """
+    global _model_loading_complete, _model_loading_error
+    
+    try:
+        logger.info("🔄 Starting model preload in background thread...")
+        start_time = time.time()
+        
+        # Import and call get_pipeline to trigger model loading
+        from qwen_image_edit_2509_inference import get_pipeline
+        
+        # This will load the model (takes 60-120 seconds)
+        pipeline = get_pipeline()
+        
+        elapsed = time.time() - start_time
+        logger.info(f"✅ Model preloaded successfully in {elapsed:.1f}s")
+        
+        _model_loading_complete = True
+        _model_loading_error = None
+        
+    except Exception as e:
+        logger.exception(f"❌ Model preload failed: {e}")
+        _model_loading_error = str(e)
+        _model_loading_complete = False
+
+
+async def _wait_for_model_and_register():
+    """
+    Wait for model to load, then register with controller.
+    
+    This runs as a background task so it doesn't block startup.
+    The worker reports "starting" status until model is loaded.
+    """
+    global startup_completed
+    
+    # Wait for model loading to complete (check every 2 seconds)
+    max_wait = 300  # 5 minutes max wait
+    waited = 0
+    
+    while not _model_loading_complete and waited < max_wait:
+        if _model_loading_error:
+            logger.error(f"Model loading failed: {_model_loading_error}")
+            break
+        
+        await asyncio.sleep(2)
+        waited += 2
+        
+        if waited % 30 == 0:
+            logger.info(f"⏳ Still waiting for model to load... ({waited}s elapsed)")
+    
+    if not _model_loading_complete:
+        logger.error(
+            f"Model loading did not complete within {max_wait}s. "
+            f"Error: {_model_loading_error or 'timeout'}"
+        )
+        # Still try to register - controller will see "starting" status
+    
+    # Mark as ready AFTER model is loaded
+    startup_completed = _model_loading_complete
+    worker_ready.set()
+    
+    if startup_completed:
+        logger.info("✅ Model loaded, worker is now READY")
+    else:
+        logger.warning("⚠️ Worker starting but model not fully loaded")
+    
+    # Register with controller
+    try:
+        register_with_controller()
+        logger.info("✅ Worker registered with controller")
+    except Exception as e:
+        logger.exception("Failed to register worker with controller: %s", e)
+        # Don't crash - worker might still work
+    
+    # Optional: Run autotest after model is loaded
+    if startup_completed and os.getenv("ENABLE_AUTOTEST", "1") == "1":
+        asyncio.create_task(run_autotest())
+
+
+# -----------------------
 # Lifespan
 # -----------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("✅ Application fully started, registering worker now")
-
-    try:
-        register_with_controller()
-    except Exception as e:
-        logger.exception("Failed to register worker with controller: %s", e)
-        raise
-
+    global startup_completed
+    
+    logger.info("🚀 Application starting up...")
+    
+    # Start background tasks FIRST (worker loop, heartbeat, health monitor)
     asyncio.create_task(worker_loop())
     asyncio.create_task(_hb_loop())
-
-    if os.getenv("ENABLE_AUTOTEST", "1") == "1":
-        asyncio.create_task(run_autotest())
-
+    asyncio.create_task(_health_monitor_loop())
+    
+    # CRITICAL: Keep startup_completed = False until model is loaded
+    # This tells the server we're still "starting" and not ready for jobs
+    startup_completed = False
+    
+    # Start model loading using the DEDICATED INFERENCE_EXECUTOR
+    # This uses the same pool that will handle inference, ensuring:
+    # 1. FastAPI event loop is never blocked
+    # 2. /health endpoint always responds
+    # 3. Model is preloaded in the inference thread for consistency
+    loop = asyncio.get_event_loop()
+    
+    logger.info("🔄 Starting model preload in INFERENCE_EXECUTOR thread...")
+    loop.run_in_executor(INFERENCE_EXECUTOR, _preload_model_sync)
+    
+    # Start background task to wait for model and then register
+    asyncio.create_task(_wait_for_model_and_register())
+    
+    logger.info("📡 Worker starting - model loading in background, health endpoint responding")
+    
     yield
-
-    logger.info("Worker shutting down; final GPU cleanup")
+    
+    # Graceful shutdown
+    logger.info("🛑 Worker shutting down gracefully...")
+    startup_completed = False
+    
+    # Wait for queue to drain (with timeout)
+    if not job_queue.empty():
+        logger.info(f"Waiting for {job_queue.qsize()} remaining jobs to complete...")
+        try:
+            await asyncio.wait_for(job_queue.join(), timeout=30.0)
+            logger.info("All jobs completed successfully")
+        except asyncio.TimeoutError:
+            logger.warning(f"Shutdown timeout, {job_queue.qsize()} jobs may be incomplete")
+    
+    # Shutdown inference executor gracefully
+    logger.info("Shutting down inference executor...")
+    INFERENCE_EXECUTOR.shutdown(wait=True, cancel_futures=False)
+    
+    # Final GPU cleanup
+    logger.info("Final GPU cleanup")
     cleanup_gpu()
+    logger.info("✅ Worker shutdown complete")
+
+# -----------------------
+# Health monitoring
+# -----------------------
+async def _health_monitor_loop():
+    """
+    Periodic health monitoring to detect issues early.
+    
+    Checks:
+    - GPU memory
+    - Queue depth
+    - Stuck jobs
+    - Endpoint reachability
+    """
+    check_interval = 60  # Check every 60 seconds
+    logger.info("Starting health monitor loop")
+    
+    while True:
+        try:
+            await asyncio.sleep(check_interval)
+            
+            # Check GPU memory
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                
+                if allocated > 22:  # Critical if > 22GB
+                    logger.warning(
+                        f"⚠️  HIGH GPU MEMORY: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved. "
+                        f"May cause OOM on next job!"
+                    )
+            
+            # Check for stuck jobs
+            async with job_status_lock:
+                stuck_count = 0
+                for jid, status in job_status.items():
+                    if status.get("status") == "running":
+                        started_at_str = status.get("started_at")
+                        if started_at_str:
+                            started_at = datetime.fromisoformat(started_at_str)
+                            runtime = (datetime.utcnow() - started_at).total_seconds()
+                            
+                            # Warn if job running > 5 minutes
+                            if runtime > 300:
+                                logger.warning(
+                                    f"⚠️  Job {jid} has been running for {runtime:.0f}s (>5min). "
+                                    f"May be stuck!"
+                                )
+                                stuck_count += 1
+                
+                if stuck_count > 0:
+                    logger.warning(f"⚠️  {stuck_count} potentially stuck job(s) detected")
+            
+            # Check queue depth
+            queue_size = job_queue.qsize()
+            if queue_size > job_queue.maxsize * 0.8:  # Warn if > 80% full
+                logger.warning(
+                    f"⚠️  Queue nearly full: {queue_size}/{job_queue.maxsize} jobs. "
+                    f"May start rejecting jobs soon!"
+                )
+            
+            # Periodic status summary
+            async with job_status_lock:
+                running = sum(1 for j in job_status.values() if j.get("status") == "running")
+                queued = sum(1 for j in job_status.values() if j.get("status") == "queued")
+            
+            logger.debug(
+                f"📊 Health check: Queue={queue_size}, Running={running}, Queued={queued}, "
+                f"Startup={startup_completed}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Health monitor error: {e}")
+
 
 # -----------------------
 # Heartbeat loop
 # -----------------------
 async def _hb_loop():
+    """
+    Periodic heartbeat to controller with status updates.
+    """
+    logger.info("Starting heartbeat loop")
+    
     while True:
         try:
-            send_heartbeat()
+            # send_heartbeat()
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(IO_EXECUTOR, send_heartbeat)
         except Exception as e:
             logger.exception("Heartbeat failed: %s", e)
+        
         await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+async def _record_job_status_later(job_id: str, model: str):
+    try:
+        async with job_status_lock:
+            job_status[job_id] = {
+                "status": "queued",
+                "queued_at": datetime.utcnow().isoformat(),
+                "model": model,
+            }
+    except Exception as e:
+        logger.warning(f"[{job_id}] Failed to record job status: {e}")
 
 # -----------------------
 # FastAPI app
@@ -358,17 +946,193 @@ app = FastAPI(title=f"QuickPod Worker ({MODEL_KEY})", lifespan=lifespan)
 
 @app.post("/run")
 async def run_endpoint(req: RunRequest):
-    if req.job_id in job_status and job_status[req.job_id].get("status") in ("queued", "running"):
-        raise HTTPException(status_code=409, detail="job already queued or running")
-    await job_queue.put(req.dict())
-    job_status[req.job_id] = {"status": "queued", "queued_at": datetime.utcnow().isoformat()}
-    logger.info("Enqueued job %s", req.job_id)
-    return {"status": "accepted", "job_id": req.job_id}
+    """
+    Accept a new job for processing.
+    
+    Enhanced logic:
+    - Check if job is already queued/running (avoid duplicates)
+    - Check if queue is full (prevent overload)
+    - Idempotent: accepting same job_id twice returns success if already accepted
+    - Validates worker is healthy before accepting
+    """
+    logger.info(f"[{req.job_id}] Received job request for model={req.model}")
+    
+    # Use timeout for lock to prevent blocking during heavy inference
+    try:
+        await asyncio.wait_for(job_status_lock.acquire(), timeout=2.0)
+        try:
+            # Check if job exists and what state it's in
+            if req.job_id in job_status:
+                current_status = job_status[req.job_id].get("status")
+                
+                # If job is already queued or running, return 409
+                if current_status in ("queued", "running"):
+                    logger.warning(f"[{req.job_id}] Already {current_status}, rejecting duplicate")
+                    raise HTTPException(status_code=409, detail=f"Job already {current_status}")
+                
+                # If job completed/failed, it was cleaned up but server is retrying
+                # This is OK - accept as new job (server might have missed completion)
+                if current_status in ("completed", "failed"):
+                    logger.info(f"[{req.job_id}] Was {current_status}, accepting as new job")
+                    del job_status[req.job_id]
+        finally:
+            job_status_lock.release()
+    except asyncio.TimeoutError:
+        # Lock timeout - worker is busy but we can still try to accept the job
+        logger.warning(f"[{req.job_id}] Lock timeout during duplicate check, proceeding anyway")
+    
+    # Check if queue is full
+    if job_queue.full():
+        logger.error(f"[{req.job_id}] Queue full ({job_queue.maxsize}), rejecting")
+        raise HTTPException(status_code=503, detail="Worker queue full, try another worker")
+    
+    # Check if worker is ready (model loaded)
+    if not startup_completed:
+        if not _model_loading_complete:
+            # Model is still loading - reject the job
+            logger.warning(f"[{req.job_id}] Model still loading, rejecting job")
+            raise HTTPException(
+                status_code=503, 
+                detail="Worker model still loading, try another worker"
+            )
+        else:
+            logger.warning(f"[{req.job_id}] Worker not fully ready yet, but model loaded - accepting")
+    
+    # Validate model is supported
+    if req.model not in MODEL_REGISTRY:
+        logger.error(f"[{req.job_id}] Unknown model: {req.model}")
+        raise HTTPException(status_code=400, detail=f"Unknown model: {req.model}")
+    
+    # Accept the job
+    try:
+        await job_queue.put(req.dict())
+        # Record status asynchronously — DO NOT BLOCK /run
+        asyncio.create_task(_record_job_status_later(req.job_id, req.model))
+        
+        # Update status with timeout to avoid blocking
+        # try:
+        #     await asyncio.wait_for(job_status_lock.acquire(), timeout=2.0)
+        #     try:
+        #         job_status[req.job_id] = {
+        #             "status": "queued", 
+        #             "queued_at": datetime.utcnow().isoformat(),
+        #             "model": req.model,
+        #         }
+        #     finally:
+        #         job_status_lock.release()
+        # except asyncio.TimeoutError:
+        #     # Lock timeout - job is queued but status not tracked (non-critical)
+        #     logger.warning(f"[{req.job_id}] Lock timeout updating status, job still queued")
+        
+        logger.info(f"[{req.job_id}] Enqueued successfully (queue size: {job_queue.qsize()})")
+        
+        return {
+            "status": "accepted",
+            "job_id": req.job_id,
+            "queue_position": job_queue.qsize(),
+            "worker_id": WORKER_ID,
+        }
+        
+    except Exception as e:
+        logger.exception(f"[{req.job_id}] Failed to enqueue: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "worker_id": WORKER_ID, "queue_size": job_queue.qsize()}
+async def health():
+    """
+    CRITICAL: Non-blocking health check that ALWAYS responds quickly.
+    
+    Enhanced with detailed worker status.
+    
+    IMPORTANT: This endpoint must NEVER block, even during heavy processing.
+    Server uses this to determine if worker is alive - timeout = pod destruction!
+    
+    Returns:
+    - status: "ok" if ready, "starting" if not ready yet, "overloaded" if queue full, "busy" if processing
+    - worker_id: unique worker identifier
+    - queue_size: current queue size
+    - queue_capacity: max queue size
+    - active_jobs: number of jobs being processed
+    - startup_completed: whether worker finished initialization
+    - ready: whether worker can accept new jobs
+    - processing: whether worker is currently processing jobs (important for server!)
+    """
+    try:
+        # Use asyncio.wait_for to prevent lock blocking
+        # If lock takes > 1s, something is seriously wrong but we still respond
+        try:
+            # FIXED: asyncio.wait_for returns a coroutine, not an async context manager
+            # Must await the lock acquisition, then manually release
+            await asyncio.wait_for(job_status_lock.acquire(), timeout=1.0)
+            try:
+                active_jobs = sum(1 for j in job_status.values() if j.get("status") == "running")
+                queued_jobs = sum(1 for j in job_status.values() if j.get("status") == "queued")
+            finally:
+                job_status_lock.release()
+        except asyncio.TimeoutError:
+            # Lock timeout - worker is extremely busy, but still alive!
+            logger.warning("Health check: job_status_lock timeout, worker is very busy")
+            active_jobs = MAX_CONCURRENT_JOBS  # Assume max
+            queued_jobs = job_queue.qsize()
+        
+        # Determine overall status
+        # CRITICAL: Use model loading state, not just startup_completed
+        if not _model_loading_complete:
+            overall_status = "starting"  # Model still loading
+        elif not startup_completed:
+            overall_status = "starting"  # Model loaded but not fully ready
+        elif job_queue.full():
+            overall_status = "overloaded"
+        elif active_jobs >= MAX_CONCURRENT_JOBS:
+            overall_status = "busy"  # IMPORTANT: busy != dead!
+        else:
+            overall_status = "ok"
+        
+        # Worker is processing if it has active jobs
+        is_processing = active_jobs > 0
+        
+        return {
+            "status": overall_status,
+            "worker_id": WORKER_ID,
+            "queue_size": job_queue.qsize(),
+            "queue_capacity": job_queue.maxsize,
+            "active_jobs": active_jobs,
+            "queued_jobs": queued_jobs,
+            "max_concurrent": MAX_CONCURRENT_JOBS,
+            "model_loaded": _model_loading_complete,  # NEW: explicitly show model state
+            "model_error": _model_loading_error,  # NEW: show error if any
+            "startup_completed": startup_completed,
+            "ready": startup_completed and not job_queue.full(),
+            "processing": is_processing,  # NEW: critical for server!
+            "healthy": True,  # We're responding, so we're healthy!
+        }
+    except Exception as e:
+        # Even if everything fails, respond with minimal info
+        # This prevents pod destruction due to health check timeout
+        logger.error(f"Health check error: {e}")
+        return {
+            "status": "busy",  # Assume busy if we can't check
+            "worker_id": WORKER_ID,
+            "queue_size": 0,
+            "queue_capacity": job_queue.maxsize,
+            "active_jobs": 1,  # Assume processing
+            "healthy": True,  # We're responding!
+            "processing": True,
+            "error": str(e),
+        }
+
 
 @app.get("/status")
-def status():
-    return {"queue_size": job_queue.qsize(), "jobs": job_status}
+async def status():
+    """Detailed status including all jobs"""
+    async with job_status_lock:
+        jobs_copy = job_status.copy()
+    
+    return {
+        "queue_size": job_queue.qsize(),
+        "queue_capacity": job_queue.maxsize,
+        "jobs": jobs_copy,
+        "worker_id": WORKER_ID,
+        "startup_completed": startup_completed,
+    }

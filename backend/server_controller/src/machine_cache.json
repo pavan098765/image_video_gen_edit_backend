@@ -1,0 +1,64 @@
+{
+  "machines": {
+    "14751": {
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2025-12-11T18:43:25.567129Z",
+          "score": 202.0,
+          "last_used": "2025-12-11T20:33:04.557654Z"
+        }
+      },
+      "is_priority": true,
+      "last_seen": "2025-12-11T20:33:04.557654Z",
+      "stats": {
+        "success": 2,
+        "failure": 0
+      },
+      "success_rate": 1.0
+    },
+    "14762": {
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2025-12-11T19:17:33.084982Z",
+          "score": 61.0
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-12-11T19:17:33.084982Z"
+    },
+    "14780": {
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2025-12-08T22:19:04.848066Z",
+          "score": 2.0
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-12-08T22:19:04.848066Z"
+    },
+    "283": {
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2025-12-11T09:51:18.934660Z",
+          "score": 38.0
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-12-11T09:51:18.934660Z"
+    },
+    "619": {
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2025-12-11T15:05:36.974759Z",
+          "score": 6.0
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-12-11T15:05:36.974759Z"
+    }
+  },
+  "meta": {
+    "version": 1,
+    "updated_at": "2025-12-11T20:33:04.557654Z"
+  }
+}
