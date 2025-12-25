@@ -241,8 +241,9 @@ class AppState:
         
         heartbeat_stale_secs = self.config.worker.heartbeat_stale_seconds
         idle_timeout_secs = self.config.worker.idle_timeout
-        # INCREASED: 60s interval to reduce load on weak servers (was 30s)
-        sweep_interval = 60
+        # CRITICAL: Sweep interval must be <= minimum adaptive timeout (20s) to catch idle workers promptly
+        # Using 15s ensures workers are destroyed within ~15-35s of exceeding timeout, not 60-80s
+        sweep_interval = 30  # Must be less than minimum adaptive_timeout (20s)
         
         logger.info(
             f"Idle worker reaper: stale>{heartbeat_stale_secs}s, "

@@ -1120,6 +1120,11 @@ class PodManager:
             if info.machine_id and self.is_machine_bad(info.machine_id):
                 continue
             
+            # CRITICAL: Skip pods that were recently destroyed (shouldn't be in candidates, but double-check)
+            if self.lifecycle.is_recently_destroyed(pod_uuid):
+                logger.debug(f"Skipping recently destroyed pod {pod_uuid}")
+                continue
+            
             if info.model == model and info.status == PodStatus.READY:
                 # Try to reserve slot
                 reserved = await self.reserve_slot_on_pod(pod_uuid, job_id)

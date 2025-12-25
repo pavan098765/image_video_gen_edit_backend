@@ -580,7 +580,9 @@ async def submit_job(
     # Generate presigned URL
     upload_url = create_presigned_put_url(result_key)
     
-    # Create job in database
+    # Create job in database with QUEUED status directly
+    # CRITICAL: Create as QUEUED to avoid blocking update_job_state call
+    # This allows us to return response immediately without waiting for dispatch
     db = SessionLocal()
     try:
         job = Job(
@@ -588,7 +590,7 @@ async def submit_job(
             model=model,
             prompt=payload.prompt,
             params=payload.params or {},
-            status=JobState.PENDING.value,
+            status=JobState.QUEUED.value,  # Start as QUEUED - no need for separate update
             result_r2_key=result_key,
             output_key=result_key,
             fcm_token=payload.fcm_token,
@@ -598,64 +600,54 @@ async def submit_job(
         )
         db.add(job)
         
-        create_audit_log(
-            db,
-            event_type="job_created",
-            message=f"Job {job_id} created for model {model}",
-            target=job_id,
-            target_type="job",
-            actor_ip=ip,
-            details={"model": model},
-        )
+        # Audit log is optional - don't block if it fails
+        try:
+            create_audit_log(
+                db,
+                event_type="job_created",
+                message=f"Job {job_id} created for model {model}",
+                target=job_id,
+                target_type="job",
+                actor_ip=ip,
+                details={"model": model},
+            )
+        except Exception as audit_error:
+            logger.warning(f"Failed to create audit log for job {job_id}: {audit_error}")
         
         db.commit()
+    except Exception as db_error:
+        logger.error(f"Failed to create job {job_id}: {db_error}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="Failed to create job")
     finally:
         db.close()
     
-    audit_logger.job_created(job_id, model, ip, auth.get("fingerprint_hash", auth.get("type")))
+    # Log job creation (non-blocking, can fail silently)
+    try:
+        audit_logger.job_created(job_id, model, ip, auth.get("fingerprint_hash", auth.get("type")))
+    except Exception:
+        pass  # Non-critical
     
-    # Try to dispatch immediately
-    worker_id = None
-    if _job_manager and _pod_manager:
-        try:
-            # Update to QUEUED
-            _job_manager.update_job_state(job_id, JobState.QUEUED)
-            
-            # Dispatch in background
-            background_tasks.add_task(_dispatch_job_background, job_id, model, payload.params.get("mode"))
-            
-        except Exception as e:
-            logger.error(f"Failed to dispatch job {job_id} immediately: {e}")
-            # Ensure job is at least in QUEUED so recovery system can pick it up
-            db = SessionLocal()
-            try:
-                job_check = db.query(Job).filter(Job.job_id == job_id).first()
-                if job_check and job_check.status == JobState.PENDING.value:
-                    job_check.status = JobState.QUEUED.value
-                    job_check.updated_at = utc_naive_now()
-                    if job_check.error_log is None:
-                        job_check.error_log = []
-                    job_check.error_log.append({
-                        "timestamp": utc_naive_now().isoformat(),
-                        "state": "dispatch_init_error",
-                        "error": str(e),
-                    })
-                    db.commit()
-                    logger.info(
-                        f"Job {job_id} manually set to QUEUED after dispatch init error. "
-                        f"Recovery system will pick it up."
-                    )
-            finally:
-                db.close()
+    # Dispatch in background task - return immediately without waiting
+    if _pod_manager:
+        background_tasks.add_task(_dispatch_job_background, job_id, model, payload.params.get("mode"))
+    elif _job_manager:
+        # Fallback: if no pod_manager, at least add to pending queue
+        # (but this should rarely happen in normal operation)
+        logger.warning(f"No pod_manager available, job {job_id} will be handled by recovery system")
     
     # Build download URL
     download_url = f"{_controller_url}/download/{job_id}" if _controller_url else f"/download/{job_id}"
     
+    # Return IMMEDIATELY - no blocking operations after this point
     return SubmitResponse(
         job_id=job_id,
         status=JobStatus.QUEUED,
         model=model,
-        routed_to_worker=worker_id,
+        routed_to_worker=None,  # Will be set when actually dispatched
         upload_url=upload_url,
         result_key=result_key,
         download_url=download_url,
@@ -2133,21 +2125,30 @@ async def worker_heartbeat(
     """
     Worker heartbeat endpoint.
     
-    Updates in-memory cache IMMEDIATELY (fast!) and DB periodically (background).
-    CRITICAL: Must be fast and resilient - workers depend on this.
+    Updates in-memory cache IMMEDIATELY (lock-free write for speed).
+    CRITICAL: Must be ultra-fast - workers depend on this.
+    
+    Lock-free dict write is safe in asyncio (single-threaded execution).
+    Lock only needed for sync task batch reads.
     """
     now = utc_naive_now()
     
-    # Update in-memory cache FIRST (no DB, instant response)
-    async with _heartbeat_cache_lock:
+    # Lock-free cache update - dict assignment is atomic in Python
+    # This is safe in asyncio since Python code runs single-threaded
+    # Lock is only needed when sync task reads multiple entries
+    try:
         _heartbeat_cache[payload.worker_id] = {
             "last_heartbeat": now,
             "status": payload.status.value if payload.status else None,
             "metrics": payload.metrics,
             "needs_sync": True,  # Mark for DB sync
         }
+    except Exception:
+        # If cache update fails for any reason, just continue
+        # Sync task will eventually catch up via DB reads
+        pass
     
-    # Return immediately - don't wait for DB
+    # Return immediately - zero blocking operations
     return {"status": "ok"}
 
 
@@ -2284,6 +2285,7 @@ async def job_complete(
                             machine_id = pod_info.machine_id
             
             # CRITICAL: CUDA kernel incompatibility (int4 variant on wrong GPU)
+            # Move heavy operations to background to avoid blocking response
             if is_cuda_incompatibility:
                 logger.error(
                     f"CUDA kernel incompatibility detected for job {job_id}! "
@@ -2296,26 +2298,60 @@ async def job_complete(
                         f"Int4 variant failed on machine {machine_id} due to CUDA incompatibility. "
                         f"Blacklisting machine {machine_id} for int4 variant (10 min)."
                     )
-                    # Blacklist this machine for longer (10 min) since it's a compatibility issue
+                    # Move to background task to avoid blocking response
                     if _pod_manager:
-                        await _pod_manager.mark_machine_bad(str(machine_id), duration=600)
+                        background_tasks.add_task(
+                            _pod_manager.mark_machine_bad,
+                            str(machine_id),
+                            600  # duration
+                        )
                     
-                    # Destroy the pod immediately - it won't work for any int4 jobs
+                    # Destroy the pod in background - it won't work for any int4 jobs
                     if pod_uuid and _pod_manager:
-                        try:
-                            await _pod_manager.destroy_individual_pod(
-                                pod_uuid,
-                                reason="CUDA kernel incompatibility (int4 variant)"
-                            )
-                            logger.info(f"Destroyed incompatible pod {pod_uuid}")
-                        except Exception as e:
-                            logger.error(f"Failed to destroy incompatible pod: {e}")
+                        background_tasks.add_task(
+                            _handle_incompatible_pod_destruction,
+                            _pod_manager,
+                            pod_uuid,
+                            "CUDA kernel incompatibility (int4 variant)"
+                        )
             
-            # Check for OOM errors
+            # Check for OOM errors - remove pod from tracking immediately, then destroy
             elif is_oom_error:
-                logger.warning(f"OOM detected for job {job_id}")
+                logger.warning(f"OOM detected for job {job_id} on pod {pod_uuid} (machine {machine_id})")
+                # CRITICAL: Remove pod from tracking IMMEDIATELY to prevent reuse
+                # Also mark worker as offline in DB immediately
+                if pod_uuid and _pod_manager:
+                    # Remove from tracking immediately (synchronously)
+                    async with _pod_manager._lock:
+                        if pod_uuid in _pod_manager.individual_pods:
+                            logger.warning(f"Removing pod {pod_uuid} from tracking immediately due to OOM (will be destroyed in background)")
+                            _pod_manager.individual_pods.pop(pod_uuid, None)
+                            _pod_manager.individual_pod_managers.pop(pod_uuid, None)
+                    
+                    # Mark worker as offline in DB immediately (synchronously)
+                    if worker_id:
+                        try:
+                            worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+                            if worker:
+                                worker.status = "offline"
+                                db.commit()
+                                logger.info(f"Marked worker {worker_id} as offline due to OOM")
+                        except Exception as e:
+                            logger.warning(f"Failed to mark worker offline: {e}")
+                    
+                    # Schedule destruction in background (cleanup)
+                    background_tasks.add_task(
+                        _pod_manager.destroy_individual_pod,
+                        pod_uuid,
+                        f"OOM detected on job {job_id}"
+                    )
+                # Also blacklist the machine (less critical - pod removal is the main fix)
                 if machine_id and _pod_manager:
-                    await _pod_manager.mark_machine_bad(str(machine_id), duration=300)  # 5 min for OOM
+                    background_tasks.add_task(
+                        _pod_manager.mark_machine_bad,
+                        str(machine_id),
+                        300  # 5 min for OOM
+                    )
             
             # Check for other critical errors
             elif is_other_cuda_error:
@@ -2377,12 +2413,15 @@ async def job_complete(
                     job.updated_at = utc_naive_now()
                     db.commit()
                 
-                # CRITICAL: Remove failed job from pending_jobs
+                # CRITICAL: Remove failed job from pending_jobs (in background)
                 if _pod_manager and job.model:
-                    try:
-                        await _pod_manager.remove_pending_job(job_id, job.model)
-                    except Exception as e:
-                        logger.debug(f"Failed to remove failed job {job_id} from pending queue: {e}")
+                    background_tasks.add_task(
+                        _remove_pending_job_safe,
+                        _pod_manager,
+                        job_id,
+                        job.model,
+                        "failed"
+                    )
                 
                 audit_logger.job_failed(job_id, worker_id, payload.error)
             
@@ -2437,12 +2476,15 @@ async def job_complete(
                     job_id,
                 )
             
-            # CRITICAL: Remove job from pending_jobs (may already be removed when it started running)
+            # CRITICAL: Remove job from pending_jobs (in background, may already be removed when it started running)
             if _pod_manager and job.model:
-                try:
-                    await _pod_manager.remove_pending_job(job_id, job.model)
-                except Exception as e:
-                    logger.debug(f"Failed to remove completed job {job_id} from pending queue: {e}")
+                background_tasks.add_task(
+                    _remove_pending_job_safe,
+                    _pod_manager,
+                    job_id,
+                    job.model,
+                    "completed"
+                )
             
             audit_logger.job_completed(job_id, worker_id)
         
@@ -2475,6 +2517,32 @@ async def job_complete(
         db.close()
     
     return {"status": "ok", "job_id": job_id}
+
+
+async def _handle_incompatible_pod_destruction(
+    pod_manager,
+    pod_uuid: str,
+    reason: str
+):
+    """Background task to destroy incompatible pod"""
+    try:
+        await pod_manager.destroy_individual_pod(pod_uuid, reason=reason)
+        logger.info(f"Destroyed incompatible pod {pod_uuid}: {reason}")
+    except Exception as e:
+        logger.error(f"Failed to destroy incompatible pod {pod_uuid}: {e}")
+
+
+async def _remove_pending_job_safe(
+    pod_manager,
+    job_id: str,
+    model: str,
+    status: str
+):
+    """Background task to safely remove job from pending queue"""
+    try:
+        await pod_manager.remove_pending_job(job_id, model)
+    except Exception as e:
+        logger.debug(f"Failed to remove {status} job {job_id} from pending queue: {e}")
 
 
 async def _send_job_notification(token: str, job_id: str, model: str, success: bool):
