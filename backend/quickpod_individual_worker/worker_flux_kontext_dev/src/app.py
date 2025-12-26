@@ -16,6 +16,22 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from tenacity import retry, wait_exponential, stop_after_attempt
 from contextlib import asynccontextmanager
+import concurrent.futures
+
+import torch
+
+# -----------------------
+# Dedicated Thread Pool for Inference
+# -----------------------
+INFERENCE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="inference"
+)
+
+IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="io"
+)
 
 # -----------------------
 # GPU cleanup
@@ -25,14 +41,12 @@ def cleanup_gpu(verbose: bool = False):
     Fully frees GPU memory and CUDA context.
     Use this between model loads to ensure a clean slate.
     """
-    import torch
     try:
         if verbose:
             allocated = torch.cuda.memory_allocated() / 1024**2
             reserved = torch.cuda.memory_reserved() / 1024**2
             print(f"[GPU] Before cleanup: {allocated:.2f} MB allocated, {reserved:.2f} MB reserved")
 
-        # 1️⃣ Delete all PyTorch GPU tensors
         for obj in gc.get_objects():
             try:
                 if torch.is_tensor(obj):
@@ -40,28 +54,18 @@ def cleanup_gpu(verbose: bool = False):
             except Exception:
                 pass
 
-        # 2️⃣ Run Python garbage collector
         gc.collect()
-
-        # 3️⃣ Clear PyTorch cache and IPC handles
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-
-        # 4️⃣ Synchronize and reset memory stats
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.reset_accumulated_memory_stats()
-
-        # 5️⃣ Reset CUDA device context (complete teardown)
-        torch.cuda.reset()
-
-        # 6️⃣ Final garbage collection
         gc.collect()
+        torch.cuda.empty_cache()
 
         if verbose:
-            torch.cuda._lazy_init()  # reinit context to check stats safely
             print(f"[GPU] After cleanup: {torch.cuda.memory_allocated()/1024**2:.2f} MB allocated")
-            print("[GPU] CUDA context successfully reset.")
+            print("[GPU] GPU memory cleanup completed.")
     except Exception as e:
         print(f"[GPU] Cleanup warning: {e}")
         pass
@@ -144,11 +148,45 @@ def signed_headers(payload: dict) -> Dict[str, str]:
         headers["Authorization"] = f"Bearer {CONTROLLER_API_KEY}"
     return headers
 
-def post_signed_json(url: str, payload: dict, timeout: int = 10) -> requests.Response:
+def post_signed_json(url: str, payload: dict, timeout: int = 10, max_retries: int = 3) -> requests.Response:
+    """Post signed JSON with retry logic for resilience."""
     headers = signed_headers(payload)
-    resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                backoff = 2 ** attempt
+                logger.warning(f"POST to {url} timeout (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s...")
+                time.sleep(backoff)
+                continue
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                backoff = 2 ** attempt
+                logger.warning(f"POST to {url} connection error (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s...")
+                time.sleep(backoff)
+                continue
+        except requests.exceptions.HTTPError as e:
+            if e.response and 400 <= e.response.status_code < 500:
+                raise
+            last_error = e
+            if attempt < max_retries - 1:
+                backoff = 2 ** attempt
+                logger.warning(f"POST to {url} server error (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s...")
+                time.sleep(backoff)
+                continue
+        except Exception as e:
+            last_error = e
+            raise
+    
+    logger.error(f"POST to {url} failed after {max_retries} attempts: {last_error}")
+    raise last_error
 
 # -----------------------
 # Controller integration
@@ -196,6 +234,7 @@ def resolve_inference_callable(model: str, mode: Optional[str]):
 async def run_inference_and_save(
     job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]
 ) -> str:
+    """Run inference in dedicated thread pool to avoid blocking FastAPI endpoints."""
     global last_model_key
     loop = asyncio.get_event_loop()
     params = params.copy()
@@ -212,7 +251,7 @@ async def run_inference_and_save(
 
     try:
         out_path = await loop.run_in_executor(
-            None, inference_func, job_id, prompt, params
+            INFERENCE_EXECUTOR, inference_func, job_id, prompt, params
         )
         return out_path
     finally:
@@ -350,11 +389,13 @@ async def lifespan(app: FastAPI):
 # Heartbeat loop
 # -----------------------
 async def _hb_loop():
+    """Heartbeat loop - uses IO_EXECUTOR to avoid blocking."""
+    loop = asyncio.get_event_loop()
     while True:
         try:
-            send_heartbeat()
+            await loop.run_in_executor(IO_EXECUTOR, send_heartbeat)
         except Exception as e:
-            logger.exception("Heartbeat failed: %s", e)
+            logger.debug(f"Heartbeat failed: {e}")
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 # -----------------------
