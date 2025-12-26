@@ -1140,6 +1140,30 @@ class PodManager:
                     )
                     
                     if worker:
+                        # CRITICAL: Never dispatch to workers that aren't truly ready.
+                        # Some pods register as "starting" and only become ready after model load.
+                        # If we flip them to "dispatching" here, routes._dispatch_to_worker won't detect
+                        # the starting state and server will timeout hitting /run.
+                        if worker.status != "ready":
+                            logger.info(
+                                f"Pod {pod_uuid} tracked as READY but DB worker {worker.worker_id} "
+                                f"is '{worker.status}'. Skipping reuse for job {job_id}."
+                            )
+                            # CRITICAL: Treat this pod as STARTING so Phase-2 can wait for it,
+                            # instead of falling through to "no existing pods" and creating a duplicate pod.
+                            async with self._lock:
+                                pi = self.individual_pods.get(pod_uuid)
+                                if pi and pi.status == PodStatus.READY:
+                                    pi.status = PodStatus.STARTING
+                                    logger.info(
+                                        f"Downgraded pod {pod_uuid} tracking status READY→STARTING "
+                                        f"(DB worker='{worker.status}') to avoid duplicate pod creation"
+                                    )
+                            # Rollback reservation and try other pods / create new pod
+                            # (must be immediate to avoid leaking queue slots)
+                            await self.release_slot_on_pod(pod_uuid, job_id)
+                            continue
+
                         worker.status = "dispatching"
                         worker.last_active = datetime.utcnow()
                         db.commit()
@@ -1769,9 +1793,18 @@ class PodManager:
         """
         from db import SessionLocal, Worker, Job
         from job_manager import JobState
+        import importlib
+        
+        # Capture pod machine_id (for blacklisting) BEFORE removing from tracking
+        machine_id: Optional[str] = None
+        async with self._lock:
+            pi = self.individual_pods.get(pod_uuid)
+            if pi:
+                machine_id = pi.machine_id
         
         # CRITICAL: Recover any running jobs BEFORE destroying the pod
         # This prevents jobs from being lost when a pod dies
+        recovered_jobs: List[Dict[str, Any]] = []
         try:
             with SessionLocal() as db:
                 # Find the worker associated with this pod
@@ -1790,6 +1823,13 @@ class PodManager:
                         job.status = JobState.QUEUED.value
                         job.worker_id = None
                         job.updated_at = datetime.utcnow()
+                        recovered_jobs.append(
+                            {
+                                "job_id": job.job_id,
+                                "model": getattr(job, "model", None),
+                                "mode": getattr(job, "mode", None),
+                            }
+                        )
                         
                         if job.error_log is None:
                             job.error_log = []
@@ -1818,6 +1858,28 @@ class PodManager:
         except Exception as e:
             logger.error(f"Error recovering jobs before destroying pod {pod_uuid}: {e}")
         
+        # CRITICAL: Recovered jobs must be re-enqueued into the in-memory pending queue,
+        # otherwise autoscaler/dispatcher won't see them and clients will be stuck in QUEUED forever.
+        for r in recovered_jobs:
+            try:
+                if r.get("job_id") and r.get("model"):
+                    await self.add_pending_job(r["job_id"], r["model"])
+            except Exception as e:
+                logger.warning(f"Failed to add recovered job {r.get('job_id')} to pending queue: {e}")
+
+        # CRITICAL: Trigger background dispatch for recovered jobs (best-effort).
+        # Avoid hard import at module import time (circular); import lazily here.
+        if recovered_jobs:
+            try:
+                routes = importlib.import_module("routes")
+                dispatch_fn = getattr(routes, "_dispatch_job_background", None)
+                if dispatch_fn:
+                    for r in recovered_jobs:
+                        if r.get("job_id") and r.get("model"):
+                            asyncio.create_task(dispatch_fn(r["job_id"], r["model"], r.get("mode")))
+            except Exception as e:
+                logger.warning(f"Failed to trigger dispatch for recovered jobs from pod {pod_uuid}: {e}")
+
         # Remove from local tracking
         async with self._lock:
             self.individual_pods.pop(pod_uuid, None)
@@ -1825,6 +1887,21 @@ class PodManager:
         
         # Destroy via lifecycle manager
         success = await self.lifecycle.destroy_pod(pod_uuid, reason=reason)
+
+        # If pod died due to infrastructure/network issues, blacklist the machine to avoid immediate reuse.
+        # (Do NOT blacklist for normal idle scale-down.)
+        if machine_id and reason:
+            reason_l = reason.lower()
+            if (
+                "stale heartbeat" in reason_l
+                or "startup timeout" in reason_l
+                or "dispatch failure" in reason_l
+                or "stuck in starting" in reason_l
+            ):
+                try:
+                    await self.mark_machine_bad(str(machine_id), duration=600)
+                except Exception as e:
+                    logger.warning(f"Failed to blacklist machine {machine_id} after pod {pod_uuid} destruction: {e}")
         
         # Remove pod lock
         self._pod_locks.pop(pod_uuid, None)

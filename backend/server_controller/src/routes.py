@@ -2115,6 +2115,22 @@ async def register_worker(
 _heartbeat_cache: Dict[str, Dict[str, Any]] = {}
 _heartbeat_cache_lock = asyncio.Lock()
 
+def get_cached_last_heartbeat(worker_id: str) -> Optional[datetime]:
+    """
+    Return last heartbeat timestamp from the in-memory cache (if present).
+    
+    CRITICAL: Used by background reaper tasks to avoid false "stale" detection
+    when DB sync lags behind the in-memory cache.
+    """
+    try:
+        data = _heartbeat_cache.get(worker_id)
+        if not data:
+            return None
+        ts = data.get("last_heartbeat")
+        return ts if isinstance(ts, datetime) else None
+    except Exception:
+        return None
+
 
 @worker_router.post("/heartbeat")
 async def worker_heartbeat(
@@ -2181,6 +2197,14 @@ async def sync_heartbeat_cache_to_db():
                 for worker_id, data in to_sync.items():
                     worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
                     if worker:
+                        # CRITICAL: Do NOT "resurrect" workers that have been taken offline/terminated.
+                        # After we destroy a pod, the worker may keep heartbeating briefly; if we
+                        # overwrite status back to "ready", the reaper will try to destroy it again
+                        # (and can end up logging "destroying pod None").
+                        if worker.status in ("offline", "terminated", "error"):
+                            continue
+
+                        # Normal sync path
                         worker.last_heartbeat = data["last_heartbeat"]
                         worker.last_active = data["last_heartbeat"]
                         if data["status"]:

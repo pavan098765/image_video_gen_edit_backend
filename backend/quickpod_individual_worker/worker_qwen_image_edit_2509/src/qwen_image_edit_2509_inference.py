@@ -1,4 +1,3 @@
-# qwen_image_edit_2509_inference.py
 # ------------------------------------------------------------------
 # Qwen Image Edit 2509 Inference
 # - Lazy pipeline loading (prevents OOM during FastAPI startup)
@@ -58,8 +57,11 @@ scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
 # Model path setup
 # -------------------------
 NUM_INFERENCE_STEPS = 8     # lower steps for speed; set to 8 for higher quality
-RANK = 128                  
-precision = get_precision()
+# IMPORTANT:
+# - fp4 is intended for RTX 50-series (Blackwell) in your deployment and uses rank=128 safetensor
+# - int4 is used for non-Blackwell GPUs and uses rank=32 safetensor in your int4 docker image
+precision = (get_precision() or "").lower()
+RANK = 128 if precision == "fp4" else 32
 
 model_filename = f"svdq-{precision}_r{RANK}-qwen-image-edit-2509-lightningv2.0-{NUM_INFERENCE_STEPS}steps.safetensors"
 model_path = os.path.join(
@@ -69,7 +71,10 @@ model_path = os.path.join(
 qwen_repo_path = os.environ.get("QWEN_2509_LOCAL_PATH", "Qwen/Qwen-Image-Edit-2509")
 
 if not os.path.exists(model_path):
-    raise FileNotFoundError(f"❌ Transformer safetensor not found: {model_path}")
+    raise FileNotFoundError(
+        f"❌ Transformer safetensor not found: {model_path} "
+        f"(precision={precision}, rank={RANK}, steps={NUM_INFERENCE_STEPS})"
+    )
 
 # -------------------------
 # Lazy pipeline global (will load on first use)
@@ -92,7 +97,7 @@ def get_pipeline():
     gc.collect()
     torch.cuda.empty_cache()
     
-    print(f"🔧 Loading Nunchaku transformer from {model_path}")
+    print(f"🔧 Loading Nunchaku transformer (precision={precision}, rank={RANK}) from {model_path}")
     transformer_start = time.time()
     transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(model_path)
     transformer_time = time.time() - transformer_start

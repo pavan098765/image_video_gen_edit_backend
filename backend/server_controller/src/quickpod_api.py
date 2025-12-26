@@ -389,12 +389,17 @@ class QuickPodManager:
             raise RuntimeError("No pod_uuid set. Cannot stop pod.")
         
         logger.info(f"Stopping pod {self.pod_uuid}")
-        return self._make_request(
+        data = self._make_request(
             "GET",
             "update/stoppod",
             params={"pod_uuid": self.pod_uuid},
             timeout=POD_OPERATION_TIMEOUT,
         )
+        # Some QuickPod endpoints return {"status": "..."} without "error".
+        # Treat non-success statuses as failures so the caller doesn't log false success.
+        if isinstance(data, dict) and data.get("status") and str(data.get("status")).lower() != "success":
+            raise PodDestroyError(self.pod_uuid, reason=f"Stop pod failed: {data}")
+        return data
     
     def restart_pod(self) -> Dict[str, Any]:
         """Restart a pod"""
@@ -424,12 +429,17 @@ class QuickPodManager:
         
         logger.info(f"Destroying pod {self.pod_uuid}")
         try:
-            return self._make_request(
+            data = self._make_request(
                 "GET",
                 "update/destroypod",
                 params={"pod_uuid": self.pod_uuid},
                 timeout=POD_OPERATION_TIMEOUT,
             )
+            # Some QuickPod endpoints return {"status": "..."} without "error".
+            # Treat non-success statuses as failures so the controller doesn't log false success.
+            if isinstance(data, dict) and data.get("status") and str(data.get("status")).lower() != "success":
+                raise PodDestroyError(self.pod_uuid, reason=f"Destroy pod failed: {data}")
+            return data
         except Exception as e:
             raise PodDestroyError(self.pod_uuid, reason=str(e), cause=e)
     
