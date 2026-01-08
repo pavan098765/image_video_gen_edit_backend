@@ -1669,6 +1669,7 @@ async def submit_job(
     # Create job in database with QUEUED status and atomically lock credits
     db = SessionLocal()
     try:
+        now = utc_naive_now()
         job = Job(
             job_id=job_id,
             model=model,
@@ -1681,9 +1682,10 @@ async def submit_job(
             user_id=user_id,  # Link job to user for credit tracking
             credits_locked=0,  # Will be set by lock_credits_for_job
             credits_refunded=0,
-            created_at=utc_naive_now(),
-            updated_at=utc_naive_now(),
-            timeout_at=utc_naive_now() + timedelta(minutes=30),
+            created_at=now,
+            updated_at=now,
+            queued_at=now,  # Set queued_at immediately since job starts in QUEUED state
+            timeout_at=now + timedelta(minutes=30),
         )
         db.add(job)
         db.flush()  # Get the job into the session before locking credits

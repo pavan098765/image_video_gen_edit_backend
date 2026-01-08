@@ -75,3 +75,6 @@ backend/wheels/zipp-3.23.0-py3-none-any.whl
 backend/uvicorn.log
 backend\server_controller\src\controller.db
 
+backend/server_controller/src/~$controller_export.xlsx
+backend/server_controller/src/controller.db
+backend/server_controller/src/controller_export.xlsx

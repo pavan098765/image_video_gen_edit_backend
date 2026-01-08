@@ -185,9 +185,11 @@ class Job(Base):
     credits_refunded = Column(Integer, default=0, nullable=False)  # Credits refunded on failure
     
     # Cost tracking - GPU infrastructure cost for this job
+    # Note: job_cost_usd = processing_cost + pod_overhead_share_usd (final total cost)
+    # To get processing cost only: job_cost_usd - pod_overhead_share_usd
     pod_uuid = Column(String(128), nullable=True, index=True)  # Pod that processed this job
     gpu_hourly_rate = Column(Float, nullable=True)  # $/hour rate for the GPU used
-    job_cost_usd = Column(Float, nullable=True)  # Calculated cost for this job in USD
+    job_cost_usd = Column(Float, nullable=True)  # TOTAL cost (processing + overhead) in USD
     pod_overhead_share_usd = Column(Float, nullable=True)  # Share of pod startup/shutdown overhead
 
     __table_args__ = (
@@ -200,6 +202,19 @@ class Job(Base):
         Index("ix_job_pod", "pod_uuid"),
     )
 
+    @property
+    def processing_cost_usd(self) -> float:
+        """Get processing cost only (total cost minus overhead)"""
+        if self.job_cost_usd is None:
+            return 0.0
+        overhead = self.pod_overhead_share_usd or 0.0
+        return max(0.0, self.job_cost_usd - overhead)
+    
+    @property
+    def total_cost_usd(self) -> float:
+        """Alias for job_cost_usd for clarity (total = processing + overhead)"""
+        return self.job_cost_usd or 0.0
+    
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
         return {
@@ -223,6 +238,11 @@ class Job(Base):
             "processing_time_seconds": self.processing_time_seconds,
             "queue_time_seconds": self.queue_time_seconds,
             "dispatch_time_seconds": self.dispatch_time_seconds,
+            # Cost metrics
+            "job_cost_usd": self.job_cost_usd,  # Total cost (processing + overhead)
+            "processing_cost_usd": self.processing_cost_usd,  # Processing cost only
+            "pod_overhead_share_usd": self.pod_overhead_share_usd,  # Overhead portion
+            "gpu_hourly_rate": self.gpu_hourly_rate,
         }
 
 
