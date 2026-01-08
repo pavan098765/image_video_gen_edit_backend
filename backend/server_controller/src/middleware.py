@@ -108,16 +108,27 @@ ALLOWED_PATHS: List[str] = [
     "/register_worker",
     "/heartbeat",
     "/download",
+    "/auth",  # Firebase auth endpoints
+    "/ads",   # Ad network SSV callbacks (AdMob, etc.)
 ]
 
 # Worker paths (exempt from some checks)
 WORKER_PATHS: List[str] = ["/register_worker", "/heartbeat"]
 
-# Trusted API paths (require auth)
-TRUSTED_API_PATHS: List[str] = ["/submit", "/job_complete", "/job_status"]
+# Trusted API paths (require auth - Bearer token or fingerprint)
+TRUSTED_API_PATHS: List[str] = [
+    "/submit",
+    "/job_complete",
+    "/job_status",
+    "/auth",  # Firebase auth endpoints require Bearer token
+]
 
 # Public paths (no auth needed)
-PUBLIC_PATHS: List[str] = ["/download", "/health"]
+PUBLIC_PATHS: List[str] = [
+    "/download", 
+    "/health",
+    "/ads/admob/ssv",  # AdMob SSV callback (called by Google, no auth)
+]
 
 
 # =============================================================================

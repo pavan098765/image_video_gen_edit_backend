@@ -20,30 +20,39 @@ def merge_parts(base_path: str, delete_parts: bool = True):
         print(f"⏩ Skipping merge, already exists: {output_path}")
         return True
 
-    print(f"🔍 Found {len(parts)} part files for {output_path}")
+    print(f"🔍 Found {len(parts)} part files for {output_path} (total ~{len(parts) * 500 / 1024:.1f} GB)")
+    
+    # Verify all parts exist before starting merge
     for p in parts:
         if not os.path.exists(p):
             print(f"❌ Missing part file: {p}")
             sys.exit(1)
 
     try:
-        # Run `cat part-* > output`
+        import time
+        merge_start = time.time()
+        # Run `cat part-* > output` - using cat is fast for large files
         cmd = ["cat"] + parts
         with open(output_path, "wb") as outfile:
             subprocess.run(cmd, stdout=outfile, check=True)
-        print(f"✅ Merged into {output_path} ({os.path.getsize(output_path)/1024/1024:.2f} MB)")
+        merge_time = time.time() - merge_start
+        file_size_mb = os.path.getsize(output_path) / 1024 / 1024
+        print(f"✅ Merged into {output_path} ({file_size_mb:.1f} MB) in {merge_time:.1f}s ({file_size_mb/merge_time:.1f} MB/s)")
     except subprocess.CalledProcessError as e:
         print(f"❌ Failed to merge {output_path}: {e}")
         sys.exit(1)
 
-    # Delete parts if requested
+    # Delete parts if requested (batch delete - only log summary to reduce noise)
     if delete_parts:
+        deleted_count = 0
         for p in parts:
             try:
                 os.remove(p)
-                print(f"🗑️ Deleted {p}")
+                deleted_count += 1
             except Exception as e:
                 print(f"⚠️ Failed to delete {p}: {e}")
+        if deleted_count > 0:
+            print(f"🗑️ Deleted {deleted_count} part files")
 
     return True
 

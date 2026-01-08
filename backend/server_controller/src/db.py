@@ -86,6 +86,13 @@ class Worker(Base):
     total_jobs_processed = Column(Integer, default=0)
     job_id_counts = Column(MutableDict.as_mutable(JSON), default=dict)
     machine_id = Column(String(64), nullable=True, index=True)
+    
+    # Cost tracking - GPU infrastructure cost
+    gpu_hourly_rate = Column(Float, nullable=True)  # $/hour rate from offer
+    offer_id = Column(Integer, nullable=True)  # QuickPod offer ID
+    gpu_type = Column(String(128), nullable=True)  # e.g., "NVIDIA GeForce RTX 3090"
+    destroyed_at = Column(DateTime, nullable=True)  # When pod was destroyed
+    total_pod_cost_usd = Column(Float, nullable=True)  # Total cost for pod lifetime
 
     __table_args__ = (
         Index("ix_worker_model_status", "model", "status"),
@@ -172,12 +179,25 @@ class Job(Base):
     fcm_token = Column(String(512), nullable=True)
     notification_sent = Column(Boolean, default=False)
 
+    # Credit tracking - for atomic credit operations
+    user_id = Column(String(128), ForeignKey("users.id"), nullable=True, index=True)
+    credits_locked = Column(Integer, default=0, nullable=False)  # Credits deducted at submit
+    credits_refunded = Column(Integer, default=0, nullable=False)  # Credits refunded on failure
+    
+    # Cost tracking - GPU infrastructure cost for this job
+    pod_uuid = Column(String(128), nullable=True, index=True)  # Pod that processed this job
+    gpu_hourly_rate = Column(Float, nullable=True)  # $/hour rate for the GPU used
+    job_cost_usd = Column(Float, nullable=True)  # Calculated cost for this job in USD
+    pod_overhead_share_usd = Column(Float, nullable=True)  # Share of pod startup/shutdown overhead
+
     __table_args__ = (
         Index("ix_job_model_status", "model", "status"),
         Index("ix_job_worker", "worker_id"),
         Index("ix_job_created", "created_at"),
         Index("ix_job_updated", "updated_at"),
         Index("ix_job_timeout", "timeout_at"),
+        Index("ix_job_user", "user_id"),
+        Index("ix_job_pod", "pod_uuid"),
     )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -328,6 +348,293 @@ class IPBan(Base):
 
 
 # =============================================================================
+# User Model
+# =============================================================================
+
+class User(Base):
+    """
+    User account with credits system.
+    Linked to Firebase Authentication via firebase_uid.
+    """
+    __tablename__ = "users"
+
+    id = Column(String(128), primary_key=True)
+    firebase_uid = Column(String(256), unique=True, nullable=False, index=True)
+    email = Column(String(256), nullable=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    last_seen = Column(DateTime, default=utc_naive_now, nullable=False)
+    
+    # Credits
+    total_credits = Column(Integer, default=0, nullable=False)
+    bonus_granted = Column(Integer, default=0, nullable=False)
+    
+    # Signup bonus tracking (prevents abuse on reinstall/re-signup)
+    signup_bonus_granted = Column(Boolean, default=False, nullable=False)
+    
+    # Daily spinner tracking
+    last_daily_spin_time = Column(DateTime, nullable=True)
+    
+    # Status
+    is_active = Column(Boolean, default=True, nullable=False)
+    
+    # Relationships
+    credit_transactions = relationship("CreditTransaction", back_populates="user")
+    subscriptions = relationship("Subscription", back_populates="user")
+    ad_rewards = relationship("AdReward", back_populates="user")
+    daily_spins = relationship("DailySpin", back_populates="user")
+    rewarded_ad_events = relationship("RewardedAdEvent", back_populates="user")
+
+    # Note: firebase_uid already has index=True on the column definition
+    # No need for additional __table_args__ index
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "firebase_uid": self.firebase_uid,
+            "email": self.email,
+            "total_credits": self.total_credits,
+            "bonus_granted": self.bonus_granted,
+            "signup_bonus_granted": self.signup_bonus_granted,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "last_seen": self.last_seen.isoformat() if self.last_seen else None,
+        }
+
+
+# =============================================================================
+# Credit Transaction Model
+# =============================================================================
+
+class CreditTransaction(Base):
+    """
+    Credit transaction log for auditing.
+    """
+    __tablename__ = "credit_transactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(128), ForeignKey("users.id"), nullable=False)
+    
+    delta = Column(Integer, nullable=False)  # Positive = add, negative = deduct
+    reason = Column(String(256), nullable=False)
+    
+    job_id = Column(String(128), nullable=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="credit_transactions")
+
+    __table_args__ = (
+        Index("ix_credit_user_time", "user_id", "created_at"),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "delta": self.delta,
+            "reason": self.reason,
+            "job_id": self.job_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# =============================================================================
+# Subscription Model
+# =============================================================================
+
+class Subscription(Base):
+    """
+    User subscription for premium features.
+    """
+    __tablename__ = "subscriptions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(128), ForeignKey("users.id"), index=True, nullable=False)
+
+    provider = Column(String(32), nullable=False)  # e.g., "stripe", "google_play", "apple"
+    plan_id = Column(String(64), nullable=False)
+    status = Column(String(32), nullable=False)  # e.g., "active", "cancelled", "expired"
+
+    started_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=True)
+    renewed_at = Column(DateTime, nullable=True)
+
+    provider_ref = Column(String(256), nullable=True)  # External subscription ID
+    last_event = Column(String(64), nullable=True)  # Last webhook event type
+
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="subscriptions")
+
+    __table_args__ = (
+        Index("ix_subscriptions_user", "user_id"),
+        Index("ix_subscriptions_status", "status"),
+    )
+
+
+# =============================================================================
+# Ad Reward Model
+# =============================================================================
+
+class AdReward(Base):
+    """
+    Ad reward tracking for rewarded video ads.
+    """
+    __tablename__ = "ad_rewards"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(128), ForeignKey("users.id"), index=True, nullable=False)
+
+    ad_provider = Column(String(32), nullable=False)  # e.g., "admob", "unity"
+    reward_type = Column(String(32), nullable=False)  # e.g., "credits", "premium_time"
+    reward_amount = Column(Integer, nullable=False)
+
+    ad_event_id = Column(String(256), nullable=True)  # For deduplication
+    verified = Column(Boolean, default=False, nullable=False)
+
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="ad_rewards")
+
+    __table_args__ = (
+        Index("ix_ad_reward_unique", "ad_provider", "ad_event_id", unique=True),
+    )
+
+
+# =============================================================================
+# App Configuration Model
+# =============================================================================
+
+class AppConfig(Base):
+    """
+    Dynamic application configuration stored in database.
+    Allows changing settings without redeploying.
+    """
+    __tablename__ = "app_config"
+
+    key = Column(String(128), primary_key=True)
+    value = Column(String(512), nullable=False)
+    description = Column(String(512), nullable=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+
+
+# Default configuration values
+DEFAULT_APP_CONFIG = {
+    "credits_per_rewarded_ad": ("1", "Credits given per rewarded ad view"),
+    "daily_ad_credit_limit": ("30", "Maximum ad credits a user can earn per day"),
+    "ad_cooldown_seconds": ("30", "Minimum seconds between ad reward claims"),
+}
+
+
+def get_app_config(db: "Session", key: str, default: str = None) -> Optional[str]:
+    """Get a configuration value from the database."""
+    config = db.query(AppConfig).filter(AppConfig.key == key).first()
+    if config:
+        return config.value
+    return default
+
+
+def get_app_config_int(db: "Session", key: str, default: int = 0) -> int:
+    """Get a configuration value as integer."""
+    value = get_app_config(db, key, str(default))
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def set_app_config(db: "Session", key: str, value: str, description: str = None):
+    """Set a configuration value in the database."""
+    config = db.query(AppConfig).filter(AppConfig.key == key).first()
+    if config:
+        config.value = value
+        if description:
+            config.description = description
+    else:
+        config = AppConfig(key=key, value=value, description=description)
+        db.add(config)
+    db.commit()
+
+
+def init_default_config(db: "Session"):
+    """Initialize default configuration values if they don't exist."""
+    for key, (value, description) in DEFAULT_APP_CONFIG.items():
+        existing = db.query(AppConfig).filter(AppConfig.key == key).first()
+        if not existing:
+            config = AppConfig(key=key, value=value, description=description)
+            db.add(config)
+    db.commit()
+
+
+# =============================================================================
+# Rewarded Ad Event Model (Anti-Abuse Tracking)
+# =============================================================================
+
+class RewardedAdEvent(Base):
+    """
+    Detailed tracking of rewarded ad events for anti-abuse and analytics.
+    """
+    __tablename__ = "rewarded_ad_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(128), ForeignKey("users.id"), index=True, nullable=False)
+    
+    # Reward details
+    credits = Column(Integer, nullable=False)
+    ad_provider = Column(String(32), nullable=False)  # "admob", "unity"
+    
+    # SSV verification data
+    ad_unit_id = Column(String(128), nullable=True)
+    transaction_id = Column(String(256), nullable=True, unique=True)  # Google's reward ID
+    signature_verified = Column(Boolean, default=False, nullable=False)
+    
+    # Anti-abuse tracking
+    ip_address = Column(String(64), nullable=True)
+    device_id = Column(String(256), nullable=True)
+    user_agent = Column(String(512), nullable=True)
+    
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="rewarded_ad_events")
+
+    __table_args__ = (
+        Index("ix_rewarded_ad_user_time", "user_id", "created_at"),
+        Index("ix_rewarded_ad_transaction", "transaction_id"),
+    )
+
+
+# =============================================================================
+# Daily Spin Model (Audit/Analytics)
+# =============================================================================
+
+class DailySpin(Base):
+    """
+    Daily spin audit log for tracking and analytics.
+    """
+    __tablename__ = "daily_spins"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(128), ForeignKey("users.id"), index=True, nullable=False)
+    
+    credits_won = Column(Integer, nullable=False)
+    device_id = Column(String(256), nullable=True)  # For fraud detection
+    
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="daily_spins")
+
+    __table_args__ = (
+        Index("ix_daily_spin_user_time", "user_id", "created_at"),
+    )
+
+
+# =============================================================================
 # Database Engine and Session Management
 # =============================================================================
 
@@ -459,13 +766,17 @@ def get_db_manager() -> DatabaseManager:
 
 
 def init_db(database_url: Optional[str] = None):
-    """Initialize database with schema"""
+    """Initialize database with schema and default config"""
     global _db_manager
     if database_url:
         _db_manager = DatabaseManager(database_url)
     else:
         _db_manager = get_db_manager()
     _db_manager.init_db()
+    
+    # Initialize default app configuration
+    with _db_manager.get_session() as session:
+        init_default_config(session)
 
 
 def get_session() -> Generator[Session, None, None]:

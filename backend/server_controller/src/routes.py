@@ -12,6 +12,8 @@ Provides all API endpoints:
 import os
 import uuid
 import time
+import hmac
+import hashlib
 import asyncio
 import mimetypes
 import logging
@@ -20,7 +22,15 @@ from typing import Optional, Dict, Any, List
 
 import requests
 
-from fastapi import APIRouter, Request, Response, HTTPException, Depends, Header, BackgroundTasks
+from fastapi import (
+    APIRouter,
+    Request,
+    Response,
+    HTTPException,
+    Depends,
+    Header,
+    BackgroundTasks,
+)
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from botocore.exceptions import ClientError
@@ -30,8 +40,21 @@ from db import (
     SessionLocal,
     Worker,
     Job,
+    User,
+    CreditTransaction,
+    DailySpin,
+    AppConfig,
+    RewardedAdEvent,
+    get_app_config_int,
     create_audit_log,
     utc_naive_now,
+)
+from credit_service import (
+    lock_credits_for_job,
+    refund_credits_for_job,
+    get_credit_cost,
+    has_sufficient_credits,
+    add_ad_reward,
 )
 from models import (
     SubmitRequest,
@@ -70,6 +93,7 @@ public_router = APIRouter(tags=["Public"])
 client_router = APIRouter(tags=["Client"])
 worker_router = APIRouter(tags=["Worker"])
 admin_router = APIRouter(prefix="/admin", tags=["Admin"])
+auth_router = APIRouter(prefix="/auth", tags=["Auth"])
 
 
 # =============================================================================
@@ -123,6 +147,53 @@ def get_client_ip(request: Request) -> str:
 # Authentication Dependencies
 # =============================================================================
 
+
+async def require_firebase_auth(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    """
+    Require Firebase ID token authentication for client requests.
+    
+    Headers:
+        Authorization: Bearer <firebase_id_token>
+    
+    Returns:
+        Dict with user info: firebase_uid, user_id, email, credits
+    """
+    ip = get_client_ip(request)
+    
+    # Verify Firebase token
+    try:
+        decoded = await verify_firebase_token(authorization)
+    except HTTPException as e:
+        ip_ban_manager.record_failed_auth(ip)
+        await ip_ban_manager.check_brute_force(ip)
+        audit_logger.auth_failure(ip, "firebase", str(e.detail))
+        raise
+    
+    firebase_uid = decoded.get("uid")
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    email = decoded.get("email")
+    
+    # Get or create user in database
+    with SessionLocal() as db:
+        user = get_or_create_user(db, firebase_uid, email)
+        
+        audit_logger.auth_success(ip, "firebase", actor=firebase_uid[:16])
+        
+        return {
+            "type": "firebase",
+            "firebase_uid": firebase_uid,
+            "user_id": user.id,
+            "email": user.email,
+            "total_credits": user.total_credits,
+            "is_active": user.is_active,
+        }
+
+
 async def require_any_auth(
     request: Request,
     authorization: Optional[str] = Header(None),
@@ -132,11 +203,19 @@ async def require_any_auth(
     x_signature: Optional[str] = Header(None),
 ) -> Dict[str, Any]:
     """
-    Require either API key or device signature authentication.
+    Require either Firebase token, API key, or device signature authentication.
+    Kept for backward compatibility with admin endpoints.
     """
     ip = get_client_ip(request)
     
-    # Try API key first
+    # Try Firebase token first (Bearer token)
+    if authorization and authorization.startswith("Bearer "):
+        try:
+            return await require_firebase_auth(request, authorization)
+        except HTTPException:
+            pass  # Fall through to other auth methods
+    
+    # Try API key
     if authorization and verify_api_key(authorization):
         audit_logger.auth_success(ip, "api_key")
         return {"type": "api_key", "key": authorization}
@@ -150,7 +229,8 @@ async def require_any_auth(
     # Normalize fingerprint
     fingerprint_hash = (
         x_fingerprint.lower()
-        if len(x_fingerprint) == 64 and all(c in "0123456789abcdef" for c in x_fingerprint.lower())
+        if len(x_fingerprint) == 64
+        and all(c in "0123456789abcdef" for c in x_fingerprint.lower())
         else hash_fingerprint(x_fingerprint)
     )
     
@@ -163,9 +243,7 @@ async def require_any_auth(
     
     # Register/update device
     device_info = register_or_update_device(
-        fingerprint_hash,
-        x_device_uuid,
-        meta={"last_auth": utc_naive_now().isoformat()}
+        fingerprint_hash, x_device_uuid, meta={"last_auth": utc_naive_now().isoformat()}
     )
     
     audit_logger.auth_success(ip, "device", actor=fingerprint_hash[:16])
@@ -200,6 +278,7 @@ async def require_worker_signature(
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
 
 def create_presigned_put_url(key: str, expires_in: int = 3600) -> Optional[str]:
     """Generate presigned PUT URL for R2"""
@@ -249,7 +328,1154 @@ async def send_fcm_notification(token: str, title: str, body: str, data: Dict = 
         logger.error(f"FCM notification failed: {e}")
 
 
-def _calculate_timing_metrics(job: Job, completion_time: datetime) -> Dict[str, Optional[float]]:
+# =============================================================================
+# Firebase Authentication Helpers
+# =============================================================================
+
+async def verify_firebase_token(authorization: Optional[str]) -> Dict[str, Any]:
+    """
+    Verify Firebase ID token and return decoded claims.
+    
+    Args:
+        authorization: "Bearer <id_token>" header value
+        
+    Returns:
+        Decoded token containing 'uid', 'email', 'email_verified', etc.
+        
+    Raises:
+        HTTPException: If token is missing, invalid, or expired
+    """
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header"
+        )
+    
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Authorization header format. Expected: Bearer <token>"
+        )
+    
+    token = authorization.replace("Bearer ", "").strip()
+    
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Empty token in Authorization header"
+        )
+    
+    try:
+        import firebase_admin
+        from firebase_admin import auth as firebase_auth
+        
+        # Check if Firebase is initialized
+        try:
+            firebase_admin.get_app()
+        except ValueError:
+            logger.error("Firebase Admin SDK not initialized!")
+            raise HTTPException(
+                status_code=500,
+                detail="Firebase Admin SDK not initialized. Check server configuration."
+            )
+        
+        # Verify the ID token and get decoded claims
+        decoded = firebase_auth.verify_id_token(token)
+        
+        logger.debug(f"Firebase token verified for uid: {decoded.get('uid')}")
+        return decoded
+        
+    except HTTPException:
+        # Re-raise HTTPExceptions as-is
+        raise
+    except firebase_auth.ExpiredIdTokenError:
+        raise HTTPException(
+            status_code=401,
+            detail="Firebase token has expired. Please refresh and try again."
+        )
+    except firebase_auth.RevokedIdTokenError:
+        raise HTTPException(
+            status_code=401,
+            detail="Firebase token has been revoked."
+        )
+    except firebase_auth.InvalidIdTokenError as e:
+        logger.warning(f"Invalid Firebase token: {e}")
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid Firebase token: {str(e)}"
+        )
+    except firebase_auth.CertificateFetchError as e:
+        logger.error(f"Firebase certificate fetch error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Firebase service temporarily unavailable. Please try again."
+        )
+    except Exception as e:
+        logger.error(f"Firebase token verification failed: {type(e).__name__}: {e}")
+        raise HTTPException(
+            status_code=401,
+            detail=f"Failed to verify Firebase token: {type(e).__name__}"
+        )
+
+
+def get_or_create_user(db: Session, firebase_uid: str, email: Optional[str] = None) -> User:
+    """
+    Get existing user by firebase_uid or create new user.
+    
+    Args:
+        db: Database session
+        firebase_uid: Firebase user ID
+        email: User's email (optional)
+        
+    Returns:
+        User instance
+    """
+    user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+    
+    if user:
+        # Update last_seen
+        user.last_seen = utc_naive_now()
+        # Update email if provided and not set
+        if email and not user.email:
+            user.email = email
+        db.commit()
+        return user
+    
+    # Create new user WITHOUT signup bonus
+    # Signup bonus is granted separately after email verification
+    user = User(
+        id=str(uuid.uuid4()),
+        firebase_uid=firebase_uid,
+        email=email,
+        created_at=utc_naive_now(),
+        last_seen=utc_naive_now(),
+        total_credits=0,  # No credits until email verified
+        bonus_granted=0,
+        signup_bonus_granted=False,  # Will be set True after email verification
+        is_active=True,
+    )
+    db.add(user)
+    
+    # Log the new user creation (no bonus yet)
+    create_audit_log(
+        db,
+        event_type="user_created",
+        message=f"New user created (pending email verification): {firebase_uid}",
+        target=user.id,
+        target_type="user",
+        severity="info",
+        details={
+            "firebase_uid": firebase_uid,
+            "email": email,
+            "signup_bonus_pending": True,
+        },
+    )
+    
+    db.commit()
+    db.refresh(user)
+    
+    logger.info(f"Created new user {user.id} for firebase_uid {firebase_uid}")
+    return user
+
+
+# =============================================================================
+# Auth Endpoints
+# =============================================================================
+
+from pydantic import BaseModel, Field
+
+class UserSyncRequest(BaseModel):
+    """Request body for user sync (optional fields)"""
+    email: Optional[str] = Field(None, description="User's email if not in token")
+    fcm_token: Optional[str] = Field(None, description="FCM token for push notifications")
+
+class UserResponse(BaseModel):
+    """User data response"""
+    user_id: str
+    firebase_uid: str
+    email: Optional[str]
+    total_credits: int
+    bonus_granted: int
+    signup_bonus_granted: bool = False  # True if 50 credits signup bonus was claimed
+    is_active: bool
+    created_at: str
+    last_seen: str
+
+class CreditBalanceResponse(BaseModel):
+    """Credit balance response"""
+    total_credits: int
+    bonus_granted: int
+
+
+class DeductCreditsRequest(BaseModel):
+    """Request body for credit deduction"""
+    amount: int = Field(..., gt=0, description="Number of credits to deduct (must be positive)")
+    reason: str = Field(..., description="Reason for deduction (e.g., 'job_completed')")
+    job_id: Optional[str] = Field(None, description="Associated job ID")
+
+
+class AddCreditsRequest(BaseModel):
+    """Request body for adding credits"""
+    amount: int = Field(..., gt=0, description="Number of credits to add (must be positive)")
+    reason: str = Field(..., description="Reason for addition (e.g., 'ad_reward', 'subscription_bonus')")
+
+
+@auth_router.post("/sync", response_model=UserResponse)
+async def sync_user(
+    request: Optional[UserSyncRequest] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Sync Firebase user with database.
+    
+    Called after Firebase sign-in to create or update user in database.
+    Creates new user if not exists (without credits).
+    Grants 50 signup bonus ONLY after email is verified.
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    
+    **Email Verification Flow:**
+    1. User signs up → account created with 0 credits
+    2. User verifies email → Firebase token now has email_verified=true
+    3. User calls /auth/sync → 50 credits granted (one-time only)
+    
+    **Returns:**
+    - User profile data including credits
+    """
+    # Verify Firebase token
+    decoded = await verify_firebase_token(authorization)
+    
+    firebase_uid = decoded.get("uid")
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    # Get email verification status from Firebase token (secure, not from client)
+    email_verified_from_token = decoded.get("email_verified", False)
+    
+    # Log token claims for debugging
+    sign_in_provider = decoded.get("firebase", {}).get("sign_in_provider", "unknown")
+    logger.info(f"[AUTH] Token claims for {firebase_uid}: email_verified={email_verified_from_token}, provider={sign_in_provider}")
+    
+    # IMPORTANT: The ID token might be stale after email verification.
+    # As a fallback, check Firebase user record directly if token says not verified
+    email_verified = email_verified_from_token
+    
+    if not email_verified_from_token:
+        try:
+            import firebase_admin
+            from firebase_admin import auth as firebase_auth
+            
+            # Get fresh user data from Firebase
+            firebase_user = firebase_auth.get_user(firebase_uid)
+            email_verified = firebase_user.email_verified
+            
+            if email_verified and not email_verified_from_token:
+                logger.info(f"[AUTH] Token stale for {firebase_uid}: token says not verified, but Firebase user IS verified. Using fresh status.")
+        except Exception as e:
+            logger.warning(f"[AUTH] Failed to check Firebase user directly: {e}. Using token value: {email_verified_from_token}")
+            email_verified = email_verified_from_token
+    
+    # Get email from token or request
+    email = decoded.get("email")
+    if not email and request:
+        email = request.email
+    
+    # Get or create user
+    try:
+        with SessionLocal() as db:
+            user = get_or_create_user(db, firebase_uid, email)
+            
+            # Log current user state
+            logger.info(f"[AUTH] User {firebase_uid}: signup_bonus_granted={user.signup_bonus_granted}, total_credits={user.total_credits}, email_verified_in_token={email_verified}")
+            
+            # Grant signup bonus if:
+            # 1. Email is verified (from Firebase token - tamper-proof)
+            # 2. Signup bonus hasn't been granted yet (prevents reinstall abuse)
+            signup_bonus_just_granted = False
+            if email_verified and not user.signup_bonus_granted:
+                SIGNUP_BONUS = 50
+                user.total_credits += SIGNUP_BONUS
+                user.bonus_granted += SIGNUP_BONUS
+                user.signup_bonus_granted = True
+                signup_bonus_just_granted = True
+                
+                # Record signup bonus as credit transaction
+                signup_transaction = CreditTransaction(
+                    user_id=user.id,
+                    delta=SIGNUP_BONUS,
+                    reason="signup_bonus_email_verified",
+                    created_at=utc_naive_now(),
+                )
+                db.add(signup_transaction)
+                
+                # Log the signup bonus grant
+                create_audit_log(
+                    db,
+                    event_type="signup_bonus_granted",
+                    message=f"Signup bonus granted after email verification: {firebase_uid}",
+                    target=user.id,
+                    target_type="user",
+                    severity="info",
+                    details={
+                        "firebase_uid": firebase_uid,
+                        "email": email,
+                        "signup_bonus": SIGNUP_BONUS,
+                        "email_verified": True,
+                    },
+                )
+                
+                db.commit()
+                db.refresh(user)
+                logger.info(f"[AUTH] Granted {SIGNUP_BONUS} signup bonus to {firebase_uid} (email verified)")
+            
+            elif not email_verified and not user.signup_bonus_granted:
+                logger.debug(f"[AUTH] User {firebase_uid} - email not verified yet, no bonus granted")
+            
+            return UserResponse(
+                user_id=user.id,
+                firebase_uid=user.firebase_uid,
+                email=user.email,
+                total_credits=user.total_credits,
+                bonus_granted=user.bonus_granted,
+                signup_bonus_granted=user.signup_bonus_granted,
+                is_active=user.is_active,
+                created_at=user.created_at.isoformat() if user.created_at else "",
+                last_seen=user.last_seen.isoformat() if user.last_seen else "",
+            )
+    except Exception as e:
+        logger.exception(f"User sync failed for {firebase_uid}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to sync user: {type(e).__name__}: {str(e)}"
+        )
+
+
+@auth_router.get("/me", response_model=UserResponse)
+async def get_current_user(
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Get current user's profile.
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    
+    **Returns:**
+    - User profile data including credits
+    
+    **Errors:**
+    - 401: Invalid/expired token
+    - 404: User not found (need to call /auth/sync first)
+    """
+    # Verify Firebase token
+    decoded = await verify_firebase_token(authorization)
+    
+    firebase_uid = decoded.get("uid")
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    # Find user
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            raise HTTPException(
+                status_code=404,
+                detail="User not found. Please sign in first."
+            )
+        
+        # Update last_seen
+        user.last_seen = utc_naive_now()
+        db.commit()
+        
+        return UserResponse(
+            user_id=user.id,
+            firebase_uid=user.firebase_uid,
+            email=user.email,
+            total_credits=user.total_credits,
+            bonus_granted=user.bonus_granted,
+            signup_bonus_granted=user.signup_bonus_granted,
+            is_active=user.is_active,
+            created_at=user.created_at.isoformat() if user.created_at else "",
+            last_seen=user.last_seen.isoformat() if user.last_seen else "",
+        )
+
+
+@auth_router.get("/credits", response_model=CreditBalanceResponse)
+async def get_credit_balance(
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Get current user's credit balance.
+    
+    Lightweight endpoint for checking credits without full profile.
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    """
+    decoded = await verify_firebase_token(authorization)
+    
+    firebase_uid = decoded.get("uid")
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            raise HTTPException(404, "User not found")
+        
+        return CreditBalanceResponse(
+            total_credits=user.total_credits,
+            bonus_granted=user.bonus_granted,
+        )
+
+
+# NOTE: /deduct_credits endpoint REMOVED
+# Credits are now handled atomically:
+# - Deducted during job submission via lock_credits_for_job()
+# - Refunded on job failure via refund_credits_for_job()
+# Client cannot directly manipulate credits.
+
+
+class AdRewardRequest(BaseModel):
+    """Request body for claiming ad reward"""
+    ad_provider: str = Field(..., description="Ad provider (e.g., 'admob', 'unity')")
+    ad_event_id: str = Field(..., description="Unique event ID from ad network (for deduplication)")
+
+
+@auth_router.post("/claim_ad_reward")
+async def claim_ad_reward(
+    payload: AdRewardRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Claim credits for watching an ad.
+    
+    **CRITICAL:** Deduplicated by (ad_provider, ad_event_id) to prevent abuse.
+    Each ad can only be claimed ONCE.
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    
+    **JSON Body:**
+    - ad_provider: Ad network provider (e.g., "admob", "unity")
+    - ad_event_id: Unique event ID from ad network callback
+    
+    **Reward amounts by provider:**
+    - admob: 5 credits
+    - unity: 5 credits
+    """
+    # Reward amounts per provider (configurable)
+    REWARD_AMOUNTS = {
+        "admob": 5,
+        "unity": 5,
+        "default": 3,
+    }
+    
+    decoded = await verify_firebase_token(authorization)
+    firebase_uid = decoded.get("uid")
+    
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            raise HTTPException(404, "User not found")
+        
+        # Get reward amount for provider
+        reward_amount = REWARD_AMOUNTS.get(payload.ad_provider, REWARD_AMOUNTS["default"])
+        
+        # Use credit service for atomic, deduplicated ad reward
+        success, message = add_ad_reward(
+            db=db,
+            user_id=user.id,
+            ad_provider=payload.ad_provider,
+            ad_event_id=payload.ad_event_id,
+            reward_amount=reward_amount,
+            reward_type="credits",
+        )
+        
+        if not success:
+            raise HTTPException(
+                status_code=409 if "already" in message.lower() else 400,
+                detail=message
+            )
+        
+        # Refresh user to get updated balance
+        db.refresh(user)
+        
+        return {
+            "status": "ok",
+            "credits_added": reward_amount,
+            "balance": user.total_credits,
+            "ad_provider": payload.ad_provider,
+        }
+
+
+# =============================================================================
+# Daily Spinner Endpoints
+# =============================================================================
+
+import random
+from datetime import timedelta
+
+# Spin reward probabilities (must sum to 1.0)
+SPIN_REWARDS = [
+    {"credits": 1,  "probability": 0.35},  # 35% - most common
+    {"credits": 2,  "probability": 0.30},  # 30%
+    {"credits": 5,  "probability": 0.20},  # 20%
+    {"credits": 10, "probability": 0.07},  # 7%
+    {"credits": 20, "probability": 0.06},  # 6% - rare
+    {"credits": 30, "probability": 0.02},  # 2% - legendary
+]
+
+SPIN_COOLDOWN_HOURS = 24
+
+
+class SpinCheckResponse(BaseModel):
+    """Response for spin eligibility check"""
+    can_spin: bool
+    next_spin_time: Optional[str] = None  # ISO 8601 UTC
+    last_spin_time: Optional[str] = None  # ISO 8601 UTC
+
+
+class SpinRequest(BaseModel):
+    """Request body for performing spin"""
+    device_id: Optional[str] = Field(None, description="Device ID for fraud detection")
+
+
+class SpinResponse(BaseModel):
+    """Response for successful spin"""
+    credits_won: int
+    next_spin_time: str  # ISO 8601 UTC
+    message: str
+    new_balance: int
+
+
+def _select_spin_reward() -> int:
+    """Server-side random reward selection based on probabilities"""
+    rand = random.random()  # 0.0 to 1.0
+    cumulative = 0.0
+    
+    for reward in SPIN_REWARDS:
+        cumulative += reward["probability"]
+        if rand <= cumulative:
+            return reward["credits"]
+    
+    return 1  # Fallback
+
+
+def _format_iso_utc(dt: datetime) -> str:
+    """Format datetime as ISO 8601 UTC string"""
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@auth_router.get("/daily-spin/check", response_model=SpinCheckResponse)
+async def check_spin_eligibility(
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Check if user is eligible to spin today (server-time based).
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    
+    **Returns:**
+    - can_spin: Whether user can spin now
+    - next_spin_time: When user can spin next (ISO 8601 UTC), null if can spin now
+    - last_spin_time: When user last spun (ISO 8601 UTC), null if never spun
+    """
+    decoded = await verify_firebase_token(authorization)
+    firebase_uid = decoded.get("uid")
+    
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            raise HTTPException(404, "User not found. Please sync first.")
+        
+        last_spin = user.last_daily_spin_time
+        now = utc_naive_now()
+        
+        # Never spun before
+        if last_spin is None:
+            return SpinCheckResponse(
+                can_spin=True,
+                next_spin_time=None,
+                last_spin_time=None,
+            )
+        
+        # Calculate next eligible spin time
+        next_spin = last_spin + timedelta(hours=SPIN_COOLDOWN_HOURS)
+        
+        if now >= next_spin:
+            # Cooldown elapsed, can spin
+            return SpinCheckResponse(
+                can_spin=True,
+                next_spin_time=None,
+                last_spin_time=_format_iso_utc(last_spin),
+            )
+        
+        # Still in cooldown
+        return SpinCheckResponse(
+            can_spin=False,
+            next_spin_time=_format_iso_utc(next_spin),
+            last_spin_time=_format_iso_utc(last_spin),
+        )
+
+
+@auth_router.post("/daily-spin/spin", response_model=SpinResponse)
+async def perform_daily_spin(
+    payload: SpinRequest = SpinRequest(),
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Perform the daily spin, determine reward (server-side RNG), grant credits.
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    
+    **JSON Body (optional):**
+    - device_id: Device identifier for fraud detection
+    
+    **Returns:**
+    - credits_won: Number of credits won
+    - next_spin_time: When user can spin next (ISO 8601 UTC)
+    - message: Success message
+    - new_balance: User's updated credit balance
+    
+    **Errors:**
+    - 429: Already spun today (rate limited)
+    - 401: Invalid/missing token
+    - 404: User not found
+    """
+    decoded = await verify_firebase_token(authorization)
+    firebase_uid = decoded.get("uid")
+    
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            raise HTTPException(404, "User not found. Please sync first.")
+        
+        last_spin = user.last_daily_spin_time
+        now = utc_naive_now()
+        
+        # Check eligibility
+        if last_spin is not None:
+            next_spin = last_spin + timedelta(hours=SPIN_COOLDOWN_HOURS)
+            if now < next_spin:
+                # Still in cooldown - return 429
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": "rate_limited",
+                        "message": "Already spun today. Come back tomorrow!",
+                        "next_spin_time": _format_iso_utc(next_spin),
+                    }
+                )
+        
+        # Select reward using server-side RNG
+        credits_won = _select_spin_reward()
+        
+        # Grant credits and update spin time atomically
+        user.total_credits += credits_won
+        user.bonus_granted += credits_won
+        user.last_daily_spin_time = now
+        
+        # Record transaction
+        transaction = CreditTransaction(
+            user_id=user.id,
+            delta=credits_won,
+            reason="daily_spin",
+            created_at=now,
+        )
+        db.add(transaction)
+        
+        # Log spin for audit/analytics
+        spin_log = DailySpin(
+            user_id=user.id,
+            credits_won=credits_won,
+            device_id=payload.device_id,
+            created_at=now,
+        )
+        db.add(spin_log)
+        
+        db.commit()
+        db.refresh(user)
+        
+        # Calculate next spin time
+        next_spin_time = now + timedelta(hours=SPIN_COOLDOWN_HOURS)
+        
+        logger.info(f"[SPIN] User {firebase_uid} won {credits_won} credits (balance: {user.total_credits})")
+        
+        return SpinResponse(
+            credits_won=credits_won,
+            next_spin_time=_format_iso_utc(next_spin_time),
+            message=f"You won {credits_won} credits!",
+            new_balance=user.total_credits,
+        )
+
+
+# =============================================================================
+# Rewarded Ads Endpoints (SSV - Server-Side Verification)
+# =============================================================================
+
+ads_router = APIRouter(prefix="/ads", tags=["ads"])
+
+# AdMob public keys for SSV signature verification
+# These are fetched from Google and cached
+import base64
+import hashlib
+import urllib.parse
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidSignature
+
+ADMOB_KEYS_URL = "https://www.gstatic.com/admob/reward/verifier-keys.json"
+_admob_keys_cache: Dict[str, Any] = {"keys": None, "last_fetch": 0}
+ADMOB_KEYS_CACHE_TTL = 24 * 60 * 60  # 24 hours
+
+
+def _fetch_admob_keys_sync() -> Dict[str, Any]:
+    """Fetch AdMob public keys for SSV verification (sync version)."""
+    import requests as req
+    
+    current_time = time.time()
+    
+    # Check cache
+    if (_admob_keys_cache["keys"] is not None and 
+        current_time - _admob_keys_cache["last_fetch"] < ADMOB_KEYS_CACHE_TTL):
+        return _admob_keys_cache["keys"]
+    
+    try:
+        response = req.get(ADMOB_KEYS_URL, timeout=10)
+        if response.status_code == 200:
+            keys_data = response.json()
+            _admob_keys_cache["keys"] = keys_data
+            _admob_keys_cache["last_fetch"] = current_time
+            logger.info("[ADS] Fetched AdMob SSV keys successfully")
+            return keys_data
+    except Exception as e:
+        logger.error(f"[ADS] Failed to fetch AdMob keys: {e}")
+    
+    # Return cached keys if fetch failed
+    return _admob_keys_cache["keys"] or {}
+
+
+async def _fetch_admob_keys() -> Dict[str, Any]:
+    """Fetch AdMob public keys for SSV verification (async wrapper)."""
+    import asyncio
+    return await asyncio.to_thread(_fetch_admob_keys_sync)
+
+
+def _verify_admob_signature(query_string: str, signature: str, key_id: str, keys_data: Dict) -> bool:
+    """
+    Verify AdMob SSV callback signature.
+    
+    Google signs the callback with ECDSA using their public key.
+    We verify the signature to ensure the callback is authentic.
+    """
+    try:
+        # Find the key by key_id
+        keys = keys_data.get("keys", [])
+        public_key_pem = None
+        for key in keys:
+            if str(key.get("keyId")) == str(key_id):
+                public_key_pem = key.get("pem")
+                break
+        
+        if not public_key_pem:
+            logger.warning(f"[ADS] AdMob key {key_id} not found in keys")
+            return False
+        
+        # Parse the public key
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+        public_key = load_pem_public_key(public_key_pem.encode(), backend=default_backend())
+        
+        # Decode the signature (URL-safe base64)
+        signature_bytes = base64.urlsafe_b64decode(signature + "==")  # Add padding
+        
+        # The message to verify is the query string without signature and key_id
+        # Parse query string, remove signature and key_id, reconstruct
+        params = urllib.parse.parse_qs(query_string, keep_blank_values=True)
+        params.pop("signature", None)
+        params.pop("key_id", None)
+        
+        # Reconstruct the message (sorted by key for consistency)
+        message_parts = []
+        for key in sorted(params.keys()):
+            for value in params[key]:
+                message_parts.append(f"{key}={value}")
+        message = "&".join(message_parts)
+        
+        # Verify signature
+        public_key.verify(signature_bytes, message.encode(), ec.ECDSA(hashes.SHA256()))
+        return True
+        
+    except InvalidSignature:
+        logger.warning("[ADS] AdMob signature verification failed: invalid signature")
+        return False
+    except Exception as e:
+        logger.error(f"[ADS] AdMob signature verification error: {e}")
+        return False
+
+
+def _get_today_ad_credits(db, user_id: str) -> int:
+    """Get total ad credits earned by user today (UTC)."""
+    from datetime import datetime, time as dt_time
+    
+    # Get start of today (UTC)
+    now = utc_naive_now()
+    today_start = datetime.combine(now.date(), dt_time.min)
+    
+    # Sum credits from rewarded_ad_events today
+    result = db.query(RewardedAdEvent).filter(
+        RewardedAdEvent.user_id == user_id,
+        RewardedAdEvent.created_at >= today_start,
+    ).all()
+    
+    return sum(event.credits for event in result)
+
+
+class AdRewardStatusResponse(BaseModel):
+    """Response for ad reward status check"""
+    can_watch: bool
+    credits_earned_today: int
+    daily_limit: int
+    credits_per_ad: int
+    next_reset_time: str  # ISO 8601 UTC
+
+
+class SSVCallbackResponse(BaseModel):
+    """Response for SSV callback"""
+    status: str
+    message: str
+
+
+@ads_router.get("/rewarded/status", response_model=AdRewardStatusResponse)
+async def get_ad_reward_status(
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Check if user can watch rewarded ads and their daily progress.
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    
+    **Returns:**
+    - can_watch: Whether user can earn more credits from ads today
+    - credits_earned_today: Credits earned from ads today
+    - daily_limit: Maximum credits earnable per day
+    - credits_per_ad: Credits per ad view
+    - next_reset_time: When daily limit resets (midnight UTC)
+    """
+    decoded = await verify_firebase_token(authorization)
+    firebase_uid = decoded.get("uid")
+    
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            raise HTTPException(404, "User not found. Please sync first.")
+        
+        # Get config
+        daily_limit = get_app_config_int(db, "daily_ad_credit_limit", 30)
+        credits_per_ad = get_app_config_int(db, "credits_per_rewarded_ad", 1)
+        
+        # Get today's earnings
+        earned_today = _get_today_ad_credits(db, user.id)
+        
+        # Calculate next reset (midnight UTC tomorrow)
+        from datetime import time as dt_time
+        now = utc_naive_now()
+        tomorrow = now.date() + timedelta(days=1)
+        next_reset = datetime.combine(tomorrow, dt_time.min)
+        
+        return AdRewardStatusResponse(
+            can_watch=earned_today < daily_limit,
+            credits_earned_today=earned_today,
+            daily_limit=daily_limit,
+            credits_per_ad=credits_per_ad,
+            next_reset_time=_format_iso_utc(next_reset),
+        )
+
+
+@ads_router.get("/admob/ssv")
+async def admob_ssv_callback(
+    request: Request,
+    ad_network: Optional[str] = None,
+    ad_unit: Optional[str] = None,
+    custom_data: Optional[str] = None,  # Contains user_id
+    reward_amount: Optional[int] = None,
+    reward_item: Optional[str] = None,
+    timestamp: Optional[str] = None,
+    transaction_id: Optional[str] = None,
+    user_id: Optional[str] = None,  # May be passed directly
+    signature: Optional[str] = None,
+    key_id: Optional[str] = None,
+):
+    """
+    AdMob Server-Side Verification (SSV) callback.
+    
+    **Called by Google AdMob** after a user completes watching a rewarded ad.
+    
+    This endpoint:
+    1. Verifies the callback signature (prevents spoofing)
+    2. Checks daily credit limit
+    3. Grants credits to user
+    4. Logs the event for anti-abuse tracking
+    
+    **Query Parameters (sent by Google):**
+    - ad_network: Ad network identifier
+    - ad_unit: Your ad unit ID
+    - custom_data: Custom data you passed (should contain user_id/firebase_uid)
+    - reward_amount: Reward amount configured in AdMob (IGNORED - we use server config)
+    - reward_item: Reward type configured in AdMob
+    - timestamp: Callback timestamp
+    - transaction_id: Unique transaction ID
+    - signature: ECDSA signature
+    - key_id: Key ID for signature verification
+    
+    **Returns:**
+    - 200 OK if successful
+    - 400 if invalid parameters
+    - 403 if signature verification fails
+    - 429 if daily limit reached
+    """
+    # Get client info for logging
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
+    query_string = str(request.query_params)
+    
+    logger.info(f"[ADS] AdMob SSV callback received: transaction_id={transaction_id}, custom_data={custom_data}, query={query_string}")
+    
+    # Handle Google's verification test (no parameters sent)
+    # Google sends a simple GET request to verify the endpoint is reachable
+    if not custom_data and not transaction_id and not user_id:
+        logger.info("[ADS] SSV verification test request - returning OK")
+        return {"status": "ok", "message": "SSV endpoint ready"}
+    
+    # Extract user identifier from custom_data or user_id parameter
+    # custom_data format: "firebase_uid:XXXX" or just the firebase_uid
+    firebase_uid = None
+    if custom_data:
+        if custom_data.startswith("firebase_uid:"):
+            firebase_uid = custom_data.split(":", 1)[1]
+        else:
+            firebase_uid = custom_data
+    elif user_id:
+        firebase_uid = user_id
+    
+    if not firebase_uid:
+        logger.warning("[ADS] SSV callback missing user identifier")
+        # Return 200 with error message instead of 400 (Google expects 200)
+        return {"status": "error", "message": "Missing user identifier in custom_data"}
+    
+    if not transaction_id:
+        logger.warning("[ADS] SSV callback missing transaction_id")
+        # Return 200 with error message instead of 400 (Google expects 200)
+        return {"status": "error", "message": "Missing transaction_id"}
+    
+    # Verify signature (CRITICAL for security)
+    signature_verified = False
+    if signature and key_id:
+        keys_data = await _fetch_admob_keys()
+        if keys_data:
+            signature_verified = _verify_admob_signature(query_string, signature, key_id, keys_data)
+            if not signature_verified:
+                logger.warning(f"[ADS] SSV signature verification failed for {firebase_uid}")
+                # In production, you might want to reject unverified callbacks
+                # For now, we log but continue (allows testing)
+    else:
+        logger.warning("[ADS] SSV callback missing signature/key_id - skipping verification")
+    
+    with SessionLocal() as db:
+        # Find user by firebase_uid
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            logger.warning(f"[ADS] SSV callback for unknown user: {firebase_uid}")
+            raise HTTPException(400, "User not found")
+        
+        # Check for duplicate transaction (prevent replay attacks)
+        existing = db.query(RewardedAdEvent).filter(
+            RewardedAdEvent.transaction_id == transaction_id
+        ).first()
+        
+        if existing:
+            logger.info(f"[ADS] Duplicate SSV callback ignored: {transaction_id}")
+            return {"status": "ok", "message": "Already processed"}
+        
+        # Get config
+        daily_limit = get_app_config_int(db, "daily_ad_credit_limit", 30)
+        credits_per_ad = get_app_config_int(db, "credits_per_rewarded_ad", 1)
+        
+        # Check daily limit
+        earned_today = _get_today_ad_credits(db, user.id)
+        
+        if earned_today >= daily_limit:
+            logger.info(f"[ADS] Daily limit reached for user {firebase_uid}: {earned_today}/{daily_limit}")
+            return {"status": "limit_reached", "message": f"Daily limit of {daily_limit} credits reached"}
+        
+        # Grant credits (use server config, ignore Google's reward_amount)
+        credits_to_grant = credits_per_ad
+        
+        # Don't exceed daily limit
+        if earned_today + credits_to_grant > daily_limit:
+            credits_to_grant = daily_limit - earned_today
+        
+        # Update user credits
+        user.total_credits += credits_to_grant
+        user.bonus_granted += credits_to_grant
+        
+        # Record credit transaction
+        transaction = CreditTransaction(
+            user_id=user.id,
+            delta=credits_to_grant,
+            reason="rewarded_ad",
+            created_at=utc_naive_now(),
+        )
+        db.add(transaction)
+        
+        # Log rewarded ad event (for anti-abuse tracking)
+        ad_event = RewardedAdEvent(
+            user_id=user.id,
+            credits=credits_to_grant,
+            ad_provider="admob",
+            ad_unit_id=ad_unit,
+            transaction_id=transaction_id,
+            signature_verified=signature_verified,
+            ip_address=client_ip,
+            user_agent=user_agent,
+            created_at=utc_naive_now(),
+        )
+        db.add(ad_event)
+        
+        db.commit()
+        
+        logger.info(f"[ADS] Granted {credits_to_grant} credits to {firebase_uid} via SSV (transaction: {transaction_id})")
+        
+        return {"status": "ok", "message": f"Granted {credits_to_grant} credits"}
+
+
+@ads_router.post("/rewarded/complete")
+async def complete_rewarded_ad(
+    authorization: Optional[str] = Header(None),
+    device_id: Optional[str] = None,
+):
+    """
+    Client-side rewarded ad completion endpoint (FALLBACK ONLY).
+    
+    **IMPORTANT:** This endpoint should only be used as a fallback when SSV is not available.
+    SSV (/ads/admob/ssv) is more secure and should be preferred.
+    
+    For production, consider disabling this endpoint and using SSV only.
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    
+    **Note:** This endpoint has stricter rate limiting since it's client-initiated.
+    """
+    decoded = await verify_firebase_token(authorization)
+    firebase_uid = decoded.get("uid")
+    
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            raise HTTPException(404, "User not found")
+        
+        # Get config
+        daily_limit = get_app_config_int(db, "daily_ad_credit_limit", 30)
+        credits_per_ad = get_app_config_int(db, "credits_per_rewarded_ad", 1)
+        cooldown_seconds = get_app_config_int(db, "ad_cooldown_seconds", 30)
+        
+        # Check cooldown (anti-abuse for client-initiated requests)
+        from datetime import timedelta
+        cooldown_start = utc_naive_now() - timedelta(seconds=cooldown_seconds)
+        recent_event = db.query(RewardedAdEvent).filter(
+            RewardedAdEvent.user_id == user.id,
+            RewardedAdEvent.created_at >= cooldown_start,
+        ).first()
+        
+        if recent_event:
+            raise HTTPException(429, f"Please wait {cooldown_seconds} seconds between ad rewards")
+        
+        # Check daily limit
+        earned_today = _get_today_ad_credits(db, user.id)
+        
+        if earned_today >= daily_limit:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "daily_limit_reached",
+                    "message": f"Daily limit of {daily_limit} credits reached",
+                    "credits_earned_today": earned_today,
+                    "daily_limit": daily_limit,
+                }
+            )
+        
+        # Grant credits
+        credits_to_grant = min(credits_per_ad, daily_limit - earned_today)
+        
+        user.total_credits += credits_to_grant
+        user.bonus_granted += credits_to_grant
+        
+        # Record transaction
+        transaction = CreditTransaction(
+            user_id=user.id,
+            delta=credits_to_grant,
+            reason="rewarded_ad_client",
+            created_at=utc_naive_now(),
+        )
+        db.add(transaction)
+        
+        # Log event
+        ad_event = RewardedAdEvent(
+            user_id=user.id,
+            credits=credits_to_grant,
+            ad_provider="client",
+            signature_verified=False,  # Client-initiated, not verified
+            device_id=device_id,
+            created_at=utc_naive_now(),
+        )
+        db.add(ad_event)
+        
+        db.commit()
+        db.refresh(user)
+        
+        logger.info(f"[ADS] Granted {credits_to_grant} credits to {firebase_uid} via client endpoint")
+        
+        return {
+            "status": "ok",
+            "credits_added": credits_to_grant,
+            "balance": user.total_credits,
+            "credits_earned_today": earned_today + credits_to_grant,
+            "daily_limit": daily_limit,
+        }
+
+
+def _calculate_timing_metrics(
+    job: Job, completion_time: datetime
+) -> Dict[str, Optional[float]]:
     """Calculate all timing metrics for a completed job"""
     metrics = {
         "total_time": None,
@@ -283,23 +1509,33 @@ def _calculate_timing_metrics(job: Job, completion_time: datetime) -> Dict[str, 
     return metrics
 
 
-def _log_timing_metrics(job_id: str, model: str, timing_metrics: Dict[str, Optional[float]]):
+def _log_timing_metrics(
+    job_id: str, model: str, timing_metrics: Dict[str, Optional[float]]
+):
     """Log timing metrics to console in a formatted way"""
     logger.info("=" * 80)
     logger.info(f"⏱️  JOB TIMING REPORT: {job_id}")
     logger.info(f"   Model: {model}")
     
     if timing_metrics["total_time"] is not None:
-        logger.info(f"   📊 Total Time: {timing_metrics['total_time']:.2f}s (created → completed)")
+        logger.info(
+            f"   📊 Total Time: {timing_metrics['total_time']:.2f}s (created → completed)"
+        )
     
     if timing_metrics["processing_time"] is not None:
-        logger.info(f"   ⚡ Processing Time: {timing_metrics['processing_time']:.2f}s (started → completed)")
+        logger.info(
+            f"   ⚡ Processing Time: {timing_metrics['processing_time']:.2f}s (started → completed)"
+        )
     
     if timing_metrics["queue_time"] is not None:
-        logger.info(f"   ⏳ Queue Time: {timing_metrics['queue_time']:.2f}s (queued → started)")
+        logger.info(
+            f"   ⏳ Queue Time: {timing_metrics['queue_time']:.2f}s (queued → started)"
+        )
     
     if timing_metrics["dispatch_time"] is not None:
-        logger.info(f"   🚀 Dispatch Time: {timing_metrics['dispatch_time']:.2f}s (dispatched → started)")
+        logger.info(
+            f"   🚀 Dispatch Time: {timing_metrics['dispatch_time']:.2f}s (dispatched → started)"
+        )
     
     logger.info("=" * 80)
 
@@ -307,6 +1543,7 @@ def _log_timing_metrics(job_id: str, model: str, timing_metrics: Dict[str, Optio
 # =============================================================================
 # Public Endpoints
 # =============================================================================
+
 
 @public_router.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -342,236 +1579,78 @@ async def health_check():
     )
 
 
-# @public_router.get("/download/{job_id}")
-# async def download_result(job_id: str, request: Request):
-#     """
-#     Download job result from R2 storage.
-    
-#     Supports HTTP Range requests for video streaming.
-    
-#     IMPORTANT: Uses retry logic to handle transient R2 connection issues.
-#     """
-#     if not _s3_client or not _r2_bucket:
-#         raise HTTPException(status_code=503, detail="Storage not configured")
-    
-#     # Get job
-#     db = SessionLocal()
-#     try:
-#         job = db.query(Job).filter(Job.job_id == job_id).first()
-#         if not job:
-#             raise HTTPException(status_code=404, detail="Job not found")
-        
-#         if job.status != JobState.COMPLETED.value:
-#             raise HTTPException(status_code=404, detail="Job not completed")
-        
-#         r2_key = job.result_r2_key
-#         if not r2_key:
-#             raise HTTPException(status_code=404, detail="No result available")
-#     finally:
-#         db.close()
-    
-#     def _stream_from_r2(bucket: str, key: str, range_str: Optional[str] = None):
-#         """
-#         Stream file from R2 storage.
-        
-#         Note: This is a synchronous generator used by StreamingResponse.
-#         R2 errors during streaming will be caught by the client as incomplete response.
-#         """
-#         try:
-#             if range_str:
-#                 resp = _s3_client.get_object(Bucket=bucket, Key=key, Range=range_str)
-#             else:
-#                 resp = _s3_client.get_object(Bucket=bucket, Key=key)
-            
-#             # Stream chunks
-#             for chunk in resp["Body"].iter_chunks():
-#                 yield chunk
-                
-#         except Exception as e:
-#             logger.error(f"R2 stream error for {key}: {e}")
-#             # For streaming responses, we can't easily retry mid-stream
-#             # The client will see an incomplete response and can retry
-#             raise
-    
-#     try:
-#         # Get object metadata
-#         head = _s3_client.head_object(Bucket=_r2_bucket, Key=r2_key)
-#         content_length = head["ContentLength"]
-#         content_type = head.get("ContentType", mimetypes.guess_type(r2_key)[0] or "application/octet-stream")
-        
-#         # Handle Range request
-#         range_header = request.headers.get("range")
-#         if range_header:
-#             # Parse range
-#             range_match = range_header.replace("bytes=", "").split("-")
-#             start = int(range_match[0]) if range_match[0] else 0
-#             end = int(range_match[1]) if len(range_match) > 1 and range_match[1] else content_length - 1
-            
-#             range_str = f"bytes={start}-{end}"
-            
-#             return StreamingResponse(
-#                 _stream_from_r2(_r2_bucket, r2_key, range_str),
-#                 status_code=206,
-#                 media_type=content_type,
-#                 headers={
-#                     "Content-Range": f"bytes {start}-{end}/{content_length}",
-#                     "Accept-Ranges": "bytes",
-#                     "Content-Length": str(end - start + 1),
-#                 }
-#             )
-        
-#         # Full download - DON'T set Content-Length to avoid mismatch errors
-#         # Use chunked transfer encoding instead - this prevents 
-#         # "Too little data for declared Content-Length" errors if R2 stream fails.
-#         # Clients handle chunked encoding well, and retrying the request works.
-#         return StreamingResponse(
-#             _stream_from_r2(_r2_bucket, r2_key),
-#             media_type=content_type,
-#             headers={
-#                 "Accept-Ranges": "bytes",
-#                 # X-Content-Length is informational only, not enforced
-#                 "X-Content-Length": str(content_length),
-#             }
-#         )
-        
-#     except ClientError as e:
-#         if e.response["Error"]["Code"] == "404":
-#             raise HTTPException(status_code=404, detail="File not found")
-#         logger.error(f"R2 download error for job {job_id}: {e}")
-#         raise HTTPException(status_code=500, detail=str(e))
-
-@public_router.get("/download/{job_id}")
-async def download_result(job_id: str, request: Request):
-    if not _s3_client or not _r2_bucket:
-        raise HTTPException(status_code=503, detail="Storage not configured")
-
-    logger.info(f"[download] job_id={job_id}")
-
-    # ----------------------------
-    # Fetch job
-    # ----------------------------
+@public_router.get("/download_url/{job_id}")
+async def get_signed_download_url(job_id: str):
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.job_id == job_id).first()
         if not job or job.status != JobState.COMPLETED.value:
-            raise HTTPException(status_code=404, detail="Result not available")
+            raise HTTPException(status_code=404, detail="Result not ready")
 
         r2_key = job.result_r2_key
-        if not r2_key:
-            raise HTTPException(status_code=404, detail="No result key")
+        # example:
+        # image-vide-generator-api/14e1a10a-1479-472e-88c4-1d64ec867bfb.png
+
+        expires = int(time.time()) + 3600  # 1 hour
+        payload = f"{r2_key}:{expires}"
+        DOWNLOAD_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "SECRETKEY")
+        if not DOWNLOAD_SECRET:
+            raise HTTPException(status_code=500, detail="DOWNLOAD_SECRET not set")
+        sig = hmac.new(
+            DOWNLOAD_SECRET.encode(), payload.encode(), hashlib.sha256
+        ).hexdigest()
+        return f"https://img-vid-gen-download.pavanalur3.workers.dev/d/{r2_key}?exp={expires}&sig={sig}"
     finally:
         db.close()
-
-    # ----------------------------
-    # HEAD object (log EVERYTHING)
-    # ----------------------------
-    try:
-        head = _s3_client.head_object(Bucket=_r2_bucket, Key=r2_key)
-    except Exception as e:
-        logger.exception("[download] head_object failed")
-        raise HTTPException(status_code=404, detail="File not found")
-
-    total_size = int(head["ContentLength"])
-    content_type = head.get(
-        "ContentType",
-        mimetypes.guess_type(r2_key)[0] or "application/octet-stream",
-    )
-
-    logger.info(f"[download] size={total_size} type={content_type}")
-
-    # ----------------------------
-    # SAFE stream generator (NO raises)
-    # ----------------------------
-    def stream_from_r2(range_header: str | None):
-        try:
-            kwargs = dict(Bucket=_r2_bucket, Key=r2_key)
-            if range_header:
-                kwargs["Range"] = range_header
-
-            resp = _s3_client.get_object(**kwargs)
-
-            for chunk in resp["Body"].iter_chunks(chunk_size=1024 * 1024):
-                if not chunk:
-                    continue
-                yield chunk
-
-        except GeneratorExit:
-            logger.info("[download] client disconnected")
-            return
-
-        except Exception as e:
-            logger.exception("[download] stream error")
-            return  # <- NEVER raise
-
-    # ----------------------------
-    # RANGE handling
-    # ----------------------------
-    range_header = request.headers.get("range")
-
-    if range_header:
-        try:
-            start_str, end_str = range_header.replace("bytes=", "").split("-")
-            start = int(start_str)
-            end = int(end_str) if end_str else total_size - 1
-            end = min(end, total_size - 1)
-        except Exception:
-            raise HTTPException(status_code=416, detail="Invalid Range")
-
-        content_length = end - start + 1
-        range_str = f"bytes={start}-{end}"
-
-        logger.info(f"[download] range {range_str}")
-
-        return StreamingResponse(
-            stream_from_r2(range_str),
-            status_code=206,
-            media_type=content_type,
-            headers={
-                "Content-Range": f"bytes {start}-{end}/{total_size}",
-                "Accept-Ranges": "bytes",
-                "Content-Length": str(content_length),
-            },
-        )
-
-    # ----------------------------
-    # FULL download
-    # ----------------------------
-    logger.info("[download] full download")
-
-    return StreamingResponse(
-        stream_from_r2(None),
-        media_type=content_type,
-        headers={
-            "Accept-Ranges": "bytes",
-            "Content-Length": str(total_size),
-            "Content-Disposition": f'inline; filename="{os.path.basename(r2_key)}"',
-        },
-    )
 
 
 # =============================================================================
 # Client Endpoints
 # =============================================================================
 
+
 @client_router.post("/submit", response_model=SubmitResponse)
 async def submit_job(
     request: Request,
     payload: SubmitRequest,
     background_tasks: BackgroundTasks,
-    auth: Dict = Depends(require_any_auth),
+    auth: Dict = Depends(require_firebase_auth),
 ):
     """
     Submit a new job for processing.
     
+    Requires Firebase authentication via Authorization: Bearer <firebase_id_token>
+    
     Returns job ID and optionally dispatches immediately if a worker is ready.
     """
     ip = get_client_ip(request)
+    user_id = auth.get("user_id")
+    
+    # Check if user account is active
+    if not auth.get("is_active", True):
+        raise HTTPException(
+            status_code=403,
+            detail="Account is disabled. Please contact support."
+        )
     
     # Validate model
     try:
         model = validate_model(payload.model)
     except InvalidModelError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    
+    # Keep full params for dispatch to worker (including base64 images)
+    # Moved earlier for credit cost calculation with scale_factor
+    full_params = dict(payload.params) if payload.params else {}
+    
+    # Check if user has sufficient credits for this model
+    # Cost includes upscale cost if scale_factor > 1
+    credit_cost = get_credit_cost(model, full_params)
+    if auth.get("total_credits", 0) < credit_cost:
+        raise HTTPException(
+            status_code=402,  # Payment Required
+            detail=f"Insufficient credits. Have: {auth.get('total_credits', 0)}, Need: {credit_cost}"
+        )
     
     # Generate job ID and result key
     job_id = str(uuid.uuid4())
@@ -580,82 +1659,115 @@ async def submit_job(
     # Generate presigned URL
     upload_url = create_presigned_put_url(result_key)
     
-    # Create job in database
+    # Prepare params for DB storage - strip large binary data like init_image
+    # These are passed to worker via cache, not stored in DB
+    db_params = dict(full_params)
+    large_fields = ["init_image", "image", "mask_image", "control_image", "source_image"]
+    for field in large_fields:
+        db_params.pop(field, None)
+    
+    # Create job in database with QUEUED status and atomically lock credits
     db = SessionLocal()
     try:
         job = Job(
             job_id=job_id,
             model=model,
             prompt=payload.prompt,
-            params=payload.params or {},
-            status=JobState.PENDING.value,
+            params=db_params,  # Use sanitized params without large binary data
+            status=JobState.QUEUED.value,  # Start as QUEUED
             result_r2_key=result_key,
             output_key=result_key,
             fcm_token=payload.fcm_token,
+            user_id=user_id,  # Link job to user for credit tracking
+            credits_locked=0,  # Will be set by lock_credits_for_job
+            credits_refunded=0,
             created_at=utc_naive_now(),
             updated_at=utc_naive_now(),
             timeout_at=utc_naive_now() + timedelta(minutes=30),
         )
         db.add(job)
+        db.flush()  # Get the job into the session before locking credits
         
-        create_audit_log(
-            db,
-            event_type="job_created",
-            message=f"Job {job_id} created for model {model}",
-            target=job_id,
-            target_type="job",
-            actor_ip=ip,
-            details={"model": model},
-        )
+        # ATOMIC CREDIT LOCK: Deduct credits immediately
+        # If job fails, credits will be refunded via refund_credits_for_job
+        # Pass full_params for accurate cost calculation (includes scale_factor for upscale cost)
+        success, message, credits_locked = lock_credits_for_job(db, user_id, job_id, model, full_params)
+        if not success:
+            db.rollback()
+            raise HTTPException(
+                status_code=402,  # Payment Required
+                detail=message
+            )
         
+        # Audit log is optional - don't block if it fails
+        try:
+            create_audit_log(
+                db,
+                event_type="job_created",
+                message=f"Job {job_id} created for model {model} ({credits_locked} credits)",
+                target=job_id,
+                target_type="job",
+                actor_ip=ip,
+                details={"model": model, "credits_locked": credits_locked},
+            )
+        except Exception as audit_error:
+            logger.warning(
+                f"Failed to create audit log for job {job_id}: {audit_error}"
+            )
+        
+        # ATOMIC COMMIT: Job creation + credit lock in single transaction
+        # If anything fails, entire operation is rolled back
         db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as db_error:
+        logger.error(f"Failed to create job {job_id}: {db_error}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="Failed to create job")
     finally:
         db.close()
     
-    audit_logger.job_created(job_id, model, ip, auth.get("fingerprint_hash", auth.get("type")))
-    
-    # Try to dispatch immediately
-    worker_id = None
-    if _job_manager and _pod_manager:
-        try:
-            # Update to QUEUED
-            _job_manager.update_job_state(job_id, JobState.QUEUED)
-            
-            # Dispatch in background
-            background_tasks.add_task(_dispatch_job_background, job_id, model, payload.params.get("mode"))
-            
-        except Exception as e:
-            logger.error(f"Failed to dispatch job {job_id} immediately: {e}")
-            # Ensure job is at least in QUEUED so recovery system can pick it up
-            db = SessionLocal()
-            try:
-                job_check = db.query(Job).filter(Job.job_id == job_id).first()
-                if job_check and job_check.status == JobState.PENDING.value:
-                    job_check.status = JobState.QUEUED.value
-                    job_check.updated_at = utc_naive_now()
-                    if job_check.error_log is None:
-                        job_check.error_log = []
-                    job_check.error_log.append({
-                        "timestamp": utc_naive_now().isoformat(),
-                        "state": "dispatch_init_error",
-                        "error": str(e),
-                    })
-                    db.commit()
-                    logger.info(
-                        f"Job {job_id} manually set to QUEUED after dispatch init error. "
-                        f"Recovery system will pick it up."
-                    )
-            finally:
-                db.close()
-    
-    # Build download URL
-    download_url = f"{_controller_url}/download/{job_id}" if _controller_url else f"/download/{job_id}"
-    
+    # Log job creation (non-blocking, can fail silently)
+    try:
+        audit_logger.job_created(
+            job_id, model, ip, auth.get("fingerprint_hash", auth.get("type"))
+        )
+    except Exception:
+        pass  # Non-critical
+
+    # Cache full params (including base64 images) for dispatch to worker
+    # DB only stores sanitized params without large binary data
+    cache_job_params(job_id, full_params)
+
+    # Dispatch in background task - return immediately without waiting
+    if _pod_manager:
+        background_tasks.add_task(
+            _dispatch_job_background, job_id, model, payload.params.get("mode")
+        )
+    elif _job_manager:
+        # Fallback: if no pod_manager, at least add to pending queue
+        # (but this should rarely happen in normal operation)
+        logger.warning(
+            f"No pod_manager available, job {job_id} will be handled by recovery system"
+        )
+
+    # Build download URL - point to signed URL endpoint (not the old direct download)
+    download_url = (
+        f"{_controller_url}/download_url/{job_id}"
+        if _controller_url
+        else f"/download_url/{job_id}"
+    )
+
+    # Return IMMEDIATELY - no blocking operations after this point
     return SubmitResponse(
         job_id=job_id,
         status=JobStatus.QUEUED,
         model=model,
-        routed_to_worker=worker_id,
+        routed_to_worker=None,  # Will be set when actually dispatched
         upload_url=upload_url,
         result_key=result_key,
         download_url=download_url,
@@ -663,7 +1775,9 @@ async def submit_job(
     )
 
 
-async def _dispatch_job_background(job_id: str, model: str, mode: Optional[str], retry_count: int = 0):
+async def _dispatch_job_background(
+    job_id: str, model: str, mode: Optional[str], retry_count: int = 0
+):
     """
     Background task to dispatch job - includes actual HTTP dispatch to worker.
     
@@ -698,7 +1812,7 @@ async def _dispatch_job_background(job_id: str, model: str, mode: Optional[str],
                 _job_manager.mark_failed(
                     job_id, 
                     f"Failed on {MAX_MACHINE_ATTEMPTS} different machines: {list(machines_attempted)}",
-                    None
+                    None,
                 )
             else:
                 job.status = JobState.FAILED.value
@@ -738,7 +1852,9 @@ async def _dispatch_job_background(job_id: str, model: str, mode: Optional[str],
                 await asyncio.sleep(retry_delay)
                 
                 # Trigger retry (this will call assign_job again, which respects blacklist)
-                asyncio.create_task(_dispatch_job_background(job_id, model, mode, retry_count + 1))
+                asyncio.create_task(
+                    _dispatch_job_background(job_id, model, mode, retry_count + 1)
+                )
             else:
                 logger.error(
                     f"Job {job_id} failed to dispatch after {max_retries} attempts. "
@@ -761,11 +1877,13 @@ async def _dispatch_job_background(job_id: str, model: str, mode: Optional[str],
                 job.updated_at = utc_naive_now()
                 if job.error_log is None:
                     job.error_log = []
-                job.error_log.append({
+                job.error_log.append(
+                    {
                     "timestamp": utc_naive_now().isoformat(),
                     "state": "dispatch_background_error",
                     "error": str(e),
-                })
+                    }
+                )
                 db.commit()
                 logger.info(
                     f"Job {job_id} reverted to QUEUED after dispatch error. "
@@ -791,7 +1909,9 @@ async def _check_worker_health(endpoint: str, timeout: int = 5) -> bool:
         return False
 
 
-async def _check_worker_health_enhanced(endpoint: str, timeout: int = 5) -> Dict[str, Any]:
+async def _check_worker_health_enhanced(
+    endpoint: str, timeout: int = 5
+) -> Dict[str, Any]:
     """
     Enhanced health check that returns detailed worker status.
     
@@ -815,7 +1935,7 @@ async def _check_worker_health_enhanced(endpoint: str, timeout: int = 5) -> Dict
         "queue_size": 0,
         "active_jobs": 0,
         "processing": False,
-        "details": {}
+        "details": {},
     }
     
     try:
@@ -848,7 +1968,9 @@ async def _check_worker_health_enhanced(endpoint: str, timeout: int = 5) -> Dict
     except requests.exceptions.Timeout:
         # CRITICAL: Timeout doesn't mean worker is broken!
         # Worker might be busy processing and can't respond quickly
-        logger.debug(f"Worker health check timeout for {endpoint} (worker may be busy processing)")
+        logger.debug(
+            f"Worker health check timeout for {endpoint} (worker may be busy processing)"
+        )
         result["status"] = "timeout"
         result["processing"] = True  # Assume processing if timeout (conservative)
         
@@ -888,10 +2010,14 @@ async def _recover_jobs_on_worker(
     
     try:
         # Find all RUNNING and DISPATCHING jobs on this worker
-        jobs_to_recover = db.query(Job).filter(
+        jobs_to_recover = (
+            db.query(Job)
+            .filter(
             Job.worker_id == worker_id,
             Job.status.in_([JobState.RUNNING.value, JobState.DISPATCHING.value]),
-        ).all()
+            )
+            .all()
+        )
         
         for job in jobs_to_recover:
             # Skip the excluded job (if specified)
@@ -911,12 +2037,14 @@ async def _recover_jobs_on_worker(
             # Log the recovery in error_log
             if job.error_log is None:
                 job.error_log = []
-            job.error_log.append({
+            job.error_log.append(
+                {
                 "timestamp": utc_naive_now().isoformat(),
                 "state": "pod_destruction_recovery",
                 "error": f"Job recovered (was {old_status}) after worker {worker_id} pod was destroyed",
                 "previous_status": old_status,
-            })
+                }
+            )
             
             recovered_jobs.append(job.job_id)
             logger.warning(
@@ -963,25 +2091,47 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             db.commit()
             return False
         
-        # CRITICAL FIX: Check worker DB status BEFORE attempting dispatch
-        # Workers in "starting" state are still loading models and will fail
+        # CRITICAL FIX: Don't trust DB status (D1 is slow/eventually consistent)
+        # Instead, do a DIRECT health check to verify worker is ready
         if worker.status == "starting":
-            logger.warning(
-                f"Worker {worker_id} is in 'starting' state (models not loaded). "
-                f"Cannot dispatch job {job_id}. Reverting to QUEUED."
-            )
-            job.status = JobState.QUEUED.value
-            job.worker_id = None
-            job.updated_at = utc_naive_now()
-            if job.error_log is None:
-                job.error_log = []
-            job.error_log.append({
-                "timestamp": utc_naive_now().isoformat(),
-                "state": "dispatch_worker_not_ready",
-                "error": f"Worker {worker_id} still in 'starting' state",
-            })
-            db.commit()
-            return False
+            # DB might be stale - do a direct health check
+            logger.info(f"Worker {worker_id} shows 'starting' in DB, verifying via health check...")
+            try:
+                health_info = await _check_worker_health_enhanced(worker.endpoint, timeout=5)
+                if health_info.get("ready") or health_info.get("status") == "ok":
+                    logger.info(f"Worker {worker_id} confirmed ready via health check (DB was stale)")
+                    # Update DB to match reality
+                    worker.status = "dispatching"
+                    db.commit()
+                else:
+                    logger.warning(
+                        f"Worker {worker_id} is in 'starting' state (models not loaded). "
+                        f"Cannot dispatch job {job_id}. Reverting to QUEUED."
+                    )
+                    job.status = JobState.QUEUED.value
+                    job.worker_id = None
+                    job.updated_at = utc_naive_now()
+                    if job.error_log is None:
+                        job.error_log = []
+                    job.error_log.append(
+                        {
+                        "timestamp": utc_naive_now().isoformat(),
+                        "state": "dispatch_worker_not_ready",
+                        "error": f"Worker {worker_id} still in 'starting' state (health check failed)",
+                        }
+                    )
+                    db.commit()
+                    return False
+            except Exception as e:
+                logger.warning(
+                    f"Worker {worker_id} health check failed: {e}. "
+                    f"Cannot dispatch job {job_id}. Reverting to QUEUED."
+                )
+                job.status = JobState.QUEUED.value
+                job.worker_id = None
+                job.updated_at = utc_naive_now()
+                db.commit()
+                return False
         
         # Verify pod still exists in pod_manager tracking
         # (If pod was destroyed, it won't be in tracking anymore)
@@ -1001,11 +2151,13 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                 job.updated_at = utc_naive_now()
                 if job.error_log is None:
                     job.error_log = []
-                job.error_log.append({
+                job.error_log.append(
+                    {
                     "timestamp": utc_naive_now().isoformat(),
                     "state": "dispatch_failed_pod_destroyed",
                     "error": f"Pod {pod_uuid} was destroyed before dispatch",
-                })
+                    }
+                )
                 db.commit()
                 return False
         
@@ -1019,18 +2171,30 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             db.commit()
         
         # Generate presigned URL for upload
-        presigned_url = create_presigned_put_url(job.result_r2_key) if job.result_r2_key else None
+        presigned_url = (
+            create_presigned_put_url(job.result_r2_key) if job.result_r2_key else None
+        )
         
         # Build the run payload
+        # CRITICAL: Use cached params (with base64 images) if available
+        # DB params are sanitized (no large binary data)
+        cached_params = get_cached_job_params(job.job_id)
+        dispatch_params = cached_params if cached_params else (job.params or {})
+        
         run_payload = {
             "job_id": job.job_id,
             "prompt": job.prompt,
             "model": job.model,
-            "mode": (job.params or {}).get("mode"),
-            "params": job.params or {},
+            "mode": dispatch_params.get("mode"),
+            "params": dispatch_params,
             "upload_url": presigned_url,
             "result_key": job.result_r2_key,
         }
+        
+        # Log if we're using cached vs DB params
+        if cached_params:
+            has_images = any(k in cached_params for k in ["init_image", "image", "mask_image", "control_image", "source_image"])
+            logger.debug(f"Job {job_id} using cached params (has_images={has_images})")
         
         # Get worker endpoint
         endpoint = worker.endpoint
@@ -1059,10 +2223,13 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             has_healthy_running_jobs = False
             try:
                 now = utc_naive_now()
-                running_jobs = db.query(Job).filter(
-                    Job.worker_id == worker_id,
-                    Job.status == JobState.RUNNING.value
-                ).all()
+                running_jobs = (
+                    db.query(Job)
+                    .filter(
+                        Job.worker_id == worker_id, Job.status == JobState.RUNNING.value
+                    )
+                    .all()
+                )
                 
                 # Check if any running jobs are healthy (not stuck)
                 max_job_runtime_seconds = 600  # 10 minutes max for image processing
@@ -1124,18 +2291,22 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                     
                     # Revert job to QUEUED
                     if _job_manager:
-                        _job_manager.update_job_state(job_id, JobState.QUEUED, force=True)
+                        _job_manager.update_job_state(
+                            job_id, JobState.QUEUED, force=True
+                        )
                     else:
                         job.status = JobState.QUEUED.value
                         job.worker_id = None
                         job.updated_at = utc_naive_now()
                         if job.error_log is None:
                             job.error_log = []
-                        job.error_log.append({
+                        job.error_log.append(
+                            {
                             "timestamp": utc_naive_now().isoformat(),
                             "state": "health_check_failed",
                             "error": "Worker failed health check twice before dispatch",
-                        })
+                            }
+                        )
                         db.commit()
                     
                     # Get machine_id and check for OTHER running jobs
@@ -1150,11 +2321,15 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                     # We don't want to destroy a pod that has successfully running jobs
                     other_running_jobs = []
                     try:
-                        other_running = db.query(Job).filter(
+                        other_running = (
+                            db.query(Job)
+                            .filter(
                             Job.worker_id == worker_id,
                             Job.status == JobState.RUNNING.value,
                             Job.job_id != job_id,  # Exclude current job
-                        ).all()
+                            )
+                            .all()
+                        )
                         other_running_jobs = [j.job_id for j in other_running]
                     except Exception as e:
                         logger.error(f"Error checking for other running jobs: {e}")
@@ -1172,22 +2347,30 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                     # INCREASED blacklist time to 600s (10 minutes) to prevent repeated failures
                     # Machine 619 kept being reused because 60s was too short
                     if machine_id and _pod_manager:
-                        await _pod_manager.mark_machine_bad(str(machine_id), duration=600)
-                        logger.info(f"Blacklisted machine {machine_id} for 600s (10 min) due to unhealthy worker")
+                        await _pod_manager.mark_machine_bad(
+                            str(machine_id), duration=600
+                        )
+                        logger.info(
+                            f"Blacklisted machine {machine_id} for 600s (10 min) due to unhealthy worker"
+                        )
                     
                     # Destroy the pod
                     if _pod_manager and pod_uuid:
                         try:
                             # Before destroying, recover any RUNNING jobs (shouldn't be any, but just in case)
-                            await _recover_jobs_on_worker(worker_id, exclude_job_id=job_id, db=db)
+                            await _recover_jobs_on_worker(
+                                worker_id, exclude_job_id=job_id, db=db
+                            )
                             
                             await _pod_manager.destroy_individual_pod(
                                 pod_uuid,
-                                reason="Health check failed twice before dispatch"
+                                reason="Health check failed twice before dispatch",
                             )
                             logger.info(f"Destroyed unhealthy pod {pod_uuid}")
                         except Exception as e:
-                            logger.error(f"Failed to destroy unhealthy pod {pod_uuid}: {e}")
+                            logger.error(
+                                f"Failed to destroy unhealthy pod {pod_uuid}: {e}"
+                            )
                     
                     return False
         
@@ -1286,7 +2469,7 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                         f"Dispatch attempt {attempt + 1}/{max_attempts} CONNECT TIMED OUT for job {job_id}: {e}"
                     )
                     if attempt < max_attempts - 1:
-                        backoff = 5 * (2 ** attempt)
+                        backoff = 5 * (2**attempt)
                         logger.info(f"Waiting {backoff}s before retry...")
                         await asyncio.sleep(backoff)
                     continue
@@ -1301,8 +2484,10 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                 )
                 if attempt < max_attempts - 1:
                     # Longer backoff for connection errors: 5s, 10s
-                    backoff = 5 * (2 ** attempt)
-                    logger.info(f"Waiting {backoff}s before retry (connection error)...")
+                    backoff = 5 * (2**attempt)
+                    logger.info(
+                        f"Waiting {backoff}s before retry (connection error)..."
+                    )
                     await asyncio.sleep(backoff)
                 continue
                 
@@ -1371,22 +2556,33 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             # Classify error type to determine if machine should be blacklisted
             error_str = str(last_error).lower()
             is_http_error = isinstance(last_error, requests.exceptions.HTTPError)
-            is_connection_error = isinstance(last_error, requests.exceptions.ConnectionError) or \
-                                  "connection refused" in error_str or \
-                                  "failed to establish" in error_str
-            is_read_timeout = isinstance(last_error, requests.exceptions.Timeout) and \
-                             ("read timeout" in error_str or "read timed out" in error_str)
-            is_connect_timeout = isinstance(last_error, requests.exceptions.Timeout) and \
-                                "connect timeout" in error_str
+            is_connection_error = (
+                isinstance(last_error, requests.exceptions.ConnectionError)
+                or "connection refused" in error_str
+                or "failed to establish" in error_str
+            )
+            is_read_timeout = isinstance(last_error, requests.exceptions.Timeout) and (
+                "read timeout" in error_str or "read timed out" in error_str
+            )
+            is_connect_timeout = (
+                isinstance(last_error, requests.exceptions.Timeout)
+                and "connect timeout" in error_str
+            )
             
             # Check for 503 (queue full) - don't blacklist, just try different worker
-            if is_http_error and hasattr(last_error, 'response') and last_error.response:
+            if (
+                is_http_error
+                and hasattr(last_error, "response")
+                and last_error.response
+            ):
                 if last_error.response.status_code == 503:
                     logger.info(
                         f"Worker {worker_id} queue full (503). Reverting job to QUEUED to try different worker."
                     )
                     if _job_manager:
-                        _job_manager.update_job_state(job_id, JobState.QUEUED, force=True)
+                        _job_manager.update_job_state(
+                            job_id, JobState.QUEUED, force=True
+                        )
                     else:
                         job.status = JobState.QUEUED.value
                         job.worker_id = None
@@ -1403,10 +2599,14 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                 )
                 # Keep job in DISPATCHING state - worker will call job_complete
                 # Don't destroy pod - worker might be processing
+                # Clear cached params - job is with worker now
+                clear_cached_job_params(job_id)
                 return True  # Treat as successful (worker will complete it)
             
             should_blacklist_machine = is_connection_error or is_connect_timeout
-            blacklist_duration = 600  # 10 minutes for all failures (prevent rapid retries)
+            blacklist_duration = (
+                600  # 10 minutes for all failures (prevent rapid retries)
+            )
             
             if is_connect_timeout:
                 # Connect timeout - machine might be completely unreachable
@@ -1436,8 +2636,11 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             if not machine_id and worker:
                 machine_id = worker.machine_id
             
-            error_type = "connection" if is_connection_error else \
-                        ("connect_timeout" if is_connect_timeout else "other")
+            error_type = (
+                "connection"
+                if is_connection_error
+                else ("connect_timeout" if is_connect_timeout else "other")
+            )
             
             logger.info(
                 f"Dispatch failure for pod {pod_uuid}, machine_id={machine_id}, "
@@ -1450,16 +2653,22 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             
             if pod_uuid and worker_id:
                 # 1. Find jobs assigned to this worker in database
-                all_jobs_on_pod = db.query(Job).filter(
+                all_jobs_on_pod = (
+                    db.query(Job)
+                    .filter(
                     Job.worker_id == worker_id,
-                    Job.status.notin_([
+                        Job.status.notin_(
+                            [
                         JobState.COMPLETED.value,
                         JobState.FAILED.value,
                         JobState.TIMEOUT.value,
                         JobState.CANCELLED.value,
                         JobState.RECOVERED.value,
-                    ])
-                ).all()
+                            ]
+                        ),
+                    )
+                    .all()
+                )
                 
                 # Note: PodInfo doesn't store job IDs in a queue, so we rely only on database assignments
                 
@@ -1470,9 +2679,14 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             # Analyze job states on this pod to decide if we should destroy immediately
             if len(all_jobs_on_pod) > 0:
                 # Count jobs in different states
-                running_jobs = [j for j in all_jobs_on_pod if j.status == JobState.RUNNING.value]
-                queued_dispatching_jobs = [j for j in all_jobs_on_pod 
-                                          if j.status in [JobState.QUEUED.value, JobState.DISPATCHING.value]]
+                running_jobs = [
+                    j for j in all_jobs_on_pod if j.status == JobState.RUNNING.value
+                ]
+                queued_dispatching_jobs = [
+                    j
+                    for j in all_jobs_on_pod
+                    if j.status in [JobState.QUEUED.value, JobState.DISPATCHING.value]
+                ]
                 
                 logger.warning(
                     f"Dispatch failed for job {job_id} on pod {pod_uuid}. "
@@ -1546,18 +2760,22 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                         )
                         # Just requeue this single failed job
                         if _job_manager:
-                            _job_manager.update_job_state(job_id, JobState.QUEUED, force=True)
+                            _job_manager.update_job_state(
+                                job_id, JobState.QUEUED, force=True
+                            )
                         else:
                             job.status = JobState.QUEUED.value
                             job.worker_id = None
                             job.updated_at = utc_naive_now()
                             if job.error_log is None:
                                 job.error_log = []
-                            job.error_log.append({
+                            job.error_log.append(
+                                {
                                 "timestamp": utc_naive_now().isoformat(),
                                 "state": "dispatch_failed_pod_busy",
                                 "error": f"Dispatch failed but pod has RUNNING jobs, only requeueing this job",
-                            })
+                                }
+                            )
                             db.commit()
                         return False  # Return false but don't destroy pod
                 else:
@@ -1577,7 +2795,9 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                 # Mark machine as bad (only for connection/timeout errors)
                 if _pod_manager and machine_id and should_blacklist_machine:
                     try:
-                        await _pod_manager.mark_machine_bad(str(machine_id), duration=blacklist_duration)
+                        await _pod_manager.mark_machine_bad(
+                            str(machine_id), duration=blacklist_duration
+                        )
                         logger.info(
                             f"Marked machine {machine_id} as bad for {blacklist_duration}s "
                             f"due to dispatch failure (error_type: {'connection' if is_connection_error else 'timeout'})"
@@ -1594,7 +2814,7 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                     try:
                         await _pod_manager.destroy_individual_pod(
                             pod_uuid,
-                            reason=f"Dispatch failure - {len(affected_job_ids)} jobs affected"
+                            reason=f"Dispatch failure - {len(affected_job_ids)} jobs affected",
                         )
                         logger.info(f"Destroyed pod {pod_uuid} due to dispatch failure")
                     except Exception as e:
@@ -1605,7 +2825,9 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                 # QUEUED/DISPATCHING jobs should be reverted to QUEUED for requeue
                 jobs_to_requeue = []
                 for affected_job_id in affected_job_ids:
-                    affected_job = db.query(Job).filter(Job.job_id == affected_job_id).first()
+                    affected_job = (
+                        db.query(Job).filter(Job.job_id == affected_job_id).first()
+                    )
                     if not affected_job:
                         continue
                     
@@ -1633,13 +2855,17 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                             affected_job.updated_at = utc_naive_now()
                             if affected_job.error_log is None:
                                 affected_job.error_log = []
-                            affected_job.error_log.append({
+                            affected_job.error_log.append(
+                                {
                                 "timestamp": utc_naive_now().isoformat(),
                                 "state": "running_pod_destroyed_retry",
                                 "error": error_msg,
                                 "retry_count": affected_job.retry_count,
-                                "machine_id": str(machine_id) if machine_id else None,
-                            })
+                                    "machine_id": (
+                                        str(machine_id) if machine_id else None
+                                    ),
+                                }
+                            )
                             db.commit()
                             jobs_to_requeue.append(affected_job_id)
                         else:
@@ -1653,38 +2879,55 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                                     _job_manager.mark_failed(
                                         affected_job_id,
                                         error=f"{error_msg} (retry limit exceeded)",
-                                        worker_id=affected_job.worker_id
+                                        worker_id=affected_job.worker_id,
                                     )
                                 except Exception as e:
-                                    logger.error(f"Failed to mark job {affected_job_id} as failed: {e}")
+                                    logger.error(
+                                        f"Failed to mark job {affected_job_id} as failed: {e}"
+                                    )
                             else:
                                 affected_job.status = JobState.FAILED.value
-                                affected_job.error = f"{error_msg} (retry limit exceeded)"
+                                affected_job.error = (
+                                    f"{error_msg} (retry limit exceeded)"
+                                )
                                 affected_job.updated_at = utc_naive_now()
                                 if affected_job.error_log is None:
                                     affected_job.error_log = []
-                                affected_job.error_log.append({
+                                affected_job.error_log.append(
+                                    {
                                     "timestamp": utc_naive_now().isoformat(),
                                     "state": "running_pod_destroyed_failed",
                                     "error": error_msg,
-                                    "machine_id": str(machine_id) if machine_id else None,
-                                })
+                                        "machine_id": (
+                                            str(machine_id) if machine_id else None
+                                        ),
+                                    }
+                                )
                                 db.commit()
                             
                             # Send FCM notification for RUNNING job that failed permanently
-                            if affected_job.fcm_token and not affected_job.notification_sent:
+                            if (
+                                affected_job.fcm_token
+                                and not affected_job.notification_sent
+                            ):
                                 try:
                                     asyncio.create_task(
                                         send_fcm_notification(
                                             affected_job.fcm_token,
                                             "Job Failed",
-                                            f"Your {affected_job.model} job failed due to pod failure",
-                                            {"job_id": affected_job_id, "status": "failed", "error": error_msg},
+                                            f"Your job failed due to internal error, Don't worry, No credits deducted",
+                                            {
+                                                "job_id": affected_job_id,
+                                                "status": "failed",
+                                                "error": error_msg,
+                                            },
                                         )
                                     )
                                     affected_job.notification_sent = True
                                 except Exception as e:
-                                    logger.error(f"Failed to send FCM notification for job {affected_job_id}: {e}")
+                                    logger.error(
+                                        f"Failed to send FCM notification for job {affected_job_id}: {e}"
+                                    )
                             
                             # Clear worker assignment
                             affected_job.worker_id = None
@@ -1693,24 +2936,32 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                         # QUEUED or DISPATCHING jobs: revert to QUEUED for requeue
                         if _job_manager:
                             try:
-                                _job_manager.update_job_state(affected_job_id, JobState.QUEUED, force=True)
+                                _job_manager.update_job_state(
+                                    affected_job_id, JobState.QUEUED, force=True
+                                )
                                 affected_job.worker_id = None
                                 db.commit()
                                 jobs_to_requeue.append(affected_job_id)
                             except Exception as e:
-                                logger.error(f"Failed to requeue job {affected_job_id}: {e}")
+                                logger.error(
+                                    f"Failed to requeue job {affected_job_id}: {e}"
+                                )
                         else:
                             affected_job.status = JobState.QUEUED.value
                             affected_job.worker_id = None
                             affected_job.updated_at = utc_naive_now()
                             if affected_job.error_log is None:
                                 affected_job.error_log = []
-                            affected_job.error_log.append({
+                            affected_job.error_log.append(
+                                {
                                 "timestamp": utc_naive_now().isoformat(),
                                 "state": "dispatch_failed_pod_destroyed",
                                 "error": error_msg,
-                                "machine_id": str(machine_id) if machine_id else None,  # Track for retry limiting
-                            })
+                                    "machine_id": (
+                                        str(machine_id) if machine_id else None
+                                    ),  # Track for retry limiting
+                                }
+                            )
                             db.commit()
                             jobs_to_requeue.append(affected_job_id)
                 
@@ -1724,7 +2975,9 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                     )
                     # Trigger requeue in background (fire and forget)
                     asyncio.create_task(
-                        _requeue_jobs_after_pod_failure(affected_job_ids, affected_model)
+                        _requeue_jobs_after_pod_failure(
+                            affected_job_ids, affected_model
+                        )
                     )
                 elif len(affected_job_ids) == 0:
                     logger.info(
@@ -1745,13 +2998,17 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             job.updated_at = utc_naive_now()
             if job.error_log is None:
                 job.error_log = []
-            job.error_log.append({
+            job.error_log.append(
+                {
                 "timestamp": utc_naive_now().isoformat(),
                 "state": "dispatch_failed",
                 "error": str(last_error),
-                "machine_id": str(machine_id) if machine_id else None,  # Track machine for retry limiting
+                    "machine_id": (
+                        str(machine_id) if machine_id else None
+                    ),  # Track machine for retry limiting
                 "pod_uuid": pod_uuid,
-            })
+                }
+            )
             db.commit()
             
             # Mark machine bad even for single job failure
@@ -1779,6 +3036,12 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                 job.status = JobState.RUNNING.value
                 job.started_at = utc_naive_now()
         
+        # Store pod_uuid in job for cost tracking
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if job and pod_uuid:
+            job.pod_uuid = pod_uuid
+            db.commit()
+        
         # CRITICAL: Remove job from pending_jobs to prevent autoscaler from creating unnecessary pods
         if _pod_manager and job:
             try:
@@ -1796,10 +3059,15 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             db.commit()
         
         logger.info(f"Job {job_id} dispatched successfully to worker {worker_id}")
+        
+        # Clear cached params - job is now with worker
+        clear_cached_job_params(job_id)
+        
         return True
         
     except Exception as e:
         logger.exception(f"_dispatch_to_worker error for job {job_id}: {e}")
+        # Don't clear cache on error - job may be retried
         return False
     finally:
         db.close()
@@ -1808,10 +3076,12 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
 @client_router.get("/job_status", response_model=JobStatusResponse)
 async def get_job_status(
     job_id: str,
-    auth: Dict = Depends(require_any_auth),
+    auth: Dict = Depends(require_firebase_auth),
 ):
     """
     Get current job status.
+    
+    Requires Firebase authentication via Authorization: Bearer <firebase_id_token>
     """
     db = SessionLocal()
     try:
@@ -1821,7 +3091,12 @@ async def get_job_status(
         
         result_url = None
         if job.status == JobState.COMPLETED.value and job.result_r2_key:
-            result_url = f"{_controller_url}/download/{job_id}" if _controller_url else f"/download/{job_id}"
+            # Point to signed URL endpoint - frontend will call this to get R2 worker URL
+            result_url = (
+                f"{_controller_url}/download_url/{job_id}"
+                if _controller_url
+                else f"/download_url/{job_id}"
+            )
         
         return JobStatusResponse(
             job_id=job.job_id,
@@ -1843,6 +3118,7 @@ async def get_job_status(
 # =============================================================================
 # Worker Endpoints
 # =============================================================================
+
 
 @worker_router.post("/register_worker")
 async def register_worker(
@@ -1869,7 +3145,9 @@ async def register_worker(
         if pod_uuid not in active_pods:
             # Check if recently destroyed
             if _pod_manager.lifecycle.is_recently_destroyed(pod_uuid):
-                logger.warning(f"Rejected registration from recently destroyed pod {pod_uuid}")
+                logger.warning(
+                    f"Rejected registration from recently destroyed pod {pod_uuid}"
+                )
                 raise HTTPException(status_code=409, detail="Pod recently destroyed")
             
             # RESILIENT FIX: Unknown pod attempting to register
@@ -1927,8 +3205,7 @@ async def register_worker(
             try:
                 # Wrap health check with timeout protection
                 health_check = await asyncio.wait_for(
-                    _check_worker_health(payload.endpoint, timeout=2),
-                    timeout=3.0
+                    _check_worker_health(payload.endpoint, timeout=2), timeout=3.0
                 )
                 if not health_check:
                     logger.warning(
@@ -1937,7 +3214,9 @@ async def register_worker(
                     )
                     worker_ready = False  # Mark as starting instead of ready
             except asyncio.TimeoutError:
-                logger.warning(f"Worker {payload.worker_id} health check timed out, marking as starting")
+                logger.warning(
+                    f"Worker {payload.worker_id} health check timed out, marking as starting"
+                )
                 worker_ready = False
             except Exception as e:
                 logger.warning(f"Worker health check failed during registration: {e}")
@@ -1948,7 +3227,7 @@ async def register_worker(
             try:
                 health_info = await asyncio.wait_for(
                     _check_worker_health_enhanced(payload.endpoint, timeout=2),
-                    timeout=3.0
+                    timeout=3.0,
                 )
                 if health_info["healthy"]:
                     # Use status from worker's health endpoint
@@ -1958,7 +3237,9 @@ async def register_worker(
                     elif worker_status in ("ok", "busy"):
                         initial_status = "ready"
                     else:
-                        initial_status = "starting"  # Conservative: wait for explicit "ok"
+                        initial_status = (
+                            "starting"  # Conservative: wait for explicit "ok"
+                        )
                     
                     logger.info(
                         f"Worker {payload.worker_id} health check: status={worker_status}, "
@@ -1971,11 +3252,27 @@ async def register_worker(
                     )
                     initial_status = "starting"
             except asyncio.TimeoutError:
-                logger.warning(f"Worker {payload.worker_id} enhanced health check timed out")
+                logger.warning(
+                    f"Worker {payload.worker_id} enhanced health check timed out"
+                )
                 initial_status = "starting"
             except Exception as e:
-                logger.warning(f"Worker {payload.worker_id} enhanced health check error: {e}")
+                logger.warning(
+                    f"Worker {payload.worker_id} enhanced health check error: {e}"
+                )
                 initial_status = "starting"
+        
+        # Get GPU cost info from pod tracking (for cost attribution)
+        gpu_hourly_rate = None
+        gpu_type = None
+        offer_id = None
+        machine_id = None
+        if _pod_manager and pod_uuid in _pod_manager.individual_pods:
+            pi = _pod_manager.individual_pods[pod_uuid]
+            gpu_hourly_rate = pi.hourly_cost if pi.hourly_cost > 0 else None
+            gpu_type = pi.gpu_type if pi.gpu_type else None
+            offer_id = pi.offer_id if pi.offer_id > 0 else None
+            machine_id = pi.machine_id
         
         if not worker:
             worker = Worker(
@@ -1989,18 +3286,32 @@ async def register_worker(
                 created_at=now,
                 info=payload.info,
                 is_warm_pod=is_warm,
+                # Cost tracking fields
+                gpu_hourly_rate=gpu_hourly_rate,
+                gpu_type=gpu_type,
+                offer_id=offer_id,
+                machine_id=machine_id,
             )
             db.add(worker)
         else:
             worker.endpoint = payload.endpoint
             worker.model = model
-            worker.container_id=pod_uuid
+            worker.container_id = pod_uuid
             worker.status = initial_status
             worker.last_heartbeat = now
             worker.last_active = now
             worker.info = payload.info
             if pod_uuid:
                 worker.is_warm_pod = is_warm
+            # Update cost tracking fields if available
+            if gpu_hourly_rate is not None:
+                worker.gpu_hourly_rate = gpu_hourly_rate
+            if gpu_type is not None:
+                worker.gpu_type = gpu_type
+            if offer_id is not None:
+                worker.offer_id = offer_id
+            if machine_id is not None:
+                worker.machine_id = machine_id
         
         # If initially starting, schedule a task to POLL for readiness
         # (models can take 60-120s to load, so single check after 8s is insufficient)
@@ -2011,6 +3322,7 @@ async def register_worker(
             # Store endpoint for background task
             endpoint_to_check = payload.endpoint
             worker_id_to_check = payload.worker_id
+            pod_uuid_to_check = pod_uuid  # Capture for use in async task
             
             async def _poll_for_readiness():
                 """
@@ -2029,19 +3341,29 @@ async def register_worker(
                     # Check current worker status in DB
                     db = SessionLocal()
                     try:
-                        w = db.query(Worker).filter(Worker.worker_id == worker_id_to_check).first()
+                        w = (
+                            db.query(Worker)
+                            .filter(Worker.worker_id == worker_id_to_check)
+                            .first()
+                        )
                         
                         if not w:
-                            logger.warning(f"Worker {worker_id_to_check} no longer exists, stopping readiness poll")
+                            logger.warning(
+                                f"Worker {worker_id_to_check} no longer exists, stopping readiness poll"
+                            )
                             return
                         
                         if w.status != "starting":
                             # Worker already transitioned to another state
-                            logger.debug(f"Worker {worker_id_to_check} status is '{w.status}', stopping readiness poll")
+                            logger.debug(
+                                f"Worker {worker_id_to_check} status is '{w.status}', stopping readiness poll"
+                            )
                             return
                         
                         # Check worker health
-                        health_info = await _check_worker_health_enhanced(endpoint_to_check, timeout=5)
+                        health_info = await _check_worker_health_enhanced(
+                            endpoint_to_check, timeout=5
+                        )
                         
                         if health_info.get("ready"):
                             w.status = "ready"
@@ -2051,6 +3373,14 @@ async def register_worker(
                                 f"Worker {worker_id_to_check} is now READY after {elapsed:.0f}s "
                                 f"(health status={health_info.get('status')})"
                             )
+                            
+                            # CRITICAL: Also update in-memory pod tracking
+                            # This ensures dispatch sees the worker as ready immediately
+                            if _pod_manager and pod_uuid_to_check in _pod_manager.individual_pods:
+                                from pod_manager import PodStatus
+                                _pod_manager.individual_pods[pod_uuid_to_check].status = PodStatus.READY
+                                logger.info(f"Updated pod {pod_uuid_to_check} in-memory status to READY")
+                            
                             return
                         
                         # Still not ready - log status and continue polling
@@ -2071,10 +3401,16 @@ async def register_worker(
             
             asyncio.create_task(_poll_for_readiness())
         
-        # Update pod manager tracking
+        # Update pod manager tracking - set status based on actual worker status
         if _pod_manager and pod_uuid in _pod_manager.individual_pods:
             from pod_manager import PodStatus
-            _pod_manager.individual_pods[pod_uuid].status = PodStatus.READY
+            
+            # CRITICAL: Don't set to READY if worker is still 'starting'
+            # The _poll_for_readiness task will update this when worker is truly ready
+            if worker.status == "ready":
+                _pod_manager.individual_pods[pod_uuid].status = PodStatus.READY
+            else:
+                _pod_manager.individual_pods[pod_uuid].status = PodStatus.STARTING
             _pod_manager.individual_pods[pod_uuid].last_active = now
         
         # Audit log is optional - don't fail registration if it fails
@@ -2089,7 +3425,9 @@ async def register_worker(
                 details={"model": model, "pod_uuid": pod_uuid},
             )
         except Exception as audit_error:
-            logger.warning(f"Failed to create audit log for worker registration: {audit_error}")
+            logger.warning(
+                f"Failed to create audit log for worker registration: {audit_error}"
+            )
         
         db.commit()
         
@@ -2103,7 +3441,11 @@ async def register_worker(
             pass
         # Return success anyway - worker can still operate
         # This prevents weak servers from rejecting valid workers
-        return {"status": "ok", "worker_id": payload.worker_id, "warning": "partial_registration"}
+        return {
+            "status": "ok",
+            "worker_id": payload.worker_id,
+            "warning": "partial_registration",
+        }
     finally:
         db.close()
     
@@ -2113,7 +3455,9 @@ async def register_worker(
     except Exception as e:
         logger.warning(f"Audit logger error (non-critical): {e}")
     
-    logger.info(f"Worker {payload.worker_id} registered for model {model} (pod: {pod_uuid})")
+    logger.info(
+        f"Worker {payload.worker_id} registered for model {model} (pod: {pod_uuid})"
+    )
     
     return {"status": "ok", "worker_id": payload.worker_id}
 
@@ -2122,6 +3466,44 @@ async def register_worker(
 # CRITICAL: This avoids DB queries on every heartbeat, making the endpoint fast
 _heartbeat_cache: Dict[str, Dict[str, Any]] = {}
 _heartbeat_cache_lock = asyncio.Lock()
+
+# In-memory cache for job params with images
+# CRITICAL: Base64 images are NOT stored in DB (too large), but must be passed to worker
+# This cache holds full params including images until job is dispatched
+_job_params_cache: Dict[str, Dict[str, Any]] = {}
+_job_params_cache_lock = asyncio.Lock()
+
+
+def cache_job_params(job_id: str, params: Dict[str, Any]):
+    """Cache full job params (including base64 images) for dispatch to worker"""
+    _job_params_cache[job_id] = params
+
+
+def get_cached_job_params(job_id: str) -> Optional[Dict[str, Any]]:
+    """Get cached job params, returns None if not cached"""
+    return _job_params_cache.get(job_id)
+
+
+def clear_cached_job_params(job_id: str):
+    """Clear cached job params after dispatch"""
+    _job_params_cache.pop(job_id, None)
+
+
+def get_cached_last_heartbeat(worker_id: str) -> Optional[datetime]:
+    """
+    Return last heartbeat timestamp from the in-memory cache (if present).
+
+    CRITICAL: Used by background reaper tasks to avoid false "stale" detection
+    when DB sync lags behind the in-memory cache.
+    """
+    try:
+        data = _heartbeat_cache.get(worker_id)
+        if not data:
+            return None
+        ts = data.get("last_heartbeat")
+        return ts if isinstance(ts, datetime) else None
+    except Exception:
+        return None
 
 
 @worker_router.post("/heartbeat")
@@ -2133,21 +3515,30 @@ async def worker_heartbeat(
     """
     Worker heartbeat endpoint.
     
-    Updates in-memory cache IMMEDIATELY (fast!) and DB periodically (background).
-    CRITICAL: Must be fast and resilient - workers depend on this.
+    Updates in-memory cache IMMEDIATELY (lock-free write for speed).
+    CRITICAL: Must be ultra-fast - workers depend on this.
+
+    Lock-free dict write is safe in asyncio (single-threaded execution).
+    Lock only needed for sync task batch reads.
     """
     now = utc_naive_now()
     
-    # Update in-memory cache FIRST (no DB, instant response)
-    async with _heartbeat_cache_lock:
+    # Lock-free cache update - dict assignment is atomic in Python
+    # This is safe in asyncio since Python code runs single-threaded
+    # Lock is only needed when sync task reads multiple entries
+    try:
         _heartbeat_cache[payload.worker_id] = {
             "last_heartbeat": now,
             "status": payload.status.value if payload.status else None,
             "metrics": payload.metrics,
             "needs_sync": True,  # Mark for DB sync
         }
+    except Exception:
+        # If cache update fails for any reason, just continue
+        # Sync task will eventually catch up via DB reads
+        pass
     
-    # Return immediately - don't wait for DB
+    # Return immediately - zero blocking operations
     return {"status": "ok"}
 
 
@@ -2178,8 +3569,18 @@ async def sync_heartbeat_cache_to_db():
             db = SessionLocal()
             try:
                 for worker_id, data in to_sync.items():
-                    worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+                    worker = (
+                        db.query(Worker).filter(Worker.worker_id == worker_id).first()
+                    )
                     if worker:
+                        # CRITICAL: Do NOT "resurrect" workers that have been taken offline/terminated.
+                        # After we destroy a pod, the worker may keep heartbeating briefly; if we
+                        # overwrite status back to "ready", the reaper will try to destroy it again
+                        # (and can end up logging "destroying pod None").
+                        if worker.status in ("offline", "terminated", "error"):
+                            continue
+
+                        # Normal sync path
                         worker.last_heartbeat = data["last_heartbeat"]
                         worker.last_active = data["last_heartbeat"]
                         if data["status"]:
@@ -2227,14 +3628,22 @@ async def job_complete(
         # Check if job is already in a terminal state
         # This can happen if the pod was destroyed while the job was running
         current_state = JobState(job.status)
-        if current_state in [JobState.COMPLETED, JobState.FAILED, JobState.TIMEOUT, JobState.CANCELLED]:
+        if current_state in [
+            JobState.COMPLETED,
+            JobState.FAILED,
+            JobState.TIMEOUT,
+            JobState.CANCELLED,
+        ]:
             logger.warning(
                 f"Worker attempted to complete job {job_id} but it's already in {current_state.value} state. "
                 f"This likely means the pod was destroyed while the job was running. "
                 f"Ignoring completion request (idempotent)."
             )
             # Return success to avoid worker retries
-            return {"status": "ok", "message": f"Job already in {current_state.value} state"}
+            return {
+                "status": "ok",
+                "message": f"Job already in {current_state.value} state",
+            }
         
         # If job is in QUEUED state, it means it was requeued after pod destruction
         # The worker is trying to complete an old job that's been requeued
@@ -2258,7 +3667,9 @@ async def job_complete(
             error_str = (payload.error or "Unknown error").lower()
             
             # Check if this is a retryable infrastructure failure
-            is_cuda_incompatibility = "no kernel image is available" in error_str and "cuda" in error_str
+            is_cuda_incompatibility = (
+                "no kernel image is available" in error_str and "cuda" in error_str
+            )
             is_oom_error = "oom" in error_str or "out of memory" in error_str
             is_other_cuda_error = "cuda" in error_str and "error" in error_str
             
@@ -2266,7 +3677,11 @@ async def job_complete(
             is_infrastructure_failure = is_cuda_incompatibility or is_oom_error
             
             # Get retry count from job
-            retry_count = job.retry_count if hasattr(job, 'retry_count') and job.retry_count else 0
+            retry_count = (
+                job.retry_count
+                if hasattr(job, "retry_count") and job.retry_count
+                else 0
+            )
             max_retries = 3  # Allow up to 3 retries for infrastructure failures
             
             # Get variant and machine info
@@ -2284,6 +3699,7 @@ async def job_complete(
                             machine_id = pod_info.machine_id
             
             # CRITICAL: CUDA kernel incompatibility (int4 variant on wrong GPU)
+            # Move heavy operations to background to avoid blocking response
             if is_cuda_incompatibility:
                 logger.error(
                     f"CUDA kernel incompatibility detected for job {job_id}! "
@@ -2296,26 +3712,70 @@ async def job_complete(
                         f"Int4 variant failed on machine {machine_id} due to CUDA incompatibility. "
                         f"Blacklisting machine {machine_id} for int4 variant (10 min)."
                     )
-                    # Blacklist this machine for longer (10 min) since it's a compatibility issue
+                    # Move to background task to avoid blocking response
                     if _pod_manager:
-                        await _pod_manager.mark_machine_bad(str(machine_id), duration=600)
-                    
-                    # Destroy the pod immediately - it won't work for any int4 jobs
+                        background_tasks.add_task(
+                            _pod_manager.mark_machine_bad,
+                            str(machine_id),
+                            600,  # duration
+                        )
+
+                    # Destroy the pod in background - it won't work for any int4 jobs
                     if pod_uuid and _pod_manager:
-                        try:
-                            await _pod_manager.destroy_individual_pod(
+                        background_tasks.add_task(
+                            _handle_incompatible_pod_destruction,
+                            _pod_manager,
                                 pod_uuid,
-                                reason="CUDA kernel incompatibility (int4 variant)"
+                            "CUDA kernel incompatibility (int4 variant)",
                             )
-                            logger.info(f"Destroyed incompatible pod {pod_uuid}")
-                        except Exception as e:
-                            logger.error(f"Failed to destroy incompatible pod: {e}")
             
-            # Check for OOM errors
+            # Check for OOM errors - remove pod from tracking immediately, then destroy
             elif is_oom_error:
-                logger.warning(f"OOM detected for job {job_id}")
+                logger.warning(
+                    f"OOM detected for job {job_id} on pod {pod_uuid} (machine {machine_id})"
+                )
+                # CRITICAL: Remove pod from tracking IMMEDIATELY to prevent reuse
+                # Also mark worker as offline in DB immediately
+                if pod_uuid and _pod_manager:
+                    # Remove from tracking immediately (synchronously)
+                    async with _pod_manager._lock:
+                        if pod_uuid in _pod_manager.individual_pods:
+                            logger.warning(
+                                f"Removing pod {pod_uuid} from tracking immediately due to OOM (will be destroyed in background)"
+                            )
+                            _pod_manager.individual_pods.pop(pod_uuid, None)
+                            _pod_manager.individual_pod_managers.pop(pod_uuid, None)
+
+                    # Mark worker as offline in DB immediately (synchronously)
+                    if worker_id:
+                        try:
+                            worker = (
+                                db.query(Worker)
+                                .filter(Worker.worker_id == worker_id)
+                                .first()
+                            )
+                            if worker:
+                                worker.status = "offline"
+                                db.commit()
+                                logger.info(
+                                    f"Marked worker {worker_id} as offline due to OOM"
+                                )
+                        except Exception as e:
+                            logger.warning(f"Failed to mark worker offline: {e}")
+
+                    # Schedule destruction in background (cleanup)
+                    background_tasks.add_task(
+                        _pod_manager.destroy_individual_pod,
+                        pod_uuid,
+                        f"OOM detected on job {job_id}",
+                    )
+                # Also blacklist the machine (less critical - pod removal is the main fix)
                 if machine_id and _pod_manager:
-                    await _pod_manager.mark_machine_bad(str(machine_id), duration=300)  # 5 min for OOM
+                    background_tasks.add_task(
+                        _pod_manager.mark_machine_bad,
+                        str(machine_id),
+                        300,  # 5 min for OOM
+                    )
             
             # Check for other critical errors
             elif is_other_cuda_error:
@@ -2337,14 +3797,16 @@ async def job_complete(
                 
                 # Add to error log
                 error_log = job.error_log or []
-                error_log.append({
+                error_log.append(
+                    {
                     "timestamp": utc_naive_now().isoformat(),
                     "worker_id": worker_id,
                     "error": payload.error,
                     "retry_count": job.retry_count,
                     "machine_id": machine_id,
                     "variant": variant,
-                })
+                    }
+                )
                 job.error_log = error_log
                 db.commit()
                 
@@ -2355,8 +3817,10 @@ async def job_complete(
                 
                 # Trigger dispatch for the requeued job
                 if _pod_manager:
-                    job_mode = job.mode if hasattr(job, 'mode') else None
-                    asyncio.create_task(_dispatch_job_background(job_id, job.model, job_mode))
+                    job_mode = job.mode if hasattr(job, "mode") else None
+                    asyncio.create_task(
+                        _dispatch_job_background(job_id, job.model, job_mode)
+                    )
                 
                 return {"status": "requeued", "retry_count": job.retry_count}
             
@@ -2370,19 +3834,24 @@ async def job_complete(
                 
                 # Mark job as permanently failed
                 if _job_manager:
-                    _job_manager.mark_failed(job_id, payload.error or "Unknown error", worker_id)
+                    _job_manager.mark_failed(
+                        job_id, payload.error or "Unknown error", worker_id
+                    )
                 else:
                     job.status = JobState.FAILED.value
                     job.error = payload.error
                     job.updated_at = utc_naive_now()
                     db.commit()
                 
-                # CRITICAL: Remove failed job from pending_jobs
+                # CRITICAL: Remove failed job from pending_jobs (in background)
                 if _pod_manager and job.model:
-                    try:
-                        await _pod_manager.remove_pending_job(job_id, job.model)
-                    except Exception as e:
-                        logger.debug(f"Failed to remove failed job {job_id} from pending queue: {e}")
+                    background_tasks.add_task(
+                        _remove_pending_job_safe,
+                        _pod_manager,
+                        job_id,
+                        job.model,
+                        "failed",
+                    )
                 
                 audit_logger.job_failed(job_id, worker_id, payload.error)
             
@@ -2393,14 +3862,20 @@ async def job_complete(
                     _s3_client.head_object(Bucket=_r2_bucket, Key=payload.result_r2_key)
                 except ClientError:
                     logger.error(f"Result file not found: {payload.result_r2_key}")
-                    raise HTTPException(status_code=400, detail="Result file not found in storage")
+                    raise HTTPException(
+                        status_code=400, detail="Result file not found in storage"
+                    )
             
-            # Mark job completed
+            # Mark job completed - use signed URL endpoint
             if _job_manager:
                 _job_manager.mark_completed(
                     job_id,
                     result_r2_key=payload.result_r2_key,
-                    output_url=f"{_controller_url}/download/{job_id}" if _controller_url else None,
+                    output_url=(
+                        f"{_controller_url}/download_url/{job_id}"
+                        if _controller_url
+                        else None
+                    ),
                 )
             else:
                 completion_time = utc_naive_now()
@@ -2422,12 +3897,39 @@ async def job_complete(
                 _log_timing_metrics(job_id, job.model, timing_metrics)
             
             # Update worker's last_job_finished_at timestamp
+            gpu_hourly_rate = 0.0
             if worker_id:
                 worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
                 if worker:
                     worker.last_job_finished_at = utc_naive_now()
                     worker.status = "ready"  # Reset to ready after job completion
+                    gpu_hourly_rate = worker.gpu_hourly_rate or 0.0
                     db.commit()
+            
+            # Calculate and store job cost (processing cost only - overhead will be added when pod is destroyed)
+            if pod_uuid and gpu_hourly_rate > 0:
+                try:
+                    from cost_service import calculate_and_store_job_cost
+                    
+                    # Refresh job to get the latest processing_time_seconds
+                    db.refresh(job)
+                    
+                    cost_breakdown = calculate_and_store_job_cost(
+                        db=db,
+                        job_id=job_id,
+                        pod_uuid=pod_uuid,
+                        gpu_hourly_rate=gpu_hourly_rate,
+                        processing_time_seconds=job.processing_time_seconds,
+                        pod_overhead_share=0.0,  # Will be calculated when pod is destroyed
+                    )
+                    
+                    if cost_breakdown:
+                        logger.info(
+                            f"💰 Job {job_id} cost: ${cost_breakdown.total_cost_usd:.6f} "
+                            f"(processing only, overhead pending)"
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to calculate job cost for {job_id}: {e}")
             
             # Update pod manager
             if _pod_manager and pod_uuid:
@@ -2437,12 +3939,15 @@ async def job_complete(
                     job_id,
                 )
             
-            # CRITICAL: Remove job from pending_jobs (may already be removed when it started running)
+            # CRITICAL: Remove job from pending_jobs (in background, may already be removed when it started running)
             if _pod_manager and job.model:
-                try:
-                    await _pod_manager.remove_pending_job(job_id, job.model)
-                except Exception as e:
-                    logger.debug(f"Failed to remove completed job {job_id} from pending queue: {e}")
+                background_tasks.add_task(
+                    _remove_pending_job_safe,
+                    _pod_manager,
+                    job_id,
+                    job.model,
+                    "completed",
+                )
             
             audit_logger.job_completed(job_id, worker_id)
         
@@ -2477,20 +3982,37 @@ async def job_complete(
     return {"status": "ok", "job_id": job_id}
 
 
+async def _handle_incompatible_pod_destruction(pod_manager, pod_uuid: str, reason: str):
+    """Background task to destroy incompatible pod"""
+    try:
+        await pod_manager.destroy_individual_pod(pod_uuid, reason=reason)
+        logger.info(f"Destroyed incompatible pod {pod_uuid}: {reason}")
+    except Exception as e:
+        logger.error(f"Failed to destroy incompatible pod {pod_uuid}: {e}")
+
+
+async def _remove_pending_job_safe(pod_manager, job_id: str, model: str, status: str):
+    """Background task to safely remove job from pending queue"""
+    try:
+        await pod_manager.remove_pending_job(job_id, model)
+    except Exception as e:
+        logger.debug(f"Failed to remove {status} job {job_id} from pending queue: {e}")
+
+
 async def _send_job_notification(token: str, job_id: str, model: str, success: bool):
     """Background task to send FCM notification"""
     if success:
         await send_fcm_notification(
             token,
             "Job Complete",
-            f"Your {model} job has finished!",
+            f"Your result is ready!",
             {"job_id": job_id, "status": "completed"},
         )
     else:
         await send_fcm_notification(
             token,
             "Job Failed",
-            f"Your {model} job has failed",
+            f"Your job has failed due to internal error, Don't worry, No credits deducted",
             {"job_id": job_id, "status": "failed"},
         )
 
@@ -2518,8 +4040,7 @@ async def _requeue_jobs_after_pod_failure(job_ids: list, model: str):
                 # Check if there are any pods for this model that are being destroyed
                 # (We want to make sure the old pod is gone before creating a new one)
                 active_pods_for_model = [
-                    p for p in _pod_manager.individual_pods.values()
-                    if p.model == model
+                    p for p in _pod_manager.individual_pods.values() if p.model == model
                 ]
             
             if len(active_pods_for_model) == 0:
@@ -2561,11 +4082,13 @@ async def _requeue_jobs_after_pod_failure(job_ids: list, model: str):
                     if job and job.status == JobState.QUEUED.value:
                         if job.error_log is None:
                             job.error_log = []
-                        job.error_log.append({
+                        job.error_log.append(
+                            {
                             "timestamp": utc_naive_now().isoformat(),
                             "state": "requeue_failed",
                             "error": f"Failed to create new pod: {str(e)}",
-                        })
+                            }
+                        )
                         job.updated_at = utc_naive_now()
                 db.commit()
             finally:
@@ -2573,10 +4096,14 @@ async def _requeue_jobs_after_pod_failure(job_ids: list, model: str):
             return
         
         if not new_pod_uuid:
-            logger.error(f"Failed to create new pod for model {model}, jobs will remain in QUEUED state")
+            logger.error(
+                f"Failed to create new pod for model {model}, jobs will remain in QUEUED state"
+            )
             return
         
-        logger.info(f"Created new pod {new_pod_uuid} for model {model}, now dispatching {len(job_ids)} job(s)")
+        logger.info(
+            f"Created new pod {new_pod_uuid} for model {model}, now dispatching {len(job_ids)} job(s)"
+        )
         
         # Wait for worker registration (similar to _wait_for_worker_registration)
         new_worker_id = None
@@ -2586,15 +4113,21 @@ async def _requeue_jobs_after_pod_failure(job_ids: list, model: str):
         while time.time() - start_time < timeout:
             db = SessionLocal()
             try:
-                worker = db.query(Worker).filter(
+                worker = (
+                    db.query(Worker)
+                    .filter(
                     Worker.container_id == new_pod_uuid,
                     Worker.model == model,
                     Worker.status == "ready",
-                ).first()
+                    )
+                    .first()
+                )
                 
                 if worker:
                     new_worker_id = worker.worker_id
-                    logger.info(f"New worker {new_worker_id} registered for pod {new_pod_uuid}")
+                    logger.info(
+                        f"New worker {new_worker_id} registered for pod {new_pod_uuid}"
+                    )
                     break
             finally:
                 db.close()
@@ -2602,7 +4135,9 @@ async def _requeue_jobs_after_pod_failure(job_ids: list, model: str):
             await asyncio.sleep(1)
         
         if not new_worker_id:
-            logger.error(f"Timeout waiting for worker registration on new pod {new_pod_uuid}")
+            logger.error(
+                f"Timeout waiting for worker registration on new pod {new_pod_uuid}"
+            )
             return
         
         # Dispatch all jobs to the new pod
@@ -2623,8 +4158,13 @@ async def _requeue_jobs_after_pod_failure(job_ids: list, model: str):
                     current_state = JobState(job.status)
                     
                     # Skip jobs that are in terminal states or RUNNING
-                    if current_state in [JobState.COMPLETED, JobState.FAILED, JobState.TIMEOUT, 
-                                         JobState.CANCELLED, JobState.RUNNING]:
+                    if current_state in [
+                        JobState.COMPLETED,
+                        JobState.FAILED,
+                        JobState.TIMEOUT,
+                        JobState.CANCELLED,
+                        JobState.RUNNING,
+                    ]:
                         logger.info(
                             f"Skipping requeue for job {job_id}: already in {current_state.value} state"
                         )
@@ -2650,9 +4190,13 @@ async def _requeue_jobs_after_pod_failure(job_ids: list, model: str):
                 success = await _dispatch_to_worker(job_id, new_worker_id)
                 if success:
                     success_count += 1
-                    logger.info(f"Successfully requeued job {job_id} to new pod {new_pod_uuid}")
+                    logger.info(
+                        f"Successfully requeued job {job_id} to new pod {new_pod_uuid}"
+                    )
                 else:
-                    logger.warning(f"Failed to dispatch requeued job {job_id} to new pod {new_pod_uuid}")
+                    logger.warning(
+                        f"Failed to dispatch requeued job {job_id} to new pod {new_pod_uuid}"
+                    )
                 
                 # Small delay between dispatches
                 await asyncio.sleep(0.5)
@@ -2673,6 +4217,7 @@ async def _requeue_jobs_after_pod_failure(job_ids: list, model: str):
 # =============================================================================
 # Admin Endpoints (Optional)
 # =============================================================================
+
 
 @admin_router.get("/workers")
 async def list_workers(
@@ -2695,7 +4240,9 @@ async def list_workers(
         return {
             "workers": [w.to_dict() for w in workers],
             "total": len(workers),
-            "active": sum(1 for w in workers if w.status in ("ready", "busy", "processing")),
+            "active": sum(
+                1 for w in workers if w.status in ("ready", "busy", "processing")
+            ),
             "idle": sum(1 for w in workers if w.status == "idle"),
         }
     finally:
@@ -2751,3 +4298,141 @@ async def unban_ip_endpoint(
     result = await ip_ban_manager.unban_ip(ip)
     return {"status": "ok" if result else "not_found", "ip": ip}
 
+
+# =============================================================================
+# Cost Analytics Endpoints
+# =============================================================================
+
+@admin_router.get("/cost/job/{job_id}")
+async def get_job_cost_endpoint(
+    job_id: str,
+    auth: Dict = Depends(require_any_auth),
+):
+    """
+    Get cost information for a specific job.
+    
+    Returns:
+        Job cost breakdown including processing cost, overhead share, and GPU info
+    """
+    from cost_service import get_job_cost
+    
+    db = SessionLocal()
+    try:
+        cost_info = get_job_cost(db, job_id)
+        if not cost_info:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return cost_info
+    finally:
+        db.close()
+
+
+@admin_router.get("/cost/pod/{pod_uuid}")
+async def get_pod_cost_endpoint(
+    pod_uuid: str,
+    auth: Dict = Depends(require_any_auth),
+):
+    """
+    Get cost information for a specific pod.
+    
+    Returns:
+        Pod cost summary including total cost, jobs processed, and GPU info
+    """
+    from cost_service import get_pod_total_cost
+    
+    db = SessionLocal()
+    try:
+        cost_info = get_pod_total_cost(db, pod_uuid)
+        if not cost_info:
+            raise HTTPException(status_code=404, detail="Pod not found")
+        return cost_info
+    finally:
+        db.close()
+
+
+@admin_router.get("/cost/summary")
+async def get_cost_summary_endpoint(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    model: Optional[str] = None,
+    auth: Dict = Depends(require_any_auth),
+):
+    """
+    Get cost summary for a time period.
+    
+    Query params:
+        start_date: ISO format date string (default: 24 hours ago)
+        end_date: ISO format date string (default: now)
+        model: Optional filter by model name
+    
+    Returns:
+        Aggregated cost metrics for the period
+    """
+    from cost_service import get_cost_summary_for_period
+    from datetime import timedelta
+    
+    db = SessionLocal()
+    try:
+        # Parse dates or use defaults
+        now = utc_naive_now()
+        if start_date:
+            try:
+                start = datetime.fromisoformat(start_date.replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format")
+        else:
+            start = now - timedelta(days=1)
+        
+        if end_date:
+            try:
+                end = datetime.fromisoformat(end_date.replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format")
+        else:
+            end = now
+        
+        summary = get_cost_summary_for_period(db, start, end, model)
+        return summary
+    finally:
+        db.close()
+
+
+@admin_router.get("/cost/by_model")
+async def get_cost_by_model_endpoint(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    auth: Dict = Depends(require_any_auth),
+):
+    """
+    Get cost breakdown by model.
+    
+    Query params:
+        start_date: ISO format date string (optional)
+        end_date: ISO format date string (optional)
+    
+    Returns:
+        List of per-model cost metrics
+    """
+    from cost_service import get_cost_by_model
+    
+    db = SessionLocal()
+    try:
+        # Parse dates
+        start = None
+        end = None
+        
+        if start_date:
+            try:
+                start = datetime.fromisoformat(start_date.replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format")
+        
+        if end_date:
+            try:
+                end = datetime.fromisoformat(end_date.replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format")
+        
+        breakdown = get_cost_by_model(db, start, end)
+        return {"models": breakdown}
+    finally:
+        db.close()

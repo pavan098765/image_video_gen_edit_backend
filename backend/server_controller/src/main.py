@@ -36,9 +36,12 @@ from routes import (
     public_router,
     client_router,
     worker_router,
+    auth_router,
+    ads_router,
     admin_router,
     set_dependencies,
     sync_heartbeat_cache_to_db,  # Background task for heartbeat caching
+    get_cached_last_heartbeat,   # CRITICAL: avoid false stale detections
 )
 from pod_manager import PodManager
 from job_manager import JobManager, job_recovery_task
@@ -241,8 +244,9 @@ class AppState:
         
         heartbeat_stale_secs = self.config.worker.heartbeat_stale_seconds
         idle_timeout_secs = self.config.worker.idle_timeout
-        # INCREASED: 60s interval to reduce load on weak servers (was 30s)
-        sweep_interval = 60
+        # CRITICAL: Sweep interval must be <= minimum adaptive timeout (20s) to catch idle workers promptly
+        # Using 15s ensures workers are destroyed within ~15-35s of exceeding timeout, not 60-80s
+        sweep_interval = 15  # Must be <= minimum adaptive_timeout (20s)
         
         logger.info(
             f"Idle worker reaper: stale>{heartbeat_stale_secs}s, "
@@ -259,13 +263,45 @@ class AppState:
                 
                 try:
                     workers = db.query(Worker).filter(
-                        Worker.status.in_(["ready", "busy", "processing"])
+                        # Include "starting" and "dispatching" for correctness
+                        Worker.status.in_(["ready", "busy", "processing", "starting", "dispatching"])
                     ).all()
                     
                     for w in workers:
                         try:
+                            # ------------------------------------------------------------------
+                            # CRITICAL: Handle workers stuck in "starting" state FIRST.
+                            # Do NOT treat "starting" as stale just because DB heartbeat is missing.
+                            # ------------------------------------------------------------------
+                            if w.status == "starting":
+                                worker_age = (now - w.created_at).total_seconds() if w.created_at else 0
+                                max_starting_time = 300  # 5 minutes
+                                
+                                if worker_age > max_starting_time:
+                                    logger.error(
+                                        f"Worker {w.worker_id} stuck in 'starting' state for {worker_age:.1f}s "
+                                        f"(max: {max_starting_time}s). Destroying pod {w.container_id}"
+                                    )
+                                    if w.container_id and self.pod_manager:
+                                        await self.pod_manager.destroy_individual_pod(
+                                            w.container_id,
+                                            reason=f"Stuck in starting state for {worker_age:.0f}s"
+                                        )
+                                    w.status = "offline"
+                                    db.commit()
+                                else:
+                                    logger.debug(
+                                        f"Worker {w.worker_id} is starting ({worker_age:.1f}s), "
+                                        f"giving time to load models (max {max_starting_time}s)"
+                                    )
+                                continue
+
                             # Stale check
-                            if not w.last_heartbeat or w.last_heartbeat < stale_cutoff:
+                            cached_hb = get_cached_last_heartbeat(w.worker_id)
+                            effective_hb = cached_hb or w.last_heartbeat
+                            
+                            # If cache shows recent heartbeat, worker is NOT stale even if DB lags
+                            if not effective_hb or effective_hb < stale_cutoff:
                                 logger.warning(
                                     f"Worker {w.worker_id} stale, destroying pod {w.container_id}"
                                 )
@@ -305,33 +341,6 @@ class AppState:
                                     logger.debug(
                                         f"Worker {w.worker_id} is {w.status} with {active_jobs} job(s), "
                                         f"skipping idle check"
-                                    )
-                                continue
-                            
-                            # CRITICAL: Handle workers stuck in "starting" state
-                            # Workers in "starting" are loading models - give them time, but not forever
-                            if w.status == "starting":
-                                worker_age = (now - w.created_at).total_seconds() if w.created_at else 0
-                                
-                                # Allow 5 minutes for model loading (models can be large)
-                                max_starting_time = 300  # 5 minutes
-                                
-                                if worker_age > max_starting_time:
-                                    logger.error(
-                                        f"Worker {w.worker_id} stuck in 'starting' state for {worker_age:.1f}s "
-                                        f"(max: {max_starting_time}s). Destroying pod {w.container_id}"
-                                    )
-                                    if w.container_id and self.pod_manager:
-                                        await self.pod_manager.destroy_individual_pod(
-                                            w.container_id,
-                                            reason=f"Stuck in starting state for {worker_age:.0f}s"
-                                        )
-                                    w.status = "offline"
-                                    db.commit()
-                                else:
-                                    logger.debug(
-                                        f"Worker {w.worker_id} is starting ({worker_age:.1f}s), "
-                                        f"giving time to load models (max {max_starting_time}s)"
                                     )
                                 continue
                             
@@ -633,6 +642,8 @@ def create_app() -> FastAPI:
     app.include_router(client_router)
     app.include_router(worker_router)
     app.include_router(admin_router)
+    app.include_router(auth_router)
+    app.include_router(ads_router)
     
     return app
 

@@ -1,4 +1,3 @@
-# qwen_image_edit_2509_inference.py
 # ------------------------------------------------------------------
 # Qwen Image Edit 2509 Inference
 # - Lazy pipeline loading (prevents OOM during FastAPI startup)
@@ -20,10 +19,16 @@ from nunchaku.utils import get_gpu_memory, get_precision
 from upscaler import upscale_image
 
 # --- Auto-merge split safetensors if merge.py exists ---
+# NOTE: Models are always in parts for Docker image size management
+# Merge happens every time on startup before model loading
 try:
+    import time
     from merge import main as merge_main
     print("🔍 Scanning for .safetensors.part-* files...")
+    merge_start = time.time()
     merge_main()
+    merge_time = time.time() - merge_start
+    print(f"✅ Merge completed in {merge_time:.1f}s")
 except Exception as e:
     print(f"⚠️ merge.py auto-merge skipped or failed: {e}")
 
@@ -52,8 +57,11 @@ scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
 # Model path setup
 # -------------------------
 NUM_INFERENCE_STEPS = 8     # lower steps for speed; set to 8 for higher quality
-RANK = 128                  
-precision = get_precision()
+# IMPORTANT:
+# - fp4 is intended for RTX 50-series (Blackwell) in your deployment and uses rank=128 safetensor
+# - int4 is used for non-Blackwell GPUs and uses rank=32 safetensor in your int4 docker image
+precision = (get_precision() or "").lower()
+RANK = 128 if precision == "fp4" else 32
 
 model_filename = f"svdq-{precision}_r{RANK}-qwen-image-edit-2509-lightningv2.0-{NUM_INFERENCE_STEPS}steps.safetensors"
 model_path = os.path.join(
@@ -63,7 +71,10 @@ model_path = os.path.join(
 qwen_repo_path = os.environ.get("QWEN_2509_LOCAL_PATH", "Qwen/Qwen-Image-Edit-2509")
 
 if not os.path.exists(model_path):
-    raise FileNotFoundError(f"❌ Transformer safetensor not found: {model_path}")
+    raise FileNotFoundError(
+        f"❌ Transformer safetensor not found: {model_path} "
+        f"(precision={precision}, rank={RANK}, steps={NUM_INFERENCE_STEPS})"
+    )
 
 # -------------------------
 # Lazy pipeline global (will load on first use)
@@ -77,37 +88,51 @@ def get_pipeline():
     if _pipeline is not None:
         return _pipeline
 
-    print(f"🔧 Loading Nunchaku transformer from {model_path}")
+    import time
+    import gc
+    total_start = time.time()
+    
+    # CRITICAL: Clear GPU cache before loading to maximize free memory
+    # This is especially important for 24GB cards (4090)
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    print(f"🔧 Loading Nunchaku transformer (precision={precision}, rank={RANK}) from {model_path}")
+    transformer_start = time.time()
     transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(model_path)
+    transformer_time = time.time() - transformer_start
+    print(f"✅ Transformer loaded in {transformer_time:.1f}s")
 
     print(f"🔧 Building QwenImageEditPlusPipeline from {qwen_repo_path}")
+    pipeline_start = time.time()
     pipeline = QwenImageEditPlusPipeline.from_pretrained(
         qwen_repo_path,
         transformer=transformer,
         scheduler=scheduler,
         torch_dtype=torch.bfloat16,
     )
+    pipeline_time = time.time() - pipeline_start
+    print(f"✅ Pipeline built in {pipeline_time:.1f}s")
 
     try:
         vram = get_gpu_memory()
     except Exception:
         vram = 8
-    
+
     print(f"🔍 Detected GPU VRAM: {vram:.1f} GB")
 
     # VRAM thresholds:
     # - 48GB+ (5090, A100): High VRAM mode with simple CPU offload
-    # - 24-48GB (4090, 3090): Medium VRAM with more aggressive offloading
+    # - 24GB (4090): Maximum aggressive offload (1 block only, no pin memory)
     # - <24GB: Low VRAM with sequential offload
     if vram >= 40:
         print("🧠 Very High VRAM (>=40GB) → enabling simple CPU offload")
         pipeline.enable_model_cpu_offload()
-    elif vram >= 20:
-        # 24GB cards (4090) need more aggressive memory management
-        print("🧠 Medium VRAM (20-40GB) → enabling aggressive sequential offload")
-        # More blocks on GPU for 24GB, but still use sequential offload
-        num_blocks = 2 if vram >= 24 else 1
-        transformer.set_offload(True, use_pin_memory=True, num_blocks_on_gpu=num_blocks)
+    elif vram >= 24 and vram < 40:
+        # CRITICAL: 24GB cards (4090) need MAXIMUM aggressive memory management
+        # Use only 1 block on GPU at a time, disable pin memory to save RAM
+        print("🧠 24GB VRAM (4090) → enabling MAXIMUM aggressive sequential offload (1 block, no pin memory)")
+        transformer.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=1)
         pipeline._exclude_from_cpu_offload.append("transformer")
         pipeline.enable_sequential_cpu_offload()
         
@@ -117,6 +142,12 @@ def get_pipeline():
             print("✅ XFormers memory efficient attention enabled")
         except Exception as e:
             print(f"ℹ️ XFormers not available: {e}")
+    elif vram >= 20:
+        # 20-24GB (3090, some 4090 variants) - also use aggressive settings
+        print("🧠 Medium VRAM (20-24GB) → enabling aggressive sequential offload")
+        transformer.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=1)
+        pipeline._exclude_from_cpu_offload.append("transformer")
+        pipeline.enable_sequential_cpu_offload()
     else:
         print("🧠 Low VRAM (<20GB) → enabling most aggressive sequential offload")
         transformer.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=1)
@@ -124,7 +155,8 @@ def get_pipeline():
         pipeline.enable_sequential_cpu_offload()
 
     _pipeline = pipeline
-    print("✅ Pipeline initialized successfully")
+    total_time = time.time() - total_start
+    print(f"✅ Pipeline initialized successfully in {total_time:.1f}s (transformer: {transformer_time:.1f}s, pipeline: {pipeline_time:.1f}s)")
     return _pipeline
 
 
@@ -240,7 +272,7 @@ def run_inference_qwen_image_edit_2509(job_id: str, prompt: str, params: Dict[st
     try:
         with torch.inference_mode():
             result = pipeline(**inputs)
-        image = result.images[0]
+            image = result.images[0]
     finally:
         # CRITICAL: Clean up GPU memory after inference
         # This prevents OOM on back-to-back jobs, especially on 24GB cards

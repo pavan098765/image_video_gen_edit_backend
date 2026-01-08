@@ -117,7 +117,7 @@ class JobManager:
         self.job_timeout = timedelta(
             minutes=job_timeout_minutes or int(os.getenv("JOB_TIMEOUT_MINUTES", "30"))
         )
-        self.auto_recover = os.getenv("JOB_AUTO_RECOVER", "true").lower() == "true"
+        self.auto_recover = os.getenv("JOB_AUTO_RECOVER", "false").lower() == "true"
     
     def _validate_transition(
         self,
@@ -521,6 +521,22 @@ class JobManager:
             )
             
             db.commit()
+            
+            # CREDIT REFUND: Refund locked credits when job fails
+            # This happens AFTER the commit to avoid rollback issues
+            # refund_credits_for_job uses its own session for atomicity
+            if job.credits_locked > 0 and job.credits_refunded < job.credits_locked:
+                try:
+                    from credit_service import refund_credits_for_job
+                    # Pass None for db - function uses its own session
+                    success, msg, refunded = refund_credits_for_job(None, job_id, f"job_failed:{error[:50] if error else 'unknown'}")
+                    if success:
+                        logger.info(f"Refunded {refunded} credits for failed job {job_id}")
+                    else:
+                        logger.warning(f"Failed to refund credits for job {job_id}: {msg}")
+                except Exception as refund_error:
+                    logger.error(f"Credit refund error for job {job_id}: {refund_error}")
+            
             db.refresh(job)
             
             logger.error(f"Job {job_id} failed: {error}")
@@ -726,17 +742,36 @@ class JobManager:
                 
                 db.commit()
                 
-                # Re-dispatch (with error handling for pod creation failures)
+                # Re-dispatch via full dispatch flow (not just assign_job!)
+                # CRITICAL: assign_job only assigns in DB, we need _dispatch_job_background
+                # to actually send the HTTP request to the worker's /run endpoint.
                 if self.pod_manager:
                     try:
-                        worker_id = await self.assign_job(job_id, job.model)
+                        # Import here to avoid circular import
+                        import asyncio
+                        import json
+                        from routes import _dispatch_job_background
+                        
+                        # Get mode from job params if available
+                        mode = None
+                        if job.params:
+                            try:
+                                params = json.loads(job.params) if isinstance(job.params, str) else job.params
+                                mode = params.get("mode")
+                            except Exception:
+                                pass
+                        
+                        # Trigger full dispatch flow (assign + HTTP dispatch)
+                        asyncio.create_task(
+                            _dispatch_job_background(job_id, job.model, mode)
+                        )
                         logger.info(
                             f"Recovered job {job_id} (retry {current_retry + 1}), "
-                            f"assigned to {worker_id}"
+                            f"dispatching via background task"
                         )
                     except Exception as e:
                         logger.error(
-                            f"Failed to assign recovered job {job_id}: {e}. "
+                            f"Failed to dispatch recovered job {job_id}: {e}. "
                             f"Job will remain in QUEUED and retry again later."
                         )
                         # Job is already in QUEUED state, so it will be picked up again

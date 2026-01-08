@@ -15,6 +15,7 @@ import os
 import json
 import time
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Tuple, List
 from enum import Enum
@@ -33,12 +34,29 @@ logger = logging.getLogger("quickpod")
 
 
 # =============================================================================
+# Offer Info Dataclass (for cost tracking)
+# =============================================================================
+
+@dataclass
+class OfferInfo:
+    """Information about a QuickPod offer including pricing."""
+    offer_id: int
+    machine_id: int
+    hourly_cost: float  # $/hour
+    gpu_type: str  # e.g., "NVIDIA GeForce RTX 4090"
+    gpu_vram: int  # MB
+    tflops: float
+    memory: float  # GB RAM
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
 QUICKPOD_BASE = os.getenv("QUICKPOD_BASE", "https://api.quickpod.org")
 BASE_URL = "https://api.quickpod.org/update"
 RENTABLE_URL = "https://api.quickpod.org/rentable"
+MYPODS_URL = "https://api.quickpod.org/mypods"
 
 # Retry configuration
 MAX_RETRIES = 3
@@ -143,7 +161,59 @@ class QuickPodManager:
     QuickPod API client with improved error handling and retry logic.
     
     For pod-specific operations, instantiate with pod_uuid.
+    
+    Token caching: Uses a shared class-level token cache keyed by email.
+    All instances with the same email share the same token, avoiding
+    redundant logins. Token auto-refreshes when expired (TTL: 6 hours).
     """
+    
+    # -------------------------------------------------------------------------
+    # CLASS-LEVEL TOKEN CACHE (shared across all instances)
+    # -------------------------------------------------------------------------
+    # Format: {email: {"token": str, "acquired_at": datetime, "ttl": timedelta}}
+    _token_cache: Dict[str, Dict[str, Any]] = {}
+    _token_cache_lock = None  # Will use threading.Lock for thread safety
+    
+    @classmethod
+    def _get_cached_token(cls, email: str) -> Optional[Tuple[str, datetime, timedelta]]:
+        """Get cached token for email if still valid."""
+        import threading
+        if cls._token_cache_lock is None:
+            cls._token_cache_lock = threading.Lock()
+        
+        with cls._token_cache_lock:
+            cache_entry = cls._token_cache.get(email)
+            if not cache_entry:
+                return None
+            
+            token = cache_entry.get("token")
+            acquired_at = cache_entry.get("acquired_at")
+            ttl = cache_entry.get("ttl", timedelta(hours=6))
+            
+            if not token or not acquired_at:
+                return None
+            
+            # Check if expired
+            if (datetime.utcnow() - acquired_at) >= ttl:
+                logger.debug(f"Cached token for {email} expired")
+                return None
+            
+            return (token, acquired_at, ttl)
+    
+    @classmethod
+    def _set_cached_token(cls, email: str, token: str, acquired_at: datetime, ttl: timedelta):
+        """Cache token for email (thread-safe)."""
+        import threading
+        if cls._token_cache_lock is None:
+            cls._token_cache_lock = threading.Lock()
+        
+        with cls._token_cache_lock:
+            cls._token_cache[email] = {
+                "token": token,
+                "acquired_at": acquired_at,
+                "ttl": ttl,
+            }
+            logger.debug(f"Cached token for {email} (TTL: {ttl})")
     
     def __init__(
         self,
@@ -157,10 +227,15 @@ class QuickPodManager:
         self.pod_uuid = pod_uuid
         self.base = api_base or QUICKPOD_BASE
         
-        # Token management
-        self.token: Optional[str] = None
-        self.token_acquired_at: Optional[datetime] = None
-        self.token_ttl = timedelta(hours=6)
+        # Token management - check shared cache first
+        cached = self._get_cached_token(self.email) if self.email else None
+        if cached:
+            self.token, self.token_acquired_at, self.token_ttl = cached
+            logger.debug(f"QuickPodManager using cached token for {self.email}")
+        else:
+            self.token: Optional[str] = None
+            self.token_acquired_at: Optional[datetime] = None
+            self.token_ttl = timedelta(hours=6)
         
         logger.info(f"QuickPodManager initialized for {self.email} with pod_uuid={pod_uuid}")
     
@@ -171,6 +246,8 @@ class QuickPodManager:
     def login(self) -> str:
         """
         Authenticate with QuickPod and acquire a token.
+        
+        Stores token in shared class-level cache for reuse by other instances.
         
         Returns:
             Authentication token
@@ -192,7 +269,7 @@ class QuickPodManager:
             
             self.token_acquired_at = datetime.utcnow()
             
-            # Parse expiry if provided
+            # Parse expiry if provided (QuickPod tokens typically valid for ~24h)
             expires_at = data.get("expires_at") or data.get("expiry")
             if expires_at:
                 try:
@@ -200,7 +277,16 @@ class QuickPodManager:
                 except Exception:
                     pass
             
-            logger.info("QuickPod login successful, token acquired")
+            # IMPORTANT: Store in shared cache for other instances to reuse
+            if self.email:
+                self._set_cached_token(
+                    self.email, 
+                    self.token, 
+                    self.token_acquired_at, 
+                    self.token_ttl
+                )
+            
+            logger.info("QuickPod login successful, token acquired and cached")
             return self.token
             
         except RequestException as e:
@@ -208,10 +294,21 @@ class QuickPodManager:
             raise QuickPodAPIError("login", reason=str(e), cause=e)
     
     def _is_token_valid(self) -> bool:
-        """Check if current token is still valid"""
-        if not self.token or not self.token_acquired_at:
+        """Check if current token is still valid (instance or cached)"""
+        # First check instance token
+        if self.token and self.token_acquired_at:
+            if (datetime.utcnow() - self.token_acquired_at) < self.token_ttl:
+                return True
+        
+        # Check shared cache (another instance might have refreshed)
+        if self.email:
+            cached = self._get_cached_token(self.email)
+            if cached:
+                self.token, self.token_acquired_at, self.token_ttl = cached
+                logger.debug(f"Loaded token from shared cache for {self.email}")
+                return True
+        
             return False
-        return (datetime.utcnow() - self.token_acquired_at) < self.token_ttl
     
     def _auth_headers(self, force_refresh: bool = False) -> Dict[str, str]:
         """Get authorization headers, refreshing token if needed"""
@@ -389,12 +486,17 @@ class QuickPodManager:
             raise RuntimeError("No pod_uuid set. Cannot stop pod.")
         
         logger.info(f"Stopping pod {self.pod_uuid}")
-        return self._make_request(
+        data = self._make_request(
             "GET",
             "update/stoppod",
             params={"pod_uuid": self.pod_uuid},
             timeout=POD_OPERATION_TIMEOUT,
         )
+        # Some QuickPod endpoints return {"status": "..."} without "error".
+        # Treat non-success statuses as failures so the caller doesn't log false success.
+        if isinstance(data, dict) and data.get("status") and str(data.get("status")).lower() != "success":
+            raise PodDestroyError(self.pod_uuid, reason=f"Stop pod failed: {data}")
+        return data
     
     def restart_pod(self) -> Dict[str, Any]:
         """Restart a pod"""
@@ -409,29 +511,162 @@ class QuickPodManager:
             timeout=POD_OPERATION_TIMEOUT,
         )
     
-    def destroy_pod(self) -> Dict[str, Any]:
+    def get_my_pods(self) -> Optional[List[Dict[str, Any]]]:
         """
-        Destroy and release a pod.
+        Fetch list of all current pods from /mypods endpoint.
+        
+        Uses authentication like other QuickPod API endpoints.
+        
+        Used to verify pod destruction - if pod is not in this list or has
+        destroyed=true, it's confirmed destroyed.
+        
+        Returns:
+            List of pod objects, or None if API call failed
+        """
+        try:
+            # Use _make_request which handles authentication automatically
+            # Pass empty params={} to avoid default pod_uuid param being added
+            data = self._make_request(
+                "GET",
+                "mypods",  # Will be prefixed with self.base (https://api.quickpod.org)
+                params={},  # Explicitly empty - /mypods doesn't need pod_uuid
+                timeout=DEFAULT_TIMEOUT,
+            )
+            if isinstance(data, list):
+                return data
+            # Some responses wrap the list in an object
+            if isinstance(data, dict) and "pods" in data:
+                return data["pods"]
+            logger.warning(f"Unexpected mypods response format: {type(data)}")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to fetch my_pods list: {e}")
+            return None
+    
+    def is_pod_destroyed(self, pod_uuid: Optional[str] = None) -> bool:
+        """
+        Verify if a pod is actually destroyed by checking /mypods.
+        
+        A pod is considered destroyed if:
+        - It doesn't exist in the /mypods response
+        - OR it exists with destroyed=true
+        - OR it exists with state='exited' and intended_state='stopped'
+        
+        Args:
+            pod_uuid: Pod UUID to check (defaults to self.pod_uuid)
+            
+        Returns:
+            True if pod is confirmed destroyed, False if still active or API failed
+        """
+        check_uuid = pod_uuid or self.pod_uuid
+        if not check_uuid:
+            return True  # No pod to check
+        
+        try:
+            pods = self.get_my_pods()
+            
+            # CRITICAL: If API call failed (returned None), assume NOT destroyed to be safe
+            # This prevents false positives where we think a pod is destroyed when really
+            # we just couldn't check (e.g., auth failure, network error)
+            if pods is None:
+                logger.warning(f"Cannot verify pod {check_uuid} destruction - API call failed, assuming NOT destroyed")
+                return False
+            
+            for pod in pods:
+                # Match by altname (which contains pod_uuid) or docker_ID
+                pod_id = pod.get("altname", "")
+                if check_uuid in pod_id or pod.get("docker_ID", "") == check_uuid:
+                    # Found the pod - check if it's destroyed
+                    if pod.get("destroyed", False):
+                        logger.info(f"Pod {check_uuid} confirmed destroyed (destroyed=true)")
+                        return True
+                    state = str(pod.get("State", "")).lower()
+                    intended = str(pod.get("intended_state", "")).lower()
+                    if state == "exited" and intended in ("stopped", "destroyed"):
+                        logger.info(f"Pod {check_uuid} confirmed destroyed (state=exited, intended={intended})")
+                        return True
+                    # Pod still exists and is active
+                    logger.warning(f"Pod {check_uuid} still active: state={state}, intended={intended}")
+                    return False
+            
+            # Pod not found in list = destroyed (only valid if API call succeeded)
+            logger.info(f"Pod {check_uuid} confirmed destroyed (not in mypods list)")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Failed to verify pod {check_uuid} destruction: {e}")
+            # On error, assume not destroyed to be safe
+            return False
+    
+    def destroy_pod(self, verify: bool = True, max_verify_attempts: int = 3) -> Dict[str, Any]:
+        """
+        Destroy and release a pod with verification.
+        
+        Args:
+            verify: If True, verify destruction via /mypods endpoint
+            max_verify_attempts: Max retry attempts if verification fails
         
         Returns:
             API response
             
         Raises:
-            PodDestroyError: If destruction fails
+            PodDestroyError: If destruction fails or cannot be verified
         """
         if not self.pod_uuid:
             raise RuntimeError("No pod_uuid set. Cannot destroy pod.")
         
         logger.info(f"Destroying pod {self.pod_uuid}")
-        try:
-            return self._make_request(
-                "GET",
-                "update/destroypod",
-                params={"pod_uuid": self.pod_uuid},
-                timeout=POD_OPERATION_TIMEOUT,
-            )
-        except Exception as e:
+        last_error = None
+        
+        for attempt in range(max_verify_attempts):
+            try:
+                    data = self._make_request(
+                    "GET",
+                    "update/destroypod",
+                    params={"pod_uuid": self.pod_uuid},
+                    timeout=POD_OPERATION_TIMEOUT,
+                )
+                    # Some QuickPod endpoints return {"status": "..."} without "error".
+                    # Treat non-success statuses as failures so the controller doesn't log false success.
+                    if isinstance(data, dict) and data.get("status") and str(data.get("status")).lower() != "success":
+                        raise PodDestroyError(self.pod_uuid, reason=f"Destroy pod failed: {data}")
+                    
+                    # Verify destruction if requested
+                    if verify:
+                        # Brief delay before verification to allow QuickPod to process
+                        time.sleep(1.0)
+                        if self.is_pod_destroyed():
+                            logger.info(f"Pod {self.pod_uuid} destruction verified via /mypods")
+                            return data
+                        else:
+                            # Pod still exists - retry destroy
+                            if attempt < max_verify_attempts - 1:
+                                logger.warning(
+                                    f"Pod {self.pod_uuid} destroy returned success but pod still active. "
+                                    f"Retrying ({attempt + 1}/{max_verify_attempts})..."
+                                )
+                                time.sleep(2.0 * (attempt + 1))  # Backoff
+                                continue
+                            else:
+                                raise PodDestroyError(
+                                    self.pod_uuid, 
+                                    reason=f"Destroy returned success but pod still active after {max_verify_attempts} attempts"
+                                )
+                    else:
+                        return data
+                        
+            except PodDestroyError:
+                    raise
+            except Exception as e:
+                    last_error = e
+                    if attempt < max_verify_attempts - 1:
+                        logger.warning(f"Destroy attempt {attempt + 1} failed: {e}, retrying...")
+                        time.sleep(2.0 * (attempt + 1))
+                        continue
             raise PodDestroyError(self.pod_uuid, reason=str(e), cause=e)
+        
+        # Should not reach here, but handle edge case
+        raise PodDestroyError(self.pod_uuid, reason=f"Max attempts reached: {last_error}")
     
     def delete_pod(self, *args, **kwargs) -> Dict[str, Any]:
         """Alias for destroy_pod (backward compatibility)"""
@@ -552,11 +787,19 @@ class QuickPodManager:
                 return True
             return False
         
+        def has_sufficient_memory(o: Dict) -> bool:
+            """Require at least 30GB RAM to handle model loading + inference."""
+            try:
+                return float(o.get("memory", 0)) > 30
+            except (ValueError, TypeError):
+                return False
+        
         def is_valid_offer(o: Dict) -> bool:
             return (
                 not is_multi_gpu_offer(o) and
                 has_valid_tflops(o) and
                 matches_gpu_name(o) and
+                has_sufficient_memory(o) and  # Require >30GB RAM
                 not is_blacklisted(o)  # Filter out blacklisted machines
             )
         
@@ -616,6 +859,158 @@ class QuickPodManager:
         
         logger.error("No suitable offers found")
         return None, None
+    
+    def get_best_offer_with_details(
+        self,
+        preferred_machine_id: Optional[int] = None,
+        min_tflops: float = 0,
+        allowed_gpu_names: Optional[List[str]] = None,
+        min_gpu_count: int = 1,
+        blacklisted_machines: Optional[List[str]] = None,
+    ) -> Optional[OfferInfo]:
+        """
+        Find the best available machine offer with full details including pricing.
+        
+        Same logic as get_best_offer but returns OfferInfo with hourly_cost.
+        
+        Returns:
+            OfferInfo with full details, or None if no match
+        """
+        blacklist_set = set(str(m) for m in (blacklisted_machines or []))
+        try:
+            offers = self.get_rentable_machines()
+        except Exception as e:
+            logger.error(f"Failed to fetch offers: {e}")
+            return None
+        
+        if not offers:
+            logger.warning("No offers available")
+            return None
+        
+        # Helper functions (same as get_best_offer)
+        def extract_offer_id(o: Dict) -> Optional[int]:
+            return o.get("offer_id") or o.get("id")
+        
+        def extract_machine_id(o: Dict) -> Optional[int]:
+            for key in ("machines_id", "machine_id", "machineId"):
+                if key in o and o[key] is not None:
+                    try:
+                        return int(o[key])
+                    except (ValueError, TypeError):
+                        pass
+            return None
+        
+        def is_multi_gpu_offer(o: Dict) -> bool:
+            name = str(o.get("offer_name", "")).upper()
+            if name.startswith(("2X", "3X", "4X")):
+                return True
+            gpu_indexes = str(o.get("gpu_indexes", "") or "")
+            tokens = [t for t in gpu_indexes.split("|") if t.strip()]
+            return len(tokens) > 1
+        
+        def extract_price(o: Dict) -> float:
+            try:
+                return float(o.get("hourly_cost", 1e9))
+            except (ValueError, TypeError):
+                return 1e9
+        
+        def has_valid_tflops(o: Dict) -> bool:
+            try:
+                return float(o.get("tflops", 0)) >= min_tflops
+            except (ValueError, TypeError):
+                return False
+        
+        def matches_gpu_name(o: Dict) -> bool:
+            if not allowed_gpu_names:
+                return True
+            offer_name = str(o.get("offer_name", "")).upper()
+            for gpu in allowed_gpu_names:
+                if gpu.upper() in offer_name:
+                    return True
+            return False
+        
+        def is_blacklisted(o: Dict) -> bool:
+            mid = extract_machine_id(o)
+            if mid and str(mid) in blacklist_set:
+                return True
+            return False
+        
+        def has_sufficient_memory(o: Dict) -> bool:
+            try:
+                return float(o.get("memory", 0)) > 30
+            except (ValueError, TypeError):
+                return False
+        
+        def is_valid_offer(o: Dict) -> bool:
+            return (
+                not is_multi_gpu_offer(o) and
+                has_valid_tflops(o) and
+                matches_gpu_name(o) and
+                has_sufficient_memory(o) and
+                not is_blacklisted(o)
+            )
+        
+        def to_offer_info(o: Dict) -> OfferInfo:
+            return OfferInfo(
+                offer_id=extract_offer_id(o) or 0,
+                machine_id=extract_machine_id(o) or 0,
+                hourly_cost=extract_price(o),
+                gpu_type=o.get("gpu_type", o.get("offer_name", "Unknown")),
+                gpu_vram=int(o.get("gpu_vram", 0)),
+                tflops=float(o.get("tflops", 0)),
+                memory=float(o.get("memory", 0)),
+            )
+        
+        # 1. Try preferred machine
+        if preferred_machine_id:
+            filtered = [
+                o for o in offers
+                if extract_machine_id(o) == int(preferred_machine_id)
+                and is_valid_offer(o)
+            ]
+            if filtered:
+                offer = filtered[0]
+                info = to_offer_info(offer)
+                logger.info(f"Using preferred machine {info.machine_id}, offer_id={info.offer_id}, hourly=${info.hourly_cost:.3f}")
+                return info
+        
+        # 2. Try env machine fallback
+        for env_key in ("MACHINE_ID", "WARM_MACHINE_ID"):
+            env_val = os.getenv(env_key)
+            if env_val:
+                try:
+                    machine_id = int(env_val)
+                    filtered = [
+                        o for o in offers
+                        if extract_machine_id(o) == machine_id
+                        and is_valid_offer(o)
+                    ]
+                    if filtered:
+                        info = to_offer_info(filtered[0])
+                        logger.info(f"Using {env_key}={info.machine_id}, offer_id={info.offer_id}, hourly=${info.hourly_cost:.3f}")
+                        return info
+                except ValueError:
+                    pass
+        
+        # 3. Fallback by GPU tier
+        gpu_tiers = ["5090", "4090", "4080TI", "4080", "4070"]
+        for tier in gpu_tiers:
+            tier_offers = [
+                o for o in offers
+                if tier in str(o.get("offer_name", "")).upper()
+                and is_valid_offer(o)
+            ]
+            tier_offers.sort(key=extract_price)
+            if tier_offers:
+                info = to_offer_info(tier_offers[0])
+                logger.info(
+                    f"Using fallback: GPU={tier}, offer_id={info.offer_id}, "
+                    f"hourly=${info.hourly_cost:.3f}, gpu={info.gpu_type}"
+                )
+                return info
+        
+        logger.error("No suitable offers found")
+        return None
     
     def create_pod(
         self,
