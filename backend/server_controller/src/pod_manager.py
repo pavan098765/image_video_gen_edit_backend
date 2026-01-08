@@ -71,12 +71,14 @@ MAX_SAME_JOB_PER_POD = int(os.getenv("MAX_SAME_JOB_PER_POD", "5"))
 @dataclass
 class PodInfo:
     """Internal pod tracking information"""
+    # Required fields (no defaults) - must come first
     pod_uuid: str
     model: str
     mode: Optional[str]
     status: PodStatus
     created_at: datetime
     last_active: datetime
+    # Optional fields with defaults
     queue_size: int = 0
     error_count: int = 0
     machine_id: Optional[str] = None
@@ -87,6 +89,10 @@ class PodInfo:
     job_start_times: Dict[str, datetime] = field(default_factory=dict)
     is_warm_pod: bool = False
     variant: Optional[str] = None
+    # Cost tracking fields
+    hourly_cost: float = 0.0  # $/hour from offer
+    gpu_type: str = ""  # e.g., "NVIDIA GeForce RTX 4090"
+    offer_id: int = 0
 
 
 # =============================================================================
@@ -1334,7 +1340,7 @@ class PodManager:
         model: str,
         mode: Optional[str] = None,
     ) -> Optional[str]:
-        """Create an individual pod using simple template selection"""
+        """Create an individual pod using simple template selection with cost tracking"""
         await self._ensure_global_login()
         
         template_uuid = self.template_uuids.get(model)
@@ -1348,27 +1354,31 @@ class PodManager:
         disk_size = self.template_disk_sizes.get(model, 50)
         
         try:
-            # Get best offer
-            offer_id, machine_id = await asyncio.to_thread(
-                self.global_qp.get_best_offer
+            # Get best offer with full details including pricing
+            offer_info = await asyncio.to_thread(
+                self.global_qp.get_best_offer_with_details
             )
             
-            if not offer_id:
+            if not offer_info:
                 raise NoAvailableMachinesError(model)
             
             # Create pod
             pod_uuid = await self.lifecycle.create_pod(
-                offer_id=offer_id,
+                offer_id=offer_info.offer_id,
                 template_uuid=template_uuid,
                 disk_size=disk_size,
                 model=model,
                 mode=mode,
-                machine_id=str(machine_id) if machine_id else None,
+                machine_id=str(offer_info.machine_id) if offer_info.machine_id else None,
             )
             
             if pod_uuid:
                 await self._register_pod_locally(
-                    pod_uuid, model, mode, str(machine_id) if machine_id else None
+                    pod_uuid, model, mode,
+                    str(offer_info.machine_id) if offer_info.machine_id else None,
+                    hourly_cost=offer_info.hourly_cost,
+                    gpu_type=offer_info.gpu_type,
+                    offer_id=offer_info.offer_id,
                 )
             
             return pod_uuid
@@ -1445,9 +1455,9 @@ class PodManager:
                         # Get current ACTIVE blacklisted machines (excludes expired)
                         blacklisted = self.blacklist.get_active_blacklist()
                         
-                        # Get offer for this machine (passing blacklist to filter at source)
-                        offer_id, actual_mid = await asyncio.to_thread(
-                            self.global_qp.get_best_offer,
+                        # Get offer with full details including pricing
+                        offer_info = await asyncio.to_thread(
+                            self.global_qp.get_best_offer_with_details,
                             int(mid),
                             min_tflops,
                             allowed_gpus,
@@ -1455,13 +1465,13 @@ class PodManager:
                             blacklisted,  # Pass active blacklist to get_best_offer
                         )
                         
-                        if not offer_id:
+                        if not offer_info:
                             logger.debug(f"No offer available for machine {mid}")
                             continue
                         
                         # Double-check: Verify the returned machine is not blacklisted
                         # (Belt and suspenders approach)
-                        final_machine_id = str(actual_mid or mid)
+                        final_machine_id = str(offer_info.machine_id or mid)
                         if self.is_machine_bad(final_machine_id):
                             logger.warning(
                                 f"Skipping machine {final_machine_id} returned by get_best_offer: "
@@ -1469,15 +1479,17 @@ class PodManager:
                             )
                             continue
                         
-                        # Create pod
+                        # Create pod with cost tracking info
                         pod_uuid = await self._try_create_pod_on_machine(
                             final_machine_id,
                             model,
                             mode,
                             variant,
-                            offer_id,
+                            offer_info.offer_id,
                             template_uuid,
                             disk_size,
+                            hourly_cost=offer_info.hourly_cost,
+                            gpu_type=offer_info.gpu_type,
                         )
                         
                         if pod_uuid:
@@ -1513,8 +1525,9 @@ class PodManager:
                     req = self.model_requirements.get(model, {})
                     min_tflops = req.get("min_tflops", 0)
                     
-                    offer_id, machine_id = await asyncio.to_thread(
-                        self.global_qp.get_best_offer,
+                    # Get offer with full details including pricing
+                    offer_info = await asyncio.to_thread(
+                        self.global_qp.get_best_offer_with_details,
                         None,  # no preferred machine
                         min_tflops,
                         allowed_gpus,  # Use variant-specific GPUs!
@@ -1522,7 +1535,7 @@ class PodManager:
                         blacklisted,  # Pass blacklist to get_best_offer
                     )
                     
-                    if not offer_id:
+                    if not offer_info:
                         logger.debug(
                             f"Global fallback: no offer for variant={variant}, "
                             f"allowed_gpus={allowed_gpus}"
@@ -1530,9 +1543,9 @@ class PodManager:
                         continue
                     
                     # Double-check: Verify the machine is not blacklisted
-                    if machine_id and self.is_machine_bad(str(machine_id)):
+                    if offer_info.machine_id and self.is_machine_bad(str(offer_info.machine_id)):
                         logger.error(
-                            f"Global fallback returned blacklisted machine {machine_id}! "
+                            f"Global fallback returned blacklisted machine {offer_info.machine_id}! "
                             f"This should not happen - blacklist was passed."
                         )
                         continue
@@ -1547,21 +1560,24 @@ class PodManager:
                     if template_uuid:
                         logger.info(
                             f"Global fallback: creating pod with variant={variant}, "
-                            f"machine={machine_id}, template={template_uuid}"
+                            f"machine={offer_info.machine_id}, template={template_uuid}, "
+                            f"hourly_cost=${offer_info.hourly_cost:.3f}"
                         )
                         pod_uuid = await self._try_create_pod_on_machine(
-                            str(machine_id) if machine_id else "unknown",
+                            str(offer_info.machine_id) if offer_info.machine_id else "unknown",
                             model,
                             mode,
                             variant,  # Use the correct variant!
-                            offer_id,
+                            offer_info.offer_id,
                             template_uuid,
                             disk_size,
+                            hourly_cost=offer_info.hourly_cost,
+                            gpu_type=offer_info.gpu_type,
                         )
                         
                         if pod_uuid:
                             # Record fallback event for autoscaler
-                            await self._record_fallback_event(model, str(machine_id))
+                            await self._record_fallback_event(model, str(offer_info.machine_id))
                             return pod_uuid
                             
                 except Exception as e:
@@ -1593,6 +1609,8 @@ class PodManager:
         offer_id: int,
         template_uuid: str,
         disk_size: int,
+        hourly_cost: float = 0.0,
+        gpu_type: str = "",
     ) -> Optional[str]:
         """
         Try to create a pod on a specific machine.
@@ -1601,10 +1619,12 @@ class PodManager:
         - QuickPod API errors (fatal vs transient)
         - Pod startup timeout
         - Machine blacklisting
+        - Cost tracking (hourly_cost, gpu_type)
         """
         logger.info(
             f"Attempting pod creation: model={model}, variant={variant}, "
-            f"machine={machine_id}, template={template_uuid}"
+            f"machine={machine_id}, template={template_uuid}, "
+            f"hourly_cost=${hourly_cost:.3f}"
         )
         
         # Final safety check: never create pod on blacklisted machine
@@ -1638,8 +1658,13 @@ class PodManager:
             await self.mark_machine_bad(machine_id)
             return None
         
-        # Register pod locally
-        await self._register_pod_locally(pod_uuid, model, mode, machine_id, variant)
+        # Register pod locally with cost tracking info
+        await self._register_pod_locally(
+            pod_uuid, model, mode, machine_id, variant,
+            hourly_cost=hourly_cost,
+            gpu_type=gpu_type,
+            offer_id=offer_id,
+        )
         
         # Wait for pod to be ready
         start = time.time()
@@ -1702,8 +1727,11 @@ class PodManager:
         mode: Optional[str],
         machine_id: Optional[str],
         variant: Optional[str] = None,
+        hourly_cost: float = 0.0,
+        gpu_type: str = "",
+        offer_id: int = 0,
     ):
-        """Register a pod in local tracking"""
+        """Register a pod in local tracking with cost info"""
         async with self._lock:
             self.individual_pods[pod_uuid] = PodInfo(
                 pod_uuid=pod_uuid,
@@ -1715,6 +1743,9 @@ class PodManager:
                 machine_id=machine_id,
                 variant=variant,
                 meta={"variant": variant},
+                hourly_cost=hourly_cost,
+                gpu_type=gpu_type,
+                offer_id=offer_id,
             )
             
             self.individual_pod_managers[pod_uuid] = QuickPodManager(
@@ -1790,17 +1821,25 @@ class PodManager:
         
         CRITICAL: Before destroying, recover any RUNNING jobs on this pod
         so users don't see jobs stuck in "processing" state forever.
+        
+        Also finalizes pod costs and distributes overhead across all jobs that ran on this pod.
         """
         from db import SessionLocal, Worker, Job
         from job_manager import JobState
         import importlib
         
-        # Capture pod machine_id (for blacklisting) BEFORE removing from tracking
+        # Capture pod info (for blacklisting and cost tracking) BEFORE removing from tracking
         machine_id: Optional[str] = None
+        pod_created_at: Optional[datetime] = None
+        pod_hourly_cost: float = 0.0
+        pod_gpu_type: str = ""
         async with self._lock:
             pi = self.individual_pods.get(pod_uuid)
             if pi:
                 machine_id = pi.machine_id
+                pod_created_at = pi.created_at
+                pod_hourly_cost = pi.hourly_cost
+                pod_gpu_type = pi.gpu_type
         
         # CRITICAL: Recover any running jobs BEFORE destroying the pod
         # This prevents jobs from being lost when a pod dies
@@ -1887,6 +1926,33 @@ class PodManager:
         
         # Destroy via lifecycle manager
         success = await self.lifecycle.destroy_pod(pod_uuid, reason=reason)
+        
+        # Finalize pod costs and distribute overhead across all jobs that ran on this pod
+        if success and pod_created_at and pod_hourly_cost > 0:
+            try:
+                from cost_service import finalize_pod_costs
+                
+                pod_destroyed_at = datetime.utcnow()
+                
+                with SessionLocal() as db:
+                    cost_summary = finalize_pod_costs(
+                        db=db,
+                        pod_uuid=pod_uuid,
+                        pod_created_at=pod_created_at,
+                        pod_destroyed_at=pod_destroyed_at,
+                        gpu_hourly_rate=pod_hourly_cost,
+                        gpu_type=pod_gpu_type,
+                        distribution_method="proportional",  # Distribute overhead by job runtime
+                    )
+                    
+                    if cost_summary:
+                        logger.info(
+                            f"Pod {pod_uuid} cost finalized: "
+                            f"${cost_summary.total_cost_usd:.6f} total, "
+                            f"{cost_summary.jobs_processed} jobs processed"
+                        )
+            except Exception as e:
+                logger.error(f"Failed to finalize pod costs for {pod_uuid}: {e}")
 
         # If pod died due to infrastructure/network issues, blacklist the machine to avoid immediate reuse.
         # (Do NOT blacklist for normal idle scale-down.)

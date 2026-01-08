@@ -36,6 +36,8 @@ from routes import (
     public_router,
     client_router,
     worker_router,
+    auth_router,
+    ads_router,
     admin_router,
     set_dependencies,
     sync_heartbeat_cache_to_db,  # Background task for heartbeat caching
@@ -640,6 +642,8 @@ def create_app() -> FastAPI:
     app.include_router(client_router)
     app.include_router(worker_router)
     app.include_router(admin_router)
+    app.include_router(auth_router)
+    app.include_router(ads_router)
     
     return app
 

@@ -1,0 +1,318 @@
+2026-01-05 10:13:35,237 | [32mINFO[0m | middleware:dispatch:383 | POST /submit - 200 - 1.132s - IP: 152.58.47.188
+2026-01-05 10:13:35,246 | [32mINFO[0m | pod_manager:_dispatch_machine_based:1214 | No existing pods for model qwen_image_edit_2509, creating new pod for job 86fd0251-cff4-45df-b765-9dfb29ecfa3d
+2026-01-05 10:13:35,247 | [32mINFO[0m | pod_manager:get_variant_plan:812 | Variant plan for qwen_image_edit_2509: [('fp4', ['5090']), ('int4', ['4090', '4080', '4070'])]
+2026-01-05 10:13:35,247 | [32mINFO[0m | pod_manager:create_machine_based_pod:1414 | Candidates for qwen_image_edit_2509 (from cache, blacklist-filtered): ['14751', '14762', '283', '14780', '619', '275', '412', '14839', '300', '299', '461']
+2026-01-05 10:13:35,247 | [32mINFO[0m | pod_manager:create_machine_based_pod:1423 | Trying variant=fp4 for model=qwen_image_edit_2509, allowed_gpus=['5090']
+2026-01-05 10:13:35,683 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14751 not available
+2026-01-05 10:13:35,684 | [32mINFO[0m | quickpod:get_best_offer:620 | Using fallback: GPU=5090, offer_id=4229299, price=0.300, tflops=137, machine_id=14780
+2026-01-05 10:13:35,684 | [32mINFO[0m | pod_manager:_try_create_pod_on_machine:1605 | Attempting pod creation: model=qwen_image_edit_2509, variant=fp4, machine=14780, template=2c3597b1-e70a-44cd-8d68-ba7f8ecf035e
+2026-01-05 10:13:35,685 | [32mINFO[0m | pod_manager:create_pod:137 | Creating pod: model=qwen_image_edit_2509, variant=fp4, template=2c3597b1-e70a-44cd-8d68-ba7f8ecf035e, offer=4229299
+2026-01-05 10:13:35,685 | [32mINFO[0m | quickpod:create_pod:656 | Creating pod: offer=4229299, template=2c3597b1-e70a-44cd-8d68-ba7f8ecf035e, disk=85GB
+2026-01-05 10:13:37,553 | [32mINFO[0m | quickpod:create_pod:680 | Pod created successfully: bbef7db5-8543-4276-a0d1-05c263da681d
+2026-01-05 10:13:37,555 | [32mINFO[0m | pod_manager:create_pod:161 | Pod created: bbef7db5-8543-4276-a0d1-05c263da681d on machine 14780
+2026-01-05 10:13:37,555 | [32mINFO[0m | quickpod:__init__:165 | QuickPodManager initialized for pavanalur3@gmail.com with pod_uuid=bbef7db5-8543-4276-a0d1-05c263da681d
+2026-01-05 10:13:45,957 | [32mINFO[0m | middleware:dispatch:383 | GET /job_status - 200 - 0.007s - IP: 152.58.47.188
+2026-01-05 10:14:10,921 | [32mINFO[0m | middleware:dispatch:383 | POST /submit - 200 - 5.001s - IP: 152.58.28.40
+2026-01-05 10:14:10,931 | [32mINFO[0m | pod_manager:_dispatch_machine_based:1186 | Found STARTING pod bbef7db5-8543-4276-a0d1-05c263da681d for model qwen_image_edit_2509, will wait instead of creating new pod for job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87
+2026-01-05 10:14:10,931 | [32mINFO[0m | pod_manager:_dispatch_machine_based:1194 | Job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87 waiting for existing STARTING pod bbef7db5-8543-4276-a0d1-05c263da681d
+2026-01-05 10:14:24,809 | [32mINFO[0m | middleware:dispatch:383 | POST /submit - 200 - 3.318s - IP: 152.58.28.40
+2026-01-05 10:14:24,825 | [32mINFO[0m | pod_manager:_dispatch_machine_based:1186 | Found STARTING pod bbef7db5-8543-4276-a0d1-05c263da681d for model qwen_image_edit_2509, will wait instead of creating new pod for job f9a186b2-63f3-41e2-b9f8-94392631711f
+2026-01-05 10:14:24,826 | [32mINFO[0m | pod_manager:_dispatch_machine_based:1194 | Job f9a186b2-63f3-41e2-b9f8-94392631711f waiting for existing STARTING pod bbef7db5-8543-4276-a0d1-05c263da681d
+2026-01-05 10:15:37,614 | [31mERROR[0m | pod_manager:_try_create_pod_on_machine:1692 | Pod bbef7db5-8543-4276-a0d1-05c263da681d startup timeout (no worker registration), destroying
+2026-01-05 10:15:37,615 | [32mINFO[0m | pod_manager:destroy_pod:237 | Destroying pod bbef7db5-8543-4276-a0d1-05c263da681d: Startup timeout - no worker registration
+2026-01-05 10:15:37,615 | [32mINFO[0m | quickpod:__init__:165 | QuickPodManager initialized for pavanalur3@gmail.com with pod_uuid=bbef7db5-8543-4276-a0d1-05c263da681d
+2026-01-05 10:15:37,615 | [32mINFO[0m | quickpod:stop_pod:391 | Stopping pod bbef7db5-8543-4276-a0d1-05c263da681d
+2026-01-05 10:15:38,344 | [32mINFO[0m | quickpod:login:203 | QuickPod login successful, token acquired
+2026-01-05 10:15:41,410 | [32mINFO[0m | quickpod:destroy_pod:430 | Destroying pod bbef7db5-8543-4276-a0d1-05c263da681d
+2026-01-05 10:15:42,696 | [32mINFO[0m | pod_manager:destroy_pod:262 | Pod bbef7db5-8543-4276-a0d1-05c263da681d destroyed successfully
+2026-01-05 10:15:42,696 | [33mWARNING[0m | pod_manager:mark_machine_bad:846 | ðŸš« BLACKLISTING machine 14780 for 600s due to failure
+2026-01-05 10:15:42,696 | [33mWARNING[0m | pod_manager:blacklist:450 | Machine 14780 blacklisted for 600s
+2026-01-05 10:15:42,698 | [32mINFO[0m | pod_manager:mark_machine_bad:857 | Currently blacklisted machines: ['14780']
+2026-01-05 10:15:42,698 | [33mWARNING[0m | pod_manager:mark_machine_bad:846 | ðŸš« BLACKLISTING machine 14780 for 600s due to failure
+2026-01-05 10:15:42,698 | [33mWARNING[0m | pod_manager:blacklist:450 | Machine 14780 blacklisted for 600s
+2026-01-05 10:15:42,700 | [32mINFO[0m | pod_manager:mark_machine_bad:857 | Currently blacklisted machines: ['14780']
+2026-01-05 10:15:43,113 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14762 not available
+2026-01-05 10:15:43,114 | [32mINFO[0m | quickpod:get_best_offer:620 | Using fallback: GPU=5090, offer_id=52523, price=0.390, tflops=136, machine_id=619
+2026-01-05 10:15:43,115 | [32mINFO[0m | pod_manager:_try_create_pod_on_machine:1605 | Attempting pod creation: model=qwen_image_edit_2509, variant=fp4, machine=619, template=2c3597b1-e70a-44cd-8d68-ba7f8ecf035e
+2026-01-05 10:15:43,115 | [32mINFO[0m | pod_manager:create_pod:137 | Creating pod: model=qwen_image_edit_2509, variant=fp4, template=2c3597b1-e70a-44cd-8d68-ba7f8ecf035e, offer=52523
+2026-01-05 10:15:43,115 | [32mINFO[0m | quickpod:create_pod:656 | Creating pod: offer=52523, template=2c3597b1-e70a-44cd-8d68-ba7f8ecf035e, disk=85GB
+2026-01-05 10:15:44,692 | [32mINFO[0m | quickpod:create_pod:680 | Pod created successfully: 952cc50b-3bfc-4e90-8612-5a11d79ffb42
+2026-01-05 10:15:44,692 | [32mINFO[0m | pod_manager:create_pod:161 | Pod created: 952cc50b-3bfc-4e90-8612-5a11d79ffb42 on machine 619
+2026-01-05 10:15:44,692 | [32mINFO[0m | quickpod:__init__:165 | QuickPodManager initialized for pavanalur3@gmail.com with pod_uuid=952cc50b-3bfc-4e90-8612-5a11d79ffb42
+2026-01-05 10:16:14,068 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.002s - IP: 77.78.53.72
+2026-01-05 10:16:46,786 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 77.78.53.72
+2026-01-05 10:17:07,877 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 77.78.53.72
+2026-01-05 10:17:20,845 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.004s - IP: 77.78.53.72
+2026-01-05 10:17:41,643 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.002s - IP: 77.78.53.72
+2026-01-05 10:17:44,751 | [31mERROR[0m | pod_manager:_try_create_pod_on_machine:1692 | Pod 952cc50b-3bfc-4e90-8612-5a11d79ffb42 startup timeout (no worker registration), destroying
+2026-01-05 10:17:44,752 | [32mINFO[0m | pod_manager:destroy_pod:237 | Destroying pod 952cc50b-3bfc-4e90-8612-5a11d79ffb42: Startup timeout - no worker registration
+2026-01-05 10:17:44,752 | [32mINFO[0m | quickpod:__init__:165 | QuickPodManager initialized for pavanalur3@gmail.com with pod_uuid=952cc50b-3bfc-4e90-8612-5a11d79ffb42
+2026-01-05 10:17:44,753 | [32mINFO[0m | quickpod:stop_pod:391 | Stopping pod 952cc50b-3bfc-4e90-8612-5a11d79ffb42
+2026-01-05 10:17:45,467 | [32mINFO[0m | quickpod:login:203 | QuickPod login successful, token acquired
+2026-01-05 10:17:48,614 | [32mINFO[0m | quickpod:destroy_pod:430 | Destroying pod 952cc50b-3bfc-4e90-8612-5a11d79ffb42
+2026-01-05 10:17:49,942 | [32mINFO[0m | pod_manager:destroy_pod:262 | Pod 952cc50b-3bfc-4e90-8612-5a11d79ffb42 destroyed successfully
+2026-01-05 10:17:49,942 | [33mWARNING[0m | pod_manager:mark_machine_bad:846 | ðŸš« BLACKLISTING machine 619 for 600s due to failure
+2026-01-05 10:17:49,942 | [33mWARNING[0m | pod_manager:blacklist:450 | Machine 619 blacklisted for 600s
+2026-01-05 10:17:49,944 | [32mINFO[0m | pod_manager:mark_machine_bad:857 | Currently blacklisted machines: ['14780', '619']
+2026-01-05 10:17:49,944 | [33mWARNING[0m | pod_manager:mark_machine_bad:846 | ðŸš« BLACKLISTING machine 619 for 600s due to failure
+2026-01-05 10:17:49,944 | [33mWARNING[0m | pod_manager:blacklist:450 | Machine 619 blacklisted for 600s
+2026-01-05 10:17:49,946 | [32mINFO[0m | pod_manager:mark_machine_bad:857 | Currently blacklisted machines: ['14780', '619']
+2026-01-05 10:17:50,388 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 283 not available
+2026-01-05 10:17:50,388 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:17:50,572 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 275 not available
+2026-01-05 10:17:50,573 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:17:50,907 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 412 not available
+2026-01-05 10:17:50,908 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:17:51,134 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14839 not available
+2026-01-05 10:17:51,135 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:17:51,370 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 300 not available
+2026-01-05 10:17:51,371 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:17:51,711 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 299 not available
+2026-01-05 10:17:51,712 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:17:51,942 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 461 not available
+2026-01-05 10:17:51,943 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:17:51,944 | [33mWARNING[0m | pod_manager:create_machine_based_pod:1491 | Variant fp4 (GPUs: ['5090']) failed on all cached machines. Trying next variant...
+2026-01-05 10:17:51,944 | [32mINFO[0m | pod_manager:create_machine_based_pod:1423 | Trying variant=int4 for model=qwen_image_edit_2509, allowed_gpus=['4090', '4080', '4070']
+2026-01-05 10:17:52,205 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14751 not available
+2026-01-05 10:17:52,206 | [32mINFO[0m | quickpod:get_best_offer:620 | Using fallback: GPU=4090, offer_id=37095, price=0.210, tflops=101, machine_id=461
+2026-01-05 10:17:52,207 | [32mINFO[0m | pod_manager:_try_create_pod_on_machine:1605 | Attempting pod creation: model=qwen_image_edit_2509, variant=int4, machine=461, template=e5f9c9f6-27ce-4984-8854-7e4ce38cb0bf
+2026-01-05 10:17:52,207 | [32mINFO[0m | pod_manager:create_pod:137 | Creating pod: model=qwen_image_edit_2509, variant=int4, template=e5f9c9f6-27ce-4984-8854-7e4ce38cb0bf, offer=37095
+2026-01-05 10:17:52,207 | [32mINFO[0m | quickpod:create_pod:656 | Creating pod: offer=37095, template=e5f9c9f6-27ce-4984-8854-7e4ce38cb0bf, disk=85GB
+2026-01-05 10:17:53,940 | [32mINFO[0m | quickpod:create_pod:680 | Pod created successfully: a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:17:53,940 | [32mINFO[0m | pod_manager:create_pod:161 | Pod created: a34536be-f57f-40eb-93dc-7a8b4ab117cb on machine 461
+2026-01-05 10:17:53,941 | [32mINFO[0m | quickpod:__init__:165 | QuickPodManager initialized for pavanalur3@gmail.com with pod_uuid=a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:18:21,331 | [33mWARNING[0m | pod_manager:_dispatch_machine_based:1207 | Timeout waiting for STARTING pod bbef7db5-8543-4276-a0d1-05c263da681d, will create new pod for job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87
+2026-01-05 10:18:21,331 | [32mINFO[0m | pod_manager:_dispatch_machine_based:1214 | No existing pods for model qwen_image_edit_2509, creating new pod for job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87
+2026-01-05 10:18:23,645 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 24.124.32.70
+2026-01-05 10:18:29,911 | [33mWARNING[0m | routes:register_worker:2010 | Worker a34536be-f57f-40eb-93dc-7a8b4ab117cb registration: /health endpoint not responding, but proceeding with registration
+2026-01-05 10:18:32,192 | [33mWARNING[0m | routes:register_worker:2048 | Worker a34536be-f57f-40eb-93dc-7a8b4ab117cb health check failed during registration, but proceeding with status='starting'
+2026-01-05 10:18:32,192 | [32mINFO[0m | routes:register_worker:2092 | Worker a34536be-f57f-40eb-93dc-7a8b4ab117cb marked as 'starting', will poll for readiness every 10s
+2026-01-05 10:18:32,207 | [32mINFO[0m | routes:register_worker:2217 | Worker a34536be-f57f-40eb-93dc-7a8b4ab117cb registered for model qwen_image_edit_2509 (pod: a34536be-f57f-40eb-93dc-7a8b4ab117cb)
+2026-01-05 10:18:32,218 | [32mINFO[0m | middleware:dispatch:383 | POST /register_worker - 200 - 4.592s - IP: 24.124.32.70
+2026-01-05 10:18:35,212 | [33mWARNING[0m | pod_manager:_dispatch_machine_based:1207 | Timeout waiting for STARTING pod bbef7db5-8543-4276-a0d1-05c263da681d, will create new pod for job f9a186b2-63f3-41e2-b9f8-94392631711f
+2026-01-05 10:18:35,213 | [32mINFO[0m | pod_manager:_dispatch_machine_based:1214 | No existing pods for model qwen_image_edit_2509, creating new pod for job f9a186b2-63f3-41e2-b9f8-94392631711f
+2026-01-05 10:18:42,772 | [32mINFO[0m | routes:_poll_for_readiness:2144 | Worker a34536be-f57f-40eb-93dc-7a8b4ab117cb is now READY after 11s (health status=ok)
+2026-01-05 10:18:43,332 | [32mINFO[0m | pod_manager:mark_image_cached:370 | Marked qwen_image_edit_2509 cached on machine 461
+2026-01-05 10:18:43,333 | [32mINFO[0m | pod_manager:_try_create_pod_on_machine:1657 | Pod a34536be-f57f-40eb-93dc-7a8b4ab117cb ready on 461
+2026-01-05 10:18:43,342 | [32mINFO[0m | pod_manager:_wait_for_worker_registration:1273 | Worker a34536be-f57f-40eb-93dc-7a8b4ab117cb is READY, assigning job 86fd0251-cff4-45df-b765-9dfb29ecfa3d
+2026-01-05 10:18:43,443 | [32mINFO[0m | job_manager:assign_job:568 | Job 86fd0251-cff4-45df-b765-9dfb29ecfa3d assigned to worker a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:18:43,443 | [32mINFO[0m | routes:_dispatch_job_background:674 | Job 86fd0251-cff4-45df-b765-9dfb29ecfa3d assigned to worker a34536be-f57f-40eb-93dc-7a8b4ab117cb, now dispatching...
+2026-01-05 10:18:43,557 | [32mINFO[0m | job_manager:update_job_state:313 | Job 86fd0251-cff4-45df-b765-9dfb29ecfa3d: queued â†’ dispatching
+2026-01-05 10:18:43,558 | [32mINFO[0m | routes:_dispatch_to_worker:1023 | Dispatching job 86fd0251-cff4-45df-b765-9dfb29ecfa3d to http://24.124.32.70:39001/run
+2026-01-05 10:18:46,202 | [32mINFO[0m | routes:_dispatch_to_worker:1254 | Worker a34536be-f57f-40eb-93dc-7a8b4ab117cb accepted job 86fd0251-cff4-45df-b765-9dfb29ecfa3d successfully
+2026-01-05 10:18:46,202 | [32mINFO[0m | routes:_dispatch_to_worker:1363 | Worker a34536be-f57f-40eb-93dc-7a8b4ab117cb confirmed receipt of job 86fd0251-cff4-45df-b765-9dfb29ecfa3d
+2026-01-05 10:18:46,317 | [32mINFO[0m | job_manager:mark_running:354 | Job 86fd0251-cff4-45df-b765-9dfb29ecfa3d running on worker a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:18:46,324 | [32mINFO[0m | routes:_dispatch_to_worker:1867 | Job 86fd0251-cff4-45df-b765-9dfb29ecfa3d dispatched successfully to worker a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:18:46,324 | [32mINFO[0m | routes:_dispatch_job_background:680 | Job 86fd0251-cff4-45df-b765-9dfb29ecfa3d successfully dispatched to worker a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:18:46,325 | [32mINFO[0m | pod_manager:get_variant_plan:812 | Variant plan for qwen_image_edit_2509: [('fp4', ['5090']), ('int4', ['4090', '4080', '4070'])]
+2026-01-05 10:18:46,325 | [32mINFO[0m | pod_manager:create_machine_based_pod:1414 | Candidates for qwen_image_edit_2509 (from cache, blacklist-filtered): ['14751', '14762', '283', '275', '412', '14839', '300', '299', '461']
+2026-01-05 10:18:46,325 | [32mINFO[0m | pod_manager:create_machine_based_pod:1423 | Trying variant=fp4 for model=qwen_image_edit_2509, allowed_gpus=['5090']
+2026-01-05 10:18:46,608 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 24.124.32.70
+2026-01-05 10:18:46,826 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14751 not available
+2026-01-05 10:18:46,827 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:18:47,068 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14762 not available
+2026-01-05 10:18:47,068 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:18:47,263 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 283 not available
+2026-01-05 10:18:47,264 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:18:47,612 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 275 not available
+2026-01-05 10:18:47,613 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:18:47,963 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 412 not available
+2026-01-05 10:18:47,964 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:18:48,221 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14839 not available
+2026-01-05 10:18:48,222 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:18:48,568 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 300 not available
+2026-01-05 10:18:48,569 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:18:48,819 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 299 not available
+2026-01-05 10:18:48,819 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:18:49,046 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 461 not available
+2026-01-05 10:18:49,047 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:18:49,048 | [33mWARNING[0m | pod_manager:create_machine_based_pod:1491 | Variant fp4 (GPUs: ['5090']) failed on all cached machines. Trying next variant...
+2026-01-05 10:18:49,048 | [32mINFO[0m | pod_manager:create_machine_based_pod:1423 | Trying variant=int4 for model=qwen_image_edit_2509, allowed_gpus=['4090', '4080', '4070']
+2026-01-05 10:18:49,441 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14751 not available
+2026-01-05 10:18:49,442 | [32mINFO[0m | quickpod:get_best_offer:620 | Using fallback: GPU=4090, offer_id=19210, price=0.230, tflops=102, machine_id=299
+2026-01-05 10:18:49,443 | [32mINFO[0m | pod_manager:_try_create_pod_on_machine:1605 | Attempting pod creation: model=qwen_image_edit_2509, variant=int4, machine=299, template=e5f9c9f6-27ce-4984-8854-7e4ce38cb0bf
+2026-01-05 10:18:49,443 | [32mINFO[0m | pod_manager:create_pod:137 | Creating pod: model=qwen_image_edit_2509, variant=int4, template=e5f9c9f6-27ce-4984-8854-7e4ce38cb0bf, offer=19210
+2026-01-05 10:18:49,443 | [32mINFO[0m | quickpod:create_pod:656 | Creating pod: offer=19210, template=e5f9c9f6-27ce-4984-8854-7e4ce38cb0bf, disk=85GB
+2026-01-05 10:18:51,174 | [32mINFO[0m | quickpod:create_pod:680 | Pod created successfully: 2653ce8f-b34e-43a3-bbc5-4e12260fbf65
+2026-01-05 10:18:51,175 | [32mINFO[0m | pod_manager:create_pod:161 | Pod created: 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 on machine 299
+2026-01-05 10:18:51,175 | [32mINFO[0m | quickpod:__init__:165 | QuickPodManager initialized for pavanalur3@gmail.com with pod_uuid=2653ce8f-b34e-43a3-bbc5-4e12260fbf65
+2026-01-05 10:19:06,220 | [32mINFO[0m | job_manager:_log_timing_metrics:464 | ================================================================================
+2026-01-05 10:19:06,221 | [32mINFO[0m | job_manager:_log_timing_metrics:465 | â±ï¸  JOB TIMING REPORT: 86fd0251-cff4-45df-b765-9dfb29ecfa3d
+2026-01-05 10:19:06,221 | [32mINFO[0m | job_manager:_log_timing_metrics:466 |    Model: qwen_image_edit_2509
+2026-01-05 10:19:06,221 | [32mINFO[0m | job_manager:_log_timing_metrics:469 |    ðŸ“Š Total Time: 330.93s (created â†’ completed)
+2026-01-05 10:19:06,221 | [32mINFO[0m | job_manager:_log_timing_metrics:472 |    âš¡ Processing Time: 19.90s (started â†’ completed)
+2026-01-05 10:19:06,221 | [32mINFO[0m | job_manager:_log_timing_metrics:478 |    ðŸš€ Dispatch Time: 2.75s (dispatched â†’ started)
+2026-01-05 10:19:06,221 | [32mINFO[0m | job_manager:_log_timing_metrics:480 | ================================================================================
+2026-01-05 10:19:06,221 | [32mINFO[0m | job_manager:mark_completed:417 | Job 86fd0251-cff4-45df-b765-9dfb29ecfa3d completed
+2026-01-05 10:19:06,241 | [32mINFO[0m | middleware:dispatch:383 | POST /job_complete - 200 - 0.582s - IP: 24.124.32.70
+2026-01-05 10:19:06,545 | [32mINFO[0m | routes:send_fcm_notification:257 | FCM notification sent: projects/power-downloader-c58a3/messages/0:1767608346503045%a0e9dcf5a0e9dcf5
+2026-01-05 10:19:07,562 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 24.124.32.70
+2026-01-05 10:19:27,621 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.002s - IP: 108.179.129.43
+2026-01-05 10:19:28,520 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 24.124.32.70
+2026-01-05 10:19:31,751 | [33mWARNING[0m | routes:register_worker:2010 | Worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 registration: /health endpoint not responding, but proceeding with registration
+2026-01-05 10:19:33,993 | [33mWARNING[0m | routes:register_worker:2048 | Worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 health check failed during registration, but proceeding with status='starting'
+2026-01-05 10:19:33,994 | [32mINFO[0m | routes:register_worker:2092 | Worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 marked as 'starting', will poll for readiness every 10s
+2026-01-05 10:19:34,007 | [32mINFO[0m | routes:register_worker:2217 | Worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 registered for model qwen_image_edit_2509 (pod: 2653ce8f-b34e-43a3-bbc5-4e12260fbf65)
+2026-01-05 10:19:34,018 | [32mINFO[0m | middleware:dispatch:383 | POST /register_worker - 200 - 4.516s - IP: 108.179.129.43
+2026-01-05 10:19:44,506 | [32mINFO[0m | routes:_poll_for_readiness:2144 | Worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 is now READY after 10s (health status=ok)
+2026-01-05 10:19:45,019 | [32mINFO[0m | pod_manager:mark_image_cached:370 | Marked qwen_image_edit_2509 cached on machine 299
+2026-01-05 10:19:45,020 | [32mINFO[0m | pod_manager:_try_create_pod_on_machine:1657 | Pod 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 ready on 299
+2026-01-05 10:19:45,030 | [32mINFO[0m | pod_manager:_wait_for_worker_registration:1273 | Worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 is READY, assigning job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87
+2026-01-05 10:19:45,146 | [32mINFO[0m | job_manager:assign_job:568 | Job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87 assigned to worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65
+2026-01-05 10:19:45,146 | [32mINFO[0m | routes:_dispatch_job_background:674 | Job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87 assigned to worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65, now dispatching...
+2026-01-05 10:19:45,265 | [32mINFO[0m | job_manager:update_job_state:313 | Job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87: queued â†’ dispatching
+2026-01-05 10:19:45,266 | [32mINFO[0m | routes:_dispatch_to_worker:1023 | Dispatching job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87 to http://108.179.129.43:34401/run
+2026-01-05 10:19:47,756 | [32mINFO[0m | routes:_dispatch_to_worker:1254 | Worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 accepted job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87 successfully
+2026-01-05 10:19:47,756 | [32mINFO[0m | routes:_dispatch_to_worker:1363 | Worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 confirmed receipt of job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87
+2026-01-05 10:19:47,870 | [32mINFO[0m | job_manager:mark_running:354 | Job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87 running on worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65
+2026-01-05 10:19:47,879 | [32mINFO[0m | routes:_dispatch_to_worker:1867 | Job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87 dispatched successfully to worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65
+2026-01-05 10:19:47,879 | [32mINFO[0m | routes:_dispatch_job_background:680 | Job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87 successfully dispatched to worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65
+2026-01-05 10:19:47,879 | [32mINFO[0m | pod_manager:get_variant_plan:812 | Variant plan for qwen_image_edit_2509: [('fp4', ['5090']), ('int4', ['4090', '4080', '4070'])]
+2026-01-05 10:19:47,879 | [32mINFO[0m | pod_manager:create_machine_based_pod:1414 | Candidates for qwen_image_edit_2509 (from cache, blacklist-filtered): ['14751', '14762', '283', '275', '412', '14839', '299', '300', '461']
+2026-01-05 10:19:47,880 | [32mINFO[0m | pod_manager:create_machine_based_pod:1423 | Trying variant=fp4 for model=qwen_image_edit_2509, allowed_gpus=['5090']
+2026-01-05 10:19:48,252 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14751 not available
+2026-01-05 10:19:48,253 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:48,446 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 108.179.129.43
+2026-01-05 10:19:48,701 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14762 not available
+2026-01-05 10:19:48,702 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:48,899 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 283 not available
+2026-01-05 10:19:48,900 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:49,106 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 275 not available
+2026-01-05 10:19:49,107 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:49,296 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 412 not available
+2026-01-05 10:19:49,297 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:49,493 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14839 not available
+2026-01-05 10:19:49,493 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:49,500 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 24.124.32.70
+2026-01-05 10:19:49,681 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 299 not available
+2026-01-05 10:19:49,682 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:50,025 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 300 not available
+2026-01-05 10:19:50,026 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:50,215 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 461 not available
+2026-01-05 10:19:50,215 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:50,216 | [33mWARNING[0m | pod_manager:create_machine_based_pod:1491 | Variant fp4 (GPUs: ['5090']) failed on all cached machines. Trying next variant...
+2026-01-05 10:19:50,216 | [32mINFO[0m | pod_manager:create_machine_based_pod:1423 | Trying variant=int4 for model=qwen_image_edit_2509, allowed_gpus=['4090', '4080', '4070']
+2026-01-05 10:19:50,387 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14751 not available
+2026-01-05 10:19:50,388 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:50,667 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14762 not available
+2026-01-05 10:19:50,668 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:50,842 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 283 not available
+2026-01-05 10:19:50,843 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:51,226 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 275 not available
+2026-01-05 10:19:51,228 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:51,407 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 412 not available
+2026-01-05 10:19:51,408 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:51,570 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14839 not available
+2026-01-05 10:19:51,571 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:51,757 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 299 not available
+2026-01-05 10:19:51,758 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:51,961 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 300 not available
+2026-01-05 10:19:51,962 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:52,153 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 461 not available
+2026-01-05 10:19:52,153 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:52,154 | [33mWARNING[0m | pod_manager:create_machine_based_pod:1491 | Variant int4 (GPUs: ['4090', '4080', '4070']) failed on all cached machines. Trying next variant...
+2026-01-05 10:19:52,154 | [33mWARNING[0m | pod_manager:create_machine_based_pod:1497 | All cached machines exhausted for all variants. Trying global fallback (searching all available machines)...
+2026-01-05 10:19:52,154 | [32mINFO[0m | pod_manager:create_machine_based_pod:1504 | Global fallback with ACTIVE blacklist: ['14780', '619']
+2026-01-05 10:19:52,154 | [32mINFO[0m | pod_manager:create_machine_based_pod:1508 | Global fallback: trying variant=fp4 with GPUs=['5090']
+2026-01-05 10:19:52,621 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:52,622 | [32mINFO[0m | pod_manager:create_machine_based_pod:1508 | Global fallback: trying variant=int4 with GPUs=['4090', '4080', '4070']
+2026-01-05 10:19:52,809 | [31mERROR[0m | quickpod:get_best_offer:627 | No suitable offers found
+2026-01-05 10:19:52,810 | [31mERROR[0m | pod_manager:create_machine_based_pod:1571 | Global fallback: no available machines for model qwen_image_edit_2509. All machines exhausted or blacklisted.
+2026-01-05 10:19:52,810 | [33mWARNING[0m | pod_manager:create_machine_based_pod:1583 | Currently blacklisted machines: ['14780 (until 10:25:42)', '619 (until 10:27:49)']
+2026-01-05 10:19:52,810 | [31mERROR[0m | routes:_dispatch_job_background:709 | Background dispatch failed for f9a186b2-63f3-41e2-b9f8-94392631711f: [E5000] Failed to create pod for model qwen_image_edit_2509: Failed to create machine-based pod. All machines blacklisted: ['14780 (until 10:25:42)', '619 (until 10:27:49)']
+2026-01-05 10:19:53,011 | [32mINFO[0m | routes:_dispatch_job_background:732 | Job f9a186b2-63f3-41e2-b9f8-94392631711f reverted to QUEUED after dispatch error. Will be picked up by recovery system.
+2026-01-05 10:20:02,254 | [32mINFO[0m | job_manager:_log_timing_metrics:464 | ================================================================================
+2026-01-05 10:20:02,254 | [32mINFO[0m | job_manager:_log_timing_metrics:465 | â±ï¸  JOB TIMING REPORT: 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87
+2026-01-05 10:20:02,254 | [32mINFO[0m | job_manager:_log_timing_metrics:466 |    Model: qwen_image_edit_2509
+2026-01-05 10:20:02,254 | [32mINFO[0m | job_manager:_log_timing_metrics:469 |    ðŸ“Š Total Time: 351.26s (created â†’ completed)
+2026-01-05 10:20:02,254 | [32mINFO[0m | job_manager:_log_timing_metrics:472 |    âš¡ Processing Time: 14.37s (started â†’ completed)
+2026-01-05 10:20:02,254 | [32mINFO[0m | job_manager:_log_timing_metrics:478 |    ðŸš€ Dispatch Time: 2.61s (dispatched â†’ started)
+2026-01-05 10:20:02,254 | [32mINFO[0m | job_manager:_log_timing_metrics:480 | ================================================================================
+2026-01-05 10:20:02,254 | [32mINFO[0m | job_manager:mark_completed:417 | Job 7ca4d730-fdbf-45c6-bd79-6f6a7e4f2c87 completed
+2026-01-05 10:20:02,272 | [32mINFO[0m | middleware:dispatch:383 | POST /job_complete - 200 - 0.327s - IP: 108.179.129.43
+2026-01-05 10:20:02,387 | [32mINFO[0m | routes:send_fcm_notification:257 | FCM notification sent: projects/power-downloader-c58a3/messages/0:1767608402341737%a0e9dcf5a0e9dcf5
+2026-01-05 10:20:09,207 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 108.179.129.43
+2026-01-05 10:20:10,436 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.002s - IP: 24.124.32.70
+2026-01-05 10:24:09,449 | [33mWARNING[0m | main:_idle_worker_reaper_task:303 | Worker a34536be-f57f-40eb-93dc-7a8b4ab117cb stale, destroying pod a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:24:09,458 | [32mINFO[0m | pod_manager:destroy_pod:237 | Destroying pod a34536be-f57f-40eb-93dc-7a8b4ab117cb: Stale heartbeat
+2026-01-05 10:24:09,458 | [32mINFO[0m | quickpod:__init__:165 | QuickPodManager initialized for pavanalur3@gmail.com with pod_uuid=a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:24:09,459 | [32mINFO[0m | quickpod:stop_pod:391 | Stopping pod a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:24:10,215 | [32mINFO[0m | quickpod:login:203 | QuickPod login successful, token acquired
+2026-01-05 10:24:10,816 | [33mWARNING[0m | quickpod:_make_request:336 | QuickPod request failed (attempt 1/4), retrying in 2.0s: [E6000] QuickPod API error during update/stoppod: Failed to stop pod (full: {"error": "Failed to stop pod"})
+2026-01-05 10:24:12,680 | [32mINFO[0m | main:_pod_cleanup_task:536 | Cleaning up pod a34536be-f57f-40eb-93dc-7a8b4ab117cb (worker a34536be-f57f-40eb-93dc-7a8b4ab117cb, status=offline)
+2026-01-05 10:24:12,682 | [32mINFO[0m | pod_manager:destroy_pod:237 | Destroying pod a34536be-f57f-40eb-93dc-7a8b4ab117cb: Worker status: offline
+2026-01-05 10:24:12,683 | [32mINFO[0m | quickpod:__init__:165 | QuickPodManager initialized for pavanalur3@gmail.com with pod_uuid=a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:24:12,683 | [32mINFO[0m | quickpod:stop_pod:391 | Stopping pod a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:24:13,307 | [32mINFO[0m | quickpod:login:203 | QuickPod login successful, token acquired
+2026-01-05 10:24:13,655 | [33mWARNING[0m | quickpod:_make_request:336 | QuickPod request failed (attempt 2/4), retrying in 4.0s: [E6000] QuickPod API error during update/stoppod: Failed to stop pod (full: {"error": "Failed to stop pod"})
+2026-01-05 10:24:14,014 | [33mWARNING[0m | quickpod:_make_request:336 | QuickPod request failed (attempt 1/4), retrying in 2.0s: [E6000] QuickPod API error during update/stoppod: Failed to stop pod (full: {"error": "Failed to stop pod"})
+2026-01-05 10:24:16,860 | [33mWARNING[0m | quickpod:_make_request:336 | QuickPod request failed (attempt 2/4), retrying in 4.0s: [E6000] QuickPod API error during update/stoppod: Failed to stop pod (full: {"error": "Failed to stop pod"})
+2026-01-05 10:24:18,405 | [33mWARNING[0m | quickpod:_make_request:336 | QuickPod request failed (attempt 3/4), retrying in 8.0s: [E6000] QuickPod API error during update/stoppod: Failed to stop pod (full: {"error": "Failed to stop pod"})
+2026-01-05 10:24:21,624 | [33mWARNING[0m | quickpod:_make_request:336 | QuickPod request failed (attempt 3/4), retrying in 8.0s: [E6000] QuickPod API error during update/stoppod: Failed to stop pod (full: {"error": "Failed to stop pod"})
+2026-01-05 10:24:27,179 | [32mINFO[0m | quickpod:destroy_pod:430 | Destroying pod a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:24:28,266 | [32mINFO[0m | pod_manager:destroy_pod:262 | Pod a34536be-f57f-40eb-93dc-7a8b4ab117cb destroyed successfully
+2026-01-05 10:24:28,266 | [33mWARNING[0m | pod_manager:mark_machine_bad:846 | ðŸš« BLACKLISTING machine 461 for 600s due to failure
+2026-01-05 10:24:28,266 | [33mWARNING[0m | pod_manager:blacklist:450 | Machine 461 blacklisted for 600s
+2026-01-05 10:24:28,268 | [32mINFO[0m | pod_manager:mark_machine_bad:857 | Currently blacklisted machines: ['14780', '619', '461']
+2026-01-05 10:24:28,278 | [33mWARNING[0m | main:_idle_worker_reaper_task:303 | Worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 stale, destroying pod 2653ce8f-b34e-43a3-bbc5-4e12260fbf65
+2026-01-05 10:24:28,286 | [32mINFO[0m | pod_manager:destroy_pod:237 | Destroying pod 2653ce8f-b34e-43a3-bbc5-4e12260fbf65: Stale heartbeat
+2026-01-05 10:24:28,286 | [32mINFO[0m | quickpod:__init__:165 | QuickPodManager initialized for pavanalur3@gmail.com with pod_uuid=2653ce8f-b34e-43a3-bbc5-4e12260fbf65
+2026-01-05 10:24:28,286 | [32mINFO[0m | quickpod:stop_pod:391 | Stopping pod 2653ce8f-b34e-43a3-bbc5-4e12260fbf65
+2026-01-05 10:24:28,947 | [32mINFO[0m | quickpod:login:203 | QuickPod login successful, token acquired
+2026-01-05 10:24:30,460 | [32mINFO[0m | quickpod:destroy_pod:430 | Destroying pod a34536be-f57f-40eb-93dc-7a8b4ab117cb
+2026-01-05 10:24:31,532 | [32mINFO[0m | pod_manager:destroy_pod:262 | Pod a34536be-f57f-40eb-93dc-7a8b4ab117cb destroyed successfully
+2026-01-05 10:24:32,007 | [32mINFO[0m | quickpod:destroy_pod:430 | Destroying pod 2653ce8f-b34e-43a3-bbc5-4e12260fbf65
+2026-01-05 10:24:33,104 | [32mINFO[0m | pod_manager:destroy_pod:262 | Pod 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 destroyed successfully
+2026-01-05 10:24:33,104 | [33mWARNING[0m | pod_manager:mark_machine_bad:846 | ðŸš« BLACKLISTING machine 299 for 600s due to failure
+2026-01-05 10:24:33,104 | [33mWARNING[0m | pod_manager:blacklist:450 | Machine 299 blacklisted for 600s
+2026-01-05 10:24:33,106 | [32mINFO[0m | pod_manager:mark_machine_bad:857 | Currently blacklisted machines: ['14780', '619', '461', '299']
+2026-01-05 10:25:16,543 | [32mINFO[0m | main:_pod_cleanup_task:536 | Cleaning up pod 2653ce8f-b34e-43a3-bbc5-4e12260fbf65 (worker 2653ce8f-b34e-43a3-bbc5-4e12260fbf65, status=offline)
+2026-01-05 10:50:18,054 | [33mWARNING[0m | job_manager:check_for_stuck_jobs:605 | Job f9a186b2-63f3-41e2-b9f8-94392631711f stuck in queued, last update: 2026-01-05 10:19:52.818927
+2026-01-05 10:50:18,467 | [32mINFO[0m | pod_manager:_dispatch_machine_based:1214 | No existing pods for model qwen_image_edit_2509, creating new pod for job f9a186b2-63f3-41e2-b9f8-94392631711f
+2026-01-05 10:50:18,468 | [32mINFO[0m | pod_manager:get_variant_plan:812 | Variant plan for qwen_image_edit_2509: [('fp4', ['5090']), ('int4', ['4090', '4080', '4070'])]
+2026-01-05 10:50:18,468 | [32mINFO[0m | pod_manager:create_machine_based_pod:1414 | Candidates for qwen_image_edit_2509 (from cache, blacklist-filtered): ['14751', '14762', '283', '14780', '619', '275', '412', '14839', '299', '300', '461']
+2026-01-05 10:50:18,468 | [32mINFO[0m | pod_manager:create_machine_based_pod:1423 | Trying variant=fp4 for model=qwen_image_edit_2509, allowed_gpus=['5090']
+2026-01-05 10:50:19,025 | [33mWARNING[0m | quickpod:get_best_offer:586 | Preferred machine 14751 not available
+2026-01-05 10:50:19,026 | [32mINFO[0m | quickpod:get_best_offer:620 | Using fallback: GPU=5090, offer_id=4229299, price=0.300, tflops=137, machine_id=14780
+2026-01-05 10:50:19,027 | [32mINFO[0m | pod_manager:_try_create_pod_on_machine:1605 | Attempting pod creation: model=qwen_image_edit_2509, variant=fp4, machine=14780, template=2c3597b1-e70a-44cd-8d68-ba7f8ecf035e
+2026-01-05 10:50:19,027 | [32mINFO[0m | pod_manager:create_pod:137 | Creating pod: model=qwen_image_edit_2509, variant=fp4, template=2c3597b1-e70a-44cd-8d68-ba7f8ecf035e, offer=4229299
+2026-01-05 10:50:19,027 | [32mINFO[0m | quickpod:create_pod:656 | Creating pod: offer=4229299, template=2c3597b1-e70a-44cd-8d68-ba7f8ecf035e, disk=85GB
+2026-01-05 10:50:20,916 | [32mINFO[0m | quickpod:create_pod:680 | Pod created successfully: 6ea82d3e-8311-4f1a-8c4f-452b6c00433a
+2026-01-05 10:50:20,916 | [32mINFO[0m | pod_manager:create_pod:161 | Pod created: 6ea82d3e-8311-4f1a-8c4f-452b6c00433a on machine 14780
+2026-01-05 10:50:20,917 | [32mINFO[0m | quickpod:__init__:165 | QuickPodManager initialized for pavanalur3@gmail.com with pod_uuid=6ea82d3e-8311-4f1a-8c4f-452b6c00433a
+2026-01-05 10:50:36,673 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.003s - IP: 107.222.215.224
+2026-01-05 10:50:57,582 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.002s - IP: 107.222.215.224
+2026-01-05 10:51:18,482 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 107.222.215.224
+2026-01-05 10:51:26,853 | [33mWARNING[0m | routes:register_worker:2010 | Worker 6ea82d3e-8311-4f1a-8c4f-452b6c00433a registration: /health endpoint not responding, but proceeding with registration
+2026-01-05 10:51:29,127 | [33mWARNING[0m | routes:register_worker:2048 | Worker 6ea82d3e-8311-4f1a-8c4f-452b6c00433a health check failed during registration, but proceeding with status='starting'
+2026-01-05 10:51:29,128 | [32mINFO[0m | routes:register_worker:2092 | Worker 6ea82d3e-8311-4f1a-8c4f-452b6c00433a marked as 'starting', will poll for readiness every 10s
+2026-01-05 10:51:29,140 | [32mINFO[0m | routes:register_worker:2217 | Worker 6ea82d3e-8311-4f1a-8c4f-452b6c00433a registered for model qwen_image_edit_2509 (pod: 6ea82d3e-8311-4f1a-8c4f-452b6c00433a)
+2026-01-05 10:51:29,141 | [32mINFO[0m | middleware:dispatch:383 | POST /register_worker - 200 - 4.568s - IP: 107.222.215.224
+2026-01-05 10:51:39,700 | [32mINFO[0m | routes:_poll_for_readiness:2144 | Worker 6ea82d3e-8311-4f1a-8c4f-452b6c00433a is now READY after 11s (health status=ok)
+2026-01-05 10:51:40,274 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.002s - IP: 107.222.215.224
+2026-01-05 10:51:40,277 | [32mINFO[0m | pod_manager:mark_image_cached:370 | Marked qwen_image_edit_2509 cached on machine 14780
+2026-01-05 10:51:40,279 | [32mINFO[0m | pod_manager:_try_create_pod_on_machine:1657 | Pod 6ea82d3e-8311-4f1a-8c4f-452b6c00433a ready on 14780
+2026-01-05 10:51:40,289 | [32mINFO[0m | pod_manager:_wait_for_worker_registration:1273 | Worker 6ea82d3e-8311-4f1a-8c4f-452b6c00433a is READY, assigning job f9a186b2-63f3-41e2-b9f8-94392631711f
+2026-01-05 10:51:40,485 | [32mINFO[0m | job_manager:assign_job:568 | Job f9a186b2-63f3-41e2-b9f8-94392631711f assigned to worker 6ea82d3e-8311-4f1a-8c4f-452b6c00433a
+2026-01-05 10:51:40,485 | [32mINFO[0m | job_manager:recover_job:733 | Recovered job f9a186b2-63f3-41e2-b9f8-94392631711f (retry 1), assigned to 6ea82d3e-8311-4f1a-8c4f-452b6c00433a
+2026-01-05 10:52:01,147 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 107.222.215.224
+
+2026-01-05 11:21:35,897 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.002s - IP: 107.222.215.224
+2026-01-05 11:21:40,658 | [33mWARNING[0m | job_manager:check_for_stuck_jobs:605 | Job f9a186b2-63f3-41e2-b9f8-94392631711f stuck in queued, last update: 2026-01-05 10:51:40.290093
+2026-01-05 11:21:41,083 | [32mINFO[0m | pod_manager:_dispatch_machine_based:1170 | Reusing READY pod 6ea82d3e-8311-4f1a-8c4f-452b6c00433a for job f9a186b2-63f3-41e2-b9f8-94392631711f
+2026-01-05 11:21:41,272 | [32mINFO[0m | job_manager:assign_job:568 | Job f9a186b2-63f3-41e2-b9f8-94392631711f assigned to worker 6ea82d3e-8311-4f1a-8c4f-452b6c00433a
+2026-01-05 11:21:41,272 | [32mINFO[0m | job_manager:recover_job:733 | Recovered job f9a186b2-63f3-41e2-b9f8-94392631711f (retry 2), assigned to 6ea82d3e-8311-4f1a-8c4f-452b6c00433a
+2026-01-05 11:21:56,766 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 107.222.215.224
+
+2026-01-05 11:51:30,370 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 107.222.215.224
+2026-01-05 11:51:41,444 | [33mWARNING[0m | job_manager:check_for_stuck_jobs:605 | Job f9a186b2-63f3-41e2-b9f8-94392631711f stuck in queued, last update: 2026-01-05 11:21:41.084443
+2026-01-05 11:51:41,873 | [32mINFO[0m | pod_manager:_dispatch_machine_based:1170 | Reusing READY pod 6ea82d3e-8311-4f1a-8c4f-452b6c00433a for job f9a186b2-63f3-41e2-b9f8-94392631711f
+2026-01-05 11:51:42,061 | [32mINFO[0m | job_manager:assign_job:568 | Job f9a186b2-63f3-41e2-b9f8-94392631711f assigned to worker 6ea82d3e-8311-4f1a-8c4f-452b6c00433a
+2026-01-05 11:51:42,061 | [32mINFO[0m | job_manager:recover_job:733 | Recovered job f9a186b2-63f3-41e2-b9f8-94392631711f (retry 3), assigned to 6ea82d3e-8311-4f1a-8c4f-452b6c00433a
+2026-01-05 11:51:51,260 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.002s - IP: 107.222.215.224
+
+2026-01-05 12:21:24,948 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.002s - IP: 107.222.215.224
+2026-01-05 12:21:42,234 | [33mWARNING[0m | job_manager:check_for_stuck_jobs:605 | Job f9a186b2-63f3-41e2-b9f8-94392631711f stuck in queued, last update: 2026-01-05 11:51:41.874936
+2026-01-05 12:21:42,699 | [31mERROR[0m | job_manager:recover_job:687 | Job f9a186b2-63f3-41e2-b9f8-94392631711f failed: max retries exceeded
+2026-01-05 12:21:43,280 | [32mINFO[0m | routes:send_fcm_notification:257 | FCM notification sent: projects/power-downloader-c58a3/messages/0:1767615703204996%a0e9dcf5a0e9dcf5
+2026-01-05 12:21:45,813 | [32mINFO[0m | middleware:dispatch:383 | POST /heartbeat - 200 - 0.001s - IP: 107.222.215.224

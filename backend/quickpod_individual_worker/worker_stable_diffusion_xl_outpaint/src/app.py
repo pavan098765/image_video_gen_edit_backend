@@ -179,9 +179,9 @@ def post_signed_json(url: str, payload: dict, timeout: int = 10, max_retries: in
     
     for attempt in range(max_retries):
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
-            resp.raise_for_status()
-            return resp
+    resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp
         except requests.exceptions.Timeout as e:
             last_error = e
             if attempt < max_retries - 1:
