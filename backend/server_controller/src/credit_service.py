@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 import requests
 
-from db import User, Job, CreditTransaction, AdReward, Subscription, SessionLocal, utc_naive_now
+from db import User, Job, CreditTransaction, Subscription, SessionLocal, utc_naive_now
 
 logger = logging.getLogger("credit_service")
 
@@ -382,75 +382,6 @@ def refund_credits_for_job(
 # =============================================================================
 # Credit Addition Operations (Server-Verified Only)
 # =============================================================================
-
-def add_ad_reward(
-    db: Session,
-    user_id: str,
-    ad_provider: str,
-    ad_event_id: str,
-    reward_amount: int,
-    reward_type: str = "credits",
-) -> Tuple[bool, str]:
-    """
-    Add credits for watching an ad.
-    
-    CRITICAL: Deduplicated by (ad_provider, ad_event_id) to prevent abuse.
-    The ad_event_id should come from the ad network's server-to-server callback.
-    
-    Returns:
-        Tuple of (success, message)
-    """
-    try:
-        # Check for duplicate reward (unique index will also catch this)
-        existing = db.query(AdReward).filter(
-            AdReward.ad_provider == ad_provider,
-            AdReward.ad_event_id == ad_event_id,
-        ).first()
-        
-        if existing:
-            logger.warning(f"Duplicate ad reward attempt: {ad_provider}/{ad_event_id}")
-            return False, "Reward already claimed"
-        
-        # Get user
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            return False, "User not found"
-        
-        # Add credits atomically
-        user.total_credits += reward_amount
-        user.bonus_granted += reward_amount
-        
-        # Record ad reward (unique index prevents duplicates)
-        ad_reward = AdReward(
-            user_id=user_id,
-            ad_provider=ad_provider,
-            ad_event_id=ad_event_id,
-            reward_type=reward_type,
-            reward_amount=reward_amount,
-            verified=True,
-            created_at=utc_naive_now(),
-        )
-        db.add(ad_reward)
-        
-        # Record transaction
-        transaction = CreditTransaction(
-            user_id=user_id,
-            delta=reward_amount,
-            reason=f"ad_reward:{ad_provider}",
-            created_at=utc_naive_now(),
-        )
-        db.add(transaction)
-        
-        db.commit()
-        
-        logger.info(f"Added {reward_amount} credits for ad reward (user: {user_id}, provider: {ad_provider})")
-        return True, f"Added {reward_amount} credits"
-        
-    except Exception as e:
-        logger.error(f"Failed to add ad reward for user {user_id}: {e}")
-        db.rollback()
-        return False, f"Failed: {str(e)}"
-
 
 def add_topup_credits(
     db: Session,

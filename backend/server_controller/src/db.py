@@ -185,9 +185,11 @@ class Job(Base):
     credits_refunded = Column(Integer, default=0, nullable=False)  # Credits refunded on failure
     
     # Cost tracking - GPU infrastructure cost for this job
+    # Note: job_cost_usd = processing_cost + pod_overhead_share_usd (final total cost)
+    # To get processing cost only: job_cost_usd - pod_overhead_share_usd
     pod_uuid = Column(String(128), nullable=True, index=True)  # Pod that processed this job
     gpu_hourly_rate = Column(Float, nullable=True)  # $/hour rate for the GPU used
-    job_cost_usd = Column(Float, nullable=True)  # Calculated cost for this job in USD
+    job_cost_usd = Column(Float, nullable=True)  # TOTAL cost (processing + overhead) in USD
     pod_overhead_share_usd = Column(Float, nullable=True)  # Share of pod startup/shutdown overhead
 
     __table_args__ = (
@@ -200,6 +202,19 @@ class Job(Base):
         Index("ix_job_pod", "pod_uuid"),
     )
 
+    @property
+    def processing_cost_usd(self) -> float:
+        """Get processing cost only (total cost minus overhead)"""
+        if self.job_cost_usd is None:
+            return 0.0
+        overhead = self.pod_overhead_share_usd or 0.0
+        return max(0.0, self.job_cost_usd - overhead)
+    
+    @property
+    def total_cost_usd(self) -> float:
+        """Alias for job_cost_usd for clarity (total = processing + overhead)"""
+        return self.job_cost_usd or 0.0
+    
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
         return {
@@ -223,6 +238,11 @@ class Job(Base):
             "processing_time_seconds": self.processing_time_seconds,
             "queue_time_seconds": self.queue_time_seconds,
             "dispatch_time_seconds": self.dispatch_time_seconds,
+            # Cost metrics
+            "job_cost_usd": self.job_cost_usd,  # Total cost (processing + overhead)
+            "processing_cost_usd": self.processing_cost_usd,  # Processing cost only
+            "pod_overhead_share_usd": self.pod_overhead_share_usd,  # Overhead portion
+            "gpu_hourly_rate": self.gpu_hourly_rate,
         }
 
 
@@ -376,13 +396,15 @@ class User(Base):
     # Daily spinner tracking
     last_daily_spin_time = Column(DateTime, nullable=True)
     
+    # Rewarded ad progress (for "X ads = 1 credit" feature)
+    pending_ad_watches = Column(Integer, default=0, nullable=False)
+    
     # Status
     is_active = Column(Boolean, default=True, nullable=False)
     
     # Relationships
     credit_transactions = relationship("CreditTransaction", back_populates="user")
     subscriptions = relationship("Subscription", back_populates="user")
-    ad_rewards = relationship("AdReward", back_populates="user")
     daily_spins = relationship("DailySpin", back_populates="user")
     rewarded_ad_events = relationship("RewardedAdEvent", back_populates="user")
 
@@ -472,36 +494,6 @@ class Subscription(Base):
     __table_args__ = (
         Index("ix_subscriptions_user", "user_id"),
         Index("ix_subscriptions_status", "status"),
-    )
-
-
-# =============================================================================
-# Ad Reward Model
-# =============================================================================
-
-class AdReward(Base):
-    """
-    Ad reward tracking for rewarded video ads.
-    """
-    __tablename__ = "ad_rewards"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(128), ForeignKey("users.id"), index=True, nullable=False)
-
-    ad_provider = Column(String(32), nullable=False)  # e.g., "admob", "unity"
-    reward_type = Column(String(32), nullable=False)  # e.g., "credits", "premium_time"
-    reward_amount = Column(Integer, nullable=False)
-
-    ad_event_id = Column(String(256), nullable=True)  # For deduplication
-    verified = Column(Boolean, default=False, nullable=False)
-
-    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
-    
-    # Relationships
-    user = relationship("User", back_populates="ad_rewards")
-
-    __table_args__ = (
-        Index("ix_ad_reward_unique", "ad_provider", "ad_event_id", unique=True),
     )
 
 

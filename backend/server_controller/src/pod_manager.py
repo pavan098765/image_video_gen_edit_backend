@@ -220,19 +220,19 @@ class PodLifecycleManager:
     async def destroy_pod(
         self,
         pod_uuid: str,
-        graceful: bool = True,
+        graceful: bool = False,  # CHANGED: Default to False - stop before destroy can leave stray pods
         reason: Optional[str] = None,
     ) -> bool:
         """
-        Destroy a pod.
+        Destroy a pod with robust retry logic.
         
         Args:
             pod_uuid: Pod UUID to destroy
-            graceful: Whether to attempt graceful shutdown
+            graceful: Whether to attempt graceful shutdown first (default False)
             reason: Reason for destruction (for logging)
             
         Returns:
-            True if destroyed successfully
+            True if destroyed successfully or confirmed destroyed
         """
         async with self._lock:
             # Check if recently destroyed
@@ -242,38 +242,73 @@ class PodLifecycleManager:
         
         logger.info(f"Destroying pod {pod_uuid}: {reason or 'no reason given'}")
         
-        try:
-            # Create manager for this pod
-            pod_manager = QuickPodManager(
-                self.qp_manager.email,
-                self.qp_manager.password,
-                pod_uuid,
-            )
-            
-            if graceful:
-                # Try to stop first
+        max_destroy_attempts = 3
+        last_error = None
+        
+        for attempt in range(max_destroy_attempts):
+            try:
+                # Create manager for this pod
+                pod_manager = QuickPodManager(
+                    self.qp_manager.email,
+                    self.qp_manager.password,
+                    pod_uuid,
+                )
+                
+                # SKIP graceful stop - it can leave pods in "stopped" state if destroy fails
+                # The destroy_pod API in QuickPod will handle stopping internally
+                if graceful and attempt == 0:
+                    # Only try graceful stop on first attempt
+                    try:
+                        await asyncio.to_thread(pod_manager.stop_pod)
+                        await asyncio.sleep(1)  # Brief wait
+                    except Exception as e:
+                        logger.debug(f"Stop pod failed (continuing to destroy): {e}")
+                
+                # Destroy pod with verification
+                await asyncio.to_thread(pod_manager.destroy_pod, verify=True, max_verify_attempts=2)
+                
+                # Mark as recently destroyed
+                async with self._lock:
+                    self._recently_destroyed[pod_uuid] = time.time()
+                
+                logger.info(f"Pod {pod_uuid} destroyed and verified successfully")
+                return True
+                
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Destroy attempt {attempt + 1}/{max_destroy_attempts} failed for pod {pod_uuid}: {e}"
+                )
+                
+                # Check if pod is actually destroyed despite the error
                 try:
-                    await asyncio.to_thread(pod_manager.stop_pod)
-                    await asyncio.sleep(2)  # Brief wait
-                except Exception as e:
-                    logger.debug(f"Stop pod failed (continuing to destroy): {e}")
-            
-            # Destroy pod
-            await asyncio.to_thread(pod_manager.destroy_pod)
-            
-            # Mark as recently destroyed
-            async with self._lock:
-                self._recently_destroyed[pod_uuid] = time.time()
-            
-            logger.info(f"Pod {pod_uuid} destroyed successfully")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to destroy pod {pod_uuid}: {e}")
-            # Still mark as recently destroyed to prevent repeated attempts
-            async with self._lock:
-                self._recently_destroyed[pod_uuid] = time.time()
-            return False
+                    pod_manager = QuickPodManager(
+                        self.qp_manager.email,
+                        self.qp_manager.password,
+                        pod_uuid,
+                    )
+                    if await asyncio.to_thread(pod_manager.is_pod_destroyed):
+                        logger.info(
+                            f"Pod {pod_uuid} verified as destroyed despite error. Marking as success."
+                        )
+                        async with self._lock:
+                            self._recently_destroyed[pod_uuid] = time.time()
+                        return True
+                except Exception as verify_err:
+                    logger.debug(f"Verification check failed: {verify_err}")
+                
+                if attempt < max_destroy_attempts - 1:
+                    # Exponential backoff before retry
+                    backoff = 3 * (attempt + 1)
+                    logger.info(f"Retrying destroy in {backoff}s...")
+                    await asyncio.sleep(backoff)
+        
+        # All attempts failed - DO NOT mark as recently destroyed so it can be retried
+        logger.error(
+            f"Failed to destroy pod {pod_uuid} after {max_destroy_attempts} attempts: {last_error}. "
+            f"Pod may still be running (incurring costs)!"
+        )
+        return False
     
     def is_recently_destroyed(self, pod_uuid: str, window: int = 300) -> bool:
         """Check if pod was recently destroyed"""
@@ -1897,6 +1932,14 @@ class PodManager:
         except Exception as e:
             logger.error(f"Error recovering jobs before destroying pod {pod_uuid}: {e}")
         
+        # CRITICAL: Remove pod from local tracking FIRST, before re-dispatching recovered jobs.
+        # This ensures any in-flight dispatches or new dispatches won't try to use this dying pod.
+        async with self._lock:
+            self.individual_pods.pop(pod_uuid, None)
+            self.individual_pod_managers.pop(pod_uuid, None)
+        
+        logger.info(f"Pod {pod_uuid} removed from tracking (recovered jobs will be re-dispatched)")
+        
         # CRITICAL: Recovered jobs must be re-enqueued into the in-memory pending queue,
         # otherwise autoscaler/dispatcher won't see them and clients will be stuck in QUEUED forever.
         for r in recovered_jobs:
@@ -1908,21 +1951,23 @@ class PodManager:
 
         # CRITICAL: Trigger background dispatch for recovered jobs (best-effort).
         # Avoid hard import at module import time (circular); import lazily here.
+        # NOTE: Pod was already removed from tracking above, so new dispatches won't reuse it.
         if recovered_jobs:
             try:
                 routes = importlib.import_module("routes")
                 dispatch_fn = getattr(routes, "_dispatch_job_background", None)
                 if dispatch_fn:
+                    # Add a small delay before re-dispatching to allow old in-flight dispatches
+                    # to complete and hit the "pod not in tracking" check. This reduces race conditions.
+                    async def delayed_dispatch(job_id: str, model: str, mode: Optional[str]):
+                        await asyncio.sleep(2)  # 2 second delay
+                        await dispatch_fn(job_id, model, mode)
+                    
                     for r in recovered_jobs:
                         if r.get("job_id") and r.get("model"):
-                            asyncio.create_task(dispatch_fn(r["job_id"], r["model"], r.get("mode")))
+                            asyncio.create_task(delayed_dispatch(r["job_id"], r["model"], r.get("mode")))
             except Exception as e:
                 logger.warning(f"Failed to trigger dispatch for recovered jobs from pod {pod_uuid}: {e}")
-
-        # Remove from local tracking
-        async with self._lock:
-            self.individual_pods.pop(pod_uuid, None)
-            self.individual_pod_managers.pop(pod_uuid, None)
         
         # Destroy via lifecycle manager
         success = await self.lifecycle.destroy_pod(pod_uuid, reason=reason)
