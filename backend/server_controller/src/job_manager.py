@@ -319,13 +319,49 @@ class JobManager:
         worker_id: str,
         started_at: Optional[datetime] = None,
     ) -> Job:
-        """Mark job as running with worker assignment"""
+        """
+        Mark job as running with worker assignment.
+        
+        CRITICAL: This method includes safety checks to prevent race conditions
+        where a job is marked as RUNNING on a worker that was destroyed.
+        """
         with self.session_factory() as db:
             job = db.query(Job).filter(Job.job_id == job_id).first()
             if not job:
                 raise JobNotFoundError(job_id)
             
+            # CRITICAL SAFETY CHECK: Verify worker is not offline/terminated
+            # This prevents race condition where pod is destroyed but in-flight dispatch succeeds
+            worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+            if worker and worker.status in ("offline", "terminated", "error"):
+                logger.warning(
+                    f"Refusing to mark job {job_id} as RUNNING on worker {worker_id} "
+                    f"(worker status: {worker.status}). Job will be recovered by pod destruction handler."
+                )
+                # Raise exception to abort the dispatch - don't silently succeed
+                raise JobStateError(
+                    job_id=job_id,
+                    current_state=f"{job.status} (worker={worker.status})",
+                    target_state=JobState.RUNNING.value,
+                )
+            
             current_state = JobState(job.status) if job.status else JobState.PENDING
+            
+            # CRITICAL: If job is already QUEUED (recovered), don't overwrite to RUNNING
+            # This can happen if job was recovered during pod destruction but dispatch succeeded
+            if current_state == JobState.QUEUED:
+                # Check if this is a stale dispatch (worker matches the one being destroyed)
+                if job.worker_id is None:
+                    logger.warning(
+                        f"Job {job_id} is in QUEUED state with no assigned worker. "
+                        f"This likely means it was recovered. Refusing to mark as RUNNING on {worker_id}."
+                    )
+                    raise JobStateError(
+                        job_id=job_id,
+                        current_state=f"{JobState.QUEUED.value} (recovered, no worker)",
+                        target_state=JobState.RUNNING.value,
+                    )
+            
             self._validate_transition(current_state, JobState.RUNNING)
             
             job.status = JobState.RUNNING.value
@@ -334,7 +370,6 @@ class JobManager:
             job.updated_at = utc_naive_now()
             
             # Update worker
-            worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
             if worker:
                 worker.status = "busy" if not worker.is_warm_pod else "processing"
                 worker.last_active = utc_naive_now()

@@ -54,7 +54,6 @@ from credit_service import (
     refund_credits_for_job,
     get_credit_cost,
     has_sufficient_credits,
-    add_ad_reward,
 )
 from models import (
     SubmitRequest,
@@ -739,83 +738,6 @@ async def get_credit_balance(
 # Client cannot directly manipulate credits.
 
 
-class AdRewardRequest(BaseModel):
-    """Request body for claiming ad reward"""
-    ad_provider: str = Field(..., description="Ad provider (e.g., 'admob', 'unity')")
-    ad_event_id: str = Field(..., description="Unique event ID from ad network (for deduplication)")
-
-
-@auth_router.post("/claim_ad_reward")
-async def claim_ad_reward(
-    payload: AdRewardRequest,
-    authorization: Optional[str] = Header(None),
-):
-    """
-    Claim credits for watching an ad.
-    
-    **CRITICAL:** Deduplicated by (ad_provider, ad_event_id) to prevent abuse.
-    Each ad can only be claimed ONCE.
-    
-    **Headers:**
-    - Authorization: Bearer <firebase_id_token>
-    
-    **JSON Body:**
-    - ad_provider: Ad network provider (e.g., "admob", "unity")
-    - ad_event_id: Unique event ID from ad network callback
-    
-    **Reward amounts by provider:**
-    - admob: 5 credits
-    - unity: 5 credits
-    """
-    # Reward amounts per provider (configurable)
-    REWARD_AMOUNTS = {
-        "admob": 5,
-        "unity": 5,
-        "default": 3,
-    }
-    
-    decoded = await verify_firebase_token(authorization)
-    firebase_uid = decoded.get("uid")
-    
-    if not firebase_uid:
-        raise HTTPException(400, "Firebase UID not found in token")
-    
-    with SessionLocal() as db:
-        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
-        
-        if not user:
-            raise HTTPException(404, "User not found")
-        
-        # Get reward amount for provider
-        reward_amount = REWARD_AMOUNTS.get(payload.ad_provider, REWARD_AMOUNTS["default"])
-        
-        # Use credit service for atomic, deduplicated ad reward
-        success, message = add_ad_reward(
-            db=db,
-            user_id=user.id,
-            ad_provider=payload.ad_provider,
-            ad_event_id=payload.ad_event_id,
-            reward_amount=reward_amount,
-            reward_type="credits",
-        )
-        
-        if not success:
-            raise HTTPException(
-                status_code=409 if "already" in message.lower() else 400,
-                detail=message
-            )
-        
-        # Refresh user to get updated balance
-        db.refresh(user)
-        
-        return {
-            "status": "ok",
-            "credits_added": reward_amount,
-            "balance": user.total_credits,
-            "ad_provider": payload.ad_provider,
-        }
-
-
 # =============================================================================
 # Daily Spinner Endpoints
 # =============================================================================
@@ -1132,30 +1054,46 @@ def _verify_admob_signature(query_string: str, signature: str, key_id: str, keys
         return False
 
 
-def _get_today_ad_credits(db, user_id: str) -> int:
-    """Get total ad credits earned by user today (UTC)."""
+def _get_today_ad_stats(db, user_id: str) -> tuple[int, int]:
+    """
+    Get user's ad stats for today (UTC).
+    
+    Returns:
+        (ads_watched_today, credits_earned_today)
+    """
     from datetime import datetime, time as dt_time
+    from sqlalchemy import func
     
     # Get start of today (UTC)
     now = utc_naive_now()
     today_start = datetime.combine(now.date(), dt_time.min)
     
-    # Sum credits from rewarded_ad_events today
-    result = db.query(RewardedAdEvent).filter(
+    # Count total ads watched today
+    ads_watched_today = db.query(func.count(RewardedAdEvent.id)).filter(
         RewardedAdEvent.user_id == user_id,
         RewardedAdEvent.created_at >= today_start,
-    ).all()
+    ).scalar() or 0
     
-    return sum(event.credits for event in result)
+    # Sum credits earned today
+    credits_earned_today = db.query(func.coalesce(func.sum(RewardedAdEvent.credits), 0)).filter(
+        RewardedAdEvent.user_id == user_id,
+        RewardedAdEvent.created_at >= today_start,
+    ).scalar() or 0
+    
+    return ads_watched_today, credits_earned_today
 
 
 class AdRewardStatusResponse(BaseModel):
     """Response for ad reward status check"""
     can_watch: bool
-    credits_earned_today: int
-    daily_limit: int
-    credits_per_ad: int
+    credits_earned_today: int  # Credits user has earned today (ads_watched / 2)
+    daily_limit: int  # Max credits per day
+    credits_per_ad: int  # 0 since credits come every 2 ads
     next_reset_time: str  # ISO 8601 UTC
+    cooldown_ends_at: Optional[str] = None  # When cooldown ends (null if no cooldown)
+    # Fields for "2 ads = 1 credit" system
+    ads_watched_today: int  # Total ads watched today (0, 1, 2, 3, 4, 5...)
+    ads_required_for_credit: int  # How many ads needed for 1 credit
 
 
 class SSVCallbackResponse(BaseModel):
@@ -1176,9 +1114,12 @@ async def get_ad_reward_status(
     
     **Returns:**
     - can_watch: Whether user can earn more credits from ads today
-    - credits_earned_today: Credits earned from ads today
+    - credits_earned_today: Credits earned from ads today (ads_watched / 2)
     - daily_limit: Maximum credits earnable per day
-    - credits_per_ad: Credits per ad view
+    - credits_per_ad: 0 (credits come every 2 ads, not per ad)
+    - ads_watched_today: Total ads watched today
+    - ads_required_for_credit: How many ads needed for 1 credit
+    - cooldown_ends_at: When cooldown ends (null if no cooldown)
     - next_reset_time: When daily limit resets (midnight UTC)
     """
     decoded = await verify_firebase_token(authorization)
@@ -1195,10 +1136,10 @@ async def get_ad_reward_status(
         
         # Get config
         daily_limit = get_app_config_int(db, "daily_ad_credit_limit", 30)
-        credits_per_ad = get_app_config_int(db, "credits_per_rewarded_ad", 1)
+        ads_required_for_credit = get_app_config_int(db, "ads_per_credit", 2)
         
-        # Get today's earnings
-        earned_today = _get_today_ad_credits(db, user.id)
+        # Get today's ad stats
+        ads_watched_today, credits_earned_today = _get_today_ad_stats(db, user.id)
         
         # Calculate next reset (midnight UTC tomorrow)
         from datetime import time as dt_time
@@ -1207,11 +1148,14 @@ async def get_ad_reward_status(
         next_reset = datetime.combine(tomorrow, dt_time.min)
         
         return AdRewardStatusResponse(
-            can_watch=earned_today < daily_limit,
-            credits_earned_today=earned_today,
+            can_watch=credits_earned_today < daily_limit,
+            credits_earned_today=credits_earned_today,
             daily_limit=daily_limit,
-            credits_per_ad=credits_per_ad,
+            credits_per_ad=0,  # 0 because credits come every N ads, not per ad
             next_reset_time=_format_iso_utc(next_reset),
+            cooldown_ends_at=None,  # No cooldown implemented yet
+            ads_watched_today=ads_watched_today,
+            ads_required_for_credit=ads_required_for_credit,
         )
 
 
@@ -1323,39 +1267,46 @@ async def admob_ssv_callback(
         
         # Get config
         daily_limit = get_app_config_int(db, "daily_ad_credit_limit", 30)
-        credits_per_ad = get_app_config_int(db, "credits_per_rewarded_ad", 1)
+        ads_required_for_credit = get_app_config_int(db, "ads_per_credit", 2)  # How many ads needed for 1 credit
+        
+        # Get today's ad stats BEFORE adding the new ad
+        ads_watched_today, credits_earned_today = _get_today_ad_stats(db, user.id)
         
         # Check daily limit
-        earned_today = _get_today_ad_credits(db, user.id)
-        
-        if earned_today >= daily_limit:
-            logger.info(f"[ADS] Daily limit reached for user {firebase_uid}: {earned_today}/{daily_limit}")
+        if credits_earned_today >= daily_limit:
+            logger.info(f"[ADS] Daily limit reached for user {firebase_uid}: {credits_earned_today}/{daily_limit}")
             return {"status": "limit_reached", "message": f"Daily limit of {daily_limit} credits reached"}
         
-        # Grant credits (use server config, ignore Google's reward_amount)
-        credits_to_grant = credits_per_ad
+        # This ad will be the Nth ad watched today (1-indexed for modulo logic)
+        new_ad_count = ads_watched_today + 1
         
-        # Don't exceed daily limit
-        if earned_today + credits_to_grant > daily_limit:
-            credits_to_grant = daily_limit - earned_today
+        # Grant credit every N ads (when count is divisible by ads_required_for_credit)
+        # e.g., if ads_required_for_credit=2: grant on 2nd, 4th, 6th ad...
+        credits_to_grant = 0
+        if new_ad_count % ads_required_for_credit == 0:
+            credits_to_grant = 1
+            
+            # Don't exceed daily limit
+            if credits_earned_today + credits_to_grant > daily_limit:
+                credits_to_grant = 0
+            
+            if credits_to_grant > 0:
+                user.total_credits += credits_to_grant
+                user.bonus_granted += credits_to_grant
+                
+                # Record credit transaction
+                transaction = CreditTransaction(
+                    user_id=user.id,
+                    delta=credits_to_grant,
+                    reason="rewarded_ad",
+                    created_at=utc_naive_now(),
+                )
+                db.add(transaction)
         
-        # Update user credits
-        user.total_credits += credits_to_grant
-        user.bonus_granted += credits_to_grant
-        
-        # Record credit transaction
-        transaction = CreditTransaction(
-            user_id=user.id,
-            delta=credits_to_grant,
-            reason="rewarded_ad",
-            created_at=utc_naive_now(),
-        )
-        db.add(transaction)
-        
-        # Log rewarded ad event (for anti-abuse tracking)
+        # Log rewarded ad event (always log, credits=0 if still accumulating)
         ad_event = RewardedAdEvent(
             user_id=user.id,
-            credits=credits_to_grant,
+            credits=credits_to_grant,  # Will be 0 if still accumulating
             ad_provider="admob",
             ad_unit_id=ad_unit,
             transaction_id=transaction_id,
@@ -1368,109 +1319,20 @@ async def admob_ssv_callback(
         
         db.commit()
         
-        logger.info(f"[ADS] Granted {credits_to_grant} credits to {firebase_uid} via SSV (transaction: {transaction_id})")
-        
-        return {"status": "ok", "message": f"Granted {credits_to_grant} credits"}
+        if credits_to_grant > 0:
+            logger.info(f"[ADS] Granted {credits_to_grant} credit to {firebase_uid} (ads watched: {new_ad_count}) via SSV (transaction: {transaction_id})")
+            return {"status": "ok", "message": f"Granted {credits_to_grant} credit"}
+        else:
+            ads_remaining = ads_required_for_credit - (new_ad_count % ads_required_for_credit)
+            logger.info(f"[ADS] Ad recorded for {firebase_uid} (ads watched: {new_ad_count}, need {ads_remaining} more for credit) (transaction: {transaction_id})")
+            return {"status": "ok", "message": f"Ad recorded. Watch {ads_remaining} more ad(s) to earn 1 credit"}
 
 
-@ads_router.post("/rewarded/complete")
-async def complete_rewarded_ad(
-    authorization: Optional[str] = Header(None),
-    device_id: Optional[str] = None,
-):
-    """
-    Client-side rewarded ad completion endpoint (FALLBACK ONLY).
-    
-    **IMPORTANT:** This endpoint should only be used as a fallback when SSV is not available.
-    SSV (/ads/admob/ssv) is more secure and should be preferred.
-    
-    For production, consider disabling this endpoint and using SSV only.
-    
-    **Headers:**
-    - Authorization: Bearer <firebase_id_token>
-    
-    **Note:** This endpoint has stricter rate limiting since it's client-initiated.
-    """
-    decoded = await verify_firebase_token(authorization)
-    firebase_uid = decoded.get("uid")
-    
-    if not firebase_uid:
-        raise HTTPException(400, "Firebase UID not found in token")
-    
-    with SessionLocal() as db:
-        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
-        
-        if not user:
-            raise HTTPException(404, "User not found")
-        
-        # Get config
-        daily_limit = get_app_config_int(db, "daily_ad_credit_limit", 30)
-        credits_per_ad = get_app_config_int(db, "credits_per_rewarded_ad", 1)
-        cooldown_seconds = get_app_config_int(db, "ad_cooldown_seconds", 30)
-        
-        # Check cooldown (anti-abuse for client-initiated requests)
-        from datetime import timedelta
-        cooldown_start = utc_naive_now() - timedelta(seconds=cooldown_seconds)
-        recent_event = db.query(RewardedAdEvent).filter(
-            RewardedAdEvent.user_id == user.id,
-            RewardedAdEvent.created_at >= cooldown_start,
-        ).first()
-        
-        if recent_event:
-            raise HTTPException(429, f"Please wait {cooldown_seconds} seconds between ad rewards")
-        
-        # Check daily limit
-        earned_today = _get_today_ad_credits(db, user.id)
-        
-        if earned_today >= daily_limit:
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "error": "daily_limit_reached",
-                    "message": f"Daily limit of {daily_limit} credits reached",
-                    "credits_earned_today": earned_today,
-                    "daily_limit": daily_limit,
-                }
-            )
-        
-        # Grant credits
-        credits_to_grant = min(credits_per_ad, daily_limit - earned_today)
-        
-        user.total_credits += credits_to_grant
-        user.bonus_granted += credits_to_grant
-        
-        # Record transaction
-        transaction = CreditTransaction(
-            user_id=user.id,
-            delta=credits_to_grant,
-            reason="rewarded_ad_client",
-            created_at=utc_naive_now(),
-        )
-        db.add(transaction)
-        
-        # Log event
-        ad_event = RewardedAdEvent(
-            user_id=user.id,
-            credits=credits_to_grant,
-            ad_provider="client",
-            signature_verified=False,  # Client-initiated, not verified
-            device_id=device_id,
-            created_at=utc_naive_now(),
-        )
-        db.add(ad_event)
-        
-        db.commit()
-        db.refresh(user)
-        
-        logger.info(f"[ADS] Granted {credits_to_grant} credits to {firebase_uid} via client endpoint")
-        
-        return {
-            "status": "ok",
-            "credits_added": credits_to_grant,
-            "balance": user.total_credits,
-            "credits_earned_today": earned_today + credits_to_grant,
-            "daily_limit": daily_limit,
-        }
+# NOTE: Client-side ad completion endpoint (/ads/rewarded/complete) has been REMOVED.
+# All rewarded ad credits are now granted exclusively via AdMob SSV (Server-Side Verification).
+# This prevents users from spoofing ad completions.
+# 
+# Frontend must configure AdMob to call /ads/admob/ssv with custom_data containing the firebase_uid.
 
 
 def _calculate_timing_metrics(
@@ -1579,6 +1441,33 @@ async def health_check():
     )
 
 
+def _generate_signed_download_url(r2_key: str, expires_in_seconds: int = 3600) -> Optional[str]:
+    """
+    Generate a signed download URL for an R2 object.
+    
+    Args:
+        r2_key: The R2 object key (e.g., "image-vide-generator-api/uuid.png")
+        expires_in_seconds: URL validity duration (default 1 hour)
+    
+    Returns:
+        Signed URL string, or None if secret not configured
+    """
+    if not r2_key:
+        return None
+    
+    DOWNLOAD_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "SECRETKEY")
+    if not DOWNLOAD_SECRET:
+        return None
+    
+    expires = int(time.time()) + expires_in_seconds
+    payload = f"{r2_key}:{expires}"
+    sig = hmac.new(
+        DOWNLOAD_SECRET.encode(), payload.encode(), hashlib.sha256
+    ).hexdigest()
+    
+    return f"https://img-vid-gen-download.pavanalur3.workers.dev/d/{r2_key}?exp={expires}&sig={sig}"
+
+
 @public_router.get("/download_url/{job_id}")
 async def get_signed_download_url(job_id: str):
     db = SessionLocal()
@@ -1588,18 +1477,12 @@ async def get_signed_download_url(job_id: str):
             raise HTTPException(status_code=404, detail="Result not ready")
 
         r2_key = job.result_r2_key
-        # example:
-        # image-vide-generator-api/14e1a10a-1479-472e-88c4-1d64ec867bfb.png
-
-        expires = int(time.time()) + 3600  # 1 hour
-        payload = f"{r2_key}:{expires}"
-        DOWNLOAD_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "SECRETKEY")
-        if not DOWNLOAD_SECRET:
+        
+        signed_url = _generate_signed_download_url(r2_key)
+        if not signed_url:
             raise HTTPException(status_code=500, detail="DOWNLOAD_SECRET not set")
-        sig = hmac.new(
-            DOWNLOAD_SECRET.encode(), payload.encode(), hashlib.sha256
-        ).hexdigest()
-        return f"https://img-vid-gen-download.pavanalur3.workers.dev/d/{r2_key}?exp={expires}&sig={sig}"
+        
+        return signed_url
     finally:
         db.close()
 
@@ -3029,9 +2912,48 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             
             return False
         
+        # CRITICAL: Before marking job as RUNNING, verify the pod is still valid.
+        # This prevents race condition where pod is destroyed mid-dispatch but HTTP request succeeded.
+        pod_still_valid = True
+        if _pod_manager and pod_uuid:
+            async with _pod_manager._lock:
+                pod_still_valid = pod_uuid in _pod_manager.individual_pods
+            
+            if not pod_still_valid:
+                logger.warning(
+                    f"Pod {pod_uuid} was destroyed during dispatch of job {job_id}. "
+                    f"Aborting mark_running - job will be recovered by pod destruction handler."
+                )
+                # Don't mark as RUNNING - let recovery handle it
+                return False
+        
+        # Also check if worker was marked offline (another sign of pod destruction)
+        worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+        if worker and worker.status == "offline":
+            logger.warning(
+                f"Worker {worker_id} is offline (pod destroyed?). "
+                f"Aborting mark_running for job {job_id} - job will be recovered."
+            )
+            return False
+        
+        # CRITICAL: Re-fetch job to check if it was recovered during dispatch
+        # (Job may have been set to QUEUED by pod destruction handler)
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if job and job.status == JobState.QUEUED.value and job.worker_id is None:
+            logger.warning(
+                f"Job {job_id} was recovered to QUEUED during dispatch (worker_id is None). "
+                f"Aborting mark_running - job will be re-dispatched by recovery system."
+            )
+            return False
+        
         # Success! Mark job as RUNNING
         if _job_manager:
-            _job_manager.mark_running(job_id, worker_id)
+            try:
+                _job_manager.mark_running(job_id, worker_id)
+            except Exception as e:
+                logger.error(f"Failed to mark job {job_id} as running: {e}")
+                # Job might have been recovered already - don't fail
+                return False
         else:
             job = db.query(Job).filter(Job.job_id == job_id).first()
             if job:
@@ -3956,12 +3878,18 @@ async def job_complete(
         # Send FCM notification
         fcm_token = job.fcm_token
         if fcm_token and not job.notification_sent:
+            # Include actual signed download URL for successful jobs so client can download directly
+            download_url = None
+            if not payload.failed and payload.result_r2_key:
+                download_url = _generate_signed_download_url(payload.result_r2_key)
+            
             background_tasks.add_task(
                 _send_job_notification,
                 fcm_token,
                 job_id,
                 job.model,
                 not payload.failed,
+                download_url,
             )
             job.notification_sent = True
             db.commit()
@@ -4001,14 +3929,17 @@ async def _remove_pending_job_safe(pod_manager, job_id: str, model: str, status:
         logger.debug(f"Failed to remove {status} job {job_id} from pending queue: {e}")
 
 
-async def _send_job_notification(token: str, job_id: str, model: str, success: bool):
+async def _send_job_notification(token: str, job_id: str, model: str, success: bool, download_url: str = None):
     """Background task to send FCM notification"""
     if success:
+        data = {"job_id": job_id, "status": "completed"}
+        if download_url:
+            data["download_url"] = download_url
         await send_fcm_notification(
             token,
             "Job Complete",
             f"Your result is ready!",
-            {"job_id": job_id, "status": "completed"},
+            data,
         )
     else:
         await send_fcm_notification(

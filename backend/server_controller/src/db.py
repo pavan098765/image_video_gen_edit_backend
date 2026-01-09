@@ -396,13 +396,15 @@ class User(Base):
     # Daily spinner tracking
     last_daily_spin_time = Column(DateTime, nullable=True)
     
+    # Rewarded ad progress (for "X ads = 1 credit" feature)
+    pending_ad_watches = Column(Integer, default=0, nullable=False)
+    
     # Status
     is_active = Column(Boolean, default=True, nullable=False)
     
     # Relationships
     credit_transactions = relationship("CreditTransaction", back_populates="user")
     subscriptions = relationship("Subscription", back_populates="user")
-    ad_rewards = relationship("AdReward", back_populates="user")
     daily_spins = relationship("DailySpin", back_populates="user")
     rewarded_ad_events = relationship("RewardedAdEvent", back_populates="user")
 
@@ -492,36 +494,6 @@ class Subscription(Base):
     __table_args__ = (
         Index("ix_subscriptions_user", "user_id"),
         Index("ix_subscriptions_status", "status"),
-    )
-
-
-# =============================================================================
-# Ad Reward Model
-# =============================================================================
-
-class AdReward(Base):
-    """
-    Ad reward tracking for rewarded video ads.
-    """
-    __tablename__ = "ad_rewards"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(128), ForeignKey("users.id"), index=True, nullable=False)
-
-    ad_provider = Column(String(32), nullable=False)  # e.g., "admob", "unity"
-    reward_type = Column(String(32), nullable=False)  # e.g., "credits", "premium_time"
-    reward_amount = Column(Integer, nullable=False)
-
-    ad_event_id = Column(String(256), nullable=True)  # For deduplication
-    verified = Column(Boolean, default=False, nullable=False)
-
-    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
-    
-    # Relationships
-    user = relationship("User", back_populates="ad_rewards")
-
-    __table_args__ = (
-        Index("ix_ad_reward_unique", "ad_provider", "ad_event_id", unique=True),
     )
 
 

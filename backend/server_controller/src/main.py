@@ -196,6 +196,14 @@ class AppState:
         self.background_tasks.append(task)
         logger.info("Started heartbeat cache sync task")
         
+        # Stray pod cleanup task (catches pods that slipped through other cleanup)
+        task = asyncio.create_task(
+            self._stray_pod_cleanup_task(),
+            name="stray_pod_cleanup"
+        )
+        self.background_tasks.append(task)
+        logger.info("Started stray pod cleanup task")
+        
         logger.info(f"Started {len(self.background_tasks)} background tasks")
     
     async def shutdown(self):
@@ -561,6 +569,156 @@ class AppState:
                 break
             except Exception:
                 logger.exception("Pod cleanup task error")
+    
+    async def _stray_pod_cleanup_task(self):
+        """
+        Periodically check for stray pods that exist in QuickPod but not in our tracking.
+        
+        This catches pods that:
+        - Failed to destroy but weren't properly tracked
+        - Were created but never registered
+        - Slipped through other cleanup mechanisms
+        
+        CRITICAL: Does NOT destroy pods that have active jobs!
+        """
+        from quickpod_api import QuickPodManager
+        from db import SessionLocal, Worker, Job
+        from job_manager import JobState
+        
+        # Run every 5 minutes
+        cleanup_interval = 300
+        
+        logger.info(f"Stray pod cleanup task started (interval={cleanup_interval}s)")
+        
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(cleanup_interval)
+                
+                if not self.pod_manager:
+                    continue
+                
+                try:
+                    # Fetch all pods from QuickPod
+                    qp = QuickPodManager(
+                        self.pod_manager.email,
+                        self.pod_manager.password,
+                    )
+                    await asyncio.to_thread(qp.login)
+                    pods = await asyncio.to_thread(qp.get_my_pods)
+                    
+                    if pods is None:
+                        logger.debug("Stray pod cleanup: Failed to fetch pods from QuickPod")
+                        continue
+                    
+                    # Get set of tracked pod UUIDs
+                    async with self.pod_manager._lock:
+                        tracked_pods = set(self.pod_manager.individual_pods.keys())
+                    
+                    # Add warm pod if we have one
+                    if self.pod_manager.warm_pod_uuid and self.pod_manager.own_warm_pod:
+                        tracked_pods.add(self.pod_manager.warm_pod_uuid)
+                    
+                    # CRITICAL: Also get pods with active jobs from DB
+                    # This protects against destroying pods after server restart
+                    db = SessionLocal()
+                    try:
+                        # Find all workers with active jobs
+                        active_workers = db.query(Worker).join(
+                            Job, Worker.worker_id == Job.worker_id
+                        ).filter(
+                            Job.status.in_([
+                                JobState.RUNNING.value,
+                                JobState.DISPATCHING.value,
+                            ])
+                        ).all()
+                        
+                        # Add their container_ids to tracked set
+                        for w in active_workers:
+                            if w.container_id:
+                                tracked_pods.add(w.container_id)
+                                logger.debug(
+                                    f"Stray pod cleanup: Protecting pod {w.container_id} "
+                                    f"(has active jobs)"
+                                )
+                    finally:
+                        db.close()
+                    
+                    # Find stray pods (exist in QuickPod but not tracked)
+                    stray_count = 0
+                    for pod in pods:
+                        # Extract pod UUID from response
+                        pod_uuid = pod.get("altname", "").split("-")
+                        if len(pod_uuid) >= 5:
+                            # altname format: prefix-uuid-uuid-uuid-uuid-uuid
+                            pod_uuid = "-".join(pod_uuid[-5:])
+                        else:
+                            pod_uuid = pod.get("docker_ID") or pod.get("id")
+                        
+                        if not pod_uuid:
+                            continue
+                        
+                        # Skip if tracked (includes pods with active jobs)
+                        if pod_uuid in tracked_pods:
+                            continue
+                        
+                        # Skip if destroyed/exited
+                        if pod.get("destroyed") or pod.get("state") == "exited":
+                            continue
+                        
+                        # Skip if in recently destroyed tracker
+                        if self.pod_manager.lifecycle.is_recently_destroyed(pod_uuid, window=600):
+                            continue
+                        
+                        # DOUBLE CHECK: Query DB directly for any active jobs on this pod
+                        db = SessionLocal()
+                        try:
+                            active_job_count = db.query(Job).join(
+                                Worker, Job.worker_id == Worker.worker_id
+                            ).filter(
+                                Worker.container_id == pod_uuid,
+                                Job.status.in_([
+                                    JobState.RUNNING.value,
+                                    JobState.DISPATCHING.value,
+                                    JobState.QUEUED.value,
+                                ])
+                            ).count()
+                            
+                            if active_job_count > 0:
+                                logger.info(
+                                    f"Stray pod cleanup: Skipping pod {pod_uuid} - "
+                                    f"has {active_job_count} active job(s) in DB"
+                                )
+                                continue
+                        finally:
+                            db.close()
+                        
+                        # This is a truly stray pod with no active jobs - destroy it
+                        logger.warning(
+                            f"Found stray pod {pod_uuid} (state={pod.get('state')}). "
+                            f"Not in local tracking and no active jobs. "
+                            f"Destroying to prevent cost leakage."
+                        )
+                        
+                        try:
+                            await self.pod_manager.lifecycle.destroy_pod(
+                                pod_uuid,
+                                graceful=False,
+                                reason="Stray pod cleanup - not in local tracking, no active jobs"
+                            )
+                            stray_count += 1
+                        except Exception as destroy_err:
+                            logger.error(f"Failed to destroy stray pod {pod_uuid}: {destroy_err}")
+                    
+                    if stray_count > 0:
+                        logger.info(f"Stray pod cleanup: destroyed {stray_count} stray pod(s)")
+                    
+                except Exception as e:
+                    logger.warning(f"Stray pod cleanup error: {e}")
+                
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Stray pod cleanup task error")
     
     async def _ban_cleanup_task(self):
         """Clean up expired IP bans"""
