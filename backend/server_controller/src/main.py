@@ -669,6 +669,14 @@ class AppState:
                         if self.pod_manager.lifecycle.is_recently_destroyed(pod_uuid, window=600):
                             continue
                         
+                        # Skip if marked as undestroyable (permission issues)
+                        if self.pod_manager.lifecycle.is_undestroyable(pod_uuid):
+                            logger.debug(
+                                f"Stray pod cleanup: Skipping undestroyable pod {pod_uuid} "
+                                f"(permission issue - will retry after 1 hour)"
+                            )
+                            continue
+                        
                         # DOUBLE CHECK: Query DB directly for any active jobs on this pod
                         db = SessionLocal()
                         try:

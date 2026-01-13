@@ -308,11 +308,35 @@ class QuickPodManager:
                 logger.debug(f"Loaded token from shared cache for {self.email}")
                 return True
         
-            return False
+        return False
+    
+    def _should_refresh_token(self) -> bool:
+        """Check if token should be refreshed (< 10 minutes remaining)"""
+        if not self.token or not self.token_acquired_at:
+            return True
+        
+        elapsed = datetime.utcnow() - self.token_acquired_at
+        remaining = self.token_ttl - elapsed
+        
+        # Refresh if less than 10 minutes remaining
+        return remaining < timedelta(minutes=10)
     
     def _auth_headers(self, force_refresh: bool = False) -> Dict[str, str]:
         """Get authorization headers, refreshing token if needed"""
-        if force_refresh or not self._is_token_valid():
+        # Only refresh if explicitly requested OR token is invalid/expiring soon
+        if force_refresh or not self._is_token_valid() or self._should_refresh_token():
+            # Double-check we actually need to login
+            # Check cache one more time as another thread might have refreshed
+            if self.email:
+                cached = self._get_cached_token(self.email)
+                if cached and not force_refresh:
+                    self.token, self.token_acquired_at, self.token_ttl = cached
+                    elapsed = datetime.utcnow() - self.token_acquired_at
+                    remaining = self.token_ttl - elapsed
+                    if remaining >= timedelta(minutes=10):
+                        # Cache has a fresh enough token, use it
+                        return {"Authorization": f"Bearer {self.token}"}
+            
             self.login()
         return {"Authorization": f"Bearer {self.token}"}
     
@@ -574,8 +598,11 @@ class QuickPodManager:
             
             for pod in pods:
                 # Match by altname (which contains pod_uuid) or docker_ID
-                pod_id = pod.get("altname", "")
-                if check_uuid in pod_id or pod.get("docker_ID", "") == check_uuid:
+                # Ensure all values are strings for comparison
+                pod_id = str(pod.get("altname", "") or "")
+                docker_id = str(pod.get("docker_ID", "") or "")
+                check_uuid_str = str(check_uuid)
+                if check_uuid_str in pod_id or docker_id == check_uuid_str:
                     # Found the pod - check if it's destroyed
                     if pod.get("destroyed", False):
                         logger.info(f"Pod {check_uuid} confirmed destroyed (destroyed=true)")
@@ -620,50 +647,80 @@ class QuickPodManager:
         
         for attempt in range(max_verify_attempts):
             try:
-                    data = self._make_request(
+                data = self._make_request(
                     "GET",
                     "update/destroypod",
                     params={"pod_uuid": self.pod_uuid},
                     timeout=POD_OPERATION_TIMEOUT,
                 )
-                    # Some QuickPod endpoints return {"status": "..."} without "error".
-                    # Treat non-success statuses as failures so the controller doesn't log false success.
-                    if isinstance(data, dict) and data.get("status") and str(data.get("status")).lower() != "success":
-                        raise PodDestroyError(self.pod_uuid, reason=f"Destroy pod failed: {data}")
-                    
-                    # Verify destruction if requested
-                    if verify:
-                        # Brief delay before verification to allow QuickPod to process
-                        time.sleep(1.0)
-                        if self.is_pod_destroyed():
-                            logger.info(f"Pod {self.pod_uuid} destruction verified via /mypods")
-                            return data
-                        else:
-                            # Pod still exists - retry destroy
-                            if attempt < max_verify_attempts - 1:
-                                logger.warning(
-                                    f"Pod {self.pod_uuid} destroy returned success but pod still active. "
-                                    f"Retrying ({attempt + 1}/{max_verify_attempts})..."
-                                )
-                                time.sleep(2.0 * (attempt + 1))  # Backoff
-                                continue
-                            else:
-                                raise PodDestroyError(
-                                    self.pod_uuid, 
-                                    reason=f"Destroy returned success but pod still active after {max_verify_attempts} attempts"
-                                )
-                    else:
+                # Some QuickPod endpoints return {"status": "..."} without "error".
+                # Treat non-success statuses as failures so the controller doesn't log false success.
+                if isinstance(data, dict) and data.get("status") and str(data.get("status")).lower() != "success":
+                    raise PodDestroyError(self.pod_uuid, reason=f"Destroy pod failed: {data}")
+                
+                # Verify destruction if requested
+                if verify:
+                    # Brief delay before verification to allow QuickPod to process
+                    time.sleep(1.0)
+                    if self.is_pod_destroyed():
+                        logger.info(f"Pod {self.pod_uuid} destruction verified via /mypods")
                         return data
-                        
+                    else:
+                        # Pod still exists - retry destroy
+                        if attempt < max_verify_attempts - 1:
+                            logger.warning(
+                                f"Pod {self.pod_uuid} destroy returned success but pod still active. "
+                                f"Retrying ({attempt + 1}/{max_verify_attempts})..."
+                            )
+                            time.sleep(2.0 * (attempt + 1))  # Backoff
+                            continue
+                        else:
+                            raise PodDestroyError(
+                                self.pod_uuid, 
+                                reason=f"Destroy returned success but pod still active after {max_verify_attempts} attempts"
+                            )
+                else:
+                    return data
+                    
             except PodDestroyError:
-                    raise
+                raise
             except Exception as e:
-                    last_error = e
-                    if attempt < max_verify_attempts - 1:
-                        logger.warning(f"Destroy attempt {attempt + 1} failed: {e}, retrying...")
-                        time.sleep(2.0 * (attempt + 1))
-                        continue
-            raise PodDestroyError(self.pod_uuid, reason=str(e), cause=e)
+                last_error = e
+                error_str = str(e).lower()
+                
+                # Handle permission/ownership errors specially
+                # QuickPod sometimes returns misleading "permission to start" errors during destroy
+                is_permission_error = (
+                    "permission" in error_str or 
+                    "not authorized" in error_str or
+                    "not found" in error_str or
+                    "does not exist" in error_str
+                )
+                
+                if is_permission_error:
+                    # Check if pod is actually destroyed despite the error
+                    logger.info(f"Permission/not found error during destroy, verifying pod status...")
+                    try:
+                        if self.is_pod_destroyed():
+                            logger.info(
+                                f"Pod {self.pod_uuid} confirmed destroyed despite error. "
+                                f"Likely already destroyed or owned by another account."
+                            )
+                            return {"status": "success", "note": "Pod confirmed destroyed via verification"}
+                        else:
+                            logger.warning(
+                                f"Pod {self.pod_uuid} still exists but cannot be destroyed "
+                                f"(permission issue). This pod may belong to another account."
+                            )
+                    except Exception as verify_err:
+                        logger.debug(f"Verification during permission error failed: {verify_err}")
+                
+                if attempt < max_verify_attempts - 1:
+                    logger.warning(f"Destroy attempt {attempt + 1} failed: {e}, retrying...")
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                # Exhausted retries - raise with the last error
+                raise PodDestroyError(self.pod_uuid, reason=str(last_error), cause=last_error)
         
         # Should not reach here, but handle edge case
         raise PodDestroyError(self.pod_uuid, reason=f"Max attempts reached: {last_error}")

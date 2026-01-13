@@ -108,11 +108,15 @@ class PodLifecycleManager:
     - Wait for pod readiness
     - Destroy pod with graceful shutdown
     - Track recently destroyed pods
+    - Track pods that cannot be destroyed (permission issues)
     """
     
     def __init__(self, qp_manager: QuickPodManager):
         self.qp_manager = qp_manager
         self._recently_destroyed: Dict[str, float] = {}
+        # Track pods we failed to destroy due to permission/ownership issues
+        # Format: {pod_uuid: timestamp} - these are skipped for 1 hour
+        self._undestroyable_pods: Dict[str, float] = {}
         self._lock = asyncio.Lock()
     
     async def create_pod(
@@ -239,11 +243,26 @@ class PodLifecycleManager:
             if pod_uuid in self._recently_destroyed:
                 logger.debug(f"Pod {pod_uuid} recently destroyed, skipping")
                 return True
+            
+            # Check if pod is marked as undestroyable (permission issues)
+            # Skip for 1 hour after a permission failure
+            if pod_uuid in self._undestroyable_pods:
+                marked_at = self._undestroyable_pods[pod_uuid]
+                if time.time() - marked_at < 3600:  # 1 hour
+                    logger.debug(
+                        f"Pod {pod_uuid} marked as undestroyable (permission issue), "
+                        f"skipping for {int(3600 - (time.time() - marked_at))}s"
+                    )
+                    return False
+                else:
+                    # Expired, remove from undestroyable list and retry
+                    del self._undestroyable_pods[pod_uuid]
         
         logger.info(f"Destroying pod {pod_uuid}: {reason or 'no reason given'}")
         
         max_destroy_attempts = 3
         last_error = None
+        is_permission_error = False
         
         for attempt in range(max_destroy_attempts):
             try:
@@ -270,12 +289,23 @@ class PodLifecycleManager:
                 # Mark as recently destroyed
                 async with self._lock:
                     self._recently_destroyed[pod_uuid] = time.time()
+                    # Remove from undestroyable if it was there
+                    self._undestroyable_pods.pop(pod_uuid, None)
                 
                 logger.info(f"Pod {pod_uuid} destroyed and verified successfully")
                 return True
                 
             except Exception as e:
                 last_error = e
+                error_str = str(e).lower()
+                
+                # Check if this is a permission/ownership error
+                is_permission_error = (
+                    "permission" in error_str or
+                    "not authorized" in error_str or
+                    "access denied" in error_str
+                )
+                
                 logger.warning(
                     f"Destroy attempt {attempt + 1}/{max_destroy_attempts} failed for pod {pod_uuid}: {e}"
                 )
@@ -293,6 +323,7 @@ class PodLifecycleManager:
                         )
                         async with self._lock:
                             self._recently_destroyed[pod_uuid] = time.time()
+                            self._undestroyable_pods.pop(pod_uuid, None)
                         return True
                 except Exception as verify_err:
                     logger.debug(f"Verification check failed: {verify_err}")
@@ -303,11 +334,21 @@ class PodLifecycleManager:
                     logger.info(f"Retrying destroy in {backoff}s...")
                     await asyncio.sleep(backoff)
         
-        # All attempts failed - DO NOT mark as recently destroyed so it can be retried
-        logger.error(
-            f"Failed to destroy pod {pod_uuid} after {max_destroy_attempts} attempts: {last_error}. "
-            f"Pod may still be running (incurring costs)!"
-        )
+        # All attempts failed
+        if is_permission_error:
+            # Mark as undestroyable to avoid retrying for 1 hour
+            async with self._lock:
+                self._undestroyable_pods[pod_uuid] = time.time()
+            logger.error(
+                f"Failed to destroy pod {pod_uuid} due to permission issues. "
+                f"This pod may belong to another account or session. "
+                f"Marked as undestroyable for 1 hour."
+            )
+        else:
+            logger.error(
+                f"Failed to destroy pod {pod_uuid} after {max_destroy_attempts} attempts: {last_error}. "
+                f"Pod may still be running (incurring costs)!"
+            )
         return False
     
     def is_recently_destroyed(self, pod_uuid: str, window: int = 300) -> bool:
@@ -317,16 +358,32 @@ class PodLifecycleManager:
             return False
         return time.time() - destroyed_at < window
     
+    def is_undestroyable(self, pod_uuid: str) -> bool:
+        """Check if pod is marked as undestroyable (permission issues)"""
+        if pod_uuid not in self._undestroyable_pods:
+            return False
+        marked_at = self._undestroyable_pods[pod_uuid]
+        return time.time() - marked_at < 3600  # 1 hour window
+    
     async def cleanup_destroyed_tracker(self, max_age: int = 3600):
-        """Clean up old entries from recently destroyed tracker"""
+        """Clean up old entries from recently destroyed and undestroyable trackers"""
         now = time.time()
         async with self._lock:
+            # Clean up recently destroyed
             expired = [
                 uuid for uuid, ts in self._recently_destroyed.items()
                 if now - ts > max_age
             ]
             for uuid in expired:
                 del self._recently_destroyed[uuid]
+            
+            # Clean up undestroyable pods (also 1 hour expiry)
+            expired_undestroyable = [
+                uuid for uuid, ts in self._undestroyable_pods.items()
+                if now - ts > 3600
+            ]
+            for uuid in expired_undestroyable:
+                del self._undestroyable_pods[uuid]
 
 
 # =============================================================================
@@ -642,6 +699,15 @@ class PodManager:
         self._model_locks: Dict[str, asyncio.Lock] = {}
         self._global_qp_lock = asyncio.Lock()
         self._global_qp_logged_in = False
+        
+        # Global pod creation semaphore - CRITICAL: prevents parallel pod creation storms
+        # Limits to 2 concurrent pod creations globally to prevent runaway pod creation
+        self._pod_creation_semaphore = asyncio.Semaphore(
+            int(os.getenv("MAX_CONCURRENT_POD_CREATIONS", "2"))
+        )
+        # Track in-flight pod creations per model to prevent duplicates
+        self._pod_creation_in_flight: Dict[str, bool] = {}
+        self._pod_creation_backoff: Dict[str, float] = {}  # model -> last_failure_time
         
         # Configuration
         self.max_individual_pods = int(os.getenv("MAX_INDIVIDUAL_PODS", "50"))
@@ -1434,7 +1500,47 @@ class PodManager:
         1. Priority machines
         2. Cached machines
         3. Global fallback
+        
+        Includes throttling to prevent runaway pod creation:
+        - Global semaphore limits concurrent creations
+        - Per-model in-flight tracking prevents duplicates
+        - Backoff after failures
         """
+        # CRITICAL: Check if pod creation is already in-flight for this model
+        async with self._lock:
+            if self._pod_creation_in_flight.get(model, False):
+                logger.warning(
+                    f"Pod creation already in-flight for model {model}, skipping duplicate request"
+                )
+                return None
+            
+            # Check backoff period (30s after failure)
+            last_failure = self._pod_creation_backoff.get(model, 0)
+            backoff_remaining = 30 - (time.time() - last_failure)
+            if backoff_remaining > 0:
+                logger.warning(
+                    f"Pod creation for model {model} in backoff period ({backoff_remaining:.1f}s remaining)"
+                )
+                return None
+            
+            # Mark as in-flight
+            self._pod_creation_in_flight[model] = True
+        
+        try:
+            # Acquire global semaphore to limit concurrent pod creations
+            async with self._pod_creation_semaphore:
+                return await self._create_machine_based_pod_impl(model, mode)
+        finally:
+            # Always clear in-flight flag
+            async with self._lock:
+                self._pod_creation_in_flight[model] = False
+    
+    async def _create_machine_based_pod_impl(
+        self,
+        model: str,
+        mode: Optional[str] = None,
+    ) -> Optional[str]:
+        """Internal implementation of pod creation (called with semaphore held)"""
         model_lock = self._get_model_lock(model)
         async with model_lock:
             await self._ensure_global_login()
@@ -1632,6 +1738,10 @@ class PodManager:
             ]
             if blacklisted_machines:
                 logger.warning(f"Currently blacklisted machines: {blacklisted_machines}")
+            
+            # Set backoff period on failure to prevent rapid retry storms
+            async with self._lock:
+                self._pod_creation_backoff[model] = time.time()
             
             return None
     
