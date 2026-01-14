@@ -599,6 +599,8 @@ class AppState:
                 
                 try:
                     # Fetch all pods from QuickPod
+                    # Create a fresh session for each cleanup run to avoid session issues
+                    from quickpod_api import QuickPodManager
                     qp = QuickPodManager(
                         self.pod_manager.email,
                         self.pod_manager.password,
@@ -647,14 +649,31 @@ class AppState:
                     stray_count = 0
                     for pod in pods:
                         # Extract pod UUID from response
-                        pod_uuid = pod.get("altname", "").split("-")
-                        if len(pod_uuid) >= 5:
-                            # altname format: prefix-uuid-uuid-uuid-uuid-uuid
-                            pod_uuid = "-".join(pod_uuid[-5:])
-                        else:
-                            pod_uuid = pod.get("docker_ID") or pod.get("id")
-                        
+                        # Prefer the altname suffix (contains the true pod UUID). Avoid falling
+                        # back to docker_ID because QuickPod destroy API expects the full UUID;
+                        # using docker_ID leads to "permission" errors.
+                        pod_uuid = None
+                        altname = pod.get("altname", "")
+                        if altname:
+                            parts = altname.split("-")
+                            if len(parts) >= 5:
+                                pod_uuid = "-".join(parts[-5:])  # suffix is the actual pod UUID
+
+                        # Secondary fallbacks
                         if not pod_uuid:
+                            pod_uuid = pod.get("pod_uuid") or pod.get("uuid") or pod.get("id")
+                        
+                        # Convert to string (pod.get("id") can return an int)
+                        if pod_uuid is not None:
+                            pod_uuid = str(pod_uuid)
+
+                        # If still not a UUID-looking string, skip to avoid bad destroy calls
+                        if not pod_uuid or "-" not in pod_uuid:
+                            logger.debug(
+                                f"Stray pod cleanup: unable to extract pod_uuid from pod entry "
+                                f"(altname={pod.get('altname')}, docker_ID={pod.get('docker_ID')}, id={pod.get('id')}). "
+                                f"Skipping destroy to avoid permission errors."
+                            )
                             continue
                         
                         # Skip if tracked (includes pods with active jobs)
@@ -667,14 +686,6 @@ class AppState:
                         
                         # Skip if in recently destroyed tracker
                         if self.pod_manager.lifecycle.is_recently_destroyed(pod_uuid, window=600):
-                            continue
-                        
-                        # Skip if marked as undestroyable (permission issues)
-                        if self.pod_manager.lifecycle.is_undestroyable(pod_uuid):
-                            logger.debug(
-                                f"Stray pod cleanup: Skipping undestroyable pod {pod_uuid} "
-                                f"(permission issue - will retry after 1 hour)"
-                            )
                             continue
                         
                         # DOUBLE CHECK: Query DB directly for any active jobs on this pod

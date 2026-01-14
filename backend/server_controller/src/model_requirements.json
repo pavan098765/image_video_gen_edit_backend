@@ -82,6 +82,7 @@
             "4090"
         ],
         "min_gpu_count": 1,
+        "max_jobs_per_pod": 1,
         "variant_template_key": {
             "fp4": "qwen_image_edit_2509",
             "int4": "qwen_image_edit_2509_int4"

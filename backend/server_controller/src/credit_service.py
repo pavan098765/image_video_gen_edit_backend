@@ -147,20 +147,25 @@ def get_model_cost_info(model: str) -> Dict[str, int]:
     return tool_config.get(model, FALLBACK_CREDIT_COSTS["default"])
 
 
-def calculate_job_cost(model: str, params: Optional[Dict[str, Any]] = None) -> int:
+def calculate_job_cost(
+    model: str,
+    params: Optional[Dict[str, Any]] = None,
+    variations: int = 1,
+) -> int:
     """
-    Calculate the total cost for a job.
+    Calculate the total cost for a job (or batch of jobs).
     
     Formula:
         base_cost = model's base cost
         upscale_cost = model's upscale cost (if scale_factor > 1)
         offer_discount = base_cost * (offer / 100)
-        
-        total = base_cost + upscale_cost - offer_discount
+        per_job_cost = base_cost + upscale_cost - offer_discount
+        total = per_job_cost * variations
     
     Args:
         model: The model name (e.g., "qwen_image_edit_2509")
         params: Job params dict, may contain "scale_factor"
+        variations: Number of variations to generate (multiplies cost)
     
     Returns:
         Total credit cost (integer, minimum 1)
@@ -183,38 +188,54 @@ def calculate_job_cost(model: str, params: Optional[Dict[str, Any]] = None) -> i
                 sf = 1
         scale_factor = int(sf) if sf else 1
     
-    # Calculate total cost
-    total = base_cost
+    # Calculate per-job cost
+    per_job_cost = base_cost
     
     # Add upscale cost if scale_factor > 1
     if scale_factor > 1:
-        total += upscale_cost
+        per_job_cost += upscale_cost
         logger.debug(f"[CREDIT] Adding upscale cost: {upscale_cost} (scale_factor={scale_factor})")
     
     # Apply offer discount
     if offer_percent > 0:
         discount = int(base_cost * offer_percent / 100)
-        total -= discount
+        per_job_cost -= discount
         logger.debug(f"[CREDIT] Applying {offer_percent}% discount: -{discount}")
     
-    # Ensure minimum cost of 1
-    total = max(1, total)
+    # Ensure minimum cost of 1 per job
+    per_job_cost = max(1, per_job_cost)
+    
+    # Multiply by variations count
+    variations = max(1, min(4, variations))  # Clamp to 1-4
+    total = per_job_cost * variations
     
     logger.info(
         f"[CREDIT] Cost for {model}: base={base_cost}, upscale={upscale_cost if scale_factor > 1 else 0}, "
-        f"offer={offer_percent}%, total={total}"
+        f"offer={offer_percent}%, per_job={per_job_cost}, variations={variations}, total={total}"
     )
     
     return total
 
 
-def get_credit_cost(model: str, params: Optional[Dict[str, Any]] = None) -> int:
+def get_credit_cost(
+    model: str,
+    params: Optional[Dict[str, Any]] = None,
+    variations: int = 1,
+) -> int:
     """
     Get credit cost for a model (with optional params for upscale calculation).
     
     This is the main entry point for cost calculation.
+    
+    Args:
+        model: Model name
+        params: Job params (may contain scale_factor)
+        variations: Number of variations to generate (1-4)
+    
+    Returns:
+        Total credit cost
     """
-    return calculate_job_cost(model, params)
+    return calculate_job_cost(model, params, variations)
 
 
 # =============================================================================

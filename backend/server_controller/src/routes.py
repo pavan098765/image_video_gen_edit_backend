@@ -20,6 +20,51 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
+
+def normalize_pod_uuid(pod_uuid: Optional[str]) -> Optional[str]:
+    """
+    Normalize pod UUID by removing hyphens for comparison purposes.
+    
+    QuickPod pod UUIDs come in format: fe0cf25f-94a2-4120-8dde-2969e8978b5c
+    Workers may send them with or without hyphens.
+    
+    Returns None if input is None or empty.
+    """
+    if not pod_uuid:
+        return None
+    return pod_uuid.replace("-", "").lower()
+
+
+def format_pod_uuid_with_hyphens(pod_uuid: Optional[str]) -> Optional[str]:
+    """
+    Format a pod UUID with hyphens (8-4-4-4-12 format) for QuickPod API calls.
+    
+    QuickPod API requires UUIDs in format: fe0cf25f-94a2-4120-8dde-2969e8978b5c
+    
+    Returns None if input is None or not a valid 32-char hex string.
+    """
+    if not pod_uuid:
+        return None
+    
+    # Remove existing hyphens first
+    clean = pod_uuid.replace("-", "").lower()
+    
+    # If already has hyphens and is 36 chars, return as-is
+    if len(pod_uuid) == 36 and "-" in pod_uuid:
+        return pod_uuid.lower()
+    
+    # If it's 32 hex chars, format with hyphens
+    if len(clean) == 32:
+        try:
+            # Validate it's hex
+            int(clean, 16)
+            return f"{clean[:8]}-{clean[8:12]}-{clean[12:16]}-{clean[16:20]}-{clean[20:]}"
+        except ValueError:
+            pass
+    
+    # Return as-is if we can't format it
+    return pod_uuid
+
 import requests
 
 from fastapi import (
@@ -55,6 +100,10 @@ from credit_service import (
     get_credit_cost,
     has_sufficient_credits,
 )
+from prompt_enhancement import (
+    enhance_prompt,
+    should_enhance_for_model,
+)
 from models import (
     SubmitRequest,
     SubmitResponse,
@@ -80,6 +129,7 @@ from exceptions import (
     InvalidModelError,
     AuthenticationError,
     InvalidSignatureError,
+    JobAlreadyProcessedError,
 )
 from job_manager import JobManager, JobState
 from logging_config import get_audit_logger
@@ -1504,7 +1554,12 @@ async def submit_job(
     
     Requires Firebase authentication via Authorization: Bearer <firebase_id_token>
     
+    Supports:
+    - enhance_prompt: If true, AI will enhance the prompt before processing
+    - variations: Number of output variations to generate (1-4, creates multiple jobs)
+    
     Returns job ID and optionally dispatches immediately if a worker is ready.
+    For variations > 1, returns batch_id and all job_ids.
     """
     ip = get_client_ip(request)
     user_id = auth.get("user_id")
@@ -1526,88 +1581,164 @@ async def submit_job(
     # Moved earlier for credit cost calculation with scale_factor
     full_params = dict(payload.params) if payload.params else {}
     
-    # Check if user has sufficient credits for this model
-    # Cost includes upscale cost if scale_factor > 1
-    credit_cost = get_credit_cost(model, full_params)
+    # Get variations count (default 1, max 4)
+    variations = max(1, min(4, payload.variations))
+    
+    # Check if user has sufficient credits for this model (including variations)
+    # Cost includes upscale cost if scale_factor > 1, multiplied by variations
+    credit_cost = get_credit_cost(model, full_params, variations)
     if auth.get("total_credits", 0) < credit_cost:
         raise HTTPException(
             status_code=402,  # Payment Required
             detail=f"Insufficient credits. Have: {auth.get('total_credits', 0)}, Need: {credit_cost}"
         )
     
-    # Generate job ID and result key
-    job_id = str(uuid.uuid4())
-    result_key = f"{_image_prefix}/{job_id}.png"
+    # Handle prompt enhancement if requested
+    prompt_enhanced = False
+    enhanced_prompt_text = None
+    final_prompt = payload.prompt or ""
     
-    # Generate presigned URL
-    upload_url = create_presigned_put_url(result_key)
+    if payload.enhance_prompt and final_prompt:
+        mode = full_params.get("mode")
+        if should_enhance_for_model(model, mode):
+            try:
+                was_enhanced, enhanced_text, original = await enhance_prompt(
+                    final_prompt, model, timeout=10.0
+                )
+                if was_enhanced:
+                    prompt_enhanced = True
+                    enhanced_prompt_text = enhanced_text
+                    final_prompt = enhanced_text
+                    logger.info(f"Prompt enhanced for model {model}")
+            except Exception as enhance_error:
+                logger.warning(f"Prompt enhancement failed: {enhance_error}")
+                # Continue with original prompt
     
-    # Prepare params for DB storage - strip large binary data like init_image
-    # These are passed to worker via cache, not stored in DB
-    db_params = dict(full_params)
-    large_fields = ["init_image", "image", "mask_image", "control_image", "source_image"]
-    for field in large_fields:
-        db_params.pop(field, None)
+    # Generate batch ID for multi-variation requests
+    batch_id = str(uuid.uuid4()) if variations > 1 else None
     
-    # Create job in database with QUEUED status and atomically lock credits
+    # Create job(s) - multiple jobs for variations > 1
+    job_ids = []
+    created_jobs = []
+    total_credits_locked = 0
+    
     db = SessionLocal()
     try:
         now = utc_naive_now()
-        job = Job(
-            job_id=job_id,
-            model=model,
-            prompt=payload.prompt,
-            params=db_params,  # Use sanitized params without large binary data
-            status=JobState.QUEUED.value,  # Start as QUEUED
-            result_r2_key=result_key,
-            output_key=result_key,
-            fcm_token=payload.fcm_token,
-            user_id=user_id,  # Link job to user for credit tracking
-            credits_locked=0,  # Will be set by lock_credits_for_job
-            credits_refunded=0,
-            created_at=now,
-            updated_at=now,
-            queued_at=now,  # Set queued_at immediately since job starts in QUEUED state
-            timeout_at=now + timedelta(minutes=30),
-        )
-        db.add(job)
-        db.flush()  # Get the job into the session before locking credits
         
-        # ATOMIC CREDIT LOCK: Deduct credits immediately
-        # If job fails, credits will be refunded via refund_credits_for_job
-        # Pass full_params for accurate cost calculation (includes scale_factor for upscale cost)
-        success, message, credits_locked = lock_credits_for_job(db, user_id, job_id, model, full_params)
+        for variation_idx in range(variations):
+            # Generate unique job ID for each variation
+            job_id = str(uuid.uuid4())
+            result_key = f"{_image_prefix}/{job_id}.png"
+            
+            # Prepare params for DB storage - strip base64 images to prevent DB bloat
+            # Full params are cached in memory for worker dispatch
+            db_params = strip_base64_images_for_db(full_params)
+            
+            # Add batch metadata to params for tracking
+            if batch_id:
+                db_params["_batch_id"] = batch_id
+                db_params["_variation_index"] = variation_idx
+                db_params["_total_variations"] = variations
+            
+            # Add enhanced prompt indicator if applicable
+            if prompt_enhanced:
+                db_params["_prompt_enhanced"] = True
+                db_params["_original_prompt"] = payload.prompt
+            
+            job = Job(
+                job_id=job_id,
+                model=model,
+                prompt=final_prompt,  # Use enhanced prompt if applicable
+                params=db_params,
+                status=JobState.QUEUED.value,
+                result_r2_key=result_key,
+                output_key=result_key,
+                fcm_token=payload.fcm_token if variation_idx == 0 else None,  # Only first job gets FCM
+                user_id=user_id,
+                credits_locked=0,
+                credits_refunded=0,
+                created_at=now,
+                updated_at=now,
+                queued_at=now,
+                timeout_at=now + timedelta(minutes=30),
+            )
+            db.add(job)
+            job_ids.append(job_id)
+            created_jobs.append({
+                "job_id": job_id,
+                "result_key": result_key,
+                "variation_idx": variation_idx,
+            })
+        
+        db.flush()  # Get all jobs into the session before locking credits
+        
+        # Lock credits for ALL jobs in batch (using first job_id as reference)
+        # The credit_cost already accounts for variations multiplier
+        primary_job_id = job_ids[0]
+        success, message, credits_locked = lock_credits_for_job(
+            db, user_id, primary_job_id, model, full_params
+        )
+        
         if not success:
             db.rollback()
             raise HTTPException(
-                status_code=402,  # Payment Required
+                status_code=402,
                 detail=message
             )
         
-        # Audit log is optional - don't block if it fails
+        total_credits_locked = credits_locked
+        
+        # For variations > 1, we need to adjust the credits_locked per job
+        # and lock additional credits for remaining jobs
+        if variations > 1:
+            per_job_cost = credits_locked  # First job already locked
+            # Lock credits for remaining jobs
+            for i, job_data in enumerate(created_jobs[1:], start=1):
+                remaining_job_id = job_data["job_id"]
+                success, msg, locked = lock_credits_for_job(
+                    db, user_id, remaining_job_id, model, full_params
+                )
+                if success:
+                    total_credits_locked += locked
+                else:
+                    # If we can't lock credits for a job, rollback everything
+                    logger.error(f"Failed to lock credits for variation {i}: {msg}")
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=402,
+                        detail=f"Insufficient credits for all variations. {msg}"
+                    )
+        
+        # Audit log for batch creation
         try:
+            audit_details = {
+                "model": model,
+                "credits_locked": total_credits_locked,
+                "variations": variations,
+                "batch_id": batch_id,
+                "prompt_enhanced": prompt_enhanced,
+            }
             create_audit_log(
                 db,
                 event_type="job_created",
-                message=f"Job {job_id} created for model {model} ({credits_locked} credits)",
-                target=job_id,
+                message=f"Job(s) created for model {model} ({total_credits_locked} credits, {variations} variations)",
+                target=primary_job_id,
                 target_type="job",
                 actor_ip=ip,
-                details={"model": model, "credits_locked": credits_locked},
+                details=audit_details,
             )
         except Exception as audit_error:
-            logger.warning(
-                f"Failed to create audit log for job {job_id}: {audit_error}"
-            )
+            logger.warning(f"Failed to create audit log: {audit_error}")
         
-        # ATOMIC COMMIT: Job creation + credit lock in single transaction
-        # If anything fails, entire operation is rolled back
+        # ATOMIC COMMIT: All jobs + credit locks in single transaction
         db.commit()
+        
     except HTTPException:
         db.rollback()
         raise
     except Exception as db_error:
-        logger.error(f"Failed to create job {job_id}: {db_error}")
+        logger.error(f"Failed to create jobs: {db_error}")
         try:
             db.rollback()
         except Exception:
@@ -1616,47 +1747,56 @@ async def submit_job(
     finally:
         db.close()
     
-    # Log job creation (non-blocking, can fail silently)
+    # Log job creation (non-blocking)
     try:
         audit_logger.job_created(
-            job_id, model, ip, auth.get("fingerprint_hash", auth.get("type"))
+            primary_job_id, model, ip, auth.get("fingerprint_hash", auth.get("type"))
         )
     except Exception:
-        pass  # Non-critical
-
-    # Cache full params (including base64 images) for dispatch to worker
-    # DB only stores sanitized params without large binary data
-    cache_job_params(job_id, full_params)
-
-    # Dispatch in background task - return immediately without waiting
-    if _pod_manager:
-        background_tasks.add_task(
-            _dispatch_job_background, job_id, model, payload.params.get("mode")
-        )
-    elif _job_manager:
-        # Fallback: if no pod_manager, at least add to pending queue
-        # (but this should rarely happen in normal operation)
-        logger.warning(
-            f"No pod_manager available, job {job_id} will be handled by recovery system"
-        )
-
-    # Build download URL - point to signed URL endpoint (not the old direct download)
+        pass
+    
+    # Cache full params and dispatch each job
+    for job_data in created_jobs:
+        jid = job_data["job_id"]
+        
+        # Cache full params (including base64 images) for dispatch to worker
+        cache_job_params(jid, full_params)
+        
+        # Dispatch in background task
+        if _pod_manager:
+            background_tasks.add_task(
+                _dispatch_job_background, jid, model, full_params.get("mode")
+            )
+        elif _job_manager:
+            logger.warning(
+                f"No pod_manager available, job {jid} will be handled by recovery system"
+            )
+    
+    # Build download URL for primary job
+    primary_job = created_jobs[0]
     download_url = (
-        f"{_controller_url}/download_url/{job_id}"
+        f"{_controller_url}/download_url/{primary_job['job_id']}"
         if _controller_url
-        else f"/download_url/{job_id}"
+        else f"/download_url/{primary_job['job_id']}"
     )
-
-    # Return IMMEDIATELY - no blocking operations after this point
+    
+    # Generate upload URL for primary job
+    upload_url = create_presigned_put_url(primary_job["result_key"])
+    
+    # Return simple response - frontend polls job_id, gets all variation results
     return SubmitResponse(
-        job_id=job_id,
+        job_id=primary_job["job_id"],
         status=JobStatus.QUEUED,
         model=model,
-        routed_to_worker=None,  # Will be set when actually dispatched
+        routed_to_worker=None,
         upload_url=upload_url,
-        result_key=result_key,
+        result_key=primary_job["result_key"],
         download_url=download_url,
         created_at=utc_naive_now(),
+        variations=variations,
+        prompt_enhanced=prompt_enhanced,
+        enhanced_prompt=enhanced_prompt_text if prompt_enhanced else None,
+        credits_used=total_credits_locked,
     )
 
 
@@ -1668,6 +1808,9 @@ async def _dispatch_job_background(
     
     CRITICAL FIX: Track machines attempted per job to limit to 3 DIFFERENT machines.
     This prevents infinite loops when all available machines are problematic.
+    
+    RACE CONDITION FIX: Check job state before dispatching to prevent double dispatch
+    when multiple dispatch tasks exist for the same job.
     """
     # Maximum of 3 DIFFERENT machines per job
     MAX_MACHINE_ATTEMPTS = 3
@@ -1679,6 +1822,32 @@ async def _dispatch_job_background(
         if not job:
             logger.error(f"Job {job_id} not found in database")
             return
+        
+        # RACE CONDITION FIX: Check if job is already in a state where it shouldn't be dispatched
+        # This can happen when multiple dispatch tasks exist for the same job (e.g., from
+        # _requeue_jobs_after_pod_failure AND _dispatch_job_background retry)
+        current_state = JobState(job.status)
+        if current_state in [JobState.RUNNING, JobState.COMPLETED, JobState.FAILED, 
+                             JobState.TIMEOUT, JobState.CANCELLED]:
+            logger.info(
+                f"Job {job_id} is already in {current_state.value} state, "
+                f"skipping dispatch (retry_count={retry_count})"
+            )
+            return
+        
+        # Also skip if job is already being dispatched by another task
+        # (DISPATCHING state means another dispatch is in progress)
+        if current_state == JobState.DISPATCHING and retry_count > 0:
+            # For retry attempts, only skip if there's a recent assignment
+            # This prevents racing dispatch tasks from creating duplicate dispatches
+            if job.updated_at:
+                time_since_update = (utc_naive_now() - job.updated_at).total_seconds()
+                if time_since_update < 30:  # If updated within last 30 seconds
+                    logger.info(
+                        f"Job {job_id} is already in DISPATCHING state (updated {time_since_update:.0f}s ago), "
+                        f"skipping retry dispatch (retry_count={retry_count})"
+                    )
+                    return
         
         # Track machines attempted
         machines_attempted = set()
@@ -1710,6 +1879,20 @@ async def _dispatch_job_background(
         db.close()
     
     try:
+        # Double-check job state before assigning (in case it changed during the checks above)
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.job_id == job_id).first()
+            if job:
+                current_state = JobState(job.status)
+                if current_state in [JobState.RUNNING, JobState.COMPLETED, JobState.FAILED]:
+                    logger.info(
+                        f"Job {job_id} state changed to {current_state.value} before assign, aborting dispatch"
+                    )
+                    return
+        finally:
+            db.close()
+        
         # Get worker_id via pod manager
         worker_id = await _job_manager.assign_job(job_id, model, mode)
         logger.info(f"Job {job_id} assigned to worker {worker_id}, now dispatching...")
@@ -1746,6 +1929,14 @@ async def _dispatch_job_background(
                     f"Job will remain in QUEUED for recovery system to handle."
                 )
             
+    except JobAlreadyProcessedError as e:
+        # Job was already handled by another dispatch task - this is expected in race conditions
+        logger.info(
+            f"Job {job_id} was already processed by another dispatch task: {e}. "
+            f"This is normal during concurrent dispatch attempts."
+        )
+        # No need to do anything - job is already being handled
+        return
     except Exception as e:
         logger.error(f"Background dispatch failed for {job_id}: {e}")
         # Ensure job is reverted to QUEUED so recovery system can pick it up
@@ -1957,6 +2148,10 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
     Actually dispatch a job to a worker via HTTP POST to /run endpoint.
     
     This is the critical step that sends the job to the worker!
+    
+    RACE CONDITION FIX: Check job state at the start to prevent dispatching
+    jobs that are already running or completed (can happen when multiple
+    dispatch tasks exist for the same job).
     """
     db = SessionLocal()
     try:
@@ -1965,6 +2160,20 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
         if not job:
             logger.error(f"_dispatch_to_worker: job {job_id} not found")
             return False
+        
+        # RACE CONDITION FIX: Check if job is already in a terminal or running state
+        # This prevents double dispatch when multiple dispatch tasks exist for the same job
+        current_state = JobState(job.status)
+        if current_state in [JobState.RUNNING, JobState.COMPLETED, JobState.FAILED,
+                             JobState.TIMEOUT, JobState.CANCELLED]:
+            logger.warning(
+                f"_dispatch_to_worker: job {job_id} is already in {current_state.value} state. "
+                f"This likely means another dispatch task already processed this job. "
+                f"Aborting dispatch to prevent duplicate processing."
+            )
+            # Return True to signal "success" (job is already being/has been processed)
+            # This prevents the caller from triggering unnecessary retries
+            return True
         
         # Get worker details
         worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
@@ -2078,7 +2287,7 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
         
         # Log if we're using cached vs DB params
         if cached_params:
-            has_images = any(k in cached_params for k in ["init_image", "image", "mask_image", "control_image", "source_image"])
+            has_images = any(k in cached_params for k in BASE64_IMAGE_FIELDS)
             logger.debug(f"Job {job_id} using cached params (has_images={has_images})")
         
         # Get worker endpoint
@@ -3006,35 +3215,209 @@ async def get_job_status(
     Get current job status.
     
     Requires Firebase authentication via Authorization: Bearer <firebase_id_token>
+    
+    For multi-variation jobs:
+    - Returns aggregated status (completed only when ALL variations done)
+    - Includes variation_results array with all variation outputs
+    - Primary result_url points to first variation
     """
+    from models import VariationResult
+    
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.job_id == job_id).first()
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         
+        # Check if this job is part of a batch (multi-variation request)
+        batch_id = job.params.get("_batch_id") if job.params else None
+        total_variations = job.params.get("_total_variations", 1) if job.params else 1
+        
+        # Default values for single job
         result_url = None
-        if job.status == JobState.COMPLETED.value and job.result_r2_key:
-            # Point to signed URL endpoint - frontend will call this to get R2 worker URL
-            result_url = (
-                f"{_controller_url}/download_url/{job_id}"
-                if _controller_url
-                else f"/download_url/{job_id}"
-            )
+        variation_results = None
+        all_completed = True
+        aggregated_status = job.status
+        aggregated_completed_at = job.completed_at
+        aggregated_error = job.error
+        
+        if batch_id and total_variations > 1:
+            # Multi-variation job - fetch all sibling jobs
+            sibling_jobs = db.query(Job).filter(
+                Job.params.contains({"_batch_id": batch_id})
+            ).all()
+            
+            # Build variation results
+            variation_results = []
+            completed_count = 0
+            failed_count = 0
+            latest_completed_at = None
+            first_error = None
+            
+            for sib_job in sorted(sibling_jobs, key=lambda j: j.params.get("_variation_index", 0) if j.params else 0):
+                var_idx = sib_job.params.get("_variation_index", 0) if sib_job.params else 0
+                var_result_url = None
+                
+                if sib_job.status == JobState.COMPLETED.value and sib_job.result_r2_key:
+                    var_result_url = (
+                        f"{_controller_url}/download_url/{sib_job.job_id}"
+                        if _controller_url
+                        else f"/download_url/{sib_job.job_id}"
+                    )
+                    completed_count += 1
+                    if sib_job.completed_at:
+                        if latest_completed_at is None or sib_job.completed_at > latest_completed_at:
+                            latest_completed_at = sib_job.completed_at
+                elif sib_job.status == JobState.FAILED.value:
+                    failed_count += 1
+                    if first_error is None:
+                        first_error = sib_job.error
+                
+                variation_results.append(VariationResult(
+                    variation_index=var_idx,
+                    status=sib_job.status,
+                    result_url=var_result_url,
+                    error=sib_job.error if sib_job.status == JobState.FAILED.value else None,
+                ))
+            
+            # Determine aggregated status
+            total_jobs = len(sibling_jobs)
+            finished_count = completed_count + failed_count
+            all_completed = finished_count == total_jobs
+            
+            if all_completed:
+                if failed_count == total_jobs:
+                    aggregated_status = JobState.FAILED.value
+                    aggregated_error = first_error or "All variations failed"
+                elif completed_count > 0:
+                    aggregated_status = JobState.COMPLETED.value
+                    aggregated_error = None
+                else:
+                    aggregated_status = JobState.FAILED.value
+                aggregated_completed_at = latest_completed_at
+            else:
+                # Still processing - find the most representative status
+                running_count = sum(1 for j in sibling_jobs if j.status == JobState.RUNNING.value)
+                if running_count > 0:
+                    aggregated_status = JobState.RUNNING.value
+                else:
+                    aggregated_status = JobState.QUEUED.value
+                aggregated_completed_at = None
+                aggregated_error = None
+            
+            # Primary result_url is first completed variation
+            for vr in variation_results:
+                if vr.result_url:
+                    result_url = vr.result_url
+                    break
+        else:
+            # Single job - standard behavior
+            total_variations = 1
+            if job.status == JobState.COMPLETED.value and job.result_r2_key:
+                result_url = (
+                    f"{_controller_url}/download_url/{job_id}"
+                    if _controller_url
+                    else f"/download_url/{job_id}"
+                )
         
         return JobStatusResponse(
             job_id=job.job_id,
-            status=JobStatus(job.status),
+            status=JobStatus(aggregated_status),
             model=job.model,
             created_at=job.created_at,
             updated_at=job.updated_at,
-            completed_at=job.completed_at,
+            completed_at=aggregated_completed_at,
             worker_id=job.worker_id,
             retry_count=job.retry_count or 0,
             result_url=result_url,
-            error=job.error,
+            error=aggregated_error,
             error_log=job.error_log,
+            # Variation fields
+            variations=total_variations,
+            variation_results=variation_results,
+            all_completed=all_completed,
         )
+    finally:
+        db.close()
+
+
+@client_router.get("/batch_status")
+async def get_batch_status(
+    batch_id: str,
+    auth: Dict = Depends(require_firebase_auth),
+):
+    """
+    Get status of all jobs in a batch (for multi-variation requests).
+    
+    Requires Firebase authentication via Authorization: Bearer <firebase_id_token>
+    
+    Returns:
+    - batch_id: The batch identifier
+    - jobs: List of job statuses
+    - all_completed: True if all jobs have finished (completed or failed)
+    - successful_count: Number of successfully completed jobs
+    - failed_count: Number of failed jobs
+    - total_count: Total number of jobs in batch
+    """
+    db = SessionLocal()
+    try:
+        # Find all jobs with this batch_id in their params
+        # Jobs store _batch_id in their params JSON
+        jobs = db.query(Job).filter(
+            Job.params.contains({"_batch_id": batch_id})
+        ).all()
+        
+        if not jobs:
+            raise HTTPException(status_code=404, detail="Batch not found")
+        
+        # Build response
+        job_statuses = []
+        successful_count = 0
+        failed_count = 0
+        
+        for job in jobs:
+            result_url = None
+            if job.status == JobState.COMPLETED.value and job.result_r2_key:
+                result_url = (
+                    f"{_controller_url}/download_url/{job.job_id}"
+                    if _controller_url
+                    else f"/download_url/{job.job_id}"
+                )
+            
+            variation_idx = job.params.get("_variation_index", 0) if job.params else 0
+            
+            job_status = {
+                "job_id": job.job_id,
+                "status": job.status,
+                "variation_index": variation_idx,
+                "result_url": result_url,
+                "error": job.error,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            }
+            job_statuses.append(job_status)
+            
+            if job.status == JobState.COMPLETED.value:
+                successful_count += 1
+            elif job.status == JobState.FAILED.value:
+                failed_count += 1
+        
+        # Sort by variation index
+        job_statuses.sort(key=lambda x: x["variation_index"])
+        
+        total_count = len(jobs)
+        finished_count = successful_count + failed_count
+        all_completed = finished_count == total_count
+        
+        return {
+            "batch_id": batch_id,
+            "jobs": job_statuses,
+            "all_completed": all_completed,
+            "successful_count": successful_count,
+            "failed_count": failed_count,
+            "total_count": total_count,
+            "pending_count": total_count - finished_count,
+        }
     finally:
         db.close()
 
@@ -3057,16 +3440,90 @@ async def register_worker(
     """
     ip = get_client_ip(request)
     
-    # Get pod UUID (prefer pod_uuid over container_id)
-    pod_uuid = payload.pod_uuid or payload.container_id
+    # Get pod UUID from worker (prefer pod_uuid over container_id)
+    worker_pod_uuid = payload.pod_uuid or payload.container_id
     
-    if not pod_uuid:
+    if not worker_pod_uuid:
         raise HTTPException(status_code=400, detail="pod_uuid or container_id required")
     
-    # Validate pod belongs to orchestrator
+    # Normalize the UUID (remove hyphens for consistent comparison/storage)
+    worker_pod_uuid_normalized = normalize_pod_uuid(worker_pod_uuid)
+    
+    # Extract worker IP and port from endpoint for verification
+    worker_ip = None
+    worker_port = None
+    if payload.endpoint:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(payload.endpoint)
+            worker_ip = parsed.hostname
+            worker_port = parsed.port
+        except Exception:
+            pass
+    
+    # CRITICAL: Match worker to tracked pod by normalized UUID or IP
+    # The server knows the real pod UUID (from create_pod response with hyphens)
+    # Worker sends the same UUID (may or may not have hyphens)
+    pod_uuid = None  # Will be set to the tracked pod's UUID (with hyphens, for API calls)
+    matched_by = None
+    
+    if _pod_manager:
+        # First: Try to match by normalized UUID
+        for tracked_uuid in list(_pod_manager.individual_pods.keys()):
+            tracked_normalized = normalize_pod_uuid(tracked_uuid)
+            if tracked_normalized == worker_pod_uuid_normalized:
+                pod_uuid = tracked_uuid  # Use the original format (with hyphens)
+                matched_by = "uuid"
+                break
+        
+        # Second: Try to match by IP (if UUID didn't match)
+        if not pod_uuid and worker_ip:
+            if hasattr(_pod_manager.lifecycle, '_pod_public_ips'):
+                ip_cache = _pod_manager.lifecycle._pod_public_ips
+                if worker_ip in ip_cache:
+                    pod_uuid = ip_cache[worker_ip]
+                    matched_by = "ip"
+        
+        if pod_uuid:
+            logger.info(
+                f"Worker registration: matched worker UUID '{worker_pod_uuid}' to tracked pod '{pod_uuid}' (by {matched_by})"
+            )
+            
+            # Verify: If we have both UUID and IP info, confirm they match
+            if matched_by == "uuid" and worker_ip:
+                if hasattr(_pod_manager.lifecycle, '_pod_public_ips'):
+                    expected_ip = None
+                    for cached_ip, cached_uuid in _pod_manager.lifecycle._pod_public_ips.items():
+                        if cached_uuid == pod_uuid:
+                            expected_ip = cached_ip
+                            break
+                    if expected_ip and expected_ip != worker_ip:
+                        logger.warning(
+                            f"Worker registration: UUID matched but IP mismatch! "
+                            f"Worker IP={worker_ip}, expected={expected_ip}. Using UUID match."
+                        )
+        else:
+            # No match found - use worker's UUID (normalized)
+            pod_uuid = worker_pod_uuid
+            logger.warning(
+                f"Worker registration: No tracked pod matches worker UUID '{worker_pod_uuid}' or IP '{worker_ip}'"
+            )
+    else:
+        pod_uuid = worker_pod_uuid
+    
+    # Normalize for storage (we'll store without hyphens for consistency)
+    pod_uuid_for_storage = normalize_pod_uuid(pod_uuid)
+    
+    # Validate pod belongs to orchestrator (using normalized comparison)
     if _pod_manager:
         active_pods = _pod_manager.active_pods
-        if pod_uuid not in active_pods:
+        # Check both formats
+        pod_in_active = (
+            pod_uuid in active_pods or 
+            pod_uuid_for_storage in active_pods or
+            any(normalize_pod_uuid(k) == pod_uuid_for_storage for k in active_pods.keys())
+        )
+        if not pod_in_active:
             # Check if recently destroyed
             if _pod_manager.lifecycle.is_recently_destroyed(pod_uuid):
                 logger.warning(
@@ -3398,9 +3855,126 @@ _job_params_cache: Dict[str, Dict[str, Any]] = {}
 _job_params_cache_lock = asyncio.Lock()
 
 
+def _normalize_base64_image(value: str) -> str:
+    """
+    Normalize base64 image string for workers:
+    1. Strip data URL prefix (e.g., 'data:image/png;base64,...')
+    2. Remove whitespace/newlines
+    3. Fix padding (base64 length must be divisible by 4)
+    
+    Workers expect clean, properly-padded base64 without the data URL prefix.
+    """
+    if not isinstance(value, str):
+        return value
+    
+    # Strip data URL prefix if present
+    if value.startswith('data:'):
+        # Format: data:image/png;base64,iVBORw0KGgo...
+        if ';base64,' in value:
+            value = value.split(';base64,', 1)[1]
+        elif ',' in value:
+            value = value.split(',', 1)[1]
+    
+    # Remove any whitespace or newlines
+    value = value.strip().replace('\n', '').replace('\r', '').replace(' ', '')
+    
+    # Fix padding if needed (base64 must be divisible by 4)
+    missing_padding = len(value) % 4
+    if missing_padding:
+        value += '=' * (4 - missing_padding)
+    
+    return value
+
+
+# Known fields that contain base64 image data
+BASE64_IMAGE_FIELDS = frozenset([
+    "init_image", "image", "mask_image", "control_image", "source_image", 
+    "images", "reference_image", "style_image", "face_image", "input_image",
+    "background_image", "foreground_image", "depth_image", "normal_image",
+])
+
+
+def _is_base64_image_string(value: Any) -> bool:
+    """
+    Check if a value looks like a base64-encoded image.
+    Returns True for long strings that appear to be base64 data.
+    """
+    if not isinstance(value, str):
+        return False
+    
+    # Must be reasonably long (images are typically > 1KB base64 = ~1365 chars)
+    if len(value) < 500:
+        return False
+    
+    # Check for data URL prefix
+    if value.startswith('data:image'):
+        return True
+    
+    # Check if it looks like base64 (mostly alphanumeric + /+=)
+    # Sample first 100 chars to avoid checking entire string
+    sample = value[:100].replace('/', '').replace('+', '').replace('=', '')
+    return sample.isalnum()
+
+
+def strip_base64_images_for_db(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Strip base64 image data from params for database storage.
+    
+    This prevents DB bloat from storing large image data that's only needed
+    for worker dispatch (which uses the in-memory cache).
+    
+    Replaces image fields with a placeholder to indicate data was present.
+    """
+    if not params:
+        return params
+    
+    cleaned = {}
+    for key, value in params.items():
+        # Skip known image fields
+        if key in BASE64_IMAGE_FIELDS:
+            if value:
+                # Store placeholder to indicate image was provided
+                cleaned[f"_{key}_provided"] = True
+            continue
+        
+        # Check for unknown fields that look like base64 images
+        if isinstance(value, str) and _is_base64_image_string(value):
+            logger.debug(f"Stripping unknown base64 field '{key}' from DB params")
+            cleaned[f"_{key}_provided"] = True
+            continue
+        
+        # Handle lists (could contain images)
+        if isinstance(value, list):
+            # Check if it's a list of images
+            if value and all(_is_base64_image_string(v) for v in value if isinstance(v, str)):
+                cleaned[f"_{key}_provided"] = True
+                cleaned[f"_{key}_count"] = len(value)
+                continue
+        
+        # Keep non-image data
+        cleaned[key] = value
+    
+    return cleaned
+
+
 def cache_job_params(job_id: str, params: Dict[str, Any]):
     """Cache full job params (including base64 images) for dispatch to worker"""
-    _job_params_cache[job_id] = params
+    # Normalize base64 image fields - strip data URL prefix and fix padding
+    cleaned_params = dict(params)
+    
+    for field in BASE64_IMAGE_FIELDS:
+        if field in cleaned_params:
+            value = cleaned_params[field]
+            if isinstance(value, str):
+                cleaned_params[field] = _normalize_base64_image(value)
+            elif isinstance(value, list):
+                # Handle list of images
+                cleaned_params[field] = [
+                    _normalize_base64_image(v) if isinstance(v, str) else v
+                    for v in value
+                ]
+    
+    _job_params_cache[job_id] = cleaned_params
 
 
 def get_cached_job_params(job_id: str) -> Optional[Dict[str, Any]]:
@@ -3876,23 +4450,78 @@ async def job_complete(
             audit_logger.job_completed(job_id, worker_id)
         
         # Send FCM notification
+        # For multi-variation jobs, only send notification when ALL variations complete
         fcm_token = job.fcm_token
-        if fcm_token and not job.notification_sent:
-            # Include actual signed download URL for successful jobs so client can download directly
-            download_url = None
-            if not payload.failed and payload.result_r2_key:
-                download_url = _generate_signed_download_url(payload.result_r2_key)
+        should_send_notification = fcm_token and not job.notification_sent
+        
+        if should_send_notification:
+            # Check if this is part of a batch
+            batch_id = job.params.get("_batch_id") if job.params else None
+            total_variations = job.params.get("_total_variations", 1) if job.params else 1
             
-            background_tasks.add_task(
-                _send_job_notification,
-                fcm_token,
-                job_id,
-                job.model,
-                not payload.failed,
-                download_url,
-            )
-            job.notification_sent = True
-            db.commit()
+            if batch_id and total_variations > 1:
+                # Multi-variation job - check if ALL variations are complete
+                sibling_jobs = db.query(Job).filter(
+                    Job.params.contains({"_batch_id": batch_id})
+                ).all()
+                
+                completed_count = sum(1 for j in sibling_jobs if j.status in [JobState.COMPLETED.value, JobState.FAILED.value])
+                all_done = completed_count == len(sibling_jobs)
+                
+                if all_done:
+                    # All variations complete - send single notification
+                    # Count successes and failures
+                    success_count = sum(1 for j in sibling_jobs if j.status == JobState.COMPLETED.value)
+                    fail_count = sum(1 for j in sibling_jobs if j.status == JobState.FAILED.value)
+                    
+                    # Get download URL for primary job (first variation)
+                    download_url = None
+                    primary_job = next((j for j in sibling_jobs if j.params.get("_variation_index", 0) == 0), None)
+                    if primary_job and primary_job.status == JobState.COMPLETED.value and primary_job.result_r2_key:
+                        download_url = _generate_signed_download_url(primary_job.result_r2_key)
+                    
+                    # Determine overall success
+                    overall_success = success_count > 0
+                    
+                    background_tasks.add_task(
+                        _send_job_notification,
+                        fcm_token,
+                        primary_job.job_id if primary_job else job_id,
+                        job.model,
+                        overall_success,
+                        download_url,
+                    )
+                    
+                    # Mark all sibling jobs as notification sent
+                    for sib in sibling_jobs:
+                        sib.notification_sent = True
+                    db.commit()
+                    
+                    logger.info(
+                        f"Batch {batch_id} complete: {success_count}/{total_variations} succeeded, "
+                        f"sent FCM notification"
+                    )
+                else:
+                    # Not all done yet - don't send notification
+                    logger.debug(
+                        f"Batch {batch_id}: {completed_count}/{total_variations} complete, waiting for others"
+                    )
+            else:
+                # Single job - standard notification
+                download_url = None
+                if not payload.failed and payload.result_r2_key:
+                    download_url = _generate_signed_download_url(payload.result_r2_key)
+                
+                background_tasks.add_task(
+                    _send_job_notification,
+                    fcm_token,
+                    job_id,
+                    job.model,
+                    not payload.failed,
+                    download_url,
+                )
+                job.notification_sent = True
+                db.commit()
     
     except HTTPException:
         raise

@@ -17,6 +17,7 @@ import time
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import traceback
 from typing import Optional, Dict, Any, Tuple, List
 from enum import Enum
 
@@ -686,41 +687,12 @@ class QuickPodManager:
                 raise
             except Exception as e:
                 last_error = e
-                error_str = str(e).lower()
-                
-                # Handle permission/ownership errors specially
-                # QuickPod sometimes returns misleading "permission to start" errors during destroy
-                is_permission_error = (
-                    "permission" in error_str or 
-                    "not authorized" in error_str or
-                    "not found" in error_str or
-                    "does not exist" in error_str
-                )
-                
-                if is_permission_error:
-                    # Check if pod is actually destroyed despite the error
-                    logger.info(f"Permission/not found error during destroy, verifying pod status...")
-                    try:
-                        if self.is_pod_destroyed():
-                            logger.info(
-                                f"Pod {self.pod_uuid} confirmed destroyed despite error. "
-                                f"Likely already destroyed or owned by another account."
-                            )
-                            return {"status": "success", "note": "Pod confirmed destroyed via verification"}
-                        else:
-                            logger.warning(
-                                f"Pod {self.pod_uuid} still exists but cannot be destroyed "
-                                f"(permission issue). This pod may belong to another account."
-                            )
-                    except Exception as verify_err:
-                        logger.debug(f"Verification during permission error failed: {verify_err}")
-                
                 if attempt < max_verify_attempts - 1:
                     logger.warning(f"Destroy attempt {attempt + 1} failed: {e}, retrying...")
+                    logger.warning(traceback.format_exc())
                     time.sleep(2.0 * (attempt + 1))
                     continue
-                # Exhausted retries - raise with the last error
-                raise PodDestroyError(self.pod_uuid, reason=str(last_error), cause=last_error)
+                raise PodDestroyError(self.pod_uuid, reason=str(e), cause=e)
         
         # Should not reach here, but handle edge case
         raise PodDestroyError(self.pod_uuid, reason=f"Max attempts reached: {last_error}")
@@ -754,10 +726,27 @@ class QuickPodManager:
         try:
             resp = requests.get(RENTABLE_URL, timeout=DEFAULT_TIMEOUT)
             resp.raise_for_status()
-            return resp.json()
+            offers = resp.json()
         except Exception as e:
             raise QuickPodAPIError("get_rentable_machines", reason=str(e), cause=e)
-    
+
+        # Debug dump to help inspect TFLOPS/GPU data returned by QuickPod
+        dump_path = os.getenv("RENTABLE_DUMP_PATH", "/tmp/rentable_dump.json")
+        try:
+            payload = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "count": len(offers) if isinstance(offers, list) else 0,
+                # Store the first 200 offers to avoid oversized files
+                "offers": offers[:200] if isinstance(offers, list) else offers,
+            }
+            with open(dump_path, "w") as f:
+                json.dump(payload, f, indent=2)
+            logger.debug(f"Wrote rentable dump to {dump_path} (count={payload.get('count')})")
+        except Exception as dump_err:
+            logger.debug(f"Failed to write rentable dump: {dump_err}")
+
+        return offers
+        
     def get_best_offer(
         self,
         preferred_machine_id: Optional[int] = None,
@@ -1135,16 +1124,105 @@ class QuickPodManager:
 # =============================================================================
 
 if __name__ == "__main__":
-    # Quick test
-    manager = QuickPodManager()
+    import sys
+    
+    print("=" * 80)
+    print("QuickPod API Test - Pod Lifecycle (Create & Destroy)")
+    print("=" * 80)
+    print()
+    # Set your credentials here
+    QUICKPOD_EMAIL = "pavanalur3@gmail.com"
+    QUICKPOD_PASSWORD = "C@9rw6fxATDm8sM"
+    
+    # Initialize manager with email and password
+    print("[1] Initializing QuickPodManager...")
+    manager = QuickPodManager(email=QUICKPOD_EMAIL, password=QUICKPOD_PASSWORD)
+    print(f"    Email: {manager.email}")
+    print(f"    Base URL: {manager.base}")
+    print()
     
     try:
-        templates = manager.get_templates()
-        print(f"Found {len(templates)} templates")
+        # Login
+        print("[2] Logging in...")
+        print(f"    → POST {BASE_URL}/auth/login")
+        token = manager.login()
+        print(f"    ✓ Login successful, token acquired")
+        print()
         
+        # Get templates
+        print("[3] Fetching templates...")
+        print(f"    → GET {manager.base}/templates")
+        templates = manager.get_templates()
+        print(f"    ✓ Found {len(templates)} templates")
+        if templates:
+            template = templates[0]
+            template_uuid = template.get("template_uuid")
+            template_name = template.get("template_name", "unknown")
+            print(f"    Using template: {template_name} ({template_uuid})")
+        print()
+        
+        # Get best offer
+        print("[4] Getting best offer...")
+        print(f"    → GET {RENTABLE_URL}")
         offer_id, machine_id = manager.get_best_offer()
-        print(f"Best offer: {offer_id}, machine: {machine_id}")
+        if offer_id and machine_id:
+            print(f"    ✓ Best offer: offer_id={offer_id}, machine_id={machine_id}")
+        else:
+            print("    ✗ No suitable offers found")
+            sys.exit(1)
+        print()
+        
+        # Create pod
+        print("[5] Creating pod...")
+        print(f"    → POST {BASE_URL}/createpod")
+        print(f"    Body: {{'offers_id': {offer_id}, 'disk_size': '50', 'template_uuid': '{template_uuid}'}}")
+        pod_data = manager.create_pod(offer_id, template_uuid, disk_size=50)
+        pod_uuid = manager.pod_uuid
+        print(f"    ✓ Pod created successfully!")
+        print(f"    Pod UUID: {pod_uuid}")
+        print(f"    Response: {json.dumps(pod_data, indent=2)}")
+        print()
+        
+        # Wait a moment
+        print("[6] Waiting 45 seconds before destroying...")
+        time.sleep(45)
+        print()
+        
+        # Destroy pod
+        print("[7] Destroying pod...")
+        print(f"    → GET {BASE_URL}/destroypod?pod_uuid={pod_uuid}")
+        print(f"    Pod UUID: {pod_uuid}")
+        
+        # Create a new manager instance for destroy (as per the actual usage pattern)
+        destroy_manager = QuickPodManager(email=QUICKPOD_EMAIL, password=QUICKPOD_PASSWORD, pod_uuid=pod_uuid)
+        destroy_manager.login()  # Ensure authenticated
+        
+        destroy_result = destroy_manager.destroy_pod(verify=True)
+        print(f"    ✓ Destroy request completed")
+        print(f"    Response: {json.dumps(destroy_result, indent=2)}")
+        print()
+        
+        # Verification (if verify was True, this was already done, but show it anyway)
+        print("[8] Verifying pod destruction...")
+        print(f"    → GET {MYPODS_URL}")
+        time.sleep(2)  # Brief wait for QuickPod to process
+        is_destroyed = destroy_manager.is_pod_destroyed(pod_uuid)
+        if is_destroyed:
+            print(f"    ✓ Pod {pod_uuid} confirmed destroyed")
+        else:
+            print(f"    ✗ Pod {pod_uuid} still exists (or verification failed)")
+        print()
+        
+        print("=" * 80)
+        print("Test completed successfully!")
+        print("=" * 80)
         
     except Exception as e:
-        print(f"Error: {e}")
+        print()
+        print("=" * 80)
+        print(f"ERROR: {type(e).__name__}: {e}")
+        print("=" * 80)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 

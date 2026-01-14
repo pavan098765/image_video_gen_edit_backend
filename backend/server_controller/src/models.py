@@ -102,9 +102,14 @@ class SubmitRequest(BaseModel):
             "mode": "txt2img",
             "width": 1024,
             "height": 1024,
+            "cfg_scale": 3.5,
+            "scale_image": true,
+            "scale_factor": 2,
             "timeout": 3600
         },
-        "fcm_token": "device-token-xyz"
+        "fcm_token": "device-token-xyz",
+        "enhance_prompt": true,
+        "variations": 2
     }
     ```
     """
@@ -121,12 +126,22 @@ class SubmitRequest(BaseModel):
     )
     params: Optional[Dict[str, Any]] = Field(
         default_factory=dict,
-        description="Additional parameters for the model"
+        description="Additional parameters for the model (cfg_scale, width, height, scale_factor, etc.)"
     )
     fcm_token: Optional[str] = Field(
         default=None,
         max_length=512,
         description="Firebase Cloud Messaging token for push notifications"
+    )
+    enhance_prompt: bool = Field(
+        default=False,
+        description="If true, AI will enhance/improve the prompt before processing"
+    )
+    variations: int = Field(
+        default=1,
+        ge=1,
+        le=4,
+        description="Number of output variations to generate (1-4, image models only)"
     )
     
     @field_validator("model")
@@ -150,6 +165,37 @@ class SubmitRequest(BaseModel):
             if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 7200:
                 raise ValueError("Timeout must be a positive number up to 7200 seconds")
         
+        # Validate cfg_scale if present
+        if "cfg_scale" in v:
+            cfg_scale = v["cfg_scale"]
+            if not isinstance(cfg_scale, (int, float)) or cfg_scale < 0.1 or cfg_scale > 15.0:
+                raise ValueError("cfg_scale must be a number between 0.1 and 15.0")
+        
+        # Validate scale_factor if present
+        if "scale_factor" in v:
+            scale_factor = v["scale_factor"]
+            if scale_factor not in [1, 2, 4]:
+                raise ValueError("scale_factor must be 1, 2, or 4")
+        
+        # Validate width and height if present
+        if "width" in v:
+            width = v["width"]
+            if not isinstance(width, int) or width < 32 or width > 2048:
+                raise ValueError("width must be an integer between 32 and 2048")
+        
+        if "height" in v:
+            height = v["height"]
+            if not isinstance(height, int) or height < 32 or height > 2048:
+                raise ValueError("height must be an integer between 32 and 2048")
+        
+        return v
+    
+    @field_validator("variations")
+    @classmethod
+    def validate_variations(cls, v: int) -> int:
+        """Validate variations count"""
+        if v < 1 or v > 4:
+            raise ValueError("variations must be between 1 and 4")
         return v
 
 
@@ -330,6 +376,19 @@ class SubmitResponse(BaseModel):
     result_key: Optional[str] = Field(None, description="R2 key where result will be stored")
     download_url: Optional[str] = Field(None, description="URL to download result when ready")
     created_at: datetime = Field(..., description="Job creation timestamp")
+    # Optional fields (backward compatible)
+    variations: int = Field(1, description="Number of variations requested")
+    prompt_enhanced: bool = Field(False, description="Whether prompt was enhanced by AI")
+    enhanced_prompt: Optional[str] = Field(None, description="The enhanced prompt if enhance_prompt was true")
+    credits_used: int = Field(0, description="Total credits used for this request")
+
+
+class VariationResult(BaseModel):
+    """Result for a single variation"""
+    variation_index: int = Field(..., description="0-based index of this variation")
+    status: str = Field(..., description="Status of this variation job")
+    result_url: Optional[str] = Field(None, description="Download URL if completed")
+    error: Optional[str] = Field(None, description="Error message if failed")
 
 
 class JobStatusResponse(BaseModel):
@@ -345,6 +404,13 @@ class JobStatusResponse(BaseModel):
     result_url: Optional[str] = None
     error: Optional[str] = None
     error_log: Optional[List[Dict[str, Any]]] = None
+    # Variation support - all results returned together
+    variations: int = Field(1, description="Total variations requested")
+    variation_results: Optional[List[VariationResult]] = Field(
+        None, 
+        description="Results for all variations (only present if variations > 1)"
+    )
+    all_completed: bool = Field(True, description="True if all variations are complete")
 
 
 class WorkerResponse(BaseModel):
