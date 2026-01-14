@@ -130,6 +130,7 @@ from exceptions import (
     AuthenticationError,
     InvalidSignatureError,
     JobAlreadyProcessedError,
+    WorkerTimeoutError,
 )
 from job_manager import JobManager, JobState
 from logging_config import get_audit_logger
@@ -1937,6 +1938,54 @@ async def _dispatch_job_background(
         )
         # No need to do anything - job is already being handled
         return
+    except WorkerTimeoutError as e:
+        # Worker registration timed out - pod may have failed to start
+        # Revert job to QUEUED and trigger immediate retry
+        logger.warning(
+            f"Worker registration timed out for job {job_id}: {e}. "
+            f"Reverting to QUEUED and triggering retry."
+        )
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.job_id == job_id).first()
+            if job and job.status not in [
+                JobState.COMPLETED.value,
+                JobState.FAILED.value,
+                JobState.RUNNING.value,
+            ]:
+                job.status = JobState.QUEUED.value
+                job.worker_id = None
+                job.updated_at = utc_naive_now()
+                if job.error_log is None:
+                    job.error_log = []
+                job.error_log.append(
+                    {
+                    "timestamp": utc_naive_now().isoformat(),
+                    "state": "dispatch_background_error",
+                    "error": str(e),
+                    }
+                )
+                db.commit()
+                
+                # CRITICAL: Trigger immediate retry instead of waiting for recovery system
+                max_retries = 5
+                if retry_count < max_retries:
+                    retry_delay = 5  # 5 second delay before retry
+                    logger.info(
+                        f"Job {job_id} will retry dispatch in {retry_delay}s (attempt {retry_count + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(retry_delay)
+                    asyncio.create_task(
+                        _dispatch_job_background(job_id, model, mode, retry_count + 1)
+                    )
+                else:
+                    logger.error(
+                        f"Job {job_id} exhausted all retries ({max_retries}) after worker timeout. "
+                        f"Job will remain in QUEUED for manual intervention."
+                    )
+        finally:
+            db.close()
+        return
     except Exception as e:
         logger.error(f"Background dispatch failed for {job_id}: {e}")
         # Ensure job is reverted to QUEUED so recovery system can pick it up
@@ -2693,8 +2742,8 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                 )
                 # Keep job in DISPATCHING state - worker will call job_complete
                 # Don't destroy pod - worker might be processing
-                # Clear cached params - job is with worker now
-                clear_cached_job_params(job_id)
+                # NOTE: DON'T clear cached params here - if job fails with OOM and is retried,
+                # we need the images. Cache will be cleared in job_complete when job reaches terminal state.
                 return True  # Treat as successful (worker will complete it)
             
             should_blacklist_machine = is_connection_error or is_connect_timeout
@@ -3193,8 +3242,9 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
         
         logger.info(f"Job {job_id} dispatched successfully to worker {worker_id}")
         
-        # Clear cached params - job is now with worker
-        clear_cached_job_params(job_id)
+        # NOTE: DON'T clear cached params here - if job fails with OOM and is retried,
+        # we need the images. Cache will be cleared in job_complete when job reaches terminal state
+        # (COMPLETED or permanently FAILED).
         
         return True
         
@@ -4262,8 +4312,10 @@ async def job_complete(
                             logger.warning(f"Failed to mark worker offline: {e}")
 
                     # Schedule destruction in background (cleanup)
+                    # Use async wrapper to ensure proper await
                     background_tasks.add_task(
-                        _pod_manager.destroy_individual_pod,
+                        _handle_oom_pod_destruction,
+                        _pod_manager,
                         pod_uuid,
                         f"OOM detected on job {job_id}",
                     )
@@ -4352,6 +4404,9 @@ async def job_complete(
                     )
                 
                 audit_logger.job_failed(job_id, worker_id, payload.error)
+                
+                # Clear cached params - job permanently failed, no more retries
+                clear_cached_job_params(job_id)
             
         else:
             # Validate R2 file exists
@@ -4448,6 +4503,9 @@ async def job_complete(
                 )
             
             audit_logger.job_completed(job_id, worker_id)
+            
+            # Clear cached params - job completed successfully
+            clear_cached_job_params(job_id)
         
         # Send FCM notification
         # For multi-variation jobs, only send notification when ALL variations complete
@@ -4548,6 +4606,25 @@ async def _handle_incompatible_pod_destruction(pod_manager, pod_uuid: str, reaso
         logger.info(f"Destroyed incompatible pod {pod_uuid}: {reason}")
     except Exception as e:
         logger.error(f"Failed to destroy incompatible pod {pod_uuid}: {e}")
+
+
+async def _handle_oom_pod_destruction(pod_manager, pod_uuid: str, reason: str):
+    """
+    Background task to destroy pod after OOM error.
+    
+    CRITICAL: This ensures the pod is actually destroyed after OOM, not just
+    removed from tracking. We use an async wrapper because background_tasks.add_task
+    requires proper handling of async functions.
+    """
+    try:
+        logger.info(f"Destroying OOM pod {pod_uuid}: {reason}")
+        success = await pod_manager.destroy_individual_pod(pod_uuid, reason=reason)
+        if success:
+            logger.info(f"Successfully destroyed OOM pod {pod_uuid}")
+        else:
+            logger.error(f"Failed to destroy OOM pod {pod_uuid} (destroy returned False)")
+    except Exception as e:
+        logger.error(f"Exception destroying OOM pod {pod_uuid}: {e}")
 
 
 async def _remove_pending_job_safe(pod_manager, job_id: str, model: str, status: str):
