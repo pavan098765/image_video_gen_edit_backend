@@ -4,61 +4,204 @@
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2025-12-11T18:43:25.567129Z",
-          "score": 202.0,
-          "last_used": "2025-12-11T20:33:04.557654Z"
+          "score": 341.0,
+          "last_used": "2026-01-13T20:47:12.802919Z"
         }
       },
       "is_priority": true,
-      "last_seen": "2025-12-11T20:33:04.557654Z",
+      "last_seen": "2026-01-13T20:47:12.802919Z",
       "stats": {
-        "success": 2,
-        "failure": 0
+        "success": 136,
+        "failure": 33
       },
-      "success_rate": 1.0
+      "success_rate": 0.8047337278106509
     },
     "14762": {
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2025-12-11T19:17:33.084982Z",
-          "score": 61.0
+          "score": 97.0,
+          "last_used": "2026-01-05T15:35:40.885888Z"
+        },
+        "flux_kontext_dev": {
+          "added_at": "2026-01-04T16:52:48.407947Z",
+          "score": 1.0,
+          "last_used": "2026-01-04T16:52:48.407947Z"
         }
       },
       "is_priority": false,
-      "last_seen": "2025-12-11T19:17:33.084982Z"
+      "last_seen": "2026-01-05T15:35:40.885888Z",
+      "stats": {
+        "success": 33,
+        "failure": 10
+      },
+      "success_rate": 0.7674418604651163
     },
     "14780": {
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2025-12-08T22:19:04.848066Z",
-          "score": 2.0
+          "score": 60.0,
+          "last_used": "2026-01-09T16:14:58.324619Z"
         }
       },
       "is_priority": false,
-      "last_seen": "2025-12-08T22:19:04.848066Z"
+      "last_seen": "2026-01-09T16:14:58.324619Z",
+      "stats": {
+        "success": 49,
+        "failure": 24
+      },
+      "success_rate": 0.6712328767123288
     },
     "283": {
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2025-12-11T09:51:18.934660Z",
-          "score": 38.0
+          "score": 100.0,
+          "last_used": "2026-01-13T20:54:40.038024Z"
+        },
+        "qwen_image_edit": {
+          "added_at": "2025-12-30T13:08:49.030046Z",
+          "score": 1.0,
+          "last_used": "2025-12-30T13:08:49.030046Z"
         }
       },
       "is_priority": false,
-      "last_seen": "2025-12-11T09:51:18.934660Z"
+      "last_seen": "2026-01-13T20:54:40.038024Z",
+      "stats": {
+        "success": 56,
+        "failure": 22
+      },
+      "success_rate": 0.717948717948718
     },
     "619": {
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2025-12-11T15:05:36.974759Z",
-          "score": 6.0
+          "score": 35.0,
+          "last_used": "2025-12-16T22:32:56.748391Z"
         }
       },
       "is_priority": false,
-      "last_seen": "2025-12-11T15:05:36.974759Z"
+      "last_seen": "2025-12-16T22:32:56.748391Z",
+      "stats": {
+        "success": 0,
+        "failure": 24
+      },
+      "success_rate": 0.0
+    },
+    "14839": {
+      "stats": {
+        "success": 15,
+        "failure": 22
+      },
+      "success_rate": 0.40540540540540543,
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2025-12-11T22:58:53.814731Z",
+          "score": 15.0,
+          "last_used": "2025-12-26T20:42:44.550082Z"
+        }
+      },
+      "last_seen": "2025-12-26T20:42:44.550082Z"
+    },
+    "300": {
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2025-12-16T20:44:59.451066Z",
+          "score": 3.0,
+          "last_used": "2025-12-16T23:09:49.110138Z"
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2025-12-16T23:09:49.110138Z",
+      "stats": {
+        "success": 3,
+        "failure": 2
+      },
+      "success_rate": 0.6
+    },
+    "412": {
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2025-12-21T07:37:58.266447Z",
+          "score": 56.0,
+          "last_used": "2026-01-13T09:50:10.611773Z"
+        },
+        "qwen_image_edit": {
+          "added_at": "2025-12-30T13:08:29.752636Z",
+          "score": 1.0,
+          "last_used": "2025-12-30T13:08:29.752636Z"
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2026-01-13T09:50:10.611773Z",
+      "stats": {
+        "success": 49,
+        "failure": 19
+      },
+      "success_rate": 0.7205882352941176
+    },
+    "275": {
+      "stats": {
+        "success": 37,
+        "failure": 16
+      },
+      "success_rate": 0.6981132075471698,
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2025-12-21T09:17:07.113498Z",
+          "score": 36.0,
+          "last_used": "2026-01-13T19:39:05.217348Z"
+        },
+        "qwen_image_edit": {
+          "added_at": "2025-12-30T12:53:15.339689Z",
+          "score": 1.0,
+          "last_used": "2025-12-30T12:53:15.339689Z"
+        }
+      },
+      "last_seen": "2026-01-13T19:39:05.217348Z"
+    },
+    "461": {
+      "stats": {
+        "success": 2,
+        "failure": 20
+      },
+      "success_rate": 0.09090909090909091,
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2026-01-04T07:36:49.866944Z",
+          "score": 3.0,
+          "last_used": "2026-01-07T03:52:40.631110Z"
+        }
+      },
+      "last_seen": "2026-01-07T03:52:40.631110Z"
+    },
+    "14838": {
+      "stats": {
+        "success": 0,
+        "failure": 9
+      },
+      "success_rate": 0.0
+    },
+    "299": {
+      "stats": {
+        "success": 8,
+        "failure": 9
+      },
+      "success_rate": 0.47058823529411764,
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2025-12-23T16:01:24.908482Z",
+          "score": 8.0,
+          "last_used": "2026-01-13T09:54:07.512330Z"
+        }
+      },
+      "last_seen": "2026-01-13T09:54:07.512330Z"
     }
   },
   "meta": {
     "version": 1,
-    "updated_at": "2025-12-11T20:33:04.557654Z"
+    "updated_at": "2026-01-13T20:54:40.038024Z"
   }
 }

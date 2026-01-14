@@ -34,9 +34,37 @@ from exceptions import (
     WorkerTimeoutError,
     QuickPodFatalError,
     QuickPodAPIError,
+    JobAlreadyProcessedError,
 )
 
 logger = logging.getLogger("pod_manager")
+
+
+def normalize_pod_uuid(pod_uuid: Optional[str]) -> Optional[str]:
+    """Normalize pod UUID by removing hyphens for comparison."""
+    if not pod_uuid:
+        return None
+    return pod_uuid.replace("-", "").lower()
+
+
+def format_pod_uuid_with_hyphens(pod_uuid: Optional[str]) -> Optional[str]:
+    """Format a pod UUID with hyphens (8-4-4-4-12 format) for QuickPod API calls."""
+    if not pod_uuid:
+        return None
+    
+    clean = pod_uuid.replace("-", "").lower()
+    
+    if len(pod_uuid) == 36 and "-" in pod_uuid:
+        return pod_uuid.lower()
+    
+    if len(clean) == 32:
+        try:
+            int(clean, 16)
+            return f"{clean[:8]}-{clean[8:12]}-{clean[12:16]}-{clean[16:20]}-{clean[20:]}"
+        except ValueError:
+            pass
+    
+    return pod_uuid
 
 
 # =============================================================================
@@ -164,7 +192,18 @@ class PodLifecycleManager:
                 logger.error(f"No pod_uuid in response: {pod_data}")
                 return None
             
-            logger.info(f"Pod created: {pod_uuid} on machine {machine_id}")
+            # CRITICAL: Cache the public IP for worker registration matching
+            # Workers register with docker container ID (CONTAINER_LABEL), not pod UUID.
+            # We need to match them by IP to get the correct pod UUID for destroy operations.
+            public_ip = pod_data.get("public_ipaddress")
+            if public_ip:
+                if not hasattr(self, '_pod_public_ips'):
+                    self._pod_public_ips = {}
+                self._pod_public_ips[public_ip] = pod_uuid
+                logger.info(f"Pod created: {pod_uuid} on machine {machine_id}, cached IP {public_ip}")
+            else:
+                logger.info(f"Pod created: {pod_uuid} on machine {machine_id}")
+            
             return pod_uuid
             
         except QuickPodFatalError as e:
@@ -220,102 +259,89 @@ class PodLifecycleManager:
     async def destroy_pod(
         self,
         pod_uuid: str,
-        graceful: bool = False,  # CHANGED: Default to False - stop before destroy can leave stray pods
+        graceful: bool = False,
         reason: Optional[str] = None,
     ) -> bool:
         """
-        Destroy a pod with robust retry logic.
+        Destroy a pod.
         
         Args:
             pod_uuid: Pod UUID to destroy
-            graceful: Whether to attempt graceful shutdown first (default False)
+            graceful: Whether to attempt graceful shutdown
             reason: Reason for destruction (for logging)
             
         Returns:
-            True if destroyed successfully or confirmed destroyed
+            True if destroyed successfully
         """
+        # CRITICAL: Ensure UUID is in hyphenated format for QuickPod API
+        original_uuid = pod_uuid
+        pod_uuid = format_pod_uuid_with_hyphens(pod_uuid) or pod_uuid
+        
+        if pod_uuid != original_uuid:
+            logger.debug(f"Formatted pod_uuid for API: {original_uuid} -> {pod_uuid}")
+        
+        pod_uuid_normalized = normalize_pod_uuid(pod_uuid)
+        
         async with self._lock:
-            # Check if recently destroyed
+            # Check if recently destroyed (check both formats)
             if pod_uuid in self._recently_destroyed:
                 logger.debug(f"Pod {pod_uuid} recently destroyed, skipping")
                 return True
+            # Also check normalized
+            for destroyed_uuid in self._recently_destroyed.keys():
+                if normalize_pod_uuid(destroyed_uuid) == pod_uuid_normalized:
+                    logger.debug(f"Pod {pod_uuid} recently destroyed (normalized match), skipping")
+                    return True
         
         logger.info(f"Destroying pod {pod_uuid}: {reason or 'no reason given'}")
         
-        max_destroy_attempts = 3
-        last_error = None
-        
-        for attempt in range(max_destroy_attempts):
-            try:
-                # Create manager for this pod
-                pod_manager = QuickPodManager(
-                    self.qp_manager.email,
-                    self.qp_manager.password,
-                    pod_uuid,
-                )
-                
-                # SKIP graceful stop - it can leave pods in "stopped" state if destroy fails
-                # The destroy_pod API in QuickPod will handle stopping internally
-                if graceful and attempt == 0:
-                    # Only try graceful stop on first attempt
-                    try:
-                        await asyncio.to_thread(pod_manager.stop_pod)
-                        await asyncio.sleep(1)  # Brief wait
-                    except Exception as e:
-                        logger.debug(f"Stop pod failed (continuing to destroy): {e}")
-                
-                # Destroy pod with verification
-                await asyncio.to_thread(pod_manager.destroy_pod, verify=True, max_verify_attempts=2)
-                
-                # Mark as recently destroyed
-                async with self._lock:
-                    self._recently_destroyed[pod_uuid] = time.time()
-                
-                logger.info(f"Pod {pod_uuid} destroyed and verified successfully")
-                return True
-                
-            except Exception as e:
-                last_error = e
-                logger.warning(
-                    f"Destroy attempt {attempt + 1}/{max_destroy_attempts} failed for pod {pod_uuid}: {e}"
-                )
-                
-                # Check if pod is actually destroyed despite the error
+        try:
+            # Create manager for this pod (must use hyphenated format)
+            pod_manager = QuickPodManager(
+                self.qp_manager.email,
+                self.qp_manager.password,
+                pod_uuid,
+            )
+            
+            if graceful:
+                # Try to stop first
                 try:
-                    pod_manager = QuickPodManager(
-                        self.qp_manager.email,
-                        self.qp_manager.password,
-                        pod_uuid,
-                    )
-                    if await asyncio.to_thread(pod_manager.is_pod_destroyed):
-                        logger.info(
-                            f"Pod {pod_uuid} verified as destroyed despite error. Marking as success."
-                        )
-                        async with self._lock:
-                            self._recently_destroyed[pod_uuid] = time.time()
-                        return True
-                except Exception as verify_err:
-                    logger.debug(f"Verification check failed: {verify_err}")
-                
-                if attempt < max_destroy_attempts - 1:
-                    # Exponential backoff before retry
-                    backoff = 3 * (attempt + 1)
-                    logger.info(f"Retrying destroy in {backoff}s...")
-                    await asyncio.sleep(backoff)
-        
-        # All attempts failed - DO NOT mark as recently destroyed so it can be retried
-        logger.error(
-            f"Failed to destroy pod {pod_uuid} after {max_destroy_attempts} attempts: {last_error}. "
-            f"Pod may still be running (incurring costs)!"
-        )
-        return False
+                    await asyncio.to_thread(pod_manager.stop_pod)
+                    await asyncio.sleep(2)  # Brief wait
+                except Exception as e:
+                    logger.debug(f"Stop pod failed (continuing to destroy): {e}")
+            
+            # Destroy pod
+            await asyncio.to_thread(pod_manager.destroy_pod)
+            
+            # Mark as recently destroyed
+            async with self._lock:
+                self._recently_destroyed[pod_uuid] = time.time()
+            
+            logger.info(f"Pod {pod_uuid} destroyed successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to destroy pod {pod_uuid}: {e}")
+            # Still mark as recently destroyed to prevent repeated attempts
+            async with self._lock:
+                self._recently_destroyed[pod_uuid] = time.time()
+            return False
     
     def is_recently_destroyed(self, pod_uuid: str, window: int = 300) -> bool:
-        """Check if pod was recently destroyed"""
+        """Check if pod was recently destroyed (uses normalized comparison)"""
+        # Direct lookup first
         destroyed_at = self._recently_destroyed.get(pod_uuid)
-        if not destroyed_at:
-            return False
-        return time.time() - destroyed_at < window
+        if destroyed_at:
+            return time.time() - destroyed_at < window
+        
+        # Try normalized comparison
+        pod_uuid_normalized = normalize_pod_uuid(pod_uuid)
+        for destroyed_uuid, destroyed_at in self._recently_destroyed.items():
+            if normalize_pod_uuid(destroyed_uuid) == pod_uuid_normalized:
+                return time.time() - destroyed_at < window
+        
+        return False
     
     async def cleanup_destroyed_tracker(self, max_age: int = 3600):
         """Clean up old entries from recently destroyed tracker"""
@@ -643,6 +669,15 @@ class PodManager:
         self._global_qp_lock = asyncio.Lock()
         self._global_qp_logged_in = False
         
+        # Global pod creation semaphore - CRITICAL: prevents parallel pod creation storms
+        # Limits to 2 concurrent pod creations globally to prevent runaway pod creation
+        self._pod_creation_semaphore = asyncio.Semaphore(
+            int(os.getenv("MAX_CONCURRENT_POD_CREATIONS", "2"))
+        )
+        # Track in-flight pod creations per model to prevent duplicates
+        self._pod_creation_in_flight: Dict[str, bool] = {}
+        self._pod_creation_backoff: Dict[str, float] = {}  # model -> last_failure_time
+        
         # Configuration
         self.max_individual_pods = int(os.getenv("MAX_INDIVIDUAL_PODS", "50"))
         self.pod_startup_timeout = int(os.getenv("POD_STARTUP_TIMEOUT", "120"))
@@ -917,7 +952,13 @@ class PodManager:
             if not pi:
                 return False
             
-            if pi.queue_size >= MAX_JOBS_PER_POD:
+            # Per-model concurrency cap: heavy models can set max_jobs_per_pod in model_requirements.json
+            model_limit = self.model_requirements.get(pi.model, {}).get(
+                "max_jobs_per_pod", MAX_JOBS_PER_POD
+            )
+            limit = max(1, int(model_limit))
+
+            if pi.queue_size >= limit:
                 return False
             
             pi.queue_size += 1
@@ -1142,9 +1183,10 @@ class PodManager:
         Dispatch using machine-based strategy.
         
         Priority:
-        1. Reuse existing READY pod for the same model
+        1. Reuse existing READY pod for the same model (with available slot)
         2. Wait for existing STARTING pod for the same model (avoid duplicate pod creation)
-        3. Create a new pod if no existing pods for this model
+        3. Wait for BUSY pod for the same model (max_jobs reached, will become free soon)
+        4. Create a new pod if no existing pods for this model
         """
         from db import SessionLocal, Worker, Job
         from models import JobStatus
@@ -1154,6 +1196,9 @@ class PodManager:
         # Collect candidates
         async with self._lock:
             candidates = list(self.individual_pods.items())
+        
+        # Track pods that exist for this model but have no available slots
+        busy_pods_for_model = []
         
         # === PHASE 1: Try to find a READY pod to reuse immediately ===
         for pod_uuid, info in candidates:
@@ -1170,6 +1215,8 @@ class PodManager:
                 # Try to reserve slot
                 reserved = await self.reserve_slot_on_pod(pod_uuid, job_id)
                 if not reserved:
+                    # Pod exists for this model but has no available slots (busy)
+                    busy_pods_for_model.append(pod_uuid)
                     continue
                 
                 # Update DB
@@ -1244,10 +1291,50 @@ class PodManager:
                         await self.record_job_start(starting_pod_uuid, job_id, started_at=pi.created_at)
                 logger.info(f"Job {job_id} successfully assigned to pod {starting_pod_uuid} (waited for STARTING)")
                 return worker_id
+            except JobAlreadyProcessedError:
+                # Job was processed by another dispatch task - this is OK, just return
+                logger.info(
+                    f"Job {job_id} was already processed by another dispatch task "
+                    f"while waiting for STARTING pod {starting_pod_uuid}"
+                )
+                raise  # Re-raise to signal to caller
             except WorkerTimeoutError:
                 logger.warning(
                     f"Timeout waiting for STARTING pod {starting_pod_uuid}, "
                     f"will create new pod for job {job_id}"
+                )
+                # Fall through to check for busy pods or create a new pod
+        
+        # === PHASE 2.5: Wait for BUSY pod to become available ===
+        # If there are existing pods for this model but all are busy (max_jobs reached),
+        # wait for one to become available instead of creating a new pod
+        if busy_pods_for_model:
+            busy_pod_uuid = busy_pods_for_model[0]
+            logger.info(
+                f"Found BUSY pod {busy_pod_uuid} for model {model} (max jobs reached), "
+                f"waiting for slot to become available for job {job_id}"
+            )
+            try:
+                worker_id = await self._wait_for_busy_pod_slot(
+                    busy_pod_uuid, model, job_id
+                )
+                if worker_id:
+                    logger.info(
+                        f"Job {job_id} successfully assigned to pod {busy_pod_uuid} "
+                        f"(waited for BUSY pod slot)"
+                    )
+                    return worker_id
+            except JobAlreadyProcessedError:
+                # Job was processed by another dispatch task - this is OK
+                logger.info(
+                    f"Job {job_id} was already processed by another dispatch task "
+                    f"while waiting for BUSY pod {busy_pod_uuid}"
+                )
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"Failed to wait for BUSY pod {busy_pod_uuid}: {e}. "
+                    f"Will create new pod for job {job_id}"
                 )
                 # Fall through to create a new pod
         
@@ -1255,6 +1342,62 @@ class PodManager:
         logger.info(f"No existing pods for model {model}, creating new pod for job {job_id}")
         pod_uuid = await self.create_machine_based_pod(model, mode)
         if not pod_uuid:
+            # RACE CONDITION FIX: If pod creation returned None, check if it's because
+            # another pod creation was already in-flight. If so, retry finding the STARTING pod.
+            async with self._lock:
+                in_flight = self._pod_creation_in_flight.get(model, False)
+            
+            if in_flight:
+                logger.info(
+                    f"Pod creation returned None (in-flight), retrying to find STARTING pod for job {job_id}"
+                )
+                # Wait a moment for the pod to be registered
+                await asyncio.sleep(0.5)
+                
+                # Retry Phase 2 - look for STARTING pod (with retries)
+                for retry_attempt in range(10):  # Try up to 10 times (5 seconds)
+                    async with self._lock:
+                        for pu, pi in self.individual_pods.items():
+                            if pi.model == model and pi.status in [PodStatus.STARTING, PodStatus.READY]:
+                                if pi.machine_id and self.is_machine_bad(pi.machine_id):
+                                    continue
+                                logger.info(
+                                    f"Found {pi.status.name} pod {pu} for model {model} after in-flight retry, "
+                                    f"waiting for it (job {job_id})"
+                                )
+                                break
+                        else:
+                            # No pod found yet, wait and retry
+                            await asyncio.sleep(0.5)
+                            continue
+                        
+                        # Found a pod, exit retry loop
+                        pod_uuid = pu
+                        break
+                
+                if pod_uuid:
+                    # Found a STARTING/READY pod, wait for worker registration
+                    try:
+                        worker_id = await self._wait_for_worker_registration(
+                            pod_uuid, model, job_id
+                        )
+                        async with self._lock:
+                            pi = self.individual_pods.get(pod_uuid)
+                            if pi:
+                                await self.record_job_start(pod_uuid, job_id, started_at=pi.created_at)
+                        logger.info(
+                            f"Job {job_id} successfully assigned to pod {pod_uuid} "
+                            f"(found after in-flight retry)"
+                        )
+                        return worker_id
+                    except JobAlreadyProcessedError:
+                        raise
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed waiting for pod {pod_uuid} after in-flight retry: {e}"
+                        )
+                        # Fall through to raise error
+            
             # Log blacklist status for debugging
             blacklisted_machines = [
                 f"{mid} (until {datetime.fromtimestamp(until).strftime('%H:%M:%S')})"
@@ -1273,7 +1416,15 @@ class PodManager:
                 await self.record_job_start(pod_uuid, job_id, started_at=pi.created_at)
         
         # Wait for worker registration
-        return await self._wait_for_worker_registration(pod_uuid, model, job_id)
+        try:
+            return await self._wait_for_worker_registration(pod_uuid, model, job_id)
+        except JobAlreadyProcessedError:
+            # Job was processed by another dispatch task - this is OK
+            logger.info(
+                f"Job {job_id} was already processed by another dispatch task "
+                f"while waiting for new pod {pod_uuid}"
+            )
+            raise
     
     async def _wait_for_worker_registration(
         self,
@@ -1286,8 +1437,12 @@ class PodManager:
         
         CRITICAL: Only assigns jobs to workers in "ready" state, NOT "starting".
         Workers in "starting" state are still loading models and cannot process jobs.
+        
+        RACE CONDITION FIX: Check job state before assigning to prevent double dispatch
+        when multiple dispatch tasks are waiting for the same pod.
         """
-        from db import SessionLocal, Worker
+        from db import SessionLocal, Worker, Job
+        from job_manager import JobState
         
         start = time.time()
         timeout = self.worker_registration_timeout
@@ -1295,6 +1450,22 @@ class PodManager:
         
         while time.time() - start < timeout:
             with SessionLocal() as db:
+                # RACE CONDITION FIX: Check if job is still in a dispatchable state
+                # Another dispatch task might have already assigned this job
+                job = db.query(Job).filter(Job.job_id == job_id).first()
+                if job:
+                    current_state = JobState(job.status)
+                    if current_state in [JobState.RUNNING, JobState.COMPLETED, JobState.FAILED,
+                                         JobState.TIMEOUT, JobState.CANCELLED]:
+                        logger.info(
+                            f"Job {job_id} is already in {current_state.value} state, "
+                            f"aborting wait for worker registration on pod {pod_uuid}"
+                        )
+                        # Raise an exception to signal the caller that job is already handled
+                        raise JobAlreadyProcessedError(
+                            f"Job {job_id} is already in {current_state.value} state"
+                        )
+                
                 # CRITICAL FIX: Only accept READY workers, NOT starting
                 # A worker in "starting" state is still loading models and will fail health checks
                 worker = (
@@ -1308,6 +1479,19 @@ class PodManager:
                 )
                 
                 if worker:
+                    # Double-check job state right before assignment
+                    job = db.query(Job).filter(Job.job_id == job_id).first()
+                    if job:
+                        current_state = JobState(job.status)
+                        if current_state in [JobState.RUNNING, JobState.COMPLETED, JobState.FAILED]:
+                            logger.info(
+                                f"Job {job_id} changed to {current_state.value} before assignment, "
+                                f"aborting wait for worker registration"
+                            )
+                            raise JobAlreadyProcessedError(
+                                f"Job {job_id} is already in {current_state.value} state"
+                            )
+                    
                     worker.status = "dispatching"
                     worker.last_active = datetime.utcnow()
                     db.commit()
@@ -1338,6 +1522,19 @@ class PodManager:
         
         # Check if we timed out with a starting worker (vs no worker at all)
         with SessionLocal() as db:
+            # Final job state check
+            job = db.query(Job).filter(Job.job_id == job_id).first()
+            if job:
+                current_state = JobState(job.status)
+                if current_state in [JobState.RUNNING, JobState.COMPLETED, JobState.FAILED]:
+                    logger.info(
+                        f"Job {job_id} is in {current_state.value} state at timeout, "
+                        f"was likely handled by another dispatch task"
+                    )
+                    raise JobAlreadyProcessedError(
+                        f"Job {job_id} is already in {current_state.value} state"
+                    )
+            
             final_worker = (
                 db.query(Worker)
                 .filter(
@@ -1355,6 +1552,15 @@ class PodManager:
                     )
                 elif final_worker.status == "ready":
                     # Race condition - worker became ready just now
+                    # But first check job state
+                    job = db.query(Job).filter(Job.job_id == job_id).first()
+                    if job:
+                        current_state = JobState(job.status)
+                        if current_state in [JobState.RUNNING, JobState.COMPLETED, JobState.FAILED]:
+                            raise JobAlreadyProcessedError(
+                                f"Job {job_id} is already in {current_state.value} state"
+                            )
+                    
                     logger.info(
                         f"Worker {final_worker.worker_id} became ready during timeout check, "
                         f"assigning job {job_id}"
@@ -1365,6 +1571,126 @@ class PodManager:
                     return final_worker.worker_id
         
         raise WorkerTimeoutError(pod_uuid, timeout)
+    
+    async def _wait_for_busy_pod_slot(
+        self,
+        pod_uuid: str,
+        model: str,
+        job_id: str,
+        timeout: int = 120,
+    ) -> Optional[str]:
+        """
+        Wait for a busy pod (max jobs reached) to have an available slot.
+        
+        This prevents creating unnecessary new pods when an existing pod is just
+        temporarily full and will become available soon.
+        
+        Args:
+            pod_uuid: The UUID of the busy pod
+            model: The model name
+            job_id: The job ID waiting for a slot
+            timeout: Maximum time to wait (default 120s = 2 minutes)
+            
+        Returns:
+            worker_id if slot became available and job was assigned
+            None if timeout or pod was destroyed
+        """
+        from db import SessionLocal, Worker, Job
+        from job_manager import JobState
+        
+        start = time.time()
+        last_log_time = 0
+        
+        while time.time() - start < timeout:
+            # RACE CONDITION FIX: Check if job is still in a dispatchable state
+            with SessionLocal() as db:
+                job = db.query(Job).filter(Job.job_id == job_id).first()
+                if job:
+                    current_state = JobState(job.status)
+                    if current_state in [JobState.RUNNING, JobState.COMPLETED, JobState.FAILED,
+                                         JobState.TIMEOUT, JobState.CANCELLED]:
+                        logger.info(
+                            f"Job {job_id} is already in {current_state.value} state, "
+                            f"aborting wait for BUSY pod slot on {pod_uuid}"
+                        )
+                        raise JobAlreadyProcessedError(
+                            f"Job {job_id} is already in {current_state.value} state"
+                        )
+            
+            # Check if pod still exists
+            async with self._lock:
+                pi = self.individual_pods.get(pod_uuid)
+                if not pi:
+                    logger.warning(
+                        f"Pod {pod_uuid} was destroyed while job {job_id} was waiting for slot"
+                    )
+                    return None
+                
+                if pi.model != model:
+                    logger.warning(
+                        f"Pod {pod_uuid} model changed from {model} to {pi.model}"
+                    )
+                    return None
+            
+            # Try to reserve a slot
+            reserved = await self.reserve_slot_on_pod(pod_uuid, job_id)
+            if reserved:
+                # Got a slot, now try to assign the job
+                with SessionLocal() as db:
+                    # Double-check job state before assignment
+                    job = db.query(Job).filter(Job.job_id == job_id).first()
+                    if job:
+                        current_state = JobState(job.status)
+                        if current_state in [JobState.RUNNING, JobState.COMPLETED, JobState.FAILED]:
+                            await self.release_slot_on_pod(pod_uuid, job_id)
+                            raise JobAlreadyProcessedError(
+                                f"Job {job_id} is already in {current_state.value} state"
+                            )
+                    
+                    worker = (
+                        db.query(Worker)
+                        .filter(Worker.container_id == pod_uuid, Worker.model == model)
+                        .first()
+                    )
+                    
+                    if worker and worker.status == "ready":
+                        worker.status = "dispatching"
+                        worker.last_active = datetime.utcnow()
+                        db.commit()
+                        
+                        elapsed = time.time() - start
+                        logger.info(
+                            f"Job {job_id} got slot on previously BUSY pod {pod_uuid} "
+                            f"after waiting {elapsed:.1f}s"
+                        )
+                        return worker.worker_id
+                    else:
+                        # Worker not ready yet, release slot and keep waiting
+                        await self.release_slot_on_pod(pod_uuid, job_id)
+                        if worker:
+                            logger.debug(
+                                f"Pod {pod_uuid} has slot but worker status is '{worker.status}', "
+                                f"waiting for ready state"
+                            )
+            
+            # Log progress every 10 seconds
+            elapsed = time.time() - start
+            if elapsed - last_log_time >= 10:
+                logger.debug(
+                    f"Job {job_id} still waiting for slot on BUSY pod {pod_uuid} "
+                    f"({elapsed:.0f}s elapsed)"
+                )
+                last_log_time = elapsed
+            
+            await asyncio.sleep(1)
+        
+        # Timeout
+        elapsed = time.time() - start
+        logger.warning(
+            f"Timeout ({elapsed:.0f}s) waiting for slot on BUSY pod {pod_uuid} "
+            f"for job {job_id}"
+        )
+        return None
     
     # -------------------------------------------------------------------------
     # Pod Creation
@@ -1434,7 +1760,47 @@ class PodManager:
         1. Priority machines
         2. Cached machines
         3. Global fallback
+        
+        Includes throttling to prevent runaway pod creation:
+        - Global semaphore limits concurrent creations
+        - Per-model in-flight tracking prevents duplicates
+        - Backoff after failures
         """
+        # CRITICAL: Check if pod creation is already in-flight for this model
+        async with self._lock:
+            if self._pod_creation_in_flight.get(model, False):
+                logger.warning(
+                    f"Pod creation already in-flight for model {model}, skipping duplicate request"
+                )
+                return None
+            
+            # Check backoff period (30s after failure)
+            last_failure = self._pod_creation_backoff.get(model, 0)
+            backoff_remaining = 30 - (time.time() - last_failure)
+            if backoff_remaining > 0:
+                logger.warning(
+                    f"Pod creation for model {model} in backoff period ({backoff_remaining:.1f}s remaining)"
+                )
+                return None
+            
+            # Mark as in-flight
+            self._pod_creation_in_flight[model] = True
+        
+        try:
+            # Acquire global semaphore to limit concurrent pod creations
+            async with self._pod_creation_semaphore:
+                return await self._create_machine_based_pod_impl(model, mode)
+        finally:
+            # Always clear in-flight flag
+            async with self._lock:
+                self._pod_creation_in_flight[model] = False
+    
+    async def _create_machine_based_pod_impl(
+        self,
+        model: str,
+        mode: Optional[str] = None,
+    ) -> Optional[str]:
+        """Internal implementation of pod creation (called with semaphore held)"""
         model_lock = self._get_model_lock(model)
         async with model_lock:
             await self._ensure_global_login()
@@ -1632,6 +1998,10 @@ class PodManager:
             ]
             if blacklisted_machines:
                 logger.warning(f"Currently blacklisted machines: {blacklisted_machines}")
+            
+            # Set backoff period on failure to prevent rapid retry storms
+            async with self._lock:
+                self._pod_creation_backoff[model] = time.time()
             
             return None
     
@@ -1863,6 +2233,36 @@ class PodManager:
         from job_manager import JobState
         import importlib
         
+        original_pod_uuid = pod_uuid
+        pod_uuid_normalized = normalize_pod_uuid(pod_uuid)
+        
+        # CRITICAL: Resolve pod_uuid to find it in tracking (may be stored with/without hyphens)
+        # Also ensure we have the hyphenated format for QuickPod API calls
+        tracked_pod_uuid = None  # The key in individual_pods
+        async with self._lock:
+            # Direct lookup first
+            if pod_uuid in self.individual_pods:
+                tracked_pod_uuid = pod_uuid
+            else:
+                # Try normalized comparison
+                for tracked_uuid in self.individual_pods.keys():
+                    if normalize_pod_uuid(tracked_uuid) == pod_uuid_normalized:
+                        tracked_pod_uuid = tracked_uuid
+                        logger.info(
+                            f"Resolved pod_uuid '{original_pod_uuid}' to tracked '{tracked_pod_uuid}'"
+                        )
+                        break
+        
+        # Use tracked UUID if found, otherwise format the input
+        if tracked_pod_uuid:
+            pod_uuid = tracked_pod_uuid
+        else:
+            # Ensure hyphenated format for API
+            pod_uuid = format_pod_uuid_with_hyphens(pod_uuid) or pod_uuid
+            logger.warning(
+                f"Pod {original_pod_uuid} not found in tracking, using formatted: {pod_uuid}"
+            )
+        
         # Capture pod info (for blacklisting and cost tracking) BEFORE removing from tracking
         machine_id: Optional[str] = None
         pod_created_at: Optional[datetime] = None
@@ -1881,8 +2281,15 @@ class PodManager:
         recovered_jobs: List[Dict[str, Any]] = []
         try:
             with SessionLocal() as db:
-                # Find the worker associated with this pod
+                # Find the worker associated with this pod (try both formats)
                 worker = db.query(Worker).filter(Worker.container_id == pod_uuid).first()
+                if not worker:
+                    # Try normalized comparison
+                    workers = db.query(Worker).filter(Worker.container_id.isnot(None)).all()
+                    for w in workers:
+                        if normalize_pod_uuid(w.container_id) == pod_uuid_normalized:
+                            worker = w
+                            break
                 
                 if worker:
                     # Find all RUNNING or DISPATCHING jobs on this worker

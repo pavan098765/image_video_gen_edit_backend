@@ -17,6 +17,7 @@ import time
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import traceback
 from typing import Optional, Dict, Any, Tuple, List
 from enum import Enum
 
@@ -308,11 +309,35 @@ class QuickPodManager:
                 logger.debug(f"Loaded token from shared cache for {self.email}")
                 return True
         
-            return False
+        return False
+    
+    def _should_refresh_token(self) -> bool:
+        """Check if token should be refreshed (< 10 minutes remaining)"""
+        if not self.token or not self.token_acquired_at:
+            return True
+        
+        elapsed = datetime.utcnow() - self.token_acquired_at
+        remaining = self.token_ttl - elapsed
+        
+        # Refresh if less than 10 minutes remaining
+        return remaining < timedelta(minutes=10)
     
     def _auth_headers(self, force_refresh: bool = False) -> Dict[str, str]:
         """Get authorization headers, refreshing token if needed"""
-        if force_refresh or not self._is_token_valid():
+        # Only refresh if explicitly requested OR token is invalid/expiring soon
+        if force_refresh or not self._is_token_valid() or self._should_refresh_token():
+            # Double-check we actually need to login
+            # Check cache one more time as another thread might have refreshed
+            if self.email:
+                cached = self._get_cached_token(self.email)
+                if cached and not force_refresh:
+                    self.token, self.token_acquired_at, self.token_ttl = cached
+                    elapsed = datetime.utcnow() - self.token_acquired_at
+                    remaining = self.token_ttl - elapsed
+                    if remaining >= timedelta(minutes=10):
+                        # Cache has a fresh enough token, use it
+                        return {"Authorization": f"Bearer {self.token}"}
+            
             self.login()
         return {"Authorization": f"Bearer {self.token}"}
     
@@ -574,8 +599,11 @@ class QuickPodManager:
             
             for pod in pods:
                 # Match by altname (which contains pod_uuid) or docker_ID
-                pod_id = pod.get("altname", "")
-                if check_uuid in pod_id or pod.get("docker_ID", "") == check_uuid:
+                # Ensure all values are strings for comparison
+                pod_id = str(pod.get("altname", "") or "")
+                docker_id = str(pod.get("docker_ID", "") or "")
+                check_uuid_str = str(check_uuid)
+                if check_uuid_str in pod_id or docker_id == check_uuid_str:
                     # Found the pod - check if it's destroyed
                     if pod.get("destroyed", False):
                         logger.info(f"Pod {check_uuid} confirmed destroyed (destroyed=true)")
@@ -620,50 +648,51 @@ class QuickPodManager:
         
         for attempt in range(max_verify_attempts):
             try:
-                    data = self._make_request(
+                data = self._make_request(
                     "GET",
                     "update/destroypod",
                     params={"pod_uuid": self.pod_uuid},
                     timeout=POD_OPERATION_TIMEOUT,
                 )
-                    # Some QuickPod endpoints return {"status": "..."} without "error".
-                    # Treat non-success statuses as failures so the controller doesn't log false success.
-                    if isinstance(data, dict) and data.get("status") and str(data.get("status")).lower() != "success":
-                        raise PodDestroyError(self.pod_uuid, reason=f"Destroy pod failed: {data}")
-                    
-                    # Verify destruction if requested
-                    if verify:
-                        # Brief delay before verification to allow QuickPod to process
-                        time.sleep(1.0)
-                        if self.is_pod_destroyed():
-                            logger.info(f"Pod {self.pod_uuid} destruction verified via /mypods")
-                            return data
-                        else:
-                            # Pod still exists - retry destroy
-                            if attempt < max_verify_attempts - 1:
-                                logger.warning(
-                                    f"Pod {self.pod_uuid} destroy returned success but pod still active. "
-                                    f"Retrying ({attempt + 1}/{max_verify_attempts})..."
-                                )
-                                time.sleep(2.0 * (attempt + 1))  # Backoff
-                                continue
-                            else:
-                                raise PodDestroyError(
-                                    self.pod_uuid, 
-                                    reason=f"Destroy returned success but pod still active after {max_verify_attempts} attempts"
-                                )
-                    else:
+                # Some QuickPod endpoints return {"status": "..."} without "error".
+                # Treat non-success statuses as failures so the controller doesn't log false success.
+                if isinstance(data, dict) and data.get("status") and str(data.get("status")).lower() != "success":
+                    raise PodDestroyError(self.pod_uuid, reason=f"Destroy pod failed: {data}")
+                
+                # Verify destruction if requested
+                if verify:
+                    # Brief delay before verification to allow QuickPod to process
+                    time.sleep(1.0)
+                    if self.is_pod_destroyed():
+                        logger.info(f"Pod {self.pod_uuid} destruction verified via /mypods")
                         return data
-                        
+                    else:
+                        # Pod still exists - retry destroy
+                        if attempt < max_verify_attempts - 1:
+                            logger.warning(
+                                f"Pod {self.pod_uuid} destroy returned success but pod still active. "
+                                f"Retrying ({attempt + 1}/{max_verify_attempts})..."
+                            )
+                            time.sleep(2.0 * (attempt + 1))  # Backoff
+                            continue
+                        else:
+                            raise PodDestroyError(
+                                self.pod_uuid, 
+                                reason=f"Destroy returned success but pod still active after {max_verify_attempts} attempts"
+                            )
+                else:
+                    return data
+                    
             except PodDestroyError:
-                    raise
+                raise
             except Exception as e:
-                    last_error = e
-                    if attempt < max_verify_attempts - 1:
-                        logger.warning(f"Destroy attempt {attempt + 1} failed: {e}, retrying...")
-                        time.sleep(2.0 * (attempt + 1))
-                        continue
-            raise PodDestroyError(self.pod_uuid, reason=str(e), cause=e)
+                last_error = e
+                if attempt < max_verify_attempts - 1:
+                    logger.warning(f"Destroy attempt {attempt + 1} failed: {e}, retrying...")
+                    logger.warning(traceback.format_exc())
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                raise PodDestroyError(self.pod_uuid, reason=str(e), cause=e)
         
         # Should not reach here, but handle edge case
         raise PodDestroyError(self.pod_uuid, reason=f"Max attempts reached: {last_error}")
@@ -697,10 +726,27 @@ class QuickPodManager:
         try:
             resp = requests.get(RENTABLE_URL, timeout=DEFAULT_TIMEOUT)
             resp.raise_for_status()
-            return resp.json()
+            offers = resp.json()
         except Exception as e:
             raise QuickPodAPIError("get_rentable_machines", reason=str(e), cause=e)
-    
+
+        # Debug dump to help inspect TFLOPS/GPU data returned by QuickPod
+        dump_path = os.getenv("RENTABLE_DUMP_PATH", "/tmp/rentable_dump.json")
+        try:
+            payload = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "count": len(offers) if isinstance(offers, list) else 0,
+                # Store the first 200 offers to avoid oversized files
+                "offers": offers[:200] if isinstance(offers, list) else offers,
+            }
+            with open(dump_path, "w") as f:
+                json.dump(payload, f, indent=2)
+            logger.debug(f"Wrote rentable dump to {dump_path} (count={payload.get('count')})")
+        except Exception as dump_err:
+            logger.debug(f"Failed to write rentable dump: {dump_err}")
+
+        return offers
+        
     def get_best_offer(
         self,
         preferred_machine_id: Optional[int] = None,
@@ -1078,16 +1124,105 @@ class QuickPodManager:
 # =============================================================================
 
 if __name__ == "__main__":
-    # Quick test
-    manager = QuickPodManager()
+    import sys
+    
+    print("=" * 80)
+    print("QuickPod API Test - Pod Lifecycle (Create & Destroy)")
+    print("=" * 80)
+    print()
+    # Set your credentials here
+    QUICKPOD_EMAIL = "pavanalur3@gmail.com"
+    QUICKPOD_PASSWORD = "C@9rw6fxATDm8sM"
+    
+    # Initialize manager with email and password
+    print("[1] Initializing QuickPodManager...")
+    manager = QuickPodManager(email=QUICKPOD_EMAIL, password=QUICKPOD_PASSWORD)
+    print(f"    Email: {manager.email}")
+    print(f"    Base URL: {manager.base}")
+    print()
     
     try:
-        templates = manager.get_templates()
-        print(f"Found {len(templates)} templates")
+        # Login
+        print("[2] Logging in...")
+        print(f"    → POST {BASE_URL}/auth/login")
+        token = manager.login()
+        print(f"    ✓ Login successful, token acquired")
+        print()
         
+        # Get templates
+        print("[3] Fetching templates...")
+        print(f"    → GET {manager.base}/templates")
+        templates = manager.get_templates()
+        print(f"    ✓ Found {len(templates)} templates")
+        if templates:
+            template = templates[0]
+            template_uuid = template.get("template_uuid")
+            template_name = template.get("template_name", "unknown")
+            print(f"    Using template: {template_name} ({template_uuid})")
+        print()
+        
+        # Get best offer
+        print("[4] Getting best offer...")
+        print(f"    → GET {RENTABLE_URL}")
         offer_id, machine_id = manager.get_best_offer()
-        print(f"Best offer: {offer_id}, machine: {machine_id}")
+        if offer_id and machine_id:
+            print(f"    ✓ Best offer: offer_id={offer_id}, machine_id={machine_id}")
+        else:
+            print("    ✗ No suitable offers found")
+            sys.exit(1)
+        print()
+        
+        # Create pod
+        print("[5] Creating pod...")
+        print(f"    → POST {BASE_URL}/createpod")
+        print(f"    Body: {{'offers_id': {offer_id}, 'disk_size': '50', 'template_uuid': '{template_uuid}'}}")
+        pod_data = manager.create_pod(offer_id, template_uuid, disk_size=50)
+        pod_uuid = manager.pod_uuid
+        print(f"    ✓ Pod created successfully!")
+        print(f"    Pod UUID: {pod_uuid}")
+        print(f"    Response: {json.dumps(pod_data, indent=2)}")
+        print()
+        
+        # Wait a moment
+        print("[6] Waiting 45 seconds before destroying...")
+        time.sleep(45)
+        print()
+        
+        # Destroy pod
+        print("[7] Destroying pod...")
+        print(f"    → GET {BASE_URL}/destroypod?pod_uuid={pod_uuid}")
+        print(f"    Pod UUID: {pod_uuid}")
+        
+        # Create a new manager instance for destroy (as per the actual usage pattern)
+        destroy_manager = QuickPodManager(email=QUICKPOD_EMAIL, password=QUICKPOD_PASSWORD, pod_uuid=pod_uuid)
+        destroy_manager.login()  # Ensure authenticated
+        
+        destroy_result = destroy_manager.destroy_pod(verify=True)
+        print(f"    ✓ Destroy request completed")
+        print(f"    Response: {json.dumps(destroy_result, indent=2)}")
+        print()
+        
+        # Verification (if verify was True, this was already done, but show it anyway)
+        print("[8] Verifying pod destruction...")
+        print(f"    → GET {MYPODS_URL}")
+        time.sleep(2)  # Brief wait for QuickPod to process
+        is_destroyed = destroy_manager.is_pod_destroyed(pod_uuid)
+        if is_destroyed:
+            print(f"    ✓ Pod {pod_uuid} confirmed destroyed")
+        else:
+            print(f"    ✗ Pod {pod_uuid} still exists (or verification failed)")
+        print()
+        
+        print("=" * 80)
+        print("Test completed successfully!")
+        print("=" * 80)
         
     except Exception as e:
-        print(f"Error: {e}")
+        print()
+        print("=" * 80)
+        print(f"ERROR: {type(e).__name__}: {e}")
+        print("=" * 80)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 

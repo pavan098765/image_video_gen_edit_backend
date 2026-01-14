@@ -259,6 +259,24 @@ class JobMaxRetriesError(JobError):
         super().__init__(message=message, details=details, **kwargs)
 
 
+class JobAlreadyProcessedError(JobError):
+    """Job is already being processed or has completed.
+    
+    This error is raised when multiple dispatch tasks try to process the same job,
+    typically due to race conditions during pod failure recovery.
+    """
+    code = ErrorCode.JOB_STATE_ERROR  # Reuse existing error code
+    status_code = 409  # Conflict
+    message = "Job is already being processed"
+    
+    def __init__(self, message: str = None, job_id: str = None, **kwargs):
+        details = {}
+        if job_id:
+            details["job_id"] = job_id
+        msg = message or self.message
+        super().__init__(message=msg, details=details, **kwargs)
+
+
 class InvalidModelError(JobError):
     """Invalid or unsupported model"""
     code = ErrorCode.INVALID_MODEL
