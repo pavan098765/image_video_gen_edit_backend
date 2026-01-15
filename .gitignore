@@ -78,3 +78,5 @@ backend\server_controller\src\controller.db
 backend/server_controller/src/~$controller_export.xlsx
 backend/server_controller/src/controller.db
 backend/server_controller/src/controller_export.xlsx
+*.db
+*.xlsx
