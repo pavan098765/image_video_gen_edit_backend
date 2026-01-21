@@ -3049,9 +3049,14 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                                 db.commit()
                             
                             # Send FCM notification for RUNNING job that failed permanently
+                            # CRITICAL: Only send if job is actually in FAILED state
+                            db.refresh(affected_job)  # Get latest status
+                            is_failed = affected_job.status == JobState.FAILED.value
+                            
                             if (
                                 affected_job.fcm_token
                                 and not affected_job.notification_sent
+                                and is_failed
                             ):
                                 try:
                                     asyncio.create_task(
@@ -3067,10 +3072,16 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                                         )
                                     )
                                     affected_job.notification_sent = True
+                                    logger.info(f"FCM failure notification sent for job {affected_job_id}")
                                 except Exception as e:
                                     logger.error(
                                         f"Failed to send FCM notification for job {affected_job_id}: {e}"
                                     )
+                            elif not is_failed and affected_job.fcm_token and not affected_job.notification_sent:
+                                logger.warning(
+                                    f"Skipping FCM notification for job {affected_job_id}: "
+                                    f"expected FAILED state but found '{affected_job.status}'"
+                                )
                             
                             # Clear worker assignment
                             affected_job.worker_id = None
@@ -4508,9 +4519,26 @@ async def job_complete(
             clear_cached_job_params(job_id)
         
         # Send FCM notification
+        # CRITICAL: Only send notifications for jobs that are actually COMPLETED or FAILED
+        # This prevents malformed notifications for jobs in intermediate states
         # For multi-variation jobs, only send notification when ALL variations complete
+        
+        # Refresh job to get the latest status from DB
+        db.refresh(job)
+        
         fcm_token = job.fcm_token
-        should_send_notification = fcm_token and not job.notification_sent
+        job_status = job.status
+        
+        # Only send notification if job is in a terminal state (COMPLETED or FAILED)
+        is_terminal_state = job_status in [JobState.COMPLETED.value, JobState.FAILED.value]
+        should_send_notification = fcm_token and not job.notification_sent and is_terminal_state
+        
+        if not is_terminal_state and fcm_token and not job.notification_sent:
+            # Log when we skip notification due to non-terminal state
+            logger.warning(
+                f"Skipping FCM notification for job {job_id}: job is in '{job_status}' state, "
+                f"not a terminal state (COMPLETED/FAILED). payload.failed={payload.failed}"
+            )
         
         if should_send_notification:
             # Check if this is part of a batch
@@ -4566,8 +4594,12 @@ async def job_complete(
                     )
             else:
                 # Single job - standard notification
+                # CRITICAL: Use job's actual status from DB, not just payload.failed
+                # This ensures notification content matches the actual job state
+                is_success = job_status == JobState.COMPLETED.value
+                
                 download_url = None
-                if not payload.failed and payload.result_r2_key:
+                if is_success and payload.result_r2_key:
                     download_url = _generate_signed_download_url(payload.result_r2_key)
                 
                 background_tasks.add_task(
@@ -4575,11 +4607,16 @@ async def job_complete(
                     fcm_token,
                     job_id,
                     job.model,
-                    not payload.failed,
+                    is_success,
                     download_url,
                 )
                 job.notification_sent = True
                 db.commit()
+                
+                logger.info(
+                    f"FCM notification queued for job {job_id}: "
+                    f"status={job_status}, success={is_success}"
+                )
     
     except HTTPException:
         raise

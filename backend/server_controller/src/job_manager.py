@@ -672,10 +672,15 @@ class JobManager:
                     db.commit()
                     
                     # Send FCM notification for timeout (if recovery is disabled or will fail)
+                    # CRITICAL: Verify job status before sending notification
                     if job.fcm_token and not job.notification_sent:
                         retry_count = job.retry_count or 0
                         # Only send notification if this is the final timeout (no more retries)
-                        if retry_count >= self.max_retries or not self.auto_recover:
+                        # AND job is actually in TIMEOUT state
+                        is_final_timeout = retry_count >= self.max_retries or not self.auto_recover
+                        is_timeout_state = job.status == JobState.TIMEOUT.value
+                        
+                        if is_final_timeout and is_timeout_state:
                             try:
                                 from routes import send_fcm_notification
                                 import asyncio
@@ -689,8 +694,14 @@ class JobManager:
                                 )
                                 job.notification_sent = True
                                 db.commit()
+                                logger.info(f"FCM timeout notification sent for job {job.job_id}")
                             except Exception as e:
                                 logger.error(f"Failed to send FCM notification for timeout job {job.job_id}: {e}")
+                        elif not is_timeout_state:
+                            logger.warning(
+                                f"Skipping FCM notification for job {job.job_id}: "
+                                f"expected TIMEOUT state but found '{job.status}'"
+                            )
                     
                     # Auto-recover if enabled
                     if self.auto_recover:
@@ -738,22 +749,32 @@ class JobManager:
                 logger.error(f"Job {job_id} failed: max retries exceeded")
                 
                 # Send FCM notification for final failure
+                # CRITICAL: Verify job is in FAILED state before sending notification
                 if job.fcm_token and not job.notification_sent:
-                    try:
-                        from routes import send_fcm_notification
-                        import asyncio
-                        asyncio.create_task(
-                            send_fcm_notification(
-                                job.fcm_token,
-                                "Job Failed",
-                                f"Your {job.model} job failed after {self.max_retries} retry attempts",
-                                {"job_id": job_id, "status": "failed", "error": "Max retries exceeded"},
+                    is_failed_state = job.status == JobState.FAILED.value
+                    
+                    if is_failed_state:
+                        try:
+                            from routes import send_fcm_notification
+                            import asyncio
+                            asyncio.create_task(
+                                send_fcm_notification(
+                                    job.fcm_token,
+                                    "Job Failed",
+                                    f"Your {job.model} job failed after {self.max_retries} retry attempts",
+                                    {"job_id": job_id, "status": "failed", "error": "Max retries exceeded"},
+                                )
                             )
+                            job.notification_sent = True
+                            db.commit()
+                            logger.info(f"FCM failure notification sent for job {job_id}")
+                        except Exception as e:
+                            logger.error(f"Failed to send FCM notification for failed job {job_id}: {e}")
+                    else:
+                        logger.warning(
+                            f"Skipping FCM notification for job {job_id}: "
+                            f"expected FAILED state but found '{job.status}'"
                         )
-                        job.notification_sent = True
-                        db.commit()
-                    except Exception as e:
-                        logger.error(f"Failed to send FCM notification for failed job {job_id}: {e}")
                 
                 return
             
