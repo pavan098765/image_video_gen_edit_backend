@@ -399,6 +399,11 @@ class User(Base):
     # Rewarded ad progress (for "X ads = 1 credit" feature)
     pending_ad_watches = Column(Integer, default=0, nullable=False)
     
+    # Ad-Free Purchase Status
+    is_ad_free = Column(Boolean, default=False, nullable=False)
+    ad_free_purchased_at = Column(DateTime, nullable=True)
+    ad_free_product_id = Column(String(100), nullable=True)
+    
     # Status
     is_active = Column(Boolean, default=True, nullable=False)
     
@@ -407,6 +412,8 @@ class User(Base):
     subscriptions = relationship("Subscription", back_populates="user")
     daily_spins = relationship("DailySpin", back_populates="user")
     rewarded_ad_events = relationship("RewardedAdEvent", back_populates="user")
+    ad_free_purchases = relationship("AdFreePurchase", back_populates="user")
+    purchases = relationship("Purchase", back_populates="user")
 
     # Note: firebase_uid already has index=True on the column definition
     # No need for additional __table_args__ index
@@ -420,6 +427,9 @@ class User(Base):
             "bonus_granted": self.bonus_granted,
             "signup_bonus_granted": self.signup_bonus_granted,
             "is_active": self.is_active,
+            "is_ad_free": self.is_ad_free,
+            "ad_free_purchased_at": self.ad_free_purchased_at.isoformat() if self.ad_free_purchased_at else None,
+            "ad_free_product_id": self.ad_free_product_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,
         }
@@ -624,6 +634,144 @@ class DailySpin(Base):
     __table_args__ = (
         Index("ix_daily_spin_user_time", "user_id", "created_at"),
     )
+
+
+# =============================================================================
+# Ad-Free Purchase Model (Audit Trail)
+# =============================================================================
+
+class AdFreePurchase(Base):
+    """
+    Ad-free purchase audit trail.
+    
+    Stores verified in-app purchases for:
+    - Audit trail and dispute resolution
+    - Preventing replay attacks (order_id must be unique)
+    - Analytics on purchase patterns
+    
+    SECURITY MODEL (Consumable Product):
+    - Google Play: Product is consumable (anyone can buy anytime)
+    - Backend: One Firebase account = one ad-free grant
+    - order_id is UNIQUE to prevent replay attacks
+    - Each Firebase account can only have ad-free granted once
+    """
+    __tablename__ = "ad_free_purchases"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(128), ForeignKey("users.id"), index=True, nullable=False)
+    firebase_uid = Column(String(256), nullable=False, index=True)
+    
+    # Purchase details
+    product_id = Column(String(100), nullable=False)
+    purchase_token = Column(String(500), nullable=False)  # Token from store
+    platform = Column(String(20), nullable=False)  # 'android' or 'ios'
+    device_id = Column(String(256), nullable=True)  # Hashed device ID for abuse prevention
+    
+    # Store verification data - order_id is CRITICAL for replay attack prevention
+    order_id = Column(String(256), nullable=True, unique=True, index=True)  # UNIQUE: Prevent replay attacks
+    store_data = Column(MutableDict.as_mutable(JSON), nullable=True)  # Raw response from store
+    
+    # Timestamps
+    verified_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="ad_free_purchases")
+
+    __table_args__ = (
+        Index("ix_ad_free_user", "user_id"),
+        Index("ix_ad_free_firebase", "firebase_uid"),
+        Index("ix_ad_free_order", "order_id"),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "firebase_uid": self.firebase_uid,
+            "product_id": self.product_id,
+            "platform": self.platform,
+            "order_id": self.order_id,
+            "verified_at": self.verified_at.isoformat() if self.verified_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# =============================================================================
+# Purchase Model (Consumable Purchases - Credits/Gems)
+# =============================================================================
+
+class Purchase(Base):
+    """
+    Tracks all consumable purchases (credit/gem packs).
+    
+    Security features:
+    - order_id is UNIQUE to prevent duplicate credit awarding
+    - purchase_token is hashed for privacy but available for verification
+    - raw store_data is stored for dispute resolution
+    
+    Workflow:
+    1. Client sends purchase_token → Server verifies with Google Play
+    2. Server checks order_id doesn't exist (duplicate prevention)
+    3. Server credits user atomically with purchase record creation
+    4. Server consumes purchase on Google Play (allows re-purchase)
+    """
+    __tablename__ = "purchases"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(128), ForeignKey("users.id"), index=True, nullable=False)
+    firebase_uid = Column(String(256), nullable=False, index=True)
+    
+    # Order identification (UNIQUE - critical for duplicate prevention)
+    order_id = Column(String(256), unique=True, nullable=True, index=True)  # Google Play order ID
+    purchase_token_hash = Column(String(64), nullable=False)  # SHA256 hash for privacy
+    
+    # Product details
+    product_id = Column(String(100), nullable=False, index=True)
+    platform = Column(String(20), nullable=False)  # 'android' or 'ios'
+    device_id = Column(String(256), nullable=True)  # Hashed device ID for fraud detection
+    
+    # Credit tracking
+    credits_awarded = Column(Integer, default=0, nullable=False)
+    
+    # Purchase state
+    purchase_state = Column(String(50), default="verified", nullable=False)  # verified, refunded, disputed
+    consumed = Column(Boolean, default=False, nullable=False)  # Whether consumed on Google Play
+    is_test_purchase = Column(Boolean, default=False, nullable=False)  # purchaseType == 0
+    
+    # Store verification data
+    store_data = Column(MutableDict.as_mutable(JSON), nullable=True)  # Raw response for auditing
+    purchase_time_ms = Column(String(20), nullable=True)  # Timestamp from store (milliseconds)
+    
+    # Timestamps
+    verified_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="purchases")
+
+    __table_args__ = (
+        Index("ix_purchase_user", "user_id"),
+        Index("ix_purchase_firebase", "firebase_uid"),
+        Index("ix_purchase_order", "order_id"),
+        Index("ix_purchase_product", "product_id"),
+        Index("ix_purchase_state", "purchase_state"),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "firebase_uid": self.firebase_uid,
+            "order_id": self.order_id,
+            "product_id": self.product_id,
+            "platform": self.platform,
+            "credits_awarded": self.credits_awarded,
+            "purchase_state": self.purchase_state,
+            "is_test_purchase": self.is_test_purchase,
+            "verified_at": self.verified_at.isoformat() if self.verified_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
 
 
 # =============================================================================

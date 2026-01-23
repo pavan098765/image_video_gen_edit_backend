@@ -25,6 +25,10 @@ botocore>=1.34.0
 # Firebase
 firebase-admin>=6.2.0
 
+# Google Play
+google-auth>=2.0.0
+google-api-python-client>=2.0.0
+
 # Environment
 python-dotenv>=1.0.0
 
