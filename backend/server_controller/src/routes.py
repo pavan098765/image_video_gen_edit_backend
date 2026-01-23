@@ -90,6 +90,8 @@ from db import (
     DailySpin,
     AppConfig,
     RewardedAdEvent,
+    AdFreePurchase,
+    Purchase,
     get_app_config_int,
     create_audit_log,
     utc_naive_now,
@@ -548,6 +550,9 @@ class UserResponse(BaseModel):
     bonus_granted: int
     signup_bonus_granted: bool = False  # True if 50 credits signup bonus was claimed
     is_active: bool
+    is_ad_free: bool = False  # True if user has purchased ad-free
+    ad_free_purchased_at: Optional[str] = None
+    ad_free_product_id: Optional[str] = None
     created_at: str
     last_seen: str
 
@@ -690,6 +695,9 @@ async def sync_user(
                 bonus_granted=user.bonus_granted,
                 signup_bonus_granted=user.signup_bonus_granted,
                 is_active=user.is_active,
+                is_ad_free=user.is_ad_free,
+                ad_free_purchased_at=user.ad_free_purchased_at.isoformat() if user.ad_free_purchased_at else None,
+                ad_free_product_id=user.ad_free_product_id,
                 created_at=user.created_at.isoformat() if user.created_at else "",
                 last_seen=user.last_seen.isoformat() if user.last_seen else "",
             )
@@ -747,6 +755,9 @@ async def get_current_user(
             bonus_granted=user.bonus_granted,
             signup_bonus_granted=user.signup_bonus_granted,
             is_active=user.is_active,
+            is_ad_free=user.is_ad_free,
+            ad_free_purchased_at=user.ad_free_purchased_at.isoformat() if user.ad_free_purchased_at else None,
+            ad_free_product_id=user.ad_free_product_id,
             created_at=user.created_at.isoformat() if user.created_at else "",
             last_seen=user.last_seen.isoformat() if user.last_seen else "",
         )
@@ -998,6 +1009,543 @@ async def perform_daily_spin(
             message=f"You won {credits_won} credits!",
             new_balance=user.total_credits,
         )
+
+
+# =============================================================================
+# Ad-Free Purchase Endpoints
+# =============================================================================
+
+class AdFreeStatusResponse(BaseModel):
+    """Response for ad-free status check"""
+    is_ad_free: bool
+    purchased_at: Optional[str] = None
+    product_id: Optional[str] = None
+
+
+class AdFreePurchaseRequest(BaseModel):
+    """Request body for ad-free purchase verification"""
+    purchase_token: str = Field(..., description="Purchase token from Google Play or receipt data from App Store")
+    product_id: str = Field(..., description="Product ID (e.g., 'remove_ads_lifetime')")
+    platform: str = Field(..., description="'android' or 'ios'")
+    device_id: Optional[str] = Field(None, description="SHA256 hashed device ID for abuse prevention")
+
+
+class AdFreePurchaseResponse(BaseModel):
+    """Response for ad-free purchase verification"""
+    verified: bool
+    is_ad_free: bool = False
+    purchased_at: Optional[str] = None
+    message: Optional[str] = None
+    detail: Optional[str] = None
+
+
+@auth_router.get("/ad-free-status", response_model=AdFreeStatusResponse)
+async def get_ad_free_status(
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Check if user has ad-free status.
+    
+    Returns the user's ad-free purchase status. This endpoint is called:
+    - After user authentication to verify cached ad-free status
+    - Periodically to ensure ad-free status is still valid
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    
+    **Returns:**
+    - is_ad_free: Whether user has ad-free status
+    - purchased_at: When ad-free was purchased (ISO format)
+    - product_id: The product that was purchased
+    """
+    # Verify Firebase token
+    decoded = await verify_firebase_token(authorization)
+    
+    firebase_uid = decoded.get("uid")
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            raise HTTPException(404, "User not found. Please call /auth/sync first.")
+        
+        if user.is_ad_free:
+            return AdFreeStatusResponse(
+                is_ad_free=True,
+                purchased_at=user.ad_free_purchased_at.isoformat() if user.ad_free_purchased_at else None,
+                product_id=user.ad_free_product_id,
+            )
+        
+        return AdFreeStatusResponse(
+            is_ad_free=False,
+            purchased_at=None,
+            product_id=None,
+        )
+
+
+@auth_router.post("/verify-ad-free-purchase", response_model=AdFreePurchaseResponse)
+async def verify_ad_free_purchase(
+    request: AdFreePurchaseRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Verify and activate ad-free purchase.
+    
+    SECURITY MODEL (Consumable Product - remove_ads_lifetime_v2):
+    - Google Play: Product is CONSUMABLE (anyone can buy anytime)
+    - Backend: One Firebase account = one ad-free grant
+    - Prevents: Double-charging same account, purchase sharing, replay attacks
+    
+    Security Checks:
+    1. Check if THIS Firebase account already has ad-free → Return success (idempotent, prevent double-charge)
+    2. Verify purchase with Google Play/App Store
+    3. Check if order_id was already used → Reject (prevent replay attacks)
+    4. Grant ad-free to THIS Firebase account only
+    5. Consume the purchase (allows product to be bought again by others)
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    
+    **Request Body:**
+    - purchase_token: The purchase token from Google Play or receipt from App Store
+    - product_id: The product ID (e.g., 'remove_ads_lifetime_v2')
+    - platform: 'android' or 'ios'
+    - device_id: SHA256 hashed device ID (optional, for abuse prevention)
+    
+    **Returns:**
+    - verified: Whether the purchase was verified
+    - is_ad_free: Whether user now has ad-free status
+    - purchased_at: When the purchase was verified
+    - message: Success or error message
+    """
+    from purchase_verification import (
+        verify_purchase, 
+        consume_google_play_purchase,
+        VALID_AD_FREE_PRODUCT_IDS,
+    )
+    from db import AdFreePurchase
+    
+    # Verify Firebase token
+    decoded = await verify_firebase_token(authorization)
+    
+    firebase_uid = decoded.get("uid")
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    # Validate platform
+    platform = request.platform.lower().strip()
+    if platform not in ["android", "ios"]:
+        raise HTTPException(400, f"Invalid platform: {platform}. Must be 'android' or 'ios'")
+    
+    # Validate product ID
+    if request.product_id not in VALID_AD_FREE_PRODUCT_IDS:
+        logger.warning(f"[AD-FREE] Invalid product ID: {request.product_id} from {firebase_uid}")
+        raise HTTPException(400, f"Invalid product ID: {request.product_id}")
+    
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            raise HTTPException(404, "User not found. Please call /auth/sync first.")
+        
+        # ============================================================
+        # SECURITY CHECK 1: Does this account already have ad-free?
+        # ============================================================
+        # This prevents double-charging the same Firebase account
+        if user.is_ad_free:
+            logger.info(f"[AD-FREE] User {firebase_uid} already has ad-free status (idempotent)")
+            return AdFreePurchaseResponse(
+                verified=True,
+                is_ad_free=True,
+                purchased_at=user.ad_free_purchased_at.isoformat() if user.ad_free_purchased_at else None,
+                message="Already ad-free",
+                detail="User already has ad-free status",
+            )
+        
+        # ============================================================
+        # SECURITY CHECK 2: Verify purchase with Google/Apple
+        # ============================================================
+        logger.info(f"[AD-FREE] Verifying {platform} purchase for {firebase_uid}: product={request.product_id}")
+        
+        result = verify_purchase(
+            purchase_token=request.purchase_token,
+            product_id=request.product_id,
+            platform=platform,
+        )
+        
+        if not result.valid:
+            logger.warning(f"[AD-FREE] Purchase verification failed for {firebase_uid}: {result.reason}")
+            raise HTTPException(400, f"Purchase verification failed: {result.reason}")
+        
+        order_id = result.order_id
+        
+        # ============================================================
+        # SECURITY CHECK 3: Check for replay attacks (order_id reuse)
+        # ============================================================
+        # Each Google Play order can only be used ONCE to grant ad-free
+        if order_id:
+            existing_purchase = db.query(AdFreePurchase).filter(
+                AdFreePurchase.order_id == order_id
+            ).first()
+            
+            if existing_purchase:
+                if existing_purchase.firebase_uid == firebase_uid:
+                    # Same account, same order - idempotent success
+                    # This can happen if client retries after network error
+                    logger.info(f"[AD-FREE] Idempotent: order {order_id} already processed for {firebase_uid}")
+                    
+                    # Ensure user has ad-free status (in case of DB inconsistency)
+                    if not user.is_ad_free:
+                        user.is_ad_free = True
+                        user.ad_free_purchased_at = existing_purchase.verified_at
+                        user.ad_free_product_id = existing_purchase.product_id
+                        db.commit()
+                    
+                    return AdFreePurchaseResponse(
+                        verified=True,
+                        is_ad_free=True,
+                        purchased_at=existing_purchase.verified_at.isoformat() if existing_purchase.verified_at else None,
+                        message="Purchase already verified",
+                        detail="This purchase was already processed for your account",
+                    )
+                else:
+                    # FRAUD ATTEMPT: Different account trying to use same order
+                    logger.warning(
+                        f"[AD-FREE] FRAUD ATTEMPT: order_id={order_id} already used by "
+                        f"firebase_uid={existing_purchase.firebase_uid}, "
+                        f"attempted reuse by firebase_uid={firebase_uid}"
+                    )
+                    raise HTTPException(400, "This purchase has already been used by another account")
+        
+        # ============================================================
+        # GRANT AD-FREE
+        # ============================================================
+        now = utc_naive_now()
+        
+        # Update user record
+        user.is_ad_free = True
+        user.ad_free_purchased_at = now
+        user.ad_free_product_id = request.product_id
+        
+        # Create audit record (order_id is UNIQUE - prevents replay attacks)
+        purchase_record = AdFreePurchase(
+            user_id=user.id,
+            firebase_uid=firebase_uid,
+            product_id=request.product_id,
+            purchase_token=request.purchase_token,
+            platform=platform,
+            device_id=request.device_id,
+            order_id=order_id,
+            store_data=result.store_data,
+            verified_at=now,
+            created_at=now,
+        )
+        db.add(purchase_record)
+        
+        # Create audit log
+        create_audit_log(
+            db,
+            event_type="ad_free_purchase",
+            message=f"Ad-free purchase verified: {request.product_id}",
+            actor=firebase_uid[:16],
+            target=user.id,
+            target_type="user",
+            severity="info",
+            details={
+                "product_id": request.product_id,
+                "platform": platform,
+                "order_id": order_id,
+                "is_test": result.is_test_purchase,
+            },
+        )
+        
+        db.commit()
+        
+        logger.info(
+            f"[AD-FREE] Purchase verified and activated for {firebase_uid}: "
+            f"product={request.product_id}, platform={platform}, order={order_id}"
+        )
+    
+    # ============================================================
+    # CONSUME the purchase on Google Play (CONSUMABLE product)
+    # ============================================================
+    # For consumable products, we CONSUME (not acknowledge)
+    # This allows other users to purchase the same product
+    # Done AFTER commit to ensure user gets ad-free even if consume fails
+    if platform == "android":
+        try:
+            consumed = consume_google_play_purchase(
+                product_id=request.product_id,
+                purchase_token=request.purchase_token,
+            )
+            if consumed:
+                logger.info(f"[AD-FREE] Consumed on Google Play: order={order_id}")
+            else:
+                logger.warning(f"[AD-FREE] Failed to consume on Google Play: order={order_id}")
+        except Exception as e:
+            # Log but don't fail - user already has ad-free status
+            logger.warning(f"[AD-FREE] Consume failed (non-critical): {e}")
+    
+    return AdFreePurchaseResponse(
+        verified=True,
+        is_ad_free=True,
+        purchased_at=now.isoformat(),
+        message="Ad-free activated!",
+    )
+
+
+# =============================================================================
+# Credit/Gem Purchase Endpoints (Consumables)
+# =============================================================================
+
+class GemPurchaseRequest(BaseModel):
+    """Request body for gem/credit pack purchase verification"""
+    purchase_token: str = Field(..., description="Purchase token from Google Play")
+    product_id: str = Field(..., description="Product ID (e.g., 'credits_500')")
+    platform: str = Field(..., description="'android' or 'ios'")
+    device_id: Optional[str] = Field(None, description="Hashed device ID for fraud detection")
+    order_id: Optional[str] = Field(None, description="Order ID from client (for early duplicate detection)")
+
+
+class GemPurchaseResponse(BaseModel):
+    """Response for gem/credit pack purchase verification"""
+    success: bool
+    credits_awarded: int = 0
+    new_balance: int = 0
+    order_id: Optional[str] = None
+    message: Optional[str] = None
+    detail: Optional[str] = None
+    is_duplicate: bool = False
+
+
+@auth_router.post("/verify-gem-purchase", response_model=GemPurchaseResponse)
+async def verify_gem_purchase(
+    request: GemPurchaseRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Verify and process a gem/credit pack purchase.
+    
+    Security workflow:
+    1. Verify Firebase token (user authentication)
+    2. Validate product_id against known products
+    3. Check for duplicate order_id (prevent replay attacks)
+    4. Verify purchase with Google Play API
+    5. Double-check order_id from verified response
+    6. Credit user atomically with purchase record
+    7. Consume purchase on Google Play (allows re-purchase)
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    
+    **Request Body:**
+    - purchase_token: The purchase token from Google Play
+    - product_id: Product ID (e.g., 'credits_500')
+    - platform: 'android' or 'ios'
+    - device_id: Hashed device ID (optional, for fraud detection)
+    - order_id: Order ID from client (optional, for early duplicate check)
+    
+    **Returns:**
+    - success: Whether purchase was processed
+    - credits_awarded: Number of credits added (0 if duplicate)
+    - new_balance: User's new credit balance
+    - order_id: The verified order ID
+    - is_duplicate: True if this was a duplicate purchase (already processed)
+    
+    **Error Codes:**
+    - 400: Invalid request (bad product_id, missing fields)
+    - 401: Unauthorized (invalid token)
+    - 402: Payment verification failed with Google
+    - 404: User not found
+    - 409: Duplicate purchase (already processed - includes current balance)
+    """
+    import hashlib
+    from purchase_verification import (
+        verify_purchase,
+        consume_google_play_purchase,
+        get_credits_for_product,
+        is_consumable_product,
+        PRODUCT_CREDITS_MAP,
+    )
+    
+    # Verify Firebase token
+    decoded = await verify_firebase_token(authorization)
+    
+    firebase_uid = decoded.get("uid")
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    # Validate platform
+    platform = request.platform.lower().strip()
+    if platform not in ["android", "ios"]:
+        raise HTTPException(400, f"Invalid platform: {platform}. Must be 'android' or 'ios'")
+    
+    # Validate product_id is a valid credit pack
+    if request.product_id not in PRODUCT_CREDITS_MAP:
+        logger.warning(f"[PURCHASE] Invalid product ID: {request.product_id} from {firebase_uid}")
+        raise HTTPException(400, f"Invalid product_id: {request.product_id}")
+    
+    # Get credits to award (from SERVER-SIDE mapping, never trust client)
+    credits_to_award = get_credits_for_product(request.product_id)
+    
+    with SessionLocal() as db:
+        # Get user
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            raise HTTPException(404, "User not found. Please call /auth/sync first.")
+        
+        # Early duplicate check using client-provided order_id
+        if request.order_id:
+            existing = db.query(Purchase).filter(Purchase.order_id == request.order_id).first()
+            if existing:
+                logger.info(f"[PURCHASE] Duplicate detected (client order_id): {request.order_id} for {firebase_uid}")
+                return GemPurchaseResponse(
+                    success=True,  # Not an error - purchase was already processed
+                    credits_awarded=0,
+                    new_balance=user.total_credits,
+                    order_id=request.order_id,
+                    message="Purchase already processed",
+                    is_duplicate=True,
+                )
+        
+        # Verify purchase with Google Play API
+        logger.info(f"[PURCHASE] Verifying {platform} purchase for {firebase_uid}: product={request.product_id}")
+        
+        result = verify_purchase(
+            purchase_token=request.purchase_token,
+            product_id=request.product_id,
+            platform=platform,
+        )
+        
+        if not result.valid:
+            logger.warning(f"[PURCHASE] Verification failed for {firebase_uid}: {result.reason}")
+            raise HTTPException(402, f"Purchase verification failed: {result.reason}")
+        
+        verified_order_id = result.order_id
+        
+        # Double-check for duplicate using verified order_id
+        if verified_order_id:
+            existing = db.query(Purchase).filter(Purchase.order_id == verified_order_id).first()
+            if existing:
+                logger.info(f"[PURCHASE] Duplicate detected (verified order_id): {verified_order_id} for {firebase_uid}")
+                return GemPurchaseResponse(
+                    success=True,  # Not an error - purchase was already processed
+                    credits_awarded=0,
+                    new_balance=user.total_credits,
+                    order_id=verified_order_id,
+                    message="Purchase already processed",
+                    is_duplicate=True,
+                )
+        
+        # Also check by purchase token hash (belt and suspenders)
+        token_hash = hashlib.sha256(request.purchase_token.encode()).hexdigest()
+        existing_by_token = db.query(Purchase).filter(Purchase.purchase_token_hash == token_hash).first()
+        if existing_by_token:
+            logger.info(f"[PURCHASE] Duplicate detected (token hash): {firebase_uid}")
+            return GemPurchaseResponse(
+                success=True,
+                credits_awarded=0,
+                new_balance=user.total_credits,
+                order_id=existing_by_token.order_id,
+                message="Purchase already processed",
+                is_duplicate=True,
+            )
+        
+        # All checks passed - credit user atomically
+        now = utc_naive_now()
+        
+        # Create purchase record
+        purchase_record = Purchase(
+            user_id=user.id,
+            firebase_uid=firebase_uid,
+            order_id=verified_order_id,
+            purchase_token_hash=token_hash,
+            product_id=request.product_id,
+            platform=platform,
+            device_id=request.device_id,
+            credits_awarded=credits_to_award,
+            purchase_state="verified",
+            consumed=False,
+            is_test_purchase=result.is_test_purchase,
+            store_data=result.store_data,
+            purchase_time_ms=str(result.purchase_time_ms) if result.purchase_time_ms else None,
+            verified_at=now,
+            created_at=now,
+        )
+        db.add(purchase_record)
+        
+        # Update user's credit balance
+        user.total_credits += credits_to_award
+        new_balance = user.total_credits
+        
+        # Create credit transaction record
+        credit_transaction = CreditTransaction(
+            user_id=user.id,
+            delta=credits_to_award,
+            reason=f"iap_purchase:{request.product_id}",
+            created_at=now,
+        )
+        db.add(credit_transaction)
+        
+        # Create audit log
+        create_audit_log(
+            db,
+            event_type="gem_purchase",
+            message=f"Gem purchase verified: {request.product_id} (+{credits_to_award} credits)",
+            actor=firebase_uid[:16],
+            target=user.id,
+            target_type="user",
+            severity="info",
+            details={
+                "product_id": request.product_id,
+                "credits_awarded": credits_to_award,
+                "platform": platform,
+                "order_id": verified_order_id,
+                "is_test": result.is_test_purchase,
+            },
+        )
+        
+        db.commit()
+        
+        logger.info(
+            f"[PURCHASE] SUCCESS: {firebase_uid} purchased {request.product_id}, "
+            f"+{credits_to_award} credits, new_balance={new_balance}, order={verified_order_id}"
+        )
+    
+    # AFTER crediting user, consume the purchase on Google Play
+    # This allows the user to buy the same product again
+    # Do this AFTER commit to ensure user gets credits even if consume fails
+    if platform == "android":
+        try:
+            consumed = consume_google_play_purchase(
+                product_id=request.product_id,
+                purchase_token=request.purchase_token,
+            )
+            if consumed:
+                # Update purchase record to mark as consumed
+                with SessionLocal() as db:
+                    purchase = db.query(Purchase).filter(Purchase.order_id == verified_order_id).first()
+                    if purchase:
+                        purchase.consumed = True
+                        db.commit()
+                logger.info(f"[PURCHASE] Consumed on Google Play: {verified_order_id}")
+            else:
+                logger.warning(f"[PURCHASE] Failed to consume on Google Play: {verified_order_id}")
+        except Exception as e:
+            # Log but don't fail - user already got their credits
+            logger.warning(f"[PURCHASE] Consume failed (non-critical): {e}")
+    
+    return GemPurchaseResponse(
+        success=True,
+        credits_awarded=credits_to_award,
+        new_balance=new_balance,
+        order_id=verified_order_id,
+        message=f"Purchase verified and {credits_to_award} credits added",
+        is_duplicate=False,
+    )
 
 
 # =============================================================================
