@@ -367,8 +367,22 @@ class BanIPRequest(BaseModel):
 # =============================================================================
 
 class SubmitResponse(BaseModel):
-    """Response for job submission"""
-    job_id: str = Field(..., description="Unique job identifier")
+    """
+    Response for job submission.
+    
+    For single variation (variations=1):
+    - job_id: The single job ID
+    - job_ids: None or empty
+    - batch_id: None
+    
+    For multiple variations (variations>1):
+    - job_id: The primary job ID (first variation, receives FCM notification)
+    - job_ids: List of ALL job IDs (including primary)
+    - batch_id: Unique batch identifier for this group
+    
+    Frontend should poll ALL job_ids when variations > 1.
+    """
+    job_id: str = Field(..., description="Primary job identifier (first variation)")
     status: JobStatus = Field(..., description="Initial job status")
     model: str = Field(..., description="Model being used")
     routed_to_worker: Optional[str] = Field(None, description="Worker ID if immediately dispatched")
@@ -376,10 +390,17 @@ class SubmitResponse(BaseModel):
     result_key: Optional[str] = Field(None, description="R2 key where result will be stored")
     download_url: Optional[str] = Field(None, description="URL to download result when ready")
     created_at: datetime = Field(..., description="Job creation timestamp")
-    # Optional fields (backward compatible)
+    
+    # Variation support (for variations > 1)
     variations: int = Field(1, description="Number of variations requested")
+    batch_id: Optional[str] = Field(None, description="Batch ID for multi-variation requests")
+    job_ids: Optional[List[str]] = Field(None, description="List of ALL job IDs when variations > 1")
+    
+    # Prompt enhancement
     prompt_enhanced: bool = Field(False, description="Whether prompt was enhanced by AI")
     enhanced_prompt: Optional[str] = Field(None, description="The enhanced prompt if enhance_prompt was true")
+    
+    # Credits
     credits_used: int = Field(0, description="Total credits used for this request")
 
 

@@ -153,11 +153,27 @@ def unload_models():
 # -------------------------
 # Helpers
 # -------------------------
-def _get_dynamic_size(max_dim: int = 1024) -> tuple[int, int]:
-    """Return a dynamic width/height within max_dim, multiple-of-64 (square default)."""
-    size = max_dim
-    size = (size // 64) * 64
-    return size, size
+def _normalize_dimension(dim: int, default: int = 1024) -> int:
+    """Ensure dimension is a positive multiple of 64."""
+    if dim <= 0:
+        dim = default
+    # Round to nearest multiple of 64
+    return ((dim + 32) // 64) * 64
+
+
+def _get_dimensions(params: Dict[str, Any], default_size: int = 1024) -> tuple[int, int]:
+    """
+    Get width and height from params, ensuring they are valid multiples of 64.
+    Falls back to default_size x default_size if not provided.
+    """
+    width = params.get("width", default_size)
+    height = params.get("height", default_size)
+    
+    # Normalize to multiples of 64
+    width = _normalize_dimension(width, default_size)
+    height = _normalize_dimension(height, default_size)
+    
+    return width, height
 
 
 # -------------------------
@@ -174,7 +190,7 @@ def run_inference_qwen_image(job_id: str, prompt: str, params: Dict[str, Any]) -
 
     inference_steps = params.get("num_inference_steps", NUM_INFERENCE_STEPS)
     cfg = params.get("cfg_scale", 1.0)
-    width, height = _get_dynamic_size(1024)
+    width, height = _get_dimensions(params, default_size=1024)
 
     pipeline = get_pipeline()
 
@@ -224,6 +240,8 @@ if __name__ == "__main__":
         "cfg_scale": 1.0,
         "output_dir": "./outputs",
         "num_inference_steps": 8,
+        "width": 1024,   # User-specified width (will be rounded to multiple of 64)
+        "height": 768,   # User-specified height (will be rounded to multiple of 64)
         "scale_image": True,
         "scale_factor": 2,
     }

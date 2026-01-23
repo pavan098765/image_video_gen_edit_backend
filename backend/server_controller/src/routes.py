@@ -78,6 +78,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import cast, String as SQLString
 from botocore.exceptions import ClientError
 
 from db import (
@@ -2203,7 +2204,7 @@ async def submit_job(
                 status=JobState.QUEUED.value,
                 result_r2_key=result_key,
                 output_key=result_key,
-                fcm_token=payload.fcm_token if variation_idx == 0 else None,  # Only first job gets FCM
+                fcm_token=payload.fcm_token,  # All jobs get FCM so frontend is notified for each variation
                 user_id=user_id,
                 credits_locked=0,
                 credits_refunded=0,
@@ -2332,7 +2333,8 @@ async def submit_job(
     # Generate upload URL for primary job
     upload_url = create_presigned_put_url(primary_job["result_key"])
     
-    # Return simple response - frontend polls job_id, gets all variation results
+    # Return response with all job IDs for variations
+    # Frontend should poll all job_ids when variations > 1
     return SubmitResponse(
         job_id=primary_job["job_id"],
         status=JobStatus.QUEUED,
@@ -2342,9 +2344,14 @@ async def submit_job(
         result_key=primary_job["result_key"],
         download_url=download_url,
         created_at=utc_naive_now(),
+        # Variation support
         variations=variations,
+        batch_id=batch_id,  # None for single variation, UUID for multiple
+        job_ids=job_ids if variations > 1 else None,  # All job IDs when variations > 1
+        # Prompt enhancement
         prompt_enhanced=prompt_enhanced,
         enhanced_prompt=enhanced_prompt_text if prompt_enhanced else None,
+        # Credits
         credits_used=total_credits_locked,
     )
 
@@ -3852,9 +3859,38 @@ async def get_job_status(
         
         if batch_id and total_variations > 1:
             # Multi-variation job - fetch all sibling jobs
-            sibling_jobs = db.query(Job).filter(
-                Job.params.contains({"_batch_id": batch_id})
-            ).all()
+            # Use database-agnostic query: cast JSON to text and use LIKE
+            # This works on both SQLite and PostgreSQL
+            try:
+                # Cast params to string and search for batch_id
+                # This is more reliable than .contains() which doesn't work on SQLite
+                sibling_jobs = db.query(Job).filter(
+                    cast(Job.params, SQLString).like(f'%"_batch_id": "{batch_id}"%')
+                ).all()
+                
+                # Fallback: try alternative JSON format (no space after colon)
+                if not sibling_jobs:
+                    sibling_jobs = db.query(Job).filter(
+                        cast(Job.params, SQLString).like(f'%"_batch_id":"{batch_id}"%')
+                    ).all()
+            except Exception as query_err:
+                logger.warning(f"Batch query failed for batch {batch_id}: {query_err}")
+                sibling_jobs = []
+            
+            # CRITICAL: If query returned empty results, fall back to just the current job
+            # This prevents the 0==0 bug where empty results cause "failed" status
+            if not sibling_jobs:
+                logger.warning(
+                    f"Batch query returned no results for batch_id={batch_id}, "
+                    f"falling back to single-job status for job {job_id}"
+                )
+                # Use current job's status only
+                sibling_jobs = [job]
+            
+            # Ensure current job is in the results (in case query missed it)
+            current_job_in_results = any(j.job_id == job_id for j in sibling_jobs)
+            if not current_job_in_results:
+                sibling_jobs.append(job)
             
             # Build variation results
             variation_results = []
@@ -3892,27 +3928,35 @@ async def get_job_status(
             # Determine aggregated status
             total_jobs = len(sibling_jobs)
             finished_count = completed_count + failed_count
-            all_completed = finished_count == total_jobs
             
-            if all_completed:
-                if failed_count == total_jobs:
-                    aggregated_status = JobState.FAILED.value
-                    aggregated_error = first_error or "All variations failed"
-                elif completed_count > 0:
-                    aggregated_status = JobState.COMPLETED.value
-                    aggregated_error = None
-                else:
-                    aggregated_status = JobState.FAILED.value
-                aggregated_completed_at = latest_completed_at
-            else:
-                # Still processing - find the most representative status
-                running_count = sum(1 for j in sibling_jobs if j.status == JobState.RUNNING.value)
-                if running_count > 0:
-                    aggregated_status = JobState.RUNNING.value
-                else:
-                    aggregated_status = JobState.QUEUED.value
+            # CRITICAL: Avoid 0==0 bug - if total_jobs is 0, treat as not completed
+            if total_jobs == 0:
+                all_completed = False
+                aggregated_status = JobState.QUEUED.value
                 aggregated_completed_at = None
                 aggregated_error = None
+            else:
+                all_completed = finished_count == total_jobs
+                
+                if all_completed:
+                    if failed_count == total_jobs:
+                        aggregated_status = JobState.FAILED.value
+                        aggregated_error = first_error or "All variations failed"
+                    elif completed_count > 0:
+                        aggregated_status = JobState.COMPLETED.value
+                        aggregated_error = None
+                    else:
+                        aggregated_status = JobState.FAILED.value
+                    aggregated_completed_at = latest_completed_at
+                else:
+                    # Still processing - find the most representative status
+                    running_count = sum(1 for j in sibling_jobs if j.status == JobState.RUNNING.value)
+                    if running_count > 0:
+                        aggregated_status = JobState.RUNNING.value
+                    else:
+                        aggregated_status = JobState.QUEUED.value
+                    aggregated_completed_at = None
+                    aggregated_error = None
             
             # Primary result_url is first completed variation
             for vr in variation_results:
@@ -3971,10 +4015,17 @@ async def get_batch_status(
     db = SessionLocal()
     try:
         # Find all jobs with this batch_id in their params
-        # Jobs store _batch_id in their params JSON
+        # Use database-agnostic query: cast JSON to text and use LIKE
+        # This works on both SQLite and PostgreSQL
         jobs = db.query(Job).filter(
-            Job.params.contains({"_batch_id": batch_id})
+            cast(Job.params, SQLString).like(f'%"_batch_id": "{batch_id}"%')
         ).all()
+        
+        # Fallback: try alternative JSON format (no space after colon)
+        if not jobs:
+            jobs = db.query(Job).filter(
+                cast(Job.params, SQLString).like(f'%"_batch_id":"{batch_id}"%')
+            ).all()
         
         if not jobs:
             raise HTTPException(status_code=404, detail="Batch not found")
@@ -5089,77 +5140,48 @@ async def job_complete(
             )
         
         if should_send_notification:
-            # Check if this is part of a batch
+            # Send individual notification for each job as it completes
+            # For multi-variation batches, frontend receives one notification per variation
+            # and can match job_id to the job_ids array from submit response
+            
+            # CRITICAL: Use job's actual status from DB, not just payload.failed
+            is_success = job_status == JobState.COMPLETED.value
+            
+            download_url = None
+            if is_success and payload.result_r2_key:
+                download_url = _generate_signed_download_url(payload.result_r2_key)
+            
+            # Include batch info in notification if part of a batch
             batch_id = job.params.get("_batch_id") if job.params else None
+            variation_index = job.params.get("_variation_index", 0) if job.params else 0
             total_variations = job.params.get("_total_variations", 1) if job.params else 1
             
-            if batch_id and total_variations > 1:
-                # Multi-variation job - check if ALL variations are complete
-                sibling_jobs = db.query(Job).filter(
-                    Job.params.contains({"_batch_id": batch_id})
-                ).all()
-                
-                completed_count = sum(1 for j in sibling_jobs if j.status in [JobState.COMPLETED.value, JobState.FAILED.value])
-                all_done = completed_count == len(sibling_jobs)
-                
-                if all_done:
-                    # All variations complete - send single notification
-                    # Count successes and failures
-                    success_count = sum(1 for j in sibling_jobs if j.status == JobState.COMPLETED.value)
-                    fail_count = sum(1 for j in sibling_jobs if j.status == JobState.FAILED.value)
-                    
-                    # Get download URL for primary job (first variation)
-                    download_url = None
-                    primary_job = next((j for j in sibling_jobs if j.params.get("_variation_index", 0) == 0), None)
-                    if primary_job and primary_job.status == JobState.COMPLETED.value and primary_job.result_r2_key:
-                        download_url = _generate_signed_download_url(primary_job.result_r2_key)
-                    
-                    # Determine overall success
-                    overall_success = success_count > 0
-                    
-                    background_tasks.add_task(
-                        _send_job_notification,
-                        fcm_token,
-                        primary_job.job_id if primary_job else job_id,
-                        job.model,
-                        overall_success,
-                        download_url,
-                    )
-                    
-                    # Mark all sibling jobs as notification sent
-                    for sib in sibling_jobs:
-                        sib.notification_sent = True
-                    db.commit()
-                    
-                    logger.info(
-                        f"Batch {batch_id} complete: {success_count}/{total_variations} succeeded, "
-                        f"sent FCM notification"
-                    )
-                else:
-                    # Not all done yet - don't send notification
-                    logger.debug(
-                        f"Batch {batch_id}: {completed_count}/{total_variations} complete, waiting for others"
-                    )
-            else:
-                # Single job - standard notification
-                # CRITICAL: Use job's actual status from DB, not just payload.failed
-                # This ensures notification content matches the actual job state
-                is_success = job_status == JobState.COMPLETED.value
-                
-                download_url = None
-                if is_success and payload.result_r2_key:
-                    download_url = _generate_signed_download_url(payload.result_r2_key)
-                
-                background_tasks.add_task(
-                    _send_job_notification,
-                    fcm_token,
-                    job_id,
-                    job.model,
-                    is_success,
-                    download_url,
+            background_tasks.add_task(
+                _send_job_notification,
+                fcm_token,
+                job_id,
+                job.model,
+                is_success,
+                download_url,
+                # Pass batch info for frontend to track variations
+                batch_id=batch_id,
+                variation_index=variation_index,
+                total_variations=total_variations,
+            )
+            job.notification_sent = True
+            db.commit()
+            
+            if batch_id:
+                logger.info(
+                    f"FCM notification sent for job {job_id} "
+                    f"(batch {batch_id}, variation {variation_index + 1}/{total_variations}, "
+                    f"status={'completed' if is_success else 'failed'})"
                 )
-                job.notification_sent = True
-                db.commit()
+            else:
+                logger.info(
+                    f"FCM notification sent for job {job_id} "
+                    f"(status={'completed' if is_success else 'failed'})"
+                )
                 
                 logger.info(
                     f"FCM notification queued for job {job_id}: "
@@ -5220,25 +5242,61 @@ async def _remove_pending_job_safe(pod_manager, job_id: str, model: str, status:
         logger.debug(f"Failed to remove {status} job {job_id} from pending queue: {e}")
 
 
-async def _send_job_notification(token: str, job_id: str, model: str, success: bool, download_url: str = None):
-    """Background task to send FCM notification"""
+async def _send_job_notification(
+    token: str,
+    job_id: str,
+    model: str,
+    success: bool,
+    download_url: str = None,
+    batch_id: str = None,
+    variation_index: int = 0,
+    total_variations: int = 1,
+):
+    """
+    Background task to send FCM notification for a completed/failed job.
+    
+    For batch jobs (variations > 1), includes batch info so frontend can track
+    which variation completed. Frontend receives individual notifications for
+    each job and can match job_id to the job_ids array from submit response.
+    """
     if success:
         data = {"job_id": job_id, "status": "completed"}
         if download_url:
             data["download_url"] = download_url
-        await send_fcm_notification(
-            token,
-            "Job Complete",
-            f"Your result is ready!",
-            data,
-        )
+        
+        # Include batch info for multi-variation jobs
+        if batch_id and total_variations > 1:
+            data["batch_id"] = batch_id
+            data["variation_index"] = str(variation_index)
+            data["total_variations"] = str(total_variations)
+        
+        # Customize message for variations
+        if total_variations > 1:
+            title = f"Variation {variation_index + 1}/{total_variations} Complete"
+            body = f"Your result is ready!"
+        else:
+            title = "Job Complete"
+            body = "Your result is ready!"
+        
+        await send_fcm_notification(token, title, body, data)
     else:
-        await send_fcm_notification(
-            token,
-            "Job Failed",
-            f"Your job has failed due to internal error, Don't worry, No credits deducted",
-            {"job_id": job_id, "status": "failed"},
-        )
+        data = {"job_id": job_id, "status": "failed"}
+        
+        # Include batch info for multi-variation jobs
+        if batch_id and total_variations > 1:
+            data["batch_id"] = batch_id
+            data["variation_index"] = str(variation_index)
+            data["total_variations"] = str(total_variations)
+        
+        # Customize message for variations
+        if total_variations > 1:
+            title = f"Variation {variation_index + 1}/{total_variations} Failed"
+            body = "Job failed. No credits deducted."
+        else:
+            title = "Job Failed"
+            body = "Your job has failed due to internal error. No credits deducted."
+        
+        await send_fcm_notification(token, title, body, data)
 
 
 async def _requeue_jobs_after_pod_failure(job_ids: list, model: str):
