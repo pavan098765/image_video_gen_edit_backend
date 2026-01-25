@@ -107,6 +107,7 @@ class AppState:
             pod_manager=self.pod_manager,
             max_retries=self.config.job.max_retries,
             job_timeout_minutes=self.config.job.timeout_minutes,
+            running_job_timeout_minutes=self.config.job.running_timeout_minutes,
         )
         
         # Load IP bans
@@ -187,6 +188,16 @@ class AppState:
             )
             self.background_tasks.append(task)
             logger.info("Started job recovery task")
+        
+        # Queued job dispatcher task (CRITICAL - dispatches QUEUED jobs to available workers)
+        # This handles jobs that were reverted to QUEUED after dispatch failures
+        if self.pod_manager:
+            task = asyncio.create_task(
+                self._queued_job_dispatcher_task(),
+                name="queued_job_dispatcher"
+            )
+            self.background_tasks.append(task)
+            logger.info("Started queued job dispatcher task")
         
         # Heartbeat cache sync task (CRITICAL - makes heartbeat endpoint fast)
         task = asyncio.create_task(
@@ -756,7 +767,8 @@ class AppState:
         
         logger.info(
             f"Job recovery task started (interval={sweep_interval}s, "
-            f"timeout={self.job_manager.job_timeout.total_seconds() / 60:.0f} min)"
+            f"running_timeout={self.job_manager.running_job_timeout.total_seconds() / 60:.0f} min, "
+            f"general_timeout={self.job_manager.job_timeout.total_seconds() / 60:.0f} min)"
         )
         
         while not self.shutdown_event.is_set():
@@ -770,6 +782,149 @@ class AppState:
                 break
             except Exception:
                 logger.exception("Job recovery task error")
+
+    async def _queued_job_dispatcher_task(self):
+        """
+        CRITICAL: Dispatch QUEUED jobs to available workers.
+        
+        This task handles jobs that were reverted to QUEUED after:
+        - Dispatch failures (e.g., all machines blacklisted)
+        - Pod destruction during dispatch
+        - Worker timeout during registration
+        
+        Without this task, QUEUED jobs would sit indefinitely waiting
+        for the 30-minute timeout, even when workers are available.
+        """
+        from db import SessionLocal, Job, Worker
+        from models import JobState
+        from routes import _dispatch_job_background
+        from pod_manager import PodStatus
+        
+        dispatch_interval = 5  # Check every 5 seconds
+        
+        # Track recently dispatched jobs to avoid re-dispatching too quickly
+        # Maps job_id -> timestamp when dispatch was triggered
+        recently_dispatched: dict = {}
+        dispatch_cooldown = 10  # Don't re-dispatch same job within 10 seconds
+        
+        logger.info(
+            f"Queued job dispatcher task started (interval={dispatch_interval}s)"
+        )
+        
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(dispatch_interval)
+                
+                if not self.pod_manager:
+                    continue
+                
+                # Clean up old entries from recently_dispatched
+                from utils import utc_naive_now
+                from datetime import timedelta
+                
+                now = utc_naive_now()
+                cutoff = now - timedelta(seconds=dispatch_cooldown * 2)
+                recently_dispatched = {
+                    k: v for k, v in recently_dispatched.items() 
+                    if v > cutoff
+                }
+                
+                # Get QUEUED jobs that need dispatch
+                db = SessionLocal()
+                try:
+                    # Find QUEUED jobs without worker assignment
+                    # Only get jobs that have been QUEUED for at least 3 seconds
+                    # (to avoid racing with initial dispatch)
+                    min_age = now - timedelta(seconds=3)
+                    
+                    queued_jobs = (
+                        db.query(Job)
+                        .filter(
+                            Job.status == JobState.QUEUED.value,
+                            Job.worker_id == None,  # noqa: E711
+                            Job.updated_at < min_age,  # At least 3 seconds old
+                        )
+                        .order_by(Job.created_at.asc())  # FIFO
+                        .limit(10)  # Process up to 10 jobs per cycle
+                        .all()
+                    )
+                    
+                    # Filter out recently dispatched jobs
+                    cooldown_threshold = now - timedelta(seconds=dispatch_cooldown)
+                    eligible_jobs = []
+                    for job in queued_jobs:
+                        last_dispatch = recently_dispatched.get(job.job_id)
+                        if last_dispatch is None or last_dispatch < cooldown_threshold:
+                            eligible_jobs.append(job)
+                    
+                    if eligible_jobs:
+                        logger.info(
+                            f"[DISPATCHER] Found {len(eligible_jobs)} QUEUED jobs to dispatch "
+                            f"(filtered from {len(queued_jobs)})"
+                        )
+                    
+                    # Group jobs by model for efficient dispatch
+                    jobs_by_model: dict = {}
+                    for job in eligible_jobs:
+                        if job.model not in jobs_by_model:
+                            jobs_by_model[job.model] = []
+                        jobs_by_model[job.model].append(job)
+                    
+                    # Check for available workers for each model
+                    for model, jobs in jobs_by_model.items():
+                        # Check if we have any READY pods for this model
+                        has_ready_pod = False
+                        
+                        # Take a snapshot of pods to check (prevents dict iteration issues)
+                        async with self.pod_manager._lock:
+                            pods_snapshot = list(self.pod_manager.individual_pods.items())
+                        
+                        for pod_uuid, info in pods_snapshot:
+                            if info.model == model and info.status == PodStatus.READY:
+                                # Verify pod isn't blacklisted
+                                if info.machine_id and self.pod_manager.is_machine_bad(info.machine_id):
+                                    continue
+                                has_ready_pod = True
+                                break
+                        
+                        if has_ready_pod or len(pods_snapshot) == 0:
+                            # Either we have a ready pod, or no pods at all
+                            # (in which case dispatch will create one)
+                            for job in jobs:
+                                logger.info(
+                                    f"[DISPATCHER] Triggering dispatch for QUEUED job {job.job_id} "
+                                    f"(model={model}, queued_since={job.updated_at})"
+                                )
+                                
+                                # Mark as recently dispatched
+                                recently_dispatched[job.job_id] = now
+                                
+                                # Get job mode from params
+                                job_mode = None
+                                if job.params and isinstance(job.params, dict):
+                                    job_mode = job.params.get("mode")
+                                
+                                # Dispatch in background
+                                asyncio.create_task(
+                                    _dispatch_job_background(job.job_id, model, job_mode)
+                                )
+                                
+                                # Small delay between dispatches to avoid thundering herd
+                                await asyncio.sleep(0.5)
+                        else:
+                            # No ready pods for this model - log but don't spam
+                            # (jobs will be picked up when a pod becomes ready)
+                            logger.debug(
+                                f"[DISPATCHER] No READY pods for model {model}, "
+                                f"{len(jobs)} job(s) waiting"
+                            )
+                finally:
+                    db.close()
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Queued job dispatcher task error")
 
 
 # =============================================================================

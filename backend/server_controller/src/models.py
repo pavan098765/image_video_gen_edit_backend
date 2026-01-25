@@ -144,6 +144,20 @@ class SubmitRequest(BaseModel):
         description="Number of output variations to generate (1-4, image models only)"
     )
     
+    # Bulk Edit Support (VIP Feature)
+    # Allows processing multiple images with the same prompt/settings
+    bulk_images: Optional[List[str]] = Field(
+        default=None,
+        max_length=10,  # Max 10 images per bulk request
+        description="List of base64-encoded images for bulk edit (VIP feature). "
+                    "Each image creates separate jobs with the same prompt/settings. "
+                    "If provided along with params.init_image, both are processed."
+    )
+    is_bulk: bool = Field(
+        default=False,
+        description="Flag indicating this is a bulk edit request (requires VIP)"
+    )
+    
     @field_validator("model")
     @classmethod
     def validate_model_name(cls, v: str) -> str:
@@ -370,17 +384,22 @@ class SubmitResponse(BaseModel):
     """
     Response for job submission.
     
-    For single variation (variations=1):
+    For single job (variations=1, no bulk):
     - job_id: The single job ID
-    - job_ids: None or empty
+    - job_ids: None
     - batch_id: None
     
     For multiple variations (variations>1):
-    - job_id: The primary job ID (first variation, receives FCM notification)
+    - job_id: The primary job ID (first job)
     - job_ids: List of ALL job IDs (including primary)
     - batch_id: Unique batch identifier for this group
     
-    Frontend should poll ALL job_ids when variations > 1.
+    For bulk edit (VIP feature):
+    - Multiple images with same prompt/settings
+    - job_ids: List of ALL job IDs (images × variations)
+    - batch_id: Unique batch identifier
+    
+    Frontend should poll ALL job_ids when job_ids is not None.
     """
     job_id: str = Field(..., description="Primary job identifier (first variation)")
     status: JobStatus = Field(..., description="Initial job status")

@@ -237,6 +237,9 @@ async def require_firebase_auth(
         
         audit_logger.auth_success(ip, "firebase", actor=firebase_uid[:16])
         
+        # Check VIP status (time-limited subscription)
+        is_vip = user.is_vip_active()
+        
         return {
             "type": "firebase",
             "firebase_uid": firebase_uid,
@@ -244,6 +247,11 @@ async def require_firebase_auth(
             "email": user.email,
             "total_credits": user.total_credits,
             "is_active": user.is_active,
+            # VIP status
+            "is_vip": is_vip,
+            "vip_expires_at": user.vip_expires_at.isoformat() if user.vip_expires_at else None,
+            # Ad-free status
+            "is_ad_free": user.is_ad_free,
         }
 
 
@@ -364,21 +372,100 @@ def validate_model(model: str) -> str:
 
 
 async def send_fcm_notification(token: str, title: str, body: str, data: Dict = None):
-    """Send FCM push notification"""
+    """
+    Send FCM push notification.
+    
+    CRITICAL: FCM data payload values MUST all be strings.
+    Non-string values will cause silent failures or corrupted notifications.
+    """
+    # Log input parameters for debugging empty notification issues
+    logger.info(
+        f"FCM send_fcm_notification called: "
+        f"token_present={bool(token)}, title='{title}', body='{body[:50] if body else None}...', "
+        f"data_keys={list(data.keys()) if data else 'None'}, data={data}"
+    )
+    
     try:
         from firebase_admin import messaging
         
+        # Validate required fields FIRST
+        if not token:
+            logger.error("FCM notification ABORTED: token is empty/None")
+            return
+        
+        # Defensive: ensure all data values are strings (FCM requirement)
+        sanitized_data = {}
+        if data:
+            for key, value in data.items():
+                if value is None:
+                    # Skip None values entirely - don't send null
+                    logger.warning(f"FCM data field '{key}' is None, skipping")
+                    continue
+                # Convert all values to strings
+                sanitized_data[key] = str(value)
+        else:
+            logger.error(
+                f"FCM notification has NULL data parameter! "
+                f"This will result in empty data payload. title='{title}'"
+            )
+        
+        # CRITICAL: Validate data has required fields
+        if not sanitized_data.get("job_id"):
+            logger.error(
+                f"FCM notification ABORTED: data missing 'job_id'! "
+                f"sanitized_data={sanitized_data}, original_data={data}"
+            )
+            return
+        
+        if not sanitized_data.get("status"):
+            logger.error(
+                f"FCM notification ABORTED: data missing 'status'! "
+                f"sanitized_data={sanitized_data}"
+            )
+            return
+        
+        # Ensure title and body are not empty
+        final_title = title if title else "Job Update"
+        final_body = body if body else "Your job has been updated."
+        
+        if not title or not body:
+            logger.warning(
+                f"FCM notification has empty title or body, using defaults. "
+                f"original_title='{title}', original_body='{body}'"
+            )
+        
         message = messaging.Message(
-            notification=messaging.Notification(title=title, body=body),
-            data=data or {},
+            notification=messaging.Notification(
+                title=final_title,
+                body=final_body,
+            ),
+            data=sanitized_data,
             token=token,
         )
         
+        # Log the exact message being sent
+        logger.info(
+            f"FCM sending message: notification.title='{final_title}', "
+            f"notification.body='{final_body[:50]}...', "
+            f"data={sanitized_data}"
+        )
+        
         response = messaging.send(message)
-        logger.info(f"FCM notification sent: {response}")
+        logger.info(
+            f"FCM notification SUCCESS: response={response}, "
+            f"job_id={sanitized_data.get('job_id')}, status={sanitized_data.get('status')}"
+        )
         
     except Exception as e:
-        logger.error(f"FCM notification failed: {e}")
+        logger.error(
+            f"FCM notification EXCEPTION: {e}, "
+            f"token_prefix={token[:20] if token else 'None'}..., "
+            f"title='{title}', data={data}"
+        )
+        # Re-raise to surface issues during development
+        # In production, you might want to remove this
+        import traceback
+        logger.error(f"FCM exception traceback: {traceback.format_exc()}")
 
 
 # =============================================================================
@@ -1298,6 +1385,306 @@ async def verify_ad_free_purchase(
 
 
 # =============================================================================
+# VIP Subscription Endpoints
+# =============================================================================
+
+class VipStatusResponse(BaseModel):
+    """Response for VIP status check"""
+    is_vip: bool
+    expires_at: Optional[str] = None
+    product_id: Optional[str] = None
+    purchased_at: Optional[str] = None
+    days_remaining: Optional[int] = None
+
+
+class VipPurchaseRequest(BaseModel):
+    """Request body for VIP purchase verification"""
+    purchase_token: str = Field(..., description="Purchase token from Google Play")
+    product_id: str = Field(..., description="VIP product ID (e.g., 'vip_pack_weekly', 'vip_pack_monthly')")
+    platform: str = Field(..., description="'android' or 'ios'")
+    device_id: Optional[str] = Field(None, description="Hashed device ID for fraud detection")
+
+
+class VipPurchaseResponse(BaseModel):
+    """Response for VIP purchase verification"""
+    verified: bool
+    is_vip: bool = False
+    expires_at: Optional[str] = None
+    days_granted: Optional[int] = None
+    message: Optional[str] = None
+    detail: Optional[str] = None
+
+
+@auth_router.get("/vip-status", response_model=VipStatusResponse)
+async def get_vip_status(
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Check if user has active VIP subscription.
+    
+    VIP is TIME-LIMITED (unlike ad-free which is permanent).
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    
+    **Returns:**
+    - is_vip: Whether user has ACTIVE VIP subscription
+    - expires_at: When VIP expires (ISO format)
+    - product_id: The last VIP product purchased
+    - purchased_at: When VIP was last purchased
+    - days_remaining: Days until VIP expires (0 if expired)
+    """
+    # Verify Firebase token
+    decoded = await verify_firebase_token(authorization)
+    
+    firebase_uid = decoded.get("uid")
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            raise HTTPException(404, "User not found. Please call /auth/sync first.")
+        
+        # Check if VIP is active (not expired)
+        is_vip_active = user.is_vip_active()
+        
+        if is_vip_active:
+            days_remaining = (user.vip_expires_at - utc_naive_now()).days if user.vip_expires_at else 0
+            days_remaining = max(0, days_remaining)
+            
+            return VipStatusResponse(
+                is_vip=True,
+                expires_at=user.vip_expires_at.isoformat() if user.vip_expires_at else None,
+                product_id=user.vip_product_id,
+                purchased_at=user.vip_purchased_at.isoformat() if user.vip_purchased_at else None,
+                days_remaining=days_remaining,
+            )
+        
+        # VIP expired or never had
+        return VipStatusResponse(
+            is_vip=False,
+            expires_at=user.vip_expires_at.isoformat() if user.vip_expires_at else None,
+            product_id=None,
+            purchased_at=None,
+            days_remaining=0,
+        )
+
+
+@auth_router.post("/verify-vip-purchase", response_model=VipPurchaseResponse)
+async def verify_vip_purchase(
+    request: VipPurchaseRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Verify and activate VIP subscription purchase.
+    
+    VIP SUBSCRIPTION MODEL:
+    - VIP is TIME-LIMITED (weekly/monthly/yearly)
+    - Multiple purchases EXTEND VIP time (adds to existing expiry)
+    - Benefits: unlimited concurrent generations, bulk edit, free upscale
+    - Server tracks expiration, client cannot modify
+    
+    Security Checks:
+    1. Verify purchase with Google Play/App Store
+    2. Check if order_id was already used → Reject (prevent replay attacks)
+    3. Grant VIP time to user (extends if already VIP)
+    4. Consume the purchase (allows re-purchase)
+    
+    **Headers:**
+    - Authorization: Bearer <firebase_id_token>
+    
+    **Request Body:**
+    - purchase_token: The purchase token from Google Play
+    - product_id: The VIP product ID (e.g., 'vip_pack_weekly', 'vip_pack_monthly')
+    - platform: 'android' or 'ios'
+    - device_id: Hashed device ID (optional)
+    
+    **Returns:**
+    - verified: Whether the purchase was verified
+    - is_vip: Whether user now has VIP status
+    - expires_at: When VIP expires
+    - days_granted: How many days were added
+    - message: Success or error message
+    """
+    from purchase_verification import (
+        verify_purchase, 
+        consume_google_play_purchase,
+        VALID_VIP_PRODUCT_IDS,
+        get_vip_duration_days,
+    )
+    from db import VipPurchase
+    from datetime import timedelta
+    
+    # Verify Firebase token
+    decoded = await verify_firebase_token(authorization)
+    
+    firebase_uid = decoded.get("uid")
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found in token")
+    
+    # Validate platform
+    platform = request.platform.lower().strip()
+    if platform not in ["android", "ios"]:
+        raise HTTPException(400, f"Invalid platform: {platform}. Must be 'android' or 'ios'")
+    
+    # Validate product ID
+    if request.product_id not in VALID_VIP_PRODUCT_IDS:
+        logger.warning(f"[VIP] Invalid product ID: {request.product_id} from {firebase_uid}")
+        raise HTTPException(400, f"Invalid VIP product ID: {request.product_id}")
+    
+    # Get VIP duration for this product
+    duration_days = get_vip_duration_days(request.product_id)
+    if duration_days <= 0:
+        raise HTTPException(400, f"Invalid VIP product duration: {request.product_id}")
+    
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            raise HTTPException(404, "User not found. Please call /auth/sync first.")
+        
+        # ============================================================
+        # SECURITY CHECK 1: Verify purchase with Google/Apple
+        # ============================================================
+        logger.info(f"[VIP] Verifying {platform} purchase for {firebase_uid}: product={request.product_id}")
+        
+        result = verify_purchase(
+            purchase_token=request.purchase_token,
+            product_id=request.product_id,
+            platform=platform,
+        )
+        
+        if not result.valid:
+            logger.warning(f"[VIP] Purchase verification failed for {firebase_uid}: {result.reason}")
+            raise HTTPException(400, f"Purchase verification failed: {result.reason}")
+        
+        order_id = result.order_id
+        
+        # ============================================================
+        # SECURITY CHECK 2: Check for replay attacks (order_id reuse)
+        # ============================================================
+        if order_id:
+            existing_purchase = db.query(VipPurchase).filter(
+                VipPurchase.order_id == order_id
+            ).first()
+            
+            if existing_purchase:
+                if existing_purchase.firebase_uid == firebase_uid:
+                    # Same account, same order - idempotent success
+                    logger.info(f"[VIP] Idempotent: order {order_id} already processed for {firebase_uid}")
+                    
+                    return VipPurchaseResponse(
+                        verified=True,
+                        is_vip=user.is_vip_active(),
+                        expires_at=user.vip_expires_at.isoformat() if user.vip_expires_at else None,
+                        days_granted=0,
+                        message="Purchase already verified",
+                        detail="This purchase was already processed for your account",
+                    )
+                else:
+                    # FRAUD ATTEMPT: Different account trying to use same order
+                    logger.warning(
+                        f"[VIP] FRAUD ATTEMPT: order_id={order_id} already used by "
+                        f"firebase_uid={existing_purchase.firebase_uid}, "
+                        f"attempted reuse by firebase_uid={firebase_uid}"
+                    )
+                    raise HTTPException(400, "This purchase has already been used by another account")
+        
+        # ============================================================
+        # GRANT VIP TIME
+        # ============================================================
+        now = utc_naive_now()
+        
+        # Calculate new expiry - extends existing VIP if active, or starts fresh
+        if user.is_vip_active() and user.vip_expires_at:
+            # Extend existing VIP
+            new_expires_at = user.vip_expires_at + timedelta(days=duration_days)
+            vip_started_at = user.vip_expires_at  # New period starts when old one ends
+        else:
+            # Start fresh VIP
+            new_expires_at = now + timedelta(days=duration_days)
+            vip_started_at = now
+        
+        # Update user record
+        user.is_vip = True
+        user.vip_expires_at = new_expires_at
+        user.vip_product_id = request.product_id
+        user.vip_purchased_at = now
+        
+        # Create purchase record (order_id is UNIQUE - prevents replay attacks)
+        purchase_record = VipPurchase(
+            user_id=user.id,
+            firebase_uid=firebase_uid,
+            product_id=request.product_id,
+            purchase_token=request.purchase_token,
+            platform=platform,
+            device_id=request.device_id,
+            order_id=order_id,
+            store_data=result.store_data,
+            duration_days=duration_days,
+            vip_started_at=vip_started_at,
+            vip_expires_at=new_expires_at,
+            verified_at=now,
+            created_at=now,
+        )
+        db.add(purchase_record)
+        
+        # Create audit log
+        create_audit_log(
+            db,
+            event_type="vip_purchase",
+            message=f"VIP purchase verified: {request.product_id} ({duration_days} days)",
+            actor=firebase_uid[:16],
+            target=user.id,
+            target_type="user",
+            severity="info",
+            details={
+                "product_id": request.product_id,
+                "platform": platform,
+                "order_id": order_id,
+                "duration_days": duration_days,
+                "new_expires_at": new_expires_at.isoformat(),
+                "is_test": result.is_test_purchase,
+            },
+        )
+        
+        db.commit()
+        
+        logger.info(
+            f"[VIP] Purchase verified and activated for {firebase_uid}: "
+            f"product={request.product_id}, platform={platform}, "
+            f"duration={duration_days}d, expires={new_expires_at.isoformat()}"
+        )
+    
+    # ============================================================
+    # CONSUME the purchase on Google Play (CONSUMABLE product)
+    # ============================================================
+    if platform == "android":
+        try:
+            consumed = consume_google_play_purchase(
+                product_id=request.product_id,
+                purchase_token=request.purchase_token,
+            )
+            if consumed:
+                logger.info(f"[VIP] Consumed on Google Play: order={order_id}")
+            else:
+                logger.warning(f"[VIP] Failed to consume on Google Play: order={order_id}")
+        except Exception as e:
+            # Log but don't fail - user already has VIP status
+            logger.warning(f"[VIP] Consume failed (non-critical): {e}")
+    
+    return VipPurchaseResponse(
+        verified=True,
+        is_vip=True,
+        expires_at=new_expires_at.isoformat(),
+        days_granted=duration_days,
+        message=f"VIP activated for {duration_days} days!",
+    )
+
+
+# =============================================================================
 # Credit/Gem Purchase Endpoints (Consumables)
 # =============================================================================
 
@@ -2107,18 +2494,39 @@ async def submit_job(
     Supports:
     - enhance_prompt: If true, AI will enhance the prompt before processing
     - variations: Number of output variations to generate (1-4, creates multiple jobs)
+    - bulk_images: List of images to process with same prompt/settings (VIP feature)
+    - is_bulk: Flag indicating bulk edit request (requires VIP)
+    
+    VIP Benefits:
+    - Bulk edit: Process multiple images with same settings
+    - Free upscale: Upscale cost is waived for VIP users
+    - More variations: Max 4 variations (non-VIP limited to 2)
     
     Returns job ID and optionally dispatches immediately if a worker is ready.
-    For variations > 1, returns batch_id and all job_ids.
+    For variations > 1 or bulk edit, returns batch_id and all job_ids.
     """
     ip = get_client_ip(request)
     user_id = auth.get("user_id")
+    is_vip = auth.get("is_vip", False)
     
     # Check if user account is active
     if not auth.get("is_active", True):
         raise HTTPException(
             status_code=403,
             detail="Account is disabled. Please contact support."
+        )
+    
+    # ==========================================================================
+    # BULK EDIT: VIP Feature Check
+    # ==========================================================================
+    # Bulk edit allows processing multiple images with the same prompt/settings
+    # Requires active VIP subscription
+    is_bulk_request = payload.is_bulk or (payload.bulk_images and len(payload.bulk_images) > 0)
+    
+    if is_bulk_request and not is_vip:
+        raise HTTPException(
+            status_code=403,
+            detail="Bulk edit requires VIP subscription. Please upgrade to VIP to use this feature."
         )
     
     # Validate model
@@ -2131,12 +2539,54 @@ async def submit_job(
     # Moved earlier for credit cost calculation with scale_factor
     full_params = dict(payload.params) if payload.params else {}
     
-    # Get variations count (default 1, max 4)
-    variations = max(1, min(4, payload.variations))
+    # ==========================================================================
+    # VARIATIONS: VIP Feature - Max 2 for non-VIP, Max 4 for VIP
+    # ==========================================================================
+    max_variations = 4 if is_vip else 2
+    requested_variations = payload.variations
+    variations = max(1, min(max_variations, requested_variations))
     
-    # Check if user has sufficient credits for this model (including variations)
-    # Cost includes upscale cost if scale_factor > 1, multiplied by variations
-    credit_cost = get_credit_cost(model, full_params, variations)
+    # If user requested more variations than allowed, notify them
+    if requested_variations > max_variations:
+        logger.info(
+            f"[VARIATIONS] User requested {requested_variations} variations, "
+            f"limited to {max_variations} (is_vip={is_vip})"
+        )
+    
+    # ==========================================================================
+    # BUILD IMAGE LIST for processing
+    # ==========================================================================
+    # For bulk edit: process all images in bulk_images
+    # For single edit: process only params.init_image
+    images_to_process = []
+    
+    if is_bulk_request and payload.bulk_images:
+        # Bulk edit: use all images from bulk_images array
+        images_to_process = payload.bulk_images[:10]  # Max 10 images
+        logger.info(f"[BULK] Processing {len(images_to_process)} images in bulk edit")
+    else:
+        # Single image: use init_image from params (or None for text-to-image)
+        single_image = full_params.get("init_image")
+        if single_image:
+            images_to_process = [single_image]
+        else:
+            images_to_process = [None]  # Text-to-image, no init_image
+    
+    num_images = len(images_to_process)
+    
+    # ==========================================================================
+    # CREDIT CALCULATION
+    # ==========================================================================
+    # VIP benefits: Free upscale
+    # Total cost = per_job_cost * variations * num_images
+    credit_cost = get_credit_cost(
+        model, 
+        full_params, 
+        variations=variations,
+        is_vip=is_vip,
+        num_images=num_images
+    )
+    
     if auth.get("total_credits", 0) < credit_cost:
         raise HTTPException(
             status_code=402,  # Payment Required
@@ -2164,70 +2614,105 @@ async def submit_job(
                 logger.warning(f"Prompt enhancement failed: {enhance_error}")
                 # Continue with original prompt
     
-    # Generate batch ID for multi-variation requests
-    batch_id = str(uuid.uuid4()) if variations > 1 else None
+    # ==========================================================================
+    # BATCH ID: Generate for multi-variation or bulk edit requests
+    # ==========================================================================
+    total_jobs = num_images * variations
+    needs_batch = total_jobs > 1
+    batch_id = str(uuid.uuid4()) if needs_batch else None
     
-    # Create job(s) - multiple jobs for variations > 1
+    if is_bulk_request:
+        logger.info(f"[BULK] Creating {total_jobs} jobs: {num_images} images × {variations} variations")
+    
+    # Create job(s) - multiple jobs for variations > 1 OR bulk edit
     job_ids = []
     created_jobs = []
     total_credits_locked = 0
+    
+    # Store full params for each job (with specific image) for dispatch
+    job_full_params_map = {}
     
     db = SessionLocal()
     try:
         now = utc_naive_now()
         
-        for variation_idx in range(variations):
-            # Generate unique job ID for each variation
-            job_id = str(uuid.uuid4())
-            result_key = f"{_image_prefix}/{job_id}.png"
-            
-            # Prepare params for DB storage - strip base64 images to prevent DB bloat
-            # Full params are cached in memory for worker dispatch
-            db_params = strip_base64_images_for_db(full_params)
-            
-            # Add batch metadata to params for tracking
-            if batch_id:
-                db_params["_batch_id"] = batch_id
-                db_params["_variation_index"] = variation_idx
-                db_params["_total_variations"] = variations
-            
-            # Add enhanced prompt indicator if applicable
-            if prompt_enhanced:
-                db_params["_prompt_enhanced"] = True
-                db_params["_original_prompt"] = payload.prompt
-            
-            job = Job(
-                job_id=job_id,
-                model=model,
-                prompt=final_prompt,  # Use enhanced prompt if applicable
-                params=db_params,
-                status=JobState.QUEUED.value,
-                result_r2_key=result_key,
-                output_key=result_key,
-                fcm_token=payload.fcm_token,  # All jobs get FCM so frontend is notified for each variation
-                user_id=user_id,
-                credits_locked=0,
-                credits_refunded=0,
-                created_at=now,
-                updated_at=now,
-                queued_at=now,
-                timeout_at=now + timedelta(minutes=30),
-            )
-            db.add(job)
-            job_ids.append(job_id)
-            created_jobs.append({
-                "job_id": job_id,
-                "result_key": result_key,
-                "variation_idx": variation_idx,
-            })
+        # Loop through images (for bulk edit) and variations
+        job_index = 0
+        for image_idx, image_data in enumerate(images_to_process):
+            for variation_idx in range(variations):
+                # Generate unique job ID for each job
+                job_id = str(uuid.uuid4())
+                result_key = f"{_image_prefix}/{job_id}.png"
+                
+                # Build full params for this specific job (with specific image)
+                job_full_params = dict(full_params)
+                if image_data:
+                    job_full_params["init_image"] = image_data
+                
+                # Store for later dispatch (includes full base64 image)
+                job_full_params_map[job_id] = job_full_params
+                
+                # Prepare params for DB storage - strip base64 images to prevent DB bloat
+                db_params = strip_base64_images_for_db(job_full_params)
+                
+                # Add batch metadata to params for tracking
+                if batch_id:
+                    db_params["_batch_id"] = batch_id
+                    db_params["_job_index"] = job_index
+                    db_params["_total_jobs"] = total_jobs
+                    # For bulk edit, track which image this is
+                    if is_bulk_request:
+                        db_params["_image_index"] = image_idx
+                        db_params["_total_images"] = num_images
+                        db_params["_is_bulk"] = True
+                    # For variations, track variation index
+                    db_params["_variation_index"] = variation_idx
+                    db_params["_total_variations"] = variations
+                
+                # Add enhanced prompt indicator if applicable
+                if prompt_enhanced:
+                    db_params["_prompt_enhanced"] = True
+                    db_params["_original_prompt"] = payload.prompt
+                
+                # Add VIP flag for reference
+                if is_vip:
+                    db_params["_is_vip"] = True
+                
+                job = Job(
+                    job_id=job_id,
+                    model=model,
+                    prompt=final_prompt,  # Use enhanced prompt if applicable
+                    params=db_params,
+                    status=JobState.QUEUED.value,
+                    result_r2_key=result_key,
+                    output_key=result_key,
+                    fcm_token=payload.fcm_token,  # All jobs get FCM so frontend is notified
+                    user_id=user_id,
+                    credits_locked=0,
+                    credits_refunded=0,
+                    created_at=now,
+                    updated_at=now,
+                    queued_at=now,
+                    timeout_at=now + timedelta(minutes=30),
+                )
+                db.add(job)
+                job_ids.append(job_id)
+                created_jobs.append({
+                    "job_id": job_id,
+                    "result_key": result_key,
+                    "image_idx": image_idx,
+                    "variation_idx": variation_idx,
+                    "job_index": job_index,
+                })
+                job_index += 1
         
         db.flush()  # Get all jobs into the session before locking credits
         
         # Lock credits for ALL jobs in batch (using first job_id as reference)
-        # The credit_cost already accounts for variations multiplier
+        # The credit_cost already accounts for variations * num_images multiplier
         primary_job_id = job_ids[0]
         success, message, credits_locked = lock_credits_for_job(
-            db, user_id, primary_job_id, model, full_params
+            db, user_id, primary_job_id, model, full_params, is_vip=is_vip
         )
         
         if not success:
@@ -2239,25 +2724,25 @@ async def submit_job(
         
         total_credits_locked = credits_locked
         
-        # For variations > 1, we need to adjust the credits_locked per job
-        # and lock additional credits for remaining jobs
-        if variations > 1:
-            per_job_cost = credits_locked  # First job already locked
+        # For multi-job requests (variations > 1 OR bulk edit), lock credits for remaining jobs
+        if total_jobs > 1:
             # Lock credits for remaining jobs
             for i, job_data in enumerate(created_jobs[1:], start=1):
                 remaining_job_id = job_data["job_id"]
+                # Get the specific params for this job (for bulk edit, each job has different image)
+                job_params = job_full_params_map.get(remaining_job_id, full_params)
                 success, msg, locked = lock_credits_for_job(
-                    db, user_id, remaining_job_id, model, full_params
+                    db, user_id, remaining_job_id, model, job_params, is_vip=is_vip
                 )
                 if success:
                     total_credits_locked += locked
                 else:
                     # If we can't lock credits for a job, rollback everything
-                    logger.error(f"Failed to lock credits for variation {i}: {msg}")
+                    logger.error(f"Failed to lock credits for job {i}: {msg}")
                     db.rollback()
                     raise HTTPException(
                         status_code=402,
-                        detail=f"Insufficient credits for all variations. {msg}"
+                        detail=f"Insufficient credits for all jobs. {msg}"
                     )
         
         # Audit log for batch creation
@@ -2266,13 +2751,24 @@ async def submit_job(
                 "model": model,
                 "credits_locked": total_credits_locked,
                 "variations": variations,
+                "num_images": num_images,
+                "total_jobs": total_jobs,
                 "batch_id": batch_id,
                 "prompt_enhanced": prompt_enhanced,
+                "is_bulk": is_bulk_request,
+                "is_vip": is_vip,
             }
+            message = f"Job(s) created for model {model} ({total_credits_locked} credits"
+            if is_bulk_request:
+                message += f", bulk: {num_images} images × {variations} variations = {total_jobs} jobs"
+            else:
+                message += f", {variations} variations"
+            message += ")"
+            
             create_audit_log(
                 db,
                 event_type="job_created",
-                message=f"Job(s) created for model {model} ({total_credits_locked} credits, {variations} variations)",
+                message=message,
                 target=primary_job_id,
                 target_type="job",
                 actor_ip=ip,
@@ -2309,13 +2805,16 @@ async def submit_job(
     for job_data in created_jobs:
         jid = job_data["job_id"]
         
+        # Get the specific params for this job (for bulk edit, each job has different image)
+        job_params = job_full_params_map.get(jid, full_params)
+        
         # Cache full params (including base64 images) for dispatch to worker
-        cache_job_params(jid, full_params)
+        cache_job_params(jid, job_params)
         
         # Dispatch in background task
         if _pod_manager:
             background_tasks.add_task(
-                _dispatch_job_background, jid, model, full_params.get("mode")
+                _dispatch_job_background, jid, model, job_params.get("mode")
             )
         elif _job_manager:
             logger.warning(
@@ -2333,8 +2832,8 @@ async def submit_job(
     # Generate upload URL for primary job
     upload_url = create_presigned_put_url(primary_job["result_key"])
     
-    # Return response with all job IDs for variations
-    # Frontend should poll all job_ids when variations > 1
+    # Return response with all job IDs for variations/bulk edit
+    # Frontend should poll all job_ids when total_jobs > 1
     return SubmitResponse(
         job_id=primary_job["job_id"],
         status=JobStatus.QUEUED,
@@ -2344,10 +2843,10 @@ async def submit_job(
         result_key=primary_job["result_key"],
         download_url=download_url,
         created_at=utc_naive_now(),
-        # Variation support
+        # Variation/Bulk support
         variations=variations,
-        batch_id=batch_id,  # None for single variation, UUID for multiple
-        job_ids=job_ids if variations > 1 else None,  # All job IDs when variations > 1
+        batch_id=batch_id,  # None for single job, UUID for multiple
+        job_ids=job_ids if total_jobs > 1 else None,  # All job IDs when multiple jobs
         # Prompt enhancement
         prompt_enhanced=prompt_enhanced,
         enhanced_prompt=enhanced_prompt_text if prompt_enhanced else None,
@@ -3618,11 +4117,12 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                                         send_fcm_notification(
                                             affected_job.fcm_token,
                                             "Job Failed",
-                                            f"Your job failed due to internal error, Don't worry, No credits deducted",
+                                            f"Your job failed due to internal error. No credits deducted.",
                                             {
                                                 "job_id": affected_job_id,
                                                 "status": "failed",
-                                                "error": error_msg,
+                                                "model": affected_job.model or "unknown",
+                                                "error": error_msg[:100] if error_msg else "Internal error",
                                             },
                                         )
                                     )
@@ -5152,9 +5652,39 @@ async def job_complete(
                 download_url = _generate_signed_download_url(payload.result_r2_key)
             
             # Include batch info in notification if part of a batch
-            batch_id = job.params.get("_batch_id") if job.params else None
-            variation_index = job.params.get("_variation_index", 0) if job.params else 0
-            total_variations = job.params.get("_total_variations", 1) if job.params else 1
+            # SAFETY: job.params might be a JSON string in some edge cases
+            params_dict = job.params
+            if isinstance(params_dict, str):
+                try:
+                    import json
+                    params_dict = json.loads(params_dict)
+                    logger.warning(f"[FCM] job.params was a string for job {job_id}, parsed to dict")
+                except Exception as e:
+                    logger.error(f"[FCM] Failed to parse job.params string for job {job_id}: {e}")
+                    params_dict = {}
+            
+            batch_id = params_dict.get("_batch_id") if params_dict else None
+            variation_index = params_dict.get("_variation_index", 0) if params_dict else 0
+            total_variations = params_dict.get("_total_variations", 1) if params_dict else 1
+            
+            # LOG ALL VALUES before adding task - DEBUGGING EMPTY NOTIFICATIONS
+            logger.info(
+                f"[FCM_QUEUE] Adding notification task for job {job_id}: "
+                f"fcm_token_present={bool(fcm_token)}, fcm_token_len={len(fcm_token) if fcm_token else 0}, "
+                f"job_id='{job_id}', job.model='{job.model}', is_success={is_success}, "
+                f"download_url_present={bool(download_url)}, batch_id='{batch_id}', "
+                f"variation_index={variation_index}, total_variations={total_variations}, "
+                f"params_type={type(params_dict).__name__}, "
+                f"params_keys={list(params_dict.keys()) if isinstance(params_dict, dict) else 'not_dict'}"
+            )
+            
+            # CRITICAL VALIDATION: Ensure we have the required data before queueing
+            if not fcm_token:
+                logger.error(f"[FCM_QUEUE] SKIPPING job {job_id}: fcm_token is empty!")
+            elif not job_id:
+                logger.error(f"[FCM_QUEUE] SKIPPING: job_id is empty!")
+            elif not job.model:
+                logger.error(f"[FCM_QUEUE] WARNING: job.model is empty for job {job_id}, will use 'unknown'")
             
             background_tasks.add_task(
                 _send_job_notification,
@@ -5171,22 +5701,12 @@ async def job_complete(
             job.notification_sent = True
             db.commit()
             
-            if batch_id:
-                logger.info(
-                    f"FCM notification sent for job {job_id} "
-                    f"(batch {batch_id}, variation {variation_index + 1}/{total_variations}, "
-                    f"status={'completed' if is_success else 'failed'})"
-                )
-            else:
-                logger.info(
-                    f"FCM notification sent for job {job_id} "
-                    f"(status={'completed' if is_success else 'failed'})"
-                )
-                
-                logger.info(
-                    f"FCM notification queued for job {job_id}: "
-                    f"status={job_status}, success={is_success}"
-                )
+            logger.info(
+                f"[FCM_QUEUE] Task added for job {job_id}: "
+                f"batch_id={batch_id}, variation={variation_index + 1}/{total_variations}, "
+                f"status={'completed' if is_success else 'failed'}, "
+                f"notification_sent flag set to True and committed"
+            )
     
     except HTTPException:
         raise
@@ -5258,15 +5778,48 @@ async def _send_job_notification(
     For batch jobs (variations > 1), includes batch info so frontend can track
     which variation completed. Frontend receives individual notifications for
     each job and can match job_id to the job_ids array from submit response.
+    
+    CRITICAL: FCM data values MUST all be strings. None values will cause issues.
     """
+    # LOG ALL INPUT PARAMETERS for debugging empty notification issues
+    logger.info(
+        f"[FCM_TASK] _send_job_notification called with: "
+        f"token_present={bool(token)}, job_id='{job_id}', model='{model}', "
+        f"success={success}, download_url_present={bool(download_url)}, "
+        f"batch_id='{batch_id}', variation={variation_index}/{total_variations}"
+    )
+    
+    # Defensive checks - ensure all required values are present
+    if not token:
+        logger.error(f"[FCM_TASK] ABORTED for job {job_id}: token is empty/None")
+        return
+    
+    if not job_id:
+        logger.error(f"[FCM_TASK] ABORTED: job_id is empty/None")
+        return
+    
+    # Ensure job_id and model are strings (FCM requires string values)
+    job_id_str = str(job_id) if job_id else ""
+    model_str = str(model) if model else "unknown"
+    
+    # Double-check after conversion
+    if not job_id_str:
+        logger.error(f"[FCM_TASK] ABORTED: job_id_str is empty after conversion")
+        return
+    
     if success:
-        data = {"job_id": job_id, "status": "completed"}
+        # CRITICAL: Include model field - frontend expects it
+        data = {
+            "job_id": job_id_str,
+            "status": "completed",
+            "model": model_str,
+        }
         if download_url:
-            data["download_url"] = download_url
+            data["download_url"] = str(download_url)
         
         # Include batch info for multi-variation jobs
         if batch_id and total_variations > 1:
-            data["batch_id"] = batch_id
+            data["batch_id"] = str(batch_id)
             data["variation_index"] = str(variation_index)
             data["total_variations"] = str(total_variations)
         
@@ -5276,26 +5829,39 @@ async def _send_job_notification(
             body = f"Your result is ready!"
         else:
             title = "Job Complete"
-            body = "Your result is ready!"
+            body = f"Your result is ready!"
         
+        logger.info(
+            f"[FCM_TASK] Preparing SUCCESS notification for job {job_id_str}: "
+            f"title='{title}', body='{body}', data={data}"
+        )
         await send_fcm_notification(token, title, body, data)
     else:
-        data = {"job_id": job_id, "status": "failed"}
+        # CRITICAL: Include model field - frontend expects it
+        data = {
+            "job_id": job_id_str,
+            "status": "failed",
+            "model": model_str,
+        }
         
         # Include batch info for multi-variation jobs
         if batch_id and total_variations > 1:
-            data["batch_id"] = batch_id
+            data["batch_id"] = str(batch_id)
             data["variation_index"] = str(variation_index)
             data["total_variations"] = str(total_variations)
         
         # Customize message for variations
         if total_variations > 1:
             title = f"Variation {variation_index + 1}/{total_variations} Failed"
-            body = "Job failed. No credits deducted."
+            body = f"Your job failed. No credits deducted."
         else:
             title = "Job Failed"
-            body = "Your job has failed due to internal error. No credits deducted."
+            body = f"Your job failed. No credits deducted."
         
+        logger.info(
+            f"[FCM_TASK] Preparing FAILURE notification for job {job_id_str}: "
+            f"title='{title}', body='{body}', data={data}"
+        )
         await send_fcm_notification(token, title, body, data)
 
 

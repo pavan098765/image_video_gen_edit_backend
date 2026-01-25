@@ -115,7 +115,8 @@ class WorkerConfig:
 class JobConfig:
     """Job management configuration"""
     max_retries: int = 3
-    timeout_minutes: int = 30
+    timeout_minutes: int = 30  # General timeout for PENDING/QUEUED/DISPATCHING jobs
+    running_timeout_minutes: int = 5  # Hard timeout for RUNNING jobs (shorter - detect stuck workers)
     auto_recover: bool = True
     queue_size_threshold: int = 5
 
@@ -314,6 +315,7 @@ class ConfigManager:
         job_config = self._config.job
         job_config.max_retries = int(os.getenv("JOB_MAX_RETRIES", "3"))
         job_config.timeout_minutes = int(os.getenv("JOB_TIMEOUT_MINUTES", "30"))
+        job_config.running_timeout_minutes = int(os.getenv("JOB_RUNNING_TIMEOUT_MINUTES", "5"))
         job_config.auto_recover = os.getenv("JOB_AUTO_RECOVER", "true").lower() == "true"
         job_config.queue_size_threshold = int(os.getenv("QUEUE_SIZE_THRESHOLD", "5"))
     

@@ -933,8 +933,15 @@ class PodManager:
         logger.info(f"Currently blacklisted machines: {blacklisted_machines}")
     
     async def mark_machine_good(self, machine_id: str):
-        """Record successful use of a machine"""
+        """Record successful use of a machine and remove from blacklist if present"""
         await self.machine_cache.update_machine_success(machine_id, success=True)
+        
+        # CRITICAL: If machine was blacklisted but now succeeded, remove from blacklist
+        # This handles the case where a machine was blacklisted due to a failed pod,
+        # but a new pod on the same machine succeeded
+        if self.is_machine_bad(str(machine_id)):
+            await self.blacklist.unblacklist(str(machine_id))
+            logger.info(f"Machine {machine_id} removed from blacklist after successful pod startup")
     
     # -------------------------------------------------------------------------
     # Pod Slot Management
@@ -2415,9 +2422,14 @@ class PodManager:
                 or "startup timeout" in reason_l
                 or "dispatch failure" in reason_l
                 or "stuck in starting" in reason_l
+                or "stuck running" in reason_l  # Worker stuck during job execution
+                or "running for" in reason_l    # Job exceeded running timeout
             ):
                 try:
                     await self.mark_machine_bad(str(machine_id), duration=600)
+                    logger.warning(
+                        f"Machine {machine_id} blacklisted for 10 min after pod {pod_uuid} destruction: {reason}"
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to blacklist machine {machine_id} after pod {pod_uuid} destruction: {e}")
         

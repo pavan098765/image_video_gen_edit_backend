@@ -108,6 +108,7 @@ class JobManager:
         pod_manager=None,
         max_retries: int = None,
         job_timeout_minutes: int = None,
+        running_job_timeout_minutes: int = None,
     ):
         self.session_factory = session_factory
         self.pod_manager = pod_manager
@@ -116,6 +117,11 @@ class JobManager:
         self.max_retries = max_retries or int(os.getenv("JOB_MAX_RETRIES", "3"))
         self.job_timeout = timedelta(
             minutes=job_timeout_minutes or int(os.getenv("JOB_TIMEOUT_MINUTES", "30"))
+        )
+        # CRITICAL: Shorter timeout for RUNNING jobs to catch stuck workers quickly
+        # Default 5 minutes - if a job is RUNNING for > 5 min without completion, it's stuck
+        self.running_job_timeout = timedelta(
+            minutes=running_job_timeout_minutes or int(os.getenv("JOB_RUNNING_TIMEOUT_MINUTES", "5"))
         )
         self.auto_recover = os.getenv("JOB_AUTO_RECOVER", "false").lower() == "true"
     
@@ -625,12 +631,80 @@ class JobManager:
     
     async def check_for_stuck_jobs(self):
         """
-        Detect and handle stuck jobs.
+        Detect and handle stuck jobs with TWO-TIER timeout system.
         
-        Checks for jobs in RUNNING or QUEUED that haven't been updated
-        within the timeout window.
+        TIER 1: RUNNING jobs - 5 minute hard timeout (based on started_at)
+                If a job is RUNNING for > 5 min, the worker is likely stuck.
+                Action: Destroy the pod (which recovers all jobs) and blacklist machine.
+        
+        TIER 2: Other jobs (PENDING/QUEUED/DISPATCHING/RECOVERED) - 30 minute timeout
+                These jobs are waiting for dispatch, use longer timeout.
+                Action: Mark as TIMEOUT and recover via normal flow.
+        
+        This two-tier approach catches stuck workers (like machine 14780) quickly
+        while being patient with jobs waiting for pods to spin up.
         """
         now = utc_naive_now()
+        
+        # =========================================================================
+        # TIER 1: RUNNING jobs with short timeout (detect stuck workers quickly)
+        # =========================================================================
+        running_timeout_threshold = now - self.running_job_timeout
+        
+        # Collect stuck RUNNING jobs and their worker/pod info
+        stuck_running_jobs_data = []
+        
+        with self.session_factory() as db:
+            # Query RUNNING jobs where started_at is older than the running timeout
+            # Use started_at (when job actually started processing) NOT updated_at
+            running_stuck_jobs = (
+                db.query(Job)
+                .filter(
+                    Job.status == JobState.RUNNING.value,
+                    Job.started_at.isnot(None),
+                    Job.started_at < running_timeout_threshold,
+                )
+                .all()
+            )
+            
+            for job in running_stuck_jobs:
+                # Get worker and container info for pod destruction
+                container_id = None
+                machine_id = None
+                if job.worker_id:
+                    worker = db.query(Worker).filter(Worker.worker_id == job.worker_id).first()
+                    if worker:
+                        container_id = worker.container_id
+                        # Try to get machine_id from pod_manager tracking
+                        if container_id and self.pod_manager:
+                            pod_info = self.pod_manager.individual_pods.get(container_id)
+                            if pod_info:
+                                machine_id = pod_info.machine_id
+                
+                running_time = (now - job.started_at).total_seconds()
+                stuck_running_jobs_data.append({
+                    "job_id": job.job_id,
+                    "worker_id": job.worker_id,
+                    "container_id": container_id,
+                    "machine_id": machine_id,
+                    "model": job.model,
+                    "started_at": job.started_at,
+                    "running_time_seconds": running_time,
+                    "fcm_token": job.fcm_token,
+                    "notification_sent": job.notification_sent,
+                    "retry_count": job.retry_count or 0,
+                })
+        
+        # Handle stuck RUNNING jobs OUTSIDE the session (involves async pod destruction)
+        for job_data in stuck_running_jobs_data:
+            try:
+                await self._handle_stuck_running_job(job_data, now)
+            except Exception as e:
+                logger.exception(f"Error handling stuck RUNNING job {job_data['job_id']}: {e}")
+        
+        # =========================================================================
+        # TIER 2: Other stuck jobs with longer timeout (PENDING/QUEUED/DISPATCHING)
+        # =========================================================================
         timeout_threshold = now - self.job_timeout
         
         with self.session_factory() as db:
@@ -642,7 +716,7 @@ class JobManager:
                             JobState.PENDING.value,      # Stuck after creation
                             JobState.QUEUED.value,       # Waiting for worker
                             JobState.DISPATCHING.value,  # Waiting for dispatch
-                            JobState.RUNNING.value,      # Stuck during execution
+                            # NOTE: RUNNING handled above in TIER 1 with shorter timeout
                             JobState.RECOVERED.value,    # Recovery failed to dispatch
                         ]),
                         Job.updated_at < timeout_threshold,
@@ -683,13 +757,16 @@ class JobManager:
                         if is_final_timeout and is_timeout_state:
                             try:
                                 from routes import send_fcm_notification
-                                import asyncio
                                 asyncio.create_task(
                                     send_fcm_notification(
                                         job.fcm_token,
                                         "Job Timeout",
                                         f"Your {job.model} job timed out after {self.job_timeout.total_seconds() / 60:.0f} minutes",
-                                        {"job_id": job.job_id, "status": "timeout"},
+                                        {
+                                            "job_id": job.job_id,
+                                            "status": "timeout",
+                                            "model": job.model or "unknown",
+                                        },
                                     )
                                 )
                                 job.notification_sent = True
@@ -709,6 +786,107 @@ class JobManager:
                         
                 except Exception as e:
                     logger.exception(f"Error handling stuck job {job.job_id}: {e}")
+    
+    async def _handle_stuck_running_job(self, job_data: Dict[str, Any], now: datetime):
+        """
+        Handle a job that's been RUNNING for too long (worker stuck detection).
+        
+        CRITICAL: This catches the scenario where:
+        - Worker is sending heartbeats (so heartbeat check passes)
+        - But job is not making progress (stuck in inference/OOM/deadlock)
+        
+        Action:
+        1. If we have pod info: destroy the pod (which recovers ALL jobs on it and re-dispatches)
+        2. If no pod info: mark as TIMEOUT and recover via normal flow
+        
+        The pod destruction also blacklists the machine to avoid immediate reuse.
+        """
+        job_id = job_data["job_id"]
+        container_id = job_data["container_id"]
+        worker_id = job_data["worker_id"]
+        machine_id = job_data["machine_id"]
+        model = job_data["model"]
+        running_time = job_data["running_time_seconds"]
+        
+        logger.error(
+            f"🚨 STUCK RUNNING JOB DETECTED: {job_id}\n"
+            f"   Model: {model}\n"
+            f"   Running for: {running_time:.0f}s (>{self.running_job_timeout.total_seconds():.0f}s timeout)\n"
+            f"   Worker: {worker_id}\n"
+            f"   Container: {container_id}\n"
+            f"   Machine: {machine_id}"
+        )
+        
+        if container_id and self.pod_manager:
+            # Destroy the pod - this will:
+            # 1. Recover ALL jobs on the pod (set to QUEUED)
+            # 2. Re-dispatch them via _dispatch_job_background
+            # 3. Blacklist the machine (due to "stuck running" in reason)
+            logger.info(
+                f"Destroying pod {container_id} due to stuck job {job_id} "
+                f"(RUNNING for {running_time:.0f}s, timeout: {self.running_job_timeout.total_seconds():.0f}s)"
+            )
+            
+            try:
+                await self.pod_manager.destroy_individual_pod(
+                    container_id,
+                    reason=f"Stuck running job {job_id} (RUNNING for {running_time:.0f}s, timeout: {self.running_job_timeout.total_seconds():.0f}s)"
+                )
+                
+                logger.info(
+                    f"Pod {container_id} destroyed. All jobs on it will be recovered and re-dispatched."
+                )
+            except Exception as e:
+                logger.error(f"Failed to destroy pod {container_id}: {e}")
+                # Fall back to marking this specific job as timeout
+                await self._fallback_timeout_single_job(job_data, now)
+        else:
+            # No pod to destroy - mark as timeout and recover via normal flow
+            logger.warning(
+                f"No pod info for stuck job {job_id}, using fallback timeout recovery"
+            )
+            await self._fallback_timeout_single_job(job_data, now)
+    
+    async def _fallback_timeout_single_job(self, job_data: Dict[str, Any], now: datetime):
+        """
+        Fallback: Mark a single job as TIMEOUT and recover it.
+        Used when we can't destroy the pod (no container info).
+        """
+        job_id = job_data["job_id"]
+        worker_id = job_data["worker_id"]
+        running_time = job_data["running_time_seconds"]
+        
+        with self.session_factory() as db:
+            job = db.query(Job).filter(Job.job_id == job_id).first()
+            if not job:
+                logger.warning(f"Job {job_id} not found for fallback timeout")
+                return
+            
+            # Skip if state already changed (e.g., pod destruction already handled it)
+            if job.status != JobState.RUNNING.value:
+                logger.debug(
+                    f"Job {job_id} state changed to {job.status}, skipping fallback timeout"
+                )
+                return
+            
+            job.status = JobState.TIMEOUT.value
+            job.updated_at = now
+            
+            self._add_error_log(
+                job,
+                JobState.TIMEOUT.value,
+                f"Job stuck in RUNNING state for {running_time:.0f}s (no container to destroy)",
+                worker_id,
+            )
+            self._reset_worker_if_dispatching(db, worker_id)
+            
+            db.commit()
+            
+            logger.info(f"Job {job_id} marked as TIMEOUT (fallback), starting recovery")
+        
+        # Recover the job (will re-dispatch)
+        if self.auto_recover:
+            await self.recover_job(job_id)
     
     async def recover_job(self, job_id: str):
         """
@@ -762,7 +940,12 @@ class JobManager:
                                     job.fcm_token,
                                     "Job Failed",
                                     f"Your {job.model} job failed after {self.max_retries} retry attempts",
-                                    {"job_id": job_id, "status": "failed", "error": "Max retries exceeded"},
+                                    {
+                                        "job_id": job_id,
+                                        "status": "failed",
+                                        "model": job.model or "unknown",
+                                        "error": "Max retries exceeded",
+                                    },
                                 )
                             )
                             job.notification_sent = True
@@ -863,7 +1046,12 @@ class JobManager:
                                 job.fcm_token,
                                 "Job Failed",
                                 f"Your {job.model} job failed during recovery",
-                                {"job_id": job_id, "status": "failed", "error": str(e)},
+                                {
+                                    "job_id": job_id,
+                                    "status": "failed",
+                                    "model": job.model or "unknown",
+                                    "error": str(e)[:100],  # Truncate long error messages
+                                },
                             )
                         )
                         job.notification_sent = True

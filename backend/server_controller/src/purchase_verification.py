@@ -68,8 +68,48 @@ VALID_AD_FREE_PRODUCT_IDS = [
 # The primary ad-free product ID (consumable)
 PRIMARY_AD_FREE_PRODUCT_ID = "remove_ads_lifetime_v2"
 
+# =============================================================================
+# VIP Subscription Products
+# =============================================================================
+
+# VIP product IDs to duration mapping (in days)
+# VIP benefits: unlimited concurrent generations, bulk edit, free upscale
+# VIP is TIME-LIMITED unlike ad-free which is permanent
+VIP_PRODUCT_DURATION_MAP = {
+    "vip_pack_weekly": 7,           # 7 days VIP
+    "vip_pack_monthly": 30,         # 30 days VIP
+    "vip_pack_yearly": 365,         # 365 days VIP (best value)
+}
+
+# List of valid VIP product IDs
+VALID_VIP_PRODUCT_IDS = list(VIP_PRODUCT_DURATION_MAP.keys())
+
+# Primary VIP product ID
+PRIMARY_VIP_PRODUCT_ID = "vip_monthly"
+
+
+def get_vip_duration_days(product_id: str) -> int:
+    """
+    Get the VIP duration in days for a product ID.
+    Returns 0 if product is not a VIP product.
+    
+    CRITICAL: This is the authoritative source for VIP duration.
+    Never use client-provided duration.
+    """
+    return VIP_PRODUCT_DURATION_MAP.get(product_id, 0)
+
+
+def is_vip_product(product_id: str) -> bool:
+    """Check if a product is a VIP subscription product"""
+    return product_id in VIP_PRODUCT_DURATION_MAP
+
+
 # All valid product IDs (combined)
-ALL_VALID_PRODUCT_IDS = list(PRODUCT_CREDITS_MAP.keys()) + VALID_AD_FREE_PRODUCT_IDS
+ALL_VALID_PRODUCT_IDS = (
+    list(PRODUCT_CREDITS_MAP.keys()) + 
+    VALID_AD_FREE_PRODUCT_IDS + 
+    VALID_VIP_PRODUCT_IDS
+)
 
 
 def get_credits_for_product(product_id: str) -> int:
