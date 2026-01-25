@@ -151,21 +151,28 @@ def calculate_job_cost(
     model: str,
     params: Optional[Dict[str, Any]] = None,
     variations: int = 1,
+    is_vip: bool = False,
+    num_images: int = 1,
 ) -> int:
     """
     Calculate the total cost for a job (or batch of jobs).
     
     Formula:
         base_cost = model's base cost
-        upscale_cost = model's upscale cost (if scale_factor > 1)
+        upscale_cost = model's upscale cost (if scale_factor > 1 AND not VIP)
         offer_discount = base_cost * (offer / 100)
         per_job_cost = base_cost + upscale_cost - offer_discount
-        total = per_job_cost * variations
+        total = per_job_cost * variations * num_images
+    
+    VIP Benefits:
+        - FREE upscale (upscale_cost = 0 for VIP users)
     
     Args:
         model: The model name (e.g., "qwen_image_edit_2509")
         params: Job params dict, may contain "scale_factor"
         variations: Number of variations to generate (multiplies cost)
+        is_vip: Whether the user has active VIP subscription (free upscale)
+        num_images: Number of images in bulk edit (multiplies cost)
     
     Returns:
         Total credit cost (integer, minimum 1)
@@ -192,9 +199,13 @@ def calculate_job_cost(
     per_job_cost = base_cost
     
     # Add upscale cost if scale_factor > 1
+    # VIP BENEFIT: Free upscale for VIP users
     if scale_factor > 1:
-        per_job_cost += upscale_cost
-        logger.debug(f"[CREDIT] Adding upscale cost: {upscale_cost} (scale_factor={scale_factor})")
+        if is_vip:
+            logger.debug(f"[CREDIT] VIP user - FREE upscale (scale_factor={scale_factor})")
+        else:
+            per_job_cost += upscale_cost
+            logger.debug(f"[CREDIT] Adding upscale cost: {upscale_cost} (scale_factor={scale_factor})")
     
     # Apply offer discount
     if offer_percent > 0:
@@ -205,13 +216,16 @@ def calculate_job_cost(
     # Ensure minimum cost of 1 per job
     per_job_cost = max(1, per_job_cost)
     
-    # Multiply by variations count
+    # Multiply by variations count and number of images (bulk edit)
     variations = max(1, min(4, variations))  # Clamp to 1-4
-    total = per_job_cost * variations
+    num_images = max(1, num_images)  # At least 1 image
+    total = per_job_cost * variations * num_images
     
+    upscale_applied = upscale_cost if (scale_factor > 1 and not is_vip) else 0
     logger.info(
-        f"[CREDIT] Cost for {model}: base={base_cost}, upscale={upscale_cost if scale_factor > 1 else 0}, "
-        f"offer={offer_percent}%, per_job={per_job_cost}, variations={variations}, total={total}"
+        f"[CREDIT] Cost for {model}: base={base_cost}, upscale={upscale_applied}, "
+        f"offer={offer_percent}%, per_job={per_job_cost}, variations={variations}, "
+        f"num_images={num_images}, is_vip={is_vip}, total={total}"
     )
     
     return total
@@ -221,6 +235,8 @@ def get_credit_cost(
     model: str,
     params: Optional[Dict[str, Any]] = None,
     variations: int = 1,
+    is_vip: bool = False,
+    num_images: int = 1,
 ) -> int:
     """
     Get credit cost for a model (with optional params for upscale calculation).
@@ -231,11 +247,13 @@ def get_credit_cost(
         model: Model name
         params: Job params (may contain scale_factor)
         variations: Number of variations to generate (1-4)
+        is_vip: Whether user has active VIP (free upscale benefit)
+        num_images: Number of images in bulk edit
     
     Returns:
         Total credit cost
     """
-    return calculate_job_cost(model, params, variations)
+    return calculate_job_cost(model, params, variations, is_vip, num_images)
 
 
 # =============================================================================
@@ -248,6 +266,7 @@ def lock_credits_for_job(
     job_id: str,
     model: str,
     params: Optional[Dict[str, Any]] = None,
+    is_vip: bool = False,
 ) -> Tuple[bool, str, int]:
     """
     Atomically lock credits for a job.
@@ -258,20 +277,24 @@ def lock_credits_for_job(
     CRITICAL: This runs within the caller's transaction (from submit endpoint).
     The caller is responsible for commit/rollback.
     
+    VIP Benefits applied here:
+    - Free upscale (upscale cost = 0 for VIP users)
+    
     Args:
         db: Database session
         user_id: User ID
         job_id: Job ID
         model: Model name
         params: Job params (used to calculate upscale cost)
+        is_vip: Whether user has active VIP subscription (free upscale)
     
     Returns:
         Tuple of (success, message, credits_locked)
     """
     try:
-        # Get credit cost (includes upscale cost calculation)
-        cost = get_credit_cost(model, params)
-        logger.info(f"[CREDIT] Attempting to lock {cost} credits for job {job_id}, user {user_id}, model {model}")
+        # Get credit cost (includes upscale cost calculation, VIP free upscale)
+        cost = get_credit_cost(model, params, variations=1, is_vip=is_vip)
+        logger.info(f"[CREDIT] Attempting to lock {cost} credits for job {job_id}, user {user_id}, model {model}, is_vip={is_vip}")
         
         # Get user (SQLite uses transaction-level locking, no with_for_update needed)
         user = db.query(User).filter(User.id == user_id).first()

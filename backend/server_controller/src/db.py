@@ -404,6 +404,13 @@ class User(Base):
     ad_free_purchased_at = Column(DateTime, nullable=True)
     ad_free_product_id = Column(String(100), nullable=True)
     
+    # VIP Subscription Status
+    # VIP is time-limited (weekly/monthly) unlike ad-free which is permanent
+    is_vip = Column(Boolean, default=False, nullable=False)
+    vip_expires_at = Column(DateTime, nullable=True)  # When VIP expires (NULL = not VIP)
+    vip_product_id = Column(String(100), nullable=True)  # Last VIP product purchased
+    vip_purchased_at = Column(DateTime, nullable=True)  # Last VIP purchase time
+    
     # Status
     is_active = Column(Boolean, default=True, nullable=False)
     
@@ -414,6 +421,7 @@ class User(Base):
     rewarded_ad_events = relationship("RewardedAdEvent", back_populates="user")
     ad_free_purchases = relationship("AdFreePurchase", back_populates="user")
     purchases = relationship("Purchase", back_populates="user")
+    vip_purchases = relationship("VipPurchase", back_populates="user")
 
     # Note: firebase_uid already has index=True on the column definition
     # No need for additional __table_args__ index
@@ -430,9 +438,21 @@ class User(Base):
             "is_ad_free": self.is_ad_free,
             "ad_free_purchased_at": self.ad_free_purchased_at.isoformat() if self.ad_free_purchased_at else None,
             "ad_free_product_id": self.ad_free_product_id,
+            "is_vip": self.is_vip,
+            "vip_expires_at": self.vip_expires_at.isoformat() if self.vip_expires_at else None,
+            "vip_product_id": self.vip_product_id,
+            "vip_purchased_at": self.vip_purchased_at.isoformat() if self.vip_purchased_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,
         }
+    
+    def is_vip_active(self) -> bool:
+        """Check if user has active VIP subscription (not expired)"""
+        if not self.is_vip:
+            return False
+        if self.vip_expires_at is None:
+            return False
+        return self.vip_expires_at > utc_naive_now()
 
 
 # =============================================================================
@@ -692,6 +712,80 @@ class AdFreePurchase(Base):
             "product_id": self.product_id,
             "platform": self.platform,
             "order_id": self.order_id,
+            "verified_at": self.verified_at.isoformat() if self.verified_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# =============================================================================
+# VIP Purchase Model (Time-Limited VIP Subscriptions)
+# =============================================================================
+
+class VipPurchase(Base):
+    """
+    Tracks VIP subscription purchases.
+    
+    VIP is different from ad-free:
+    - VIP is TIME-LIMITED (weekly/monthly) - expires after duration
+    - VIP benefits: unlimited concurrent generations, bulk edit, free upscale
+    - Multiple purchases allowed (each extends VIP period)
+    - Uses consumable products that grant VIP time
+    
+    Security:
+    - order_id is UNIQUE to prevent duplicate VIP time grants
+    - Server tracks expiration, not client
+    - Expiration checked on every protected operation
+    
+    Product IDs (suggested):
+    - vip_pack_weekly: 7 days VIP
+    - vip_pack_monthly: 30 days VIP
+    """
+    __tablename__ = "vip_purchases"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(128), ForeignKey("users.id"), index=True, nullable=False)
+    firebase_uid = Column(String(256), nullable=False, index=True)
+    
+    # Purchase details
+    product_id = Column(String(100), nullable=False, index=True)
+    purchase_token = Column(String(500), nullable=False)  # Token from store
+    platform = Column(String(20), nullable=False)  # 'android' or 'ios'
+    device_id = Column(String(256), nullable=True)  # Hashed device ID for fraud detection
+    
+    # Store verification data - order_id is CRITICAL for replay attack prevention
+    order_id = Column(String(256), nullable=True, unique=True, index=True)  # UNIQUE: Prevent replay attacks
+    store_data = Column(MutableDict.as_mutable(JSON), nullable=True)  # Raw response from store
+    
+    # VIP duration tracking
+    duration_days = Column(Integer, nullable=False)  # How many days this purchase grants
+    vip_started_at = Column(DateTime, nullable=False)  # When VIP period started
+    vip_expires_at = Column(DateTime, nullable=False)  # When VIP period ends
+    
+    # Timestamps
+    verified_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="vip_purchases")
+
+    __table_args__ = (
+        Index("ix_vip_user", "user_id"),
+        Index("ix_vip_firebase", "firebase_uid"),
+        Index("ix_vip_order", "order_id"),
+        Index("ix_vip_expires", "vip_expires_at"),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "firebase_uid": self.firebase_uid,
+            "product_id": self.product_id,
+            "platform": self.platform,
+            "order_id": self.order_id,
+            "duration_days": self.duration_days,
+            "vip_started_at": self.vip_started_at.isoformat() if self.vip_started_at else None,
+            "vip_expires_at": self.vip_expires_at.isoformat() if self.vip_expires_at else None,
             "verified_at": self.verified_at.isoformat() if self.verified_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
