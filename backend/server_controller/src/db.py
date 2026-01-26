@@ -422,6 +422,7 @@ class User(Base):
     ad_free_purchases = relationship("AdFreePurchase", back_populates="user")
     purchases = relationship("Purchase", back_populates="user")
     vip_purchases = relationship("VipPurchase", back_populates="user")
+    adgem_conversions = relationship("AdGemConversion", back_populates="user")
 
     # Note: firebase_uid already has index=True on the column definition
     # No need for additional __table_args__ index
@@ -864,6 +865,88 @@ class Purchase(Base):
             "purchase_state": self.purchase_state,
             "is_test_purchase": self.is_test_purchase,
             "verified_at": self.verified_at.isoformat() if self.verified_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# =============================================================================
+# AdGem Offerwall Conversion Model
+# =============================================================================
+
+class AdGemConversion(Base):
+    """
+    AdGem offerwall conversion tracking.
+    
+    Stores verified AdGem postback conversions for:
+    - Duplicate prevention (transaction_id is UNIQUE)
+    - Anti-fraud detection and audit trail
+    - Revenue tracking and analytics
+    
+    SECURITY MODEL:
+    - Unique transaction_id (prevents replay attacks)
+    - Optional secret token validation
+    - Server is authoritative - client SDK callbacks are NEVER trusted
+    
+    CREDIT CALCULATION:
+    - amount field = credits to award (configured via AdGem dashboard multiplier)
+    - No server-side calculation needed - AdGem sends the correct amount
+    """
+    __tablename__ = "adgem_conversions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # User identification - linked to our User table
+    user_id = Column(String(128), ForeignKey("users.id"), index=True, nullable=True)
+    player_id = Column(String(256), nullable=False, index=True)  # Raw player_id from AdGem
+    
+    # AdGem transaction details
+    transaction_id = Column(String(256), unique=True, nullable=False, index=True)  # UNIQUE: Prevent replay
+    app_id = Column(String(64), nullable=False)
+    offer_id = Column(String(128), nullable=True)
+    offer_name = Column(String(512), nullable=True)
+    
+    # Reward values
+    amount = Column(Integer, nullable=False)  # Virtual currency amount from AdGem
+    payout = Column(Float, nullable=False)  # USD payout from AdGem
+    credits_awarded = Column(Integer, nullable=False)  # Credits granted to user
+    
+    # Geo/metadata
+    country = Column(String(8), nullable=True)
+    conversion_time = Column(DateTime, nullable=True)  # From AdGem's conversion_datetime
+    
+    # Verification status
+    verifier_valid = Column(Boolean, default=False, nullable=False)
+    
+    # Anti-fraud tracking
+    ip_address = Column(String(64), nullable=True)
+    user_agent = Column(String(512), nullable=True)
+    raw_payload = Column(MutableDict.as_mutable(JSON), nullable=True)  # Full query params for audit
+    
+    # Timestamps
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="adgem_conversions")
+
+    __table_args__ = (
+        Index("ix_adgem_user_time", "user_id", "created_at"),
+        Index("ix_adgem_transaction", "transaction_id"),
+        Index("ix_adgem_player", "player_id"),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "player_id": self.player_id,
+            "transaction_id": self.transaction_id,
+            "app_id": self.app_id,
+            "offer_id": self.offer_id,
+            "amount": self.amount,
+            "payout": self.payout,
+            "credits_awarded": self.credits_awarded,
+            "country": self.country,
+            "verifier_valid": self.verifier_valid,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
