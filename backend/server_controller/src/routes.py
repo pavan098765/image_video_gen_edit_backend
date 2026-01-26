@@ -2073,12 +2073,12 @@ def _get_today_ad_stats(db, user_id: str) -> tuple[int, int]:
 class AdRewardStatusResponse(BaseModel):
     """Response for ad reward status check"""
     can_watch: bool
-    credits_earned_today: int  # Credits user has earned today (ads_watched / 2)
+    credits_earned_today: int  # Credits user has earned today (ads_watched / 4)
     daily_limit: int  # Max credits per day
-    credits_per_ad: int  # 0 since credits come every 2 ads
+    credits_per_ad: int  # 0 since credits come every 4 ads
     next_reset_time: str  # ISO 8601 UTC
     cooldown_ends_at: Optional[str] = None  # When cooldown ends (null if no cooldown)
-    # Fields for "2 ads = 1 credit" system
+    # Fields for "4 ads = 1 credit" system
     ads_watched_today: int  # Total ads watched today (0, 1, 2, 3, 4, 5...)
     ads_required_for_credit: int  # How many ads needed for 1 credit
 
@@ -2101,11 +2101,11 @@ async def get_ad_reward_status(
     
     **Returns:**
     - can_watch: Whether user can earn more credits from ads today
-    - credits_earned_today: Credits earned from ads today (ads_watched / 2)
+    - credits_earned_today: Credits earned from ads today (ads_watched / 4)
     - daily_limit: Maximum credits earnable per day
-    - credits_per_ad: 0 (credits come every 2 ads, not per ad)
+    - credits_per_ad: 0 (credits come every 4 ads, not per ad)
     - ads_watched_today: Total ads watched today
-    - ads_required_for_credit: How many ads needed for 1 credit
+    - ads_required_for_credit: How many ads needed for 1 credit (4)
     - cooldown_ends_at: When cooldown ends (null if no cooldown)
     - next_reset_time: When daily limit resets (midnight UTC)
     """
@@ -2123,7 +2123,7 @@ async def get_ad_reward_status(
         
         # Get config
         daily_limit = get_app_config_int(db, "daily_ad_credit_limit", 30)
-        ads_required_for_credit = get_app_config_int(db, "ads_per_credit", 2)
+        ads_required_for_credit = get_app_config_int(db, "ads_per_credit", 4)
         
         # Get today's ad stats
         ads_watched_today, credits_earned_today = _get_today_ad_stats(db, user.id)
@@ -2254,7 +2254,7 @@ async def admob_ssv_callback(
         
         # Get config
         daily_limit = get_app_config_int(db, "daily_ad_credit_limit", 30)
-        ads_required_for_credit = get_app_config_int(db, "ads_per_credit", 2)  # How many ads needed for 1 credit
+        ads_required_for_credit = get_app_config_int(db, "ads_per_credit", 4)  # How many ads needed for 1 credit
         
         # Get today's ad stats BEFORE adding the new ad
         ads_watched_today, credits_earned_today = _get_today_ad_stats(db, user.id)
@@ -2268,7 +2268,7 @@ async def admob_ssv_callback(
         new_ad_count = ads_watched_today + 1
         
         # Grant credit every N ads (when count is divisible by ads_required_for_credit)
-        # e.g., if ads_required_for_credit=2: grant on 2nd, 4th, 6th ad...
+        # e.g., if ads_required_for_credit=4: grant on 4th, 8th, 12th ad...
         credits_to_grant = 0
         if new_ad_count % ads_required_for_credit == 0:
             credits_to_grant = 1
@@ -2320,6 +2320,324 @@ async def admob_ssv_callback(
 # This prevents users from spoofing ad completions.
 # 
 # Frontend must configure AdMob to call /ads/admob/ssv with custom_data containing the firebase_uid.
+
+
+# =============================================================================
+# AdGem Offerwall Postback
+# =============================================================================
+
+# AdGem Configuration
+# 
+# Credit calculation is done in AdGem dashboard via multiplier setting.
+# The `amount` field in postback already contains the correct credits to award.
+# We NEVER calculate credits client-side - server postback is authoritative.
+#
+# Environment variable for postback key (used for secret token validation)
+ADGEM_POSTBACK_KEY = os.getenv("ADGEM_POSTBACK_KEY", "")
+
+
+@ads_router.get("/adgem/postback")
+async def adgem_postback(
+    request: Request,
+    app_id: Optional[str] = None,  # AdGem macro: {app_id}
+    player_id: Optional[str] = None,  # AdGem macro: {player_id} - Contains firebase_uid
+    amount: Optional[str] = None,  # AdGem macro: {amount} - Virtual currency amount
+    payout: Optional[str] = None,  # AdGem macro: {payout} - Actual payout in currency
+    transaction_id: Optional[str] = None,  # AdGem macro: {transaction_id}
+    offer_id: Optional[str] = None,  # AdGem macro: {offer_id}
+    offer_name: Optional[str] = None,  # AdGem macro: {offer_name}
+    country: Optional[str] = None,  # AdGem macro: {country}
+    conversion_datetime: Optional[str] = None,  # AdGem macro: {conversion_datetime}
+    campaign_id: Optional[str] = None,  # AdGem macro: {campaign_id}
+    ip: Optional[str] = None,  # AdGem macro: {ip} - User's IP
+    platform: Optional[str] = None,  # AdGem macro: {platform}
+    gaid: Optional[str] = None,  # AdGem macro: {gaid} - Google Advertising ID
+    idfa: Optional[str] = None,  # AdGem macro: {idfa} - iOS Identifier for Advertisers
+):
+    """
+    AdGem Offerwall Server-Side Postback.
+    
+    **Called by AdGem** after a user completes an offer.
+    
+    SECURITY: Server postback is AUTHORITATIVE. Never trust client SDK callbacks.
+    
+    This endpoint:
+    1. Validates required parameters
+    2. Optionally validates secret token (append &secret=YOUR_KEY to postback URL)
+    3. Checks for duplicate transaction_id (prevents replay attacks)
+    4. Awards credits to user (amount = credits, configured via AdGem dashboard multiplier)
+    5. Logs the event for audit
+    
+    **Query Parameters (AdGem macros):**
+    - app_id: AdGem app ID (31874) {app_id}
+    - player_id: User's firebase_uid {player_id}
+    - amount: Credits to award (configured via AdGem dashboard multiplier) {amount}
+    - payout: AdGem payout amount {payout}
+    - transaction_id: Unique transaction ID {transaction_id}
+    - offer_id: Offer identifier {offer_id}
+    - offer_name: Offer name {offer_name}
+    - country: Country code {country}
+    - conversion_datetime: Conversion timestamp {conversion_datetime}
+    - campaign_id: Campaign ID {campaign_id}
+    - ip: User IP {ip}
+    - platform: Platform {platform}
+    - gaid: Google Advertising ID {gaid}
+    - idfa: iOS IDFA {idfa}
+    
+    **Returns:**
+    - "OK" (HTTP 200) if successful or duplicate (idempotent)
+    - "INVALID" (HTTP 403) if invalid params or secret mismatch
+    
+    **Security:**
+    - Server-side only - NEVER trust client
+    - transaction_id uniqueness prevents replay attacks
+    - Optional secret token validation
+    - Full audit logging
+    """
+    from db import AdGemConversion
+    
+    # Get client info for logging/anti-fraud
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
+    query_string = str(request.query_params)
+    
+    logger.info(
+        f"[ADGEM] Postback received: transaction_id={transaction_id}, "
+        f"player_id={player_id}, amount={amount}, payout={payout}, IP={client_ip}"
+    )
+    
+    # Store raw payload for audit
+    raw_payload = dict(request.query_params)
+    
+    # ==========================================================================
+    # 1. Validate Required Parameters
+    # ==========================================================================
+    
+    if not app_id:
+        logger.warning(f"[ADGEM] Missing app_id, IP={client_ip}")
+        return Response(content="INVALID", status_code=403)
+    
+    if not player_id:
+        logger.warning(f"[ADGEM] Missing player_id, IP={client_ip}")
+        return Response(content="INVALID", status_code=403)
+    
+    if not amount:
+        logger.warning(f"[ADGEM] Missing amount, IP={client_ip}")
+        return Response(content="INVALID", status_code=403)
+    
+    if not transaction_id:
+        logger.warning(f"[ADGEM] Missing transaction_id, IP={client_ip}")
+        return Response(content="INVALID", status_code=403)
+    
+    # Parse numeric values
+    try:
+        amount_int = int(amount)
+    except (ValueError, TypeError):
+        logger.warning(f"[ADGEM] Invalid amount '{amount}', IP={client_ip}")
+        return Response(content="INVALID", status_code=403)
+    
+    try:
+        payout_float = float(payout) if payout else 0.0
+    except (ValueError, TypeError):
+        logger.warning(f"[ADGEM] Invalid payout '{payout}', IP={client_ip}")
+        payout_float = 0.0
+    
+    if amount_int <= 0:
+        logger.warning(f"[ADGEM] Amount must be > 0, got {amount_int}, IP={client_ip}")
+        return Response(content="INVALID", status_code=403)
+    
+    # ==========================================================================
+    # 2. Optional Secret Token Validation
+    # ==========================================================================
+    # 
+    # AdGem doesn't provide a {verifier} macro, so we use an optional secret token.
+    # If ADGEM_POSTBACK_KEY is configured, you can add it to your postback URL:
+    #   &secret={your_key}
+    # This provides additional security beyond transaction_id uniqueness.
+    #
+    secret_token = request.query_params.get("secret")
+    secret_valid = True  # Default to valid if no secret configured
+    
+    if ADGEM_POSTBACK_KEY:
+        if secret_token:
+            # Validate secret token if provided
+            secret_valid = hmac.compare_digest(secret_token, ADGEM_POSTBACK_KEY)
+            if not secret_valid:
+                logger.warning(
+                    f"[ADGEM] ❌ SECRET TOKEN MISMATCH! "
+                    f"transaction_id={transaction_id}, player_id={player_id}, IP={client_ip}"
+                )
+                # Log audit event for security monitoring
+                with SessionLocal() as db:
+                    create_audit_log(
+                        db,
+                        event_type="adgem_secret_mismatch",
+                        severity="warning",
+                        actor="adgem",
+                        actor_ip=client_ip,
+                        target=transaction_id,
+                        target_type="adgem_postback",
+                        message=f"Secret token mismatch for player_id={player_id}",
+                        details={"raw_payload": raw_payload},
+                    )
+                    db.commit()
+                return Response(content="INVALID", status_code=403)
+            logger.info(f"[ADGEM] ✅ Secret token validated for transaction_id={transaction_id}")
+        else:
+            # No secret provided - log warning but allow (for backward compatibility)
+            logger.warning(
+                f"[ADGEM] No secret token in postback URL. "
+                f"Consider adding &secret=YOUR_KEY to postback URL for security. "
+                f"transaction_id={transaction_id}"
+            )
+    
+    # ==========================================================================
+    # 3. Check for Duplicate Transaction (Idempotency)
+    # ==========================================================================
+    
+    with SessionLocal() as db:
+        existing = db.query(AdGemConversion).filter(
+            AdGemConversion.transaction_id == transaction_id
+        ).first()
+        
+        if existing:
+            logger.info(f"[ADGEM] Duplicate transaction ignored: {transaction_id} (already processed)")
+            # Return 200 OK for idempotency - AdGem may retry
+            return Response(content="OK", status_code=200)
+        
+        # ==========================================================================
+        # 4. Find User by firebase_uid (player_id)
+        # ==========================================================================
+        
+        # player_id should contain the firebase_uid
+        firebase_uid = player_id
+        
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        
+        if not user:
+            # Log the conversion anyway for audit, but can't credit
+            logger.warning(f"[ADGEM] User not found for firebase_uid={firebase_uid}, transaction_id={transaction_id}")
+            
+            conversion = AdGemConversion(
+                user_id=None,  # User not found
+                player_id=player_id,
+                transaction_id=transaction_id,
+                app_id=app_id,
+                offer_id=offer_id,
+                offer_name=offer_name,
+                amount=amount_int,
+                payout=payout_float,
+                credits_awarded=0,  # No credits awarded
+                country=country,
+                verifier_valid=secret_valid,
+                ip_address=client_ip,
+                user_agent=user_agent,
+                raw_payload=raw_payload,
+                created_at=utc_naive_now(),
+            )
+            
+            # Parse conversion datetime if provided
+            if conversion_datetime:
+                try:
+                    conversion.conversion_time = datetime.strptime(
+                        conversion_datetime, "%Y-%m-%d %H:%M:%S"
+                    )
+                except ValueError:
+                    pass
+            
+            db.add(conversion)
+            db.commit()
+            
+            # Return OK to prevent AdGem retries (user just doesn't exist)
+            return Response(content="OK", status_code=200)
+        
+        # ==========================================================================
+        # 5. Award Credits (amount from AdGem = credits, configured via dashboard multiplier)
+        # ==========================================================================
+        
+        # IMPORTANT: amount_int is the credits to award (set via AdGem dashboard multiplier)
+        # We NEVER calculate credits client-side - server postback is authoritative
+        credits_to_award = amount_int
+        
+        logger.info(
+            f"[ADGEM] Awarding credits: amount={credits_to_award} credits, "
+            f"payout=₹{payout_float}, offer_id={offer_id}"
+        )
+        
+        # Credit user atomically
+        old_balance = user.total_credits
+        user.total_credits += credits_to_award
+        user.bonus_granted += credits_to_award
+        
+        # Record credit transaction
+        from db import CreditTransaction
+        transaction = CreditTransaction(
+            user_id=user.id,
+            delta=credits_to_award,
+            reason=f"adgem_offer:{offer_id or 'unknown'}",
+            created_at=utc_naive_now(),
+        )
+        db.add(transaction)
+        
+        # ==========================================================================
+        # 6. Log Conversion Record
+        # ==========================================================================
+        
+        conversion = AdGemConversion(
+            user_id=user.id,
+            player_id=player_id,
+            transaction_id=transaction_id,
+            app_id=app_id,
+            offer_id=offer_id,
+            offer_name=offer_name,
+            amount=amount_int,
+            payout=payout_float,
+            credits_awarded=credits_to_award,
+            country=country,
+            verifier_valid=secret_valid,
+            ip_address=client_ip,
+            user_agent=user_agent,
+            raw_payload=raw_payload,
+            created_at=utc_naive_now(),
+        )
+        
+        # Parse conversion datetime if provided
+        if conversion_datetime:
+            try:
+                conversion.conversion_time = datetime.strptime(
+                    conversion_datetime, "%Y-%m-%d %H:%M:%S"
+                )
+            except ValueError:
+                pass
+        
+        db.add(conversion)
+        
+        # Commit all changes atomically
+        db.commit()
+        
+        logger.info(
+            f"[ADGEM] ✅ SUCCESS: Awarded {credits_to_award} credits to user {user.id} "
+            f"(firebase_uid={firebase_uid}, balance: {old_balance} → {user.total_credits}, "
+            f"transaction_id={transaction_id}, offer_id={offer_id}, payout={payout_float})"
+        )
+        
+        # Return OK to AdGem
+        return Response(content="OK", status_code=200)
+
+
+@ads_router.get("/adgem/health")
+async def adgem_health():
+    """
+    Health check for AdGem postback endpoint.
+    
+    Use this to verify the endpoint is reachable and configured.
+    """
+    key_configured = bool(ADGEM_POSTBACK_KEY)
+    return {
+        "status": "ok",
+        "adgem_postback_key_configured": key_configured,
+        "endpoint": "/ads/adgem/postback",
+    }
 
 
 def _calculate_timing_metrics(
