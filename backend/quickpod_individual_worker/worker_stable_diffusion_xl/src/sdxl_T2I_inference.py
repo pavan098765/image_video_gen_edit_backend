@@ -1,9 +1,11 @@
 # inference_sdxl_t2i.py
 # ✅ Lazy-loading implementation
+# ✅ GPU memory cleanup before/after inference (OOM prevention)
 # SDXL Txt2Img with scheduler switch, embedding auto-prepend, and upscaling
 # GPU-only, assumes baked local models
 
 import os
+import gc
 import random
 from typing import Dict, Any
 from PIL import Image
@@ -14,8 +16,6 @@ from diffusers import (
     EulerAncestralDiscreteScheduler,
 )
 from upscaler import upscale_image
-
-torch.cuda.empty_cache()
 
 # -------------------------
 # Paths / Config
@@ -35,16 +35,24 @@ DEFAULT_OUTPUT_DIR = "./outputs"
 os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
 # -------------------------
-# Lazy Loader Cache
+# Lazy Pipeline Global
 # -------------------------
-_model_cache = {"pipe": None, "scheduler_config": None}
+_pipeline = None
+_scheduler_config = None
 
 
 def get_sdxl_t2i_pipe():
     """Lazy-load the SDXL Txt2Img pipeline and cache it."""
-    global _model_cache
-    if _model_cache["pipe"] is not None:
-        return _model_cache["pipe"], _model_cache["scheduler_config"]
+    global _pipeline, _scheduler_config
+    if _pipeline is not None:
+        return _pipeline, _scheduler_config
+
+    import time
+    total_start = time.time()
+
+    # CRITICAL: Clear GPU cache before loading to maximize free memory
+    gc.collect()
+    torch.cuda.empty_cache()
 
     print("🧠 Loading SDXL Txt2Img pipeline...")
     pipe = StableDiffusionXLPipeline.from_pretrained(
@@ -71,17 +79,19 @@ def get_sdxl_t2i_pipe():
         except Exception as e:
             print(f"⚠️ Failed to load NEG embedding: {e}")
 
-    _model_cache["pipe"] = pipe
-    _model_cache["scheduler_config"] = scheduler_config
-    print("✅ SDXL Txt2Img pipeline loaded and cached.")
+    _pipeline = pipe
+    _scheduler_config = scheduler_config
+    total_time = time.time() - total_start
+    print(f"✅ SDXL Txt2Img pipeline loaded in {total_time:.1f}s")
     return pipe, scheduler_config
 
 
 def unload_sdxl_t2i_pipe():
     """Optional cleanup: unload SDXL Txt2Img pipeline and free GPU memory."""
-    global _model_cache
-    _model_cache["pipe"] = None
-    _model_cache["scheduler_config"] = None
+    global _pipeline, _scheduler_config
+    _pipeline = None
+    _scheduler_config = None
+    gc.collect()
     torch.cuda.empty_cache()
     print("🧹 SDXL Txt2Img pipeline cache cleared and GPU memory freed.")
 
@@ -121,21 +131,38 @@ def run_inference_sdxl_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
     os.makedirs(output_dir, exist_ok=True)
 
+    # CRITICAL: Clear GPU memory before inference to maximize available VRAM
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    # Log memory state before inference
+    try:
+        free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+        print(f"🔍 GPU memory before inference: {free_mem / 1024**3:.2f} GB free")
+    except Exception:
+        pass
+
     print(f"⚙️ Running Txt2Img | Steps={steps}, CFG={cfg}, Sampler={sampler_name}, Seed={seed}")
     generator = torch.manual_seed(seed) if seed >= 0 else None
 
-    # Inference
-    result = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        width=width,
-        height=height,
-        num_inference_steps=steps,
-        guidance_scale=cfg,
-        generator=generator,
-    )
+    try:
+        with torch.inference_mode():
+            result = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+                num_inference_steps=steps,
+                guidance_scale=cfg,
+                generator=generator,
+            )
+            image = result.images[0]
+    finally:
+        # CRITICAL: Clean up GPU memory after inference
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    image = result.images[0]
     out_path = os.path.join(output_dir, f"sdxl_t2i_{job_id}.png")
     image.save(out_path)
     print(f"🖼️ Base image saved at {out_path}")
@@ -147,7 +174,7 @@ def run_inference_sdxl_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     scale_factor = params.get("scale_factor", 2) if scale_image else 0
     model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
 
-    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
+    upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
 
     upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
     upscaled.save(upscaled_path)

@@ -1,7 +1,8 @@
 # inference_sd15_t2i.py
-# ✅ Lazy-loading implementation
+# ✅ Lazy-loading implementation with GPU memory optimizations
 # SD 1.5 Txt2Img using pre-downloaded GGUF + VAE (GPU-only, baked models)
 
+import gc
 import os
 from typing import Dict, Any
 from PIL import Image
@@ -10,7 +11,11 @@ import torch
 from stable_diffusion_cpp import StableDiffusion
 from upscaler import upscale_image
 
-torch.cuda.empty_cache()
+# Aggressive GPU cleanup at import to prevent OOM
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 # -------------------------
 # Environment / Paths
@@ -78,7 +83,10 @@ def unload_sd15_t2i():
     """
     global _model_cache
     _model_cache["stable_diffusion_t2i"] = None
-    torch.cuda.empty_cache()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
     print("🧹 Stable Diffusion Txt2Img model cache cleared and GPU memory freed.")
 
 
@@ -91,6 +99,13 @@ def run_inference_sd15_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     Returns the path to the saved PNG file.
     """
     print(f"🧩 Starting SD 1.5 Txt2Img job: {job_id}")
+    
+    # Pre-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
     stable_diffusion = get_stable_diffusion_t2i()
 
     negative_prompt = params.get("negative_prompt", None)
@@ -106,16 +121,17 @@ def run_inference_sd15_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
 
     print(f"⚙️ Running Txt2Img | Steps={steps}, CFG={cfg}, Size={width}x{height}, Seed={seed}, Sampler={method}")
 
-    output = stable_diffusion.generate_image(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        width=width,
-        height=height,
-        sample_steps=steps,
-        cfg_scale=cfg,
-        sample_method=method,
-        seed=seed,
-    )
+    with torch.inference_mode():
+        output = stable_diffusion.generate_image(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            sample_steps=steps,
+            cfg_scale=cfg,
+            sample_method=method,
+            seed=seed,
+        )
 
     out_path = os.path.join(output_dir, f"sd_15_t2i_{job_id}.png")
 
@@ -125,6 +141,12 @@ def run_inference_sd15_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
         output.save(out_path)
     else:
         Image.fromarray(output).save(out_path)
+
+    # Post-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     print(f"🖼️ Base generated image saved to {out_path}")
 

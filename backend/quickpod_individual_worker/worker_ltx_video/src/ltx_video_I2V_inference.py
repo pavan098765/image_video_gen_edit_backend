@@ -1,3 +1,7 @@
+# ltx_video_I2V_inference.py
+# ✅ Lazy-loading implementation with GPU memory optimizations
+
+import gc
 import os
 import base64
 import random
@@ -9,6 +13,12 @@ import numpy as np
 import torch
 import imageio
 import yaml
+
+# Aggressive GPU cleanup at import to prevent OOM
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 # --- Auto-merge split safetensors if merge.py exists ---
 try:
@@ -90,6 +100,19 @@ def get_pipelines() -> dict:
     return PIPELINE_CACHE["ltx"]
 
 
+def unload_ltx_pipelines():
+    """
+    Optional cleanup: unload LTX Video models and free VRAM/CPU cache.
+    """
+    global PIPELINE_CACHE
+    PIPELINE_CACHE.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    print("🧹 LTX Video model cache cleared and GPU memory freed.")
+
+
 # -----------------------------
 # Inference Logic
 # -----------------------------
@@ -97,6 +120,14 @@ def run_inference_ltx_t2v_i2v_v2v(job_id: str, prompt: str, params: Dict[str, An
     """
     Unified Text-to-Video, Image-to-Video, Video-to-Video inference for LTX Video.
     """
+    print(f"🧩 Starting LTX Video job: {job_id}")
+    
+    # Pre-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
     data = get_pipelines()
     pipe = data["pipe"]
     upsampler = data["upsampler"]
@@ -177,11 +208,18 @@ def run_inference_ltx_t2v_i2v_v2v(job_id: str, prompt: str, params: Dict[str, An
         final_pipe = pipe
 
     print(f"[LTX] Generating with seed {seed}, {num_frames} frames at {FPS} fps...")
-    result = final_pipe(**call_kwargs)
+    with torch.inference_mode():
+        result = final_pipe(**call_kwargs)
     tensor_out = result.images
 
     if tensor_out is None:
         raise RuntimeError("❌ LTX Video generation failed: no frames returned.")
+    
+    # Post-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     video_np = tensor_out[0].permute(1, 2, 3, 0).cpu().float().numpy()
     video_np = np.clip(video_np, 0, 1)

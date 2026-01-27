@@ -1,8 +1,10 @@
-# sd35_inpaint_inference.py
+# sd35_i2i_inference.py
 # ✅ Lazy-loading implementation
+# ✅ GPU memory cleanup before/after inference (OOM prevention)
 # SD 3.5 Img2Img using pre-downloaded GGUF + text encoders (GPU-only, baked models)
 
 import os
+import gc
 import base64
 from io import BytesIO
 from typing import Any, Dict, Optional, Union
@@ -11,8 +13,6 @@ import torch
 
 from stable_diffusion_cpp import StableDiffusion
 from upscaler import upscale_image
-
-torch.cuda.empty_cache()
 
 # -------------------------
 # Environment / Paths
@@ -42,20 +42,23 @@ for key, path in MODEL_PATHS.items():
         print(f"✓ {key} found at {path}")
 
 # -------------------------
-# Lazy Loader Cache
+# Lazy Pipeline Global
 # -------------------------
-_model_cache = {
-    "sd35": None
-}
+_pipeline = None
+
 
 def get_sd35() -> StableDiffusion:
-    """
-    Lazily load the Stable Diffusion 3.5 model.
-    Cached globally for reuse across Img2Img jobs.
-    """
-    global _model_cache
-    if _model_cache["sd35"] is not None:
-        return _model_cache["sd35"]
+    """Lazy-load the Stable Diffusion 3.5 model."""
+    global _pipeline
+    if _pipeline is not None:
+        return _pipeline
+
+    import time
+    total_start = time.time()
+
+    # CRITICAL: Clear GPU cache before loading to maximize free memory
+    gc.collect()
+    torch.cuda.empty_cache()
 
     print("🧠 Loading Stable Diffusion 3.5 model (GGUF + CLIP + T5)...")
     sd = StableDiffusion(
@@ -66,17 +69,17 @@ def get_sd35() -> StableDiffusion:
         keep_vae_on_cpu=True,
         keep_clip_on_cpu=True
     )
-    _model_cache["sd35"] = sd
-    print("✅ Stable Diffusion 3.5 model loaded and cached.")
+    _pipeline = sd
+    total_time = time.time() - total_start
+    print(f"✅ Stable Diffusion 3.5 model loaded in {total_time:.1f}s")
     return sd
 
 
 def unload_sd35():
-    """
-    Optional cleanup: unload SD3.5 model and free GPU/CPU memory.
-    """
-    global _model_cache
-    _model_cache["sd35"] = None
+    """Optional cleanup: unload SD3.5 model and free GPU/CPU memory."""
+    global _pipeline
+    _pipeline = None
+    gc.collect()
     torch.cuda.empty_cache()
     print("🧹 Stable Diffusion 3.5 model cache cleared and GPU memory freed.")
 
@@ -143,21 +146,38 @@ def run_inference_sd35_i2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     width, height = _get_dynamic_size(init_image, max_dim=1152)
 
     os.makedirs(output_dir, exist_ok=True)
+
+    # CRITICAL: Clear GPU memory before inference to maximize available VRAM
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    # Log memory state before inference
+    try:
+        free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+        print(f"🔍 GPU memory before inference: {free_mem / 1024**3:.2f} GB free")
+    except Exception:
+        pass
+
     print(f"⚙️ Running SD3.5 Inference | Steps={steps}, CFG={cfg}, Strength={strength}, Method={method}")
 
-    # Run inference
-    output = sd.generate_image(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        init_image=init_image,
-        strength=strength,
-        width=width,
-        height=height,
-        sample_steps=steps,
-        cfg_scale=cfg,
-        sample_method=method,
-        seed=seed,
-    )
+    try:
+        output = sd.generate_image(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            init_image=init_image,
+            strength=strength,
+            width=width,
+            height=height,
+            sample_steps=steps,
+            cfg_scale=cfg,
+            sample_method=method,
+            seed=seed,
+        )
+    finally:
+        # CRITICAL: Clean up GPU memory after inference
+        gc.collect()
+        torch.cuda.empty_cache()
 
     out_path = os.path.join(output_dir, f"sd_35_i2i_{job_id}.png")
 
@@ -177,7 +197,7 @@ def run_inference_sd35_i2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     scale_factor = params.get("scale_factor", 2) if scale_image else 0
     model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
 
-    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
+    upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
 
     upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
     upscaled.save(upscaled_path)
@@ -206,7 +226,7 @@ if __name__ == "__main__":
         "sample_method": "dpmpp2mv2",
         "seed": -1,
         "output_dir": "./outputs",
-        "images": img_b64,
+        "init_image": img_b64,
         "negative_prompt": (
             "lowres, bad anatomy, error body, blurry, fuzzy, out of focus, malformed, "
             "extra limbs, cloned face, gross proportions, deformed, disfigured"

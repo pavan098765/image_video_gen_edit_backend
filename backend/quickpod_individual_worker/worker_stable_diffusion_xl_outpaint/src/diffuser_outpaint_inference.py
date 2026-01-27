@@ -1,3 +1,7 @@
+# diffuser_outpaint_inference.py
+# ✅ Lazy-loading implementation with GPU memory optimizations
+
+import gc
 import os
 import io
 import base64
@@ -12,6 +16,11 @@ from upscaler import upscale_image
 from controlnet_union import ControlNetModel_Union
 from pipeline_fill_sd_xl import StableDiffusionXLFillPipeline
 
+# Aggressive GPU cleanup at import to prevent OOM
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 # --- Default Local Model Paths ---
 CTRLNET_LOCAL = os.environ.get(
@@ -26,6 +35,79 @@ PIPELINE_LOCAL = os.environ.get(
     "PIPELINE_LOCAL_PATH",
     "/quickpod/app/worker_stable_diffusion_xl_outpaint/models/sdxl_outpaint/pipeline",
 )
+
+# -------------------------
+# Lazy Loader Cache
+# -------------------------
+_model_cache = {
+    "pipeline": None,
+    "controlnet": None,
+    "vae": None,
+}
+
+
+def get_sdxl_outpaint_pipeline():
+    """
+    Lazily load SDXL Outpaint pipeline with ControlNet and VAE.
+    Cached globally for reuse.
+    """
+    global _model_cache
+    if _model_cache["pipeline"] is not None:
+        return _model_cache["pipeline"], _model_cache["controlnet"]
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+    print("🧠 Loading SDXL Outpaint ControlNet...")
+    controlnet_config_path = os.path.join(CTRLNET_LOCAL, "config_promax.json")
+    controlnet_weights_path = os.path.join(
+        CTRLNET_LOCAL, "diffusion_pytorch_model_promax.safetensors"
+    )
+
+    config = ControlNetModel_Union.load_config(controlnet_config_path)
+    controlnet_model = ControlNetModel_Union.from_config(config)
+    state_dict = load_state_dict(controlnet_weights_path)
+    loaded_keys = list(state_dict.keys())
+    controlnet_model, *_ = ControlNetModel_Union._load_pretrained_model(
+        controlnet_model,
+        state_dict,
+        controlnet_weights_path,
+        CTRLNET_LOCAL,
+        loaded_keys,
+    )
+    controlnet_model = controlnet_model.to(device=device, dtype=dtype)
+
+    print("🧠 Loading SDXL Outpaint VAE and Pipeline...")
+    vae = AutoencoderKL.from_pretrained(VAE_LOCAL, torch_dtype=dtype).to(device)
+    pipe = StableDiffusionXLFillPipeline.from_pretrained(
+        PIPELINE_LOCAL,
+        torch_dtype=dtype,
+        vae=vae,
+        controlnet=controlnet_model,
+        variant="fp16",
+    ).to(device)
+    pipe.scheduler = TCDScheduler.from_config(pipe.scheduler.config)
+
+    _model_cache["pipeline"] = pipe
+    _model_cache["controlnet"] = controlnet_model
+    _model_cache["vae"] = vae
+    print("✅ SDXL Outpaint pipeline loaded and cached.")
+    return pipe, controlnet_model
+
+
+def unload_sdxl_outpaint():
+    """
+    Optional cleanup: unload SDXL Outpaint models and free VRAM/CPU cache.
+    """
+    global _model_cache
+    _model_cache["pipeline"] = None
+    _model_cache["controlnet"] = None
+    _model_cache["vae"] = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    print("🧹 SDXL Outpaint model cache cleared and GPU memory freed.")
 
 
 # ==========================================================
@@ -137,6 +219,110 @@ def compute_target_canvas(
     }
 
 
+def compute_custom_canvas(
+    image,
+    params: Dict[str, Any],
+    max_dim: int = 1152,
+):
+    """
+    Compute canvas dimensions for custom mode where user has freely
+    positioned and scaled the image within a 1:1 canvas.
+    
+    Args:
+        image: PIL Image
+        params: Dictionary containing:
+            - custom_scale: float (0.3 to 3.0, where 1.0 = image fits canvas)
+            - norm_offset_x: float (-1.0 to 1.0, 0 = centered horizontally)
+            - norm_offset_y: float (-1.0 to 1.0, 0 = centered vertically)
+        max_dim: Maximum canvas dimension
+    
+    Returns:
+        dict with target dimensions and paste coordinates
+    """
+    orig_w, orig_h = image.size
+    custom_scale = float(params.get("custom_scale", 0.7))
+    norm_offset_x = float(params.get("norm_offset_x", 0.0))
+    norm_offset_y = float(params.get("norm_offset_y", 0.0))
+    
+    # Clamp custom_scale to valid range
+    custom_scale = max(0.3, min(3.0, custom_scale))
+    # Clamp offsets to valid range
+    norm_offset_x = max(-1.0, min(1.0, norm_offset_x))
+    norm_offset_y = max(-1.0, min(1.0, norm_offset_y))
+    
+    # Use 1:1 canvas for custom mode
+    # Canvas size based on image's larger dimension, scaled by custom_scale inverse
+    base_dim = max(orig_w, orig_h)
+    
+    # When custom_scale < 1, the image is smaller than canvas
+    # We need a canvas that can contain the full arrangement
+    if custom_scale < 1.0:
+        # Canvas should be larger to accommodate the scaled-down image
+        canvas_dim = int(base_dim / custom_scale)
+    else:
+        # When zoomed in, canvas can be smaller or equal
+        canvas_dim = int(base_dim)
+    
+    # Cap at max_dim and round to 64
+    canvas_dim = min(canvas_dim, max_dim)
+    
+    def round64(x):
+        return max(64, (int(x) // 64) * 64)
+    
+    target_w = round64(canvas_dim)
+    target_h = round64(canvas_dim)
+    
+    # Calculate the final image size on canvas
+    # Image is scaled relative to its contain-fit size in the canvas
+    image_aspect = orig_w / orig_h
+    if image_aspect > 1.0:
+        # Landscape: width fills canvas
+        contain_w = target_w
+        contain_h = int(target_w / image_aspect)
+    else:
+        # Portrait: height fills canvas
+        contain_h = target_h
+        contain_w = int(target_h * image_aspect)
+    
+    # Apply custom scale
+    final_image_w = int(contain_w * custom_scale)
+    final_image_h = int(contain_h * custom_scale)
+    
+    # Ensure minimum size
+    final_image_w = max(64, final_image_w)
+    final_image_h = max(64, final_image_h)
+    
+    # Calculate paste position from normalized offset
+    # norm_offset is -1 to 1, where 0 is centered
+    # Available space for movement
+    space_x = target_w - final_image_w
+    space_y = target_h - final_image_h
+    
+    # Center position
+    center_x = space_x // 2
+    center_y = space_y // 2
+    
+    # Apply offset (normalized offset * half the available space)
+    paste_x = int(center_x + (norm_offset_x * (space_x / 2)))
+    paste_y = int(center_y + (norm_offset_y * (space_y / 2)))
+    
+    # Clamp to valid range
+    paste_x = max(0, min(paste_x, target_w - final_image_w))
+    paste_y = max(0, min(paste_y, target_h - final_image_h))
+    
+    print(f"[Custom Canvas] scale={custom_scale}, offset=({norm_offset_x}, {norm_offset_y})")
+    print(f"[Custom Canvas] canvas={target_w}x{target_h}, image={final_image_w}x{final_image_h}, paste=({paste_x}, {paste_y})")
+    
+    return {
+        "target_w": target_w,
+        "target_h": target_h,
+        "final_image_w": final_image_w,
+        "final_image_h": final_image_h,
+        "paste_x": paste_x,
+        "paste_y": paste_y,
+    }
+
+
 def prepare_image_and_mask(
     image,
     width,
@@ -201,41 +387,19 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
     """
     Entry point: Outpainting with auto aspect ratio + alignment expansion.
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    print(f"🧩 Starting SDXL Outpaint job: {job_id}")
+    
+    # Pre-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     output_dir = params.get("output_dir", "./outputs")
     os.makedirs(output_dir, exist_ok=True)
 
-    # --- Load ControlNet ---
-    controlnet_config_path = os.path.join(CTRLNET_LOCAL, "config_promax.json")
-    controlnet_weights_path = os.path.join(
-        CTRLNET_LOCAL, "diffusion_pytorch_model_promax.safetensors"
-    )
-
-    config = ControlNetModel_Union.load_config(controlnet_config_path)
-    controlnet_model = ControlNetModel_Union.from_config(config)
-    state_dict = load_state_dict(controlnet_weights_path)
-    loaded_keys = list(state_dict.keys())
-    controlnet_model, *_ = ControlNetModel_Union._load_pretrained_model(
-        controlnet_model,
-        state_dict,
-        controlnet_weights_path,
-        CTRLNET_LOCAL,
-        loaded_keys,
-    )
-    controlnet_model = controlnet_model.to(device=device, dtype=dtype)
-
-    # --- Load VAE and Pipeline ---
-    vae = AutoencoderKL.from_pretrained(VAE_LOCAL, torch_dtype=dtype).to(device)
-    pipe = StableDiffusionXLFillPipeline.from_pretrained(
-        PIPELINE_LOCAL,
-        torch_dtype=dtype,
-        vae=vae,
-        controlnet=controlnet_model,
-        variant="fp16",
-    ).to(device)
-    pipe.scheduler = TCDScheduler.from_config(pipe.scheduler.config)
+    # --- Load Pipeline (lazy cached) ---
+    pipe, controlnet_model = get_sdxl_outpaint_pipeline()
 
     # --- Load Input Image ---
     init_image = params.get("init_image") or params.get("images")
@@ -251,13 +415,44 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
     else:
         raise ValueError("Invalid input image format in params['init_image'] or ['images'].")
 
-    # --- Compute Smart Canvas ---
-    aspect_ratio = params.get("aspect_ratio", "9:16")
-    alignment = params.get("alignment", "Middle")
+    # --- Check for Custom Mode ---
+    is_custom_mode = params.get("is_custom_mode", False)
     max_dim = int(params.get("max_dim", 1152))
-    expansion_factor = float(params.get("expansion_factor", 1.25))
+    alignment = params.get("alignment", "Middle")
+    
+    if is_custom_mode:
+        # Custom mode: use explicit positioning from frontend
+        print(f"[SDXL Outpaint] Using custom mode positioning")
+        canvas = compute_custom_canvas(image, params, max_dim)
+        
+        # For custom mode, determine which edges have expansion area
+        # based on where the image is positioned
+        paste_x = canvas["paste_x"]
+        paste_y = canvas["paste_y"]
+        img_w = canvas["final_image_w"]
+        img_h = canvas["final_image_h"]
+        target_w = canvas["target_w"]
+        target_h = canvas["target_h"]
+        
+        # Check if there's space on each side (threshold of 5 pixels)
+        overlap_left = paste_x > 5
+        overlap_right = (paste_x + img_w) < (target_w - 5)
+        overlap_top = paste_y > 5
+        overlap_bottom = (paste_y + img_h) < (target_h - 5)
+        
+        print(f"[Custom Mode] Expansion edges - left:{overlap_left}, right:{overlap_right}, top:{overlap_top}, bottom:{overlap_bottom}")
+    else:
+        # Existing behavior: compute canvas based on alignment/aspect_ratio
+        aspect_ratio = params.get("aspect_ratio", "9:16")
+        expansion_factor = float(params.get("expansion_factor", 1.25))
+        canvas = compute_target_canvas(image, aspect_ratio, alignment, max_dim, expansion_factor)
+        
+        # Use params for overlap flags in non-custom mode
+        overlap_left = params.get("overlap_left", False)
+        overlap_right = params.get("overlap_right", False)
+        overlap_top = params.get("overlap_top", False)
+        overlap_bottom = params.get("overlap_bottom", False)
 
-    canvas = compute_target_canvas(image, aspect_ratio, alignment, max_dim, expansion_factor)
     resized_source = image.resize(
         (canvas["final_image_w"], canvas["final_image_h"]), Image.LANCZOS
     )
@@ -270,10 +465,10 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
         resize_option=params.get("resize_option", "Full"),
         custom_resize_percentage=params.get("custom_resize_percentage", 100),
         alignment=alignment,
-        overlap_left=params.get("overlap_left", False),
-        overlap_right=params.get("overlap_right", False),
-        overlap_top=params.get("overlap_top", False),
-        overlap_bottom=params.get("overlap_bottom", False),
+        overlap_left=overlap_left,
+        overlap_right=overlap_right,
+        overlap_top=overlap_top,
+        overlap_bottom=overlap_bottom,
         pre_resized_source=resized_source,
         paste_x=canvas["paste_x"],
         paste_y=canvas["paste_y"],
@@ -288,26 +483,33 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
 
     final_prompt = f"{prompt}, high quality, 4k"
 
-    (
-        prompt_embeds,
-        negative_prompt_embeds,
-        pooled_prompt_embeds,
-        negative_pooled_prompt_embeds,
-    ) = pipe.encode_prompt(final_prompt, "cuda", True)
+    with torch.inference_mode():
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+            pooled_prompt_embeds,
+            negative_pooled_prompt_embeds,
+        ) = pipe.encode_prompt(final_prompt, "cuda", True)
 
-    generated_image = None
-    for image in pipe(
-        prompt_embeds=prompt_embeds,
-        negative_prompt_embeds=negative_prompt_embeds,
-        pooled_prompt_embeds=pooled_prompt_embeds,
-        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-        image=cnet_image,
-        num_inference_steps=int(params.get("num_inference_steps", 12)),
-    ):
-        generated_image = image
+        generated_image = None
+        for image in pipe(
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            image=cnet_image,
+            num_inference_steps=int(params.get("num_inference_steps", 12)),
+        ):
+            generated_image = image
 
     if generated_image is None:
         raise RuntimeError("Generation failed: No image returned.")
+    
+    # Post-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     output_path = os.path.join(output_dir, f"{job_id}_final.png")
     generated_image.save(output_path)
@@ -337,7 +539,9 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
 
 if __name__ == "__main__":
     print("⚙️  Running test inference via entrypoint...")
-    test_params = {
+    
+    # Test 1: Standard mode (existing behavior)
+    test_params_standard = {
         "output_dir": "./outputs_test",
         "init_image": "input_image.jpg",
         "aspect_ratio": "16:9",
@@ -346,7 +550,48 @@ if __name__ == "__main__":
         "scale_image": True,
         "scale_factor": 2,
     }
+    
+    # Test 2: Custom mode - centered, smaller than canvas
+    test_params_custom_centered = {
+        "output_dir": "./outputs_test",
+        "init_image": "input_image.jpg",
+        "is_custom_mode": True,
+        "custom_scale": 0.7,
+        "norm_offset_x": 0.0,
+        "norm_offset_y": 0.0,
+        "num_inference_steps": 10,
+    }
+    
+    # Test 3: Custom mode - image on left edge
+    test_params_custom_left = {
+        "output_dir": "./outputs_test",
+        "init_image": "input_image.jpg",
+        "is_custom_mode": True,
+        "custom_scale": 0.5,
+        "norm_offset_x": -1.0,
+        "norm_offset_y": 0.0,
+        "num_inference_steps": 10,
+    }
+    
+    # Test 4: Custom mode - image at bottom
+    test_params_custom_bottom = {
+        "output_dir": "./outputs_test",
+        "init_image": "input_image.jpg",
+        "is_custom_mode": True,
+        "custom_scale": 0.5,
+        "norm_offset_x": 0.0,
+        "norm_offset_y": 1.0,
+        "num_inference_steps": 10,
+    }
+    
+    # Run standard mode test
     result_path = run_inference_sdxl_outpaint(
-        "job1234", "Expand the image naturally", test_params
+        "job_standard", "Expand the image naturally", test_params_standard
     )
-    print(f"✅ Test complete. Output at: {result_path}")
+    print(f"✅ Standard mode test complete. Output at: {result_path}")
+    
+    # Uncomment to run custom mode tests:
+    # result_path = run_inference_sdxl_outpaint(
+    #     "job_custom_centered", "Expand the image naturally", test_params_custom_centered
+    # )
+    # print(f"✅ Custom mode (centered) test complete. Output at: {result_path}")

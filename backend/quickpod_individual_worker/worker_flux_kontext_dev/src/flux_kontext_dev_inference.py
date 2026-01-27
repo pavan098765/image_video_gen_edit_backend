@@ -1,16 +1,16 @@
 # flux_kontext_dev_inference.py
+# ✅ Lazy Loading for model and pipeline
+# ✅ GPU memory cleanup before/after inference (OOM prevention)
 # Dynamic resolution (keeps aspect ratio, multiple-of-64), seed, CFG, steps
-# ✅ Now with Lazy Loading for model and pipeline
 
 import os
 import base64
+import gc
 from io import BytesIO
 from typing import Dict, Any
 from PIL import Image
 import httpx
 import torch
-
-torch.cuda.empty_cache()
 
 from diffusers import FluxKontextPipeline
 from nunchaku import NunchakuFluxTransformer2dModel
@@ -45,61 +45,53 @@ if not os.path.exists(TRANSFORMER_PATH):
     raise FileNotFoundError(f"Transformer file not found at {TRANSFORMER_PATH}")
 
 # -------------------------
-# Lazy loader cache
+# Lazy Pipeline Global
 # -------------------------
-_model_cache = {
-    "transformer": None,
-    "pipeline": None
-}
-
-# -------------------------
-# Lazy load functions
-# -------------------------
-def get_transformer():
-    """
-    Lazily load and return the Nunchaku transformer.
-    Cached after first load.
-    """
-    global _model_cache
-    if _model_cache["transformer"] is not None:
-        return _model_cache["transformer"]
-
-    print("🧠 Loading Nunchaku Transformer...")
-    transformer = NunchakuFluxTransformer2dModel.from_pretrained(TRANSFORMER_PATH)
-    _model_cache["transformer"] = transformer
-    print("✅ Transformer loaded and cached.")
-    return transformer
+_pipeline = None
+_transformer = None
 
 
 def get_pipeline():
-    """
-    Lazily load and return the Flux-Kontext Diffusers pipeline.
-    Cached after first load.
-    """
-    global _model_cache
-    if _model_cache["pipeline"] is not None:
-        return _model_cache["pipeline"]
+    """Lazy-initialize the pipeline only once to prevent duplicate GPU memory usage."""
+    global _pipeline, _transformer
+    if _pipeline is not None:
+        return _pipeline, _transformer
 
-    transformer = get_transformer()
-    print("🚀 Loading Flux-Kontext pipeline...")
+    import time
+    total_start = time.time()
+
+    # CRITICAL: Clear GPU cache before loading to maximize free memory
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    print(f"🧠 Loading Nunchaku Transformer from {TRANSFORMER_PATH}...")
+    transformer_start = time.time()
+    transformer = NunchakuFluxTransformer2dModel.from_pretrained(TRANSFORMER_PATH)
+    transformer_time = time.time() - transformer_start
+    _transformer = transformer
+    print(f"✅ Transformer loaded in {transformer_time:.1f}s")
+
+    print(f"🚀 Loading Flux-Kontext pipeline from {FLUX_LOCAL_PATH}...")
+    pipeline_start = time.time()
     pipe = FluxKontextPipeline.from_pretrained(
         FLUX_LOCAL_PATH,
         transformer=transformer,
         torch_dtype=torch.bfloat16
     ).to("cuda")
+    pipeline_time = time.time() - pipeline_start
 
-    _model_cache["pipeline"] = pipe
-    print("✅ Pipeline loaded and cached.")
-    return pipe
+    _pipeline = pipe
+    total_time = time.time() - total_start
+    print(f"✅ Pipeline initialized in {total_time:.1f}s (transformer: {transformer_time:.1f}s, pipeline: {pipeline_time:.1f}s)")
+    return _pipeline, _transformer
 
 
 def unload_models():
-    """
-    Frees up GPU memory by unloading models from cache (optional manual call).
-    """
-    global _model_cache
-    _model_cache["transformer"] = None
-    _model_cache["pipeline"] = None
+    """Frees up GPU memory by unloading models from cache."""
+    global _pipeline, _transformer
+    _pipeline = None
+    _transformer = None
+    gc.collect()
     torch.cuda.empty_cache()
     print("🧹 Model cache cleared and GPU memory freed.")
 
@@ -108,9 +100,7 @@ def unload_models():
 # LoRA Setup (optional)
 # -------------------------
 def maybe_apply_lora(transformer, params: Dict[str, Any]):
-    """
-    Enable LoRA only if params contain lora_path (and optionally lora_strength).
-    """
+    """Enable LoRA only if params contain lora_path (and optionally lora_strength)."""
     apply_lora = params.get("apply_lora", False)
     if not apply_lora:
         print("[LoRA] Skipped (apply_lora is False)")
@@ -134,6 +124,7 @@ def _load_image(img_b64: str) -> Image.Image:
     decoded_bytes = base64.b64decode(img_b64)
     return Image.open(BytesIO(decoded_bytes)).convert("RGB")
 
+
 def _get_dynamic_size(img: Image.Image, max_dim: int = 1152) -> tuple[int, int]:
     """Return width/height close to input, within max_dim, multiple-of-64."""
     w, h = img.size
@@ -144,7 +135,6 @@ def _get_dynamic_size(img: Image.Image, max_dim: int = 1152) -> tuple[int, int]:
     else:
         new_h = min(h, max_dim)
         new_w = int(new_h * aspect)
-    # Round to multiple-of-64
     new_w = max(64, (new_w // 64) * 64)
     new_h = max(64, (new_h // 64) * 64)
     return new_w, new_h
@@ -172,20 +162,37 @@ def run_inference_flux_kontext_dev(job_id: str, prompt: str, params: Dict[str, A
     steps = params.get("sample_steps", 28)
     cfg = params.get("cfg_scale", 1.5)
 
-    transformer = get_transformer()
+    pipeline, transformer = get_pipeline()
     maybe_apply_lora(transformer, params)
-    pipeline = get_pipeline()
+
+    # CRITICAL: Clear GPU memory before inference to maximize available VRAM
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    # Log memory state before inference
+    try:
+        free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+        print(f"🔍 GPU memory before inference: {free_mem / 1024**3:.2f} GB free")
+    except Exception:
+        pass
 
     print(f"⚙️ Running pipeline at {width}x{height} | Steps={steps} | CFG={cfg}")
 
-    output = pipeline(
-        image=image,
-        prompt=prompt,
-        guidance_scale=cfg,
-        num_inference_steps=steps,
-        width=width,
-        height=height
-    ).images[0]
+    try:
+        with torch.inference_mode():
+            output = pipeline(
+                image=image,
+                prompt=prompt,
+                guidance_scale=cfg,
+                num_inference_steps=steps,
+                width=width,
+                height=height
+            ).images[0]
+    finally:
+        # CRITICAL: Clean up GPU memory after inference
+        gc.collect()
+        torch.cuda.empty_cache()
 
     out_path = os.path.join(output_dir, f"flux_kontext_{job_id}.png")
     output.save(out_path)
@@ -198,7 +205,7 @@ def run_inference_flux_kontext_dev(job_id: str, prompt: str, params: Dict[str, A
     scale_factor = params.get("scale_factor", 2) if scale_image else 0
     model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
 
-    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
+    upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
 
     upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
     upscaled.save(upscaled_path)
@@ -217,9 +224,6 @@ if __name__ == "__main__":
 
     with httpx.Client(timeout=60) as c:
         img_bytes = c.get(url).content
-    img_b64 = base64.b64encode(img_bytes).decode()
-
-
     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
     params = {
