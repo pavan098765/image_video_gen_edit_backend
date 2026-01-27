@@ -312,7 +312,7 @@ def compute_custom_canvas(
     
     print(f"[Custom Canvas] scale={custom_scale}, offset=({norm_offset_x}, {norm_offset_y})")
     print(f"[Custom Canvas] canvas={target_w}x{target_h}, image={final_image_w}x{final_image_h}, paste=({paste_x}, {paste_y})")
-    
+
     return {
         "target_w": target_w,
         "target_h": target_h,
@@ -443,9 +443,9 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
         print(f"[Custom Mode] Expansion edges - left:{overlap_left}, right:{overlap_right}, top:{overlap_top}, bottom:{overlap_bottom}")
     else:
         # Existing behavior: compute canvas based on alignment/aspect_ratio
-        aspect_ratio = params.get("aspect_ratio", "9:16")
-        expansion_factor = float(params.get("expansion_factor", 1.25))
-        canvas = compute_target_canvas(image, aspect_ratio, alignment, max_dim, expansion_factor)
+    aspect_ratio = params.get("aspect_ratio", "9:16")
+    expansion_factor = float(params.get("expansion_factor", 1.25))
+    canvas = compute_target_canvas(image, aspect_ratio, alignment, max_dim, expansion_factor)
         
         # Use params for overlap flags in non-custom mode
         overlap_left = params.get("overlap_left", False)
@@ -484,23 +484,23 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
     final_prompt = f"{prompt}, high quality, 4k"
 
     with torch.inference_mode():
-        (
-            prompt_embeds,
-            negative_prompt_embeds,
-            pooled_prompt_embeds,
-            negative_pooled_prompt_embeds,
-        ) = pipe.encode_prompt(final_prompt, "cuda", True)
+    (
+        prompt_embeds,
+        negative_prompt_embeds,
+        pooled_prompt_embeds,
+        negative_pooled_prompt_embeds,
+    ) = pipe.encode_prompt(final_prompt, "cuda", True)
 
-        generated_image = None
-        for image in pipe(
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            pooled_prompt_embeds=pooled_prompt_embeds,
-            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-            image=cnet_image,
-            num_inference_steps=int(params.get("num_inference_steps", 12)),
-        ):
-            generated_image = image
+    generated_image = None
+    for image in pipe(
+        prompt_embeds=prompt_embeds,
+        negative_prompt_embeds=negative_prompt_embeds,
+        pooled_prompt_embeds=pooled_prompt_embeds,
+        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+        image=cnet_image,
+        num_inference_steps=int(params.get("num_inference_steps", 12)),
+    ):
+        generated_image = image
 
     if generated_image is None:
         raise RuntimeError("Generation failed: No image returned.")

@@ -66,14 +66,16 @@ def write_rest(f):
     f.write("\n# Worker code (last to leverage cache)\n")
     f.write("COPY src /app/worker/src\n\n")
 
-    f.write("""# --- Install SageAttention 2.x from source ---
-    RUN apt-get update && apt-get install -y git build-essential python3-dev && \\
-        git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention && \\
-        cd /tmp/SageAttention && \\
-        export EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS=32 && \\
-        python setup.py install && \\
-        cd / && rm -rf /tmp/SageAttention
-    """)
+    f.write("# Install SageAttention 2.x from source\n")
+    f.write("RUN apt-get update && apt-get install -y git build-essential python3-dev && \\\n")
+    f.write("    git clone https://github.com/thu-ml/SageAttention.git /tmp/SageAttention && \\\n")
+    f.write("    cd /tmp/SageAttention && \\\n")
+    f.write("    export CUDA_HOME=/usr/local/cuda && \\\n")
+    f.write("    export PATH=$CUDA_HOME/bin:$PATH && \\\n")
+    f.write("    export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH && \\\n")
+    f.write("    export EXT_PARALLEL=4 NVCC_APPEND_FLAGS=\"--threads 8\" MAX_JOBS=32 && \\\n")
+    f.write("    python setup.py install && \\\n")
+    f.write("    cd / && rm -rf /tmp/SageAttention\n\n")
 
 
     f.write("RUN rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*\n\n")
