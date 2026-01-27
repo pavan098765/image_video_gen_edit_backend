@@ -2746,13 +2746,13 @@ async def health_check():
     )
 
 
-def _generate_signed_download_url(r2_key: str, expires_in_seconds: int = 3600) -> Optional[str]:
+def _generate_signed_download_url(r2_key: str, expires_in_seconds: int = 86400) -> Optional[str]:
     """
     Generate a signed download URL for an R2 object.
     
     Args:
         r2_key: The R2 object key (e.g., "image-vide-generator-api/uuid.png")
-        expires_in_seconds: URL validity duration (default 1 hour)
+        expires_in_seconds: URL validity duration (default 1 day)
     
     Returns:
         Signed URL string, or None if secret not configured
