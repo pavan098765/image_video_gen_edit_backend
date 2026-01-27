@@ -1,7 +1,8 @@
 # inpaint_refactor.py
-# ✅ Lazy-loading implementation
+# ✅ Lazy-loading implementation with GPU memory optimizations
 # SD 1.5 Inpaint using pre-downloaded GGUF + VAE (GPU-only, baked models)
 
+import gc
 import os
 import base64
 import numpy as np
@@ -13,7 +14,11 @@ import torch
 from stable_diffusion_cpp import StableDiffusion
 from upscaler import upscale_image
 
-torch.cuda.empty_cache()
+# Aggressive GPU cleanup at import to prevent OOM
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 # -------------------------
 # Environment / Paths
@@ -78,7 +83,10 @@ def unload_sd15_inpaint():
     """
     global _model_cache
     _model_cache["sd_inpaint"] = None
-    torch.cuda.empty_cache()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
     print("🧹 Stable Diffusion Inpaint model cache cleared and GPU memory freed.")
 
 
@@ -166,6 +174,13 @@ def run_inference_sd15_inpaint(job_id: str, prompt: str, params: Dict[str, Any])
     Returns the absolute path of the final upscaled PNG.
     """
     print(f"🧩 Starting SD 1.5 Inpaint job: {job_id}")
+    
+    # Pre-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
     sd = get_sd15_inpaint()
 
     init_image = _load_image(params.get("init_image"))
@@ -217,19 +232,20 @@ def run_inference_sd15_inpaint(job_id: str, prompt: str, params: Dict[str, Any])
 
     print(f"⚙️ Inpainting | Steps={steps}, CFG={cfg}, Strength={strength}, Method={method}")
 
-    out = sd.generate_image(
-        prompt=prompt,
-        negative_prompt=negative,
-        init_image=init_image,
-        mask_image=mask_image,
-        strength=strength,
-        width=width,
-        height=height,
-        sample_steps=steps,
-        cfg_scale=cfg,
-        sample_method=method,
-        seed=seed,
-    )
+    with torch.inference_mode():
+        out = sd.generate_image(
+            prompt=prompt,
+            negative_prompt=negative,
+            init_image=init_image,
+            mask_image=mask_image,
+            strength=strength,
+            width=width,
+            height=height,
+            sample_steps=steps,
+            cfg_scale=cfg,
+            sample_method=method,
+            seed=seed,
+        )
 
     out_path = os.path.join(output_dir, f"sd_15_inpaint_{job_id}.png")
     img = out[0] if isinstance(out, list) else out
@@ -237,6 +253,12 @@ def run_inference_sd15_inpaint(job_id: str, prompt: str, params: Dict[str, Any])
         img.save(out_path)
     else:
         Image.fromarray(img).save(out_path)
+
+    # Post-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     print(f"🖼️ Inpainted base image saved to {out_path}")
 

@@ -1,9 +1,11 @@
 # realism_illustrious_inpaint.py
 # ✅ Lazy-loading implementation
+# ✅ GPU memory cleanup before/after inference (OOM prevention)
 # SDXL Inpaint with dynamic resolution + mask preprocessing + embedding auto-prepend (GPU-only, baked local models)
 
 import base64
 import os
+import gc
 import random
 from typing import Dict, Any, Optional, Union
 from io import BytesIO
@@ -16,8 +18,6 @@ from diffusers import (
     EulerAncestralDiscreteScheduler,
 )
 from upscaler import upscale_image
-
-torch.cuda.empty_cache()
 
 # -------------------------
 # Paths / Config
@@ -37,16 +37,24 @@ DEFAULT_OUTPUT_DIR = "./outputs"
 os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
 # -------------------------
-# Lazy Loader Cache
+# Lazy Pipeline Global
 # -------------------------
-_model_cache = {"pipe": None, "scheduler_config": None}
+_pipeline = None
+_scheduler_config = None
 
 
 def get_inpaint_pipe():
     """Lazy-load SDXL inpaint pipeline with embeddings and cache it."""
-    global _model_cache
-    if _model_cache["pipe"] is not None:
-        return _model_cache["pipe"], _model_cache["scheduler_config"]
+    global _pipeline, _scheduler_config
+    if _pipeline is not None:
+        return _pipeline, _scheduler_config
+
+    import time
+    total_start = time.time()
+
+    # CRITICAL: Clear GPU cache before loading to maximize free memory
+    gc.collect()
+    torch.cuda.empty_cache()
 
     print("🧠 Loading SDXL Inpaint pipeline...")
     pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
@@ -73,17 +81,19 @@ def get_inpaint_pipe():
         except Exception as e:
             print(f"⚠️ Failed to load NEG embedding: {e}")
 
-    _model_cache["pipe"] = pipe
-    _model_cache["scheduler_config"] = scheduler_config
-    print("✅ SDXL Inpaint pipeline cached successfully.")
+    _pipeline = pipe
+    _scheduler_config = scheduler_config
+    total_time = time.time() - total_start
+    print(f"✅ SDXL Inpaint pipeline loaded in {total_time:.1f}s")
     return pipe, scheduler_config
 
 
 def unload_inpaint_pipe():
     """Optional cleanup: unload SDXL pipeline and clear GPU/CPU memory."""
-    global _model_cache
-    _model_cache["pipe"] = None
-    _model_cache["scheduler_config"] = None
+    global _pipeline, _scheduler_config
+    _pipeline = None
+    _scheduler_config = None
+    gc.collect()
     torch.cuda.empty_cache()
     print("🧹 SDXL Inpaint pipeline cache cleared and GPU memory freed.")
 
@@ -218,22 +228,40 @@ def run_inference_sdxl_inpaint(job_id: str, prompt: str, params: Dict[str, Any])
     output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
     os.makedirs(output_dir, exist_ok=True)
 
+    # CRITICAL: Clear GPU memory before inference to maximize available VRAM
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    # Log memory state before inference
+    try:
+        free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+        print(f"🔍 GPU memory before inference: {free_mem / 1024**3:.2f} GB free")
+    except Exception:
+        pass
+
     print(f"⚙️ Inpainting | Steps={steps}, CFG={cfg}, Sampler={sampler_name}, Seed={seed}")
     generator = torch.manual_seed(seed) if seed >= 0 else None
 
-    result = pipe(
-        prompt=prompt,
-        width=width,
-        height=height,
-        negative_prompt=negative_prompt,
-        image=init_image,
-        mask_image=mask_image,
-        num_inference_steps=steps,
-        guidance_scale=cfg,
-        generator=generator,
-    )
+    try:
+        with torch.inference_mode():
+            result = pipe(
+                prompt=prompt,
+                width=width,
+                height=height,
+                negative_prompt=negative_prompt,
+                image=init_image,
+                mask_image=mask_image,
+                num_inference_steps=steps,
+                guidance_scale=cfg,
+                generator=generator,
+            )
+            image = result.images[0]
+    finally:
+        # CRITICAL: Clean up GPU memory after inference
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    image = result.images[0]
     out_path = os.path.join(output_dir, f"sdxl_inpaint_{job_id}.png")
     image.save(out_path)
     print(f"🖼️ Base inpaint result saved to {out_path}")
@@ -245,7 +273,7 @@ def run_inference_sdxl_inpaint(job_id: str, prompt: str, params: Dict[str, Any])
     scale_factor = params.get("scale_factor", 2) if scale_image else 0
     model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
 
-    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
+    upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
 
     upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
     upscaled.save(upscaled_path)

@@ -1,4 +1,8 @@
+# fastwan_5b_inference.py
+# ✅ Lazy-loading implementation with GPU memory optimizations
+
 import base64
+import gc
 from io import BytesIO
 import os
 import uuid
@@ -11,6 +15,12 @@ import numpy as np
 from diffusers import AutoencoderKLWan, WanPipeline, WanImageToVideoPipeline, UniPCMultistepScheduler
 from diffusers.utils import export_to_video
 from upscaler import upscale_image
+
+# Aggressive GPU cleanup at import to prevent OOM
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 # --- Auto-merge split safetensors if merge.py exists ---
 try:
@@ -94,13 +104,36 @@ def get_pipelines():
             pass
 
     PIPELINE_CACHE[MODEL_ID_5B] = {"t2v": t2v_pipe, "i2v": i2v_pipe}
+    print("✅ WAN 5B pipelines loaded and cached.")
     return PIPELINE_CACHE[MODEL_ID_5B]
+
+
+def unload_wan_5b_pipelines():
+    """
+    Optional cleanup: unload WAN 5B models and free VRAM/CPU cache.
+    """
+    global PIPELINE_CACHE
+    if MODEL_ID_5B in PIPELINE_CACHE:
+        del PIPELINE_CACHE[MODEL_ID_5B]
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    print("🧹 WAN 5B model cache cleared and GPU memory freed.")
 
 # -----------------------------
 # Inference
 # -----------------------------
 def run_inference_wan_5b_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
     """Text-to-Image with WAN 5B."""
+    print(f"🧩 Starting WAN 5B T2I job: {job_id}")
+    
+    # Pre-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
     pipes = get_pipelines()
     t2v_pipe = pipes["t2v"]
 
@@ -140,6 +173,12 @@ def run_inference_wan_5b_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -
     elif isinstance(frame, Image.Image):
         frame.save(out_path)
 
+    # Post-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
     # -------------------------
     # Optional Upscaling and compulsory metadata removal
     # -------------------------
@@ -157,6 +196,14 @@ def run_inference_wan_5b_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -
 
 def run_inference_wan_5b_t2v(job_id: str, prompt: str, params: Dict[str, Any], init_image: Optional[Image.Image] = None) -> str:
     """Text-to-Video or Image-to-Video with WAN 5B (init_image is a PIL.Image if provided)."""
+    print(f"🧩 Starting WAN 5B T2V/I2V job: {job_id}")
+    
+    # Pre-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
     pipes = get_pipelines()
     t2v_pipe = pipes["t2v"]
     i2v_pipe = pipes["i2v"]
@@ -205,6 +252,12 @@ def run_inference_wan_5b_t2v(job_id: str, prompt: str, params: Dict[str, Any], i
                 generator=torch.Generator(device="cuda").manual_seed(current_seed),
             ).frames[0]
         prefix = "t2v"
+
+    # Post-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"wan_{prefix}_5B_{job_id}.mp4")

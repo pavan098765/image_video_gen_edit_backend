@@ -1,3 +1,7 @@
+# fastwan_1b_inference.py
+# ✅ Lazy-loading implementation with GPU memory optimizations
+
+import gc
 import os
 import uuid
 import random
@@ -13,6 +17,12 @@ from diffusers import (
 )
 from diffusers.utils import export_to_video
 from upscaler import upscale_image
+
+# Aggressive GPU cleanup at import to prevent OOM
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 # --- Auto-merge split safetensors if merge.py exists ---
 try:
@@ -71,13 +81,36 @@ def get_pipelines():
             pass
 
     PIPELINE_CACHE[MODEL_ID_1B] = {"t2v": t2v_pipe, "i2v": i2v_pipe}
+    print("✅ WAN 1B pipelines loaded and cached.")
     return PIPELINE_CACHE[MODEL_ID_1B]
+
+
+def unload_wan_1b_pipelines():
+    """
+    Optional cleanup: unload WAN 1B models and free VRAM/CPU cache.
+    """
+    global PIPELINE_CACHE
+    if MODEL_ID_1B in PIPELINE_CACHE:
+        del PIPELINE_CACHE[MODEL_ID_1B]
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    print("🧹 WAN 1B model cache cleared and GPU memory freed.")
 
 # -----------------------------
 # Inference
 # -----------------------------
 def run_inference_wan_1b_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
     """Text-to-Image using WAN 1B."""
+    print(f"🧩 Starting WAN 1B T2I job: {job_id}")
+    
+    # Pre-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
     pipes = get_pipelines()
     t2v_pipe = pipes["t2v"]
 
@@ -117,6 +150,12 @@ def run_inference_wan_1b_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -
     elif isinstance(frame, Image.Image):
         frame.save(out_path)
 
+    # Post-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
     # -------------------------
     # Optional Upscaling and compulsory metadata removal
     # -------------------------
@@ -139,6 +178,14 @@ def run_inference_wan_1b_t2v(
     input_image: Optional[Image.Image] = None,
 ) -> str:
     """Text-to-Video using WAN 1B."""
+    print(f"🧩 Starting WAN 1B T2V job: {job_id}")
+    
+    # Pre-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
     pipes = get_pipelines()
     t2v_pipe = pipes["t2v"]
 
@@ -169,9 +216,16 @@ def run_inference_wan_1b_t2v(
             generator=torch.Generator(device="cuda").manual_seed(current_seed),
         ).frames[0]
 
+    # Post-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"wan_t2v_1B_{job_id}.mp4")
     export_to_video(frames_list, out_path, fps=FIXED_FPS)
+    print(f"[T2V 1B] ✅ Video saved at {out_path}")
     return out_path
 
 # -----------------------------

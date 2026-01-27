@@ -1,8 +1,9 @@
 # qwen_image_diffusers.py
-# ✅ Qwen Image (Lightning LoRA fused) Lazy Inference
+# ✅ Qwen Image (Lightning LoRA fused) Lazy Inference with GPU memory optimizations
 # - Based on official Nunchaku repo logic (FlowMatchEulerDiscreteScheduler + QwenImagePipeline)
 # - Keeps lazy loading, caching, offload, and upscaler integration
 
+import gc
 import os
 import math
 import base64
@@ -17,7 +18,11 @@ from nunchaku.models.transformers.transformer_qwenimage import NunchakuQwenImage
 from nunchaku.utils import get_gpu_memory, get_precision
 from upscaler import upscale_image
 
-torch.cuda.empty_cache()
+# Aggressive GPU cleanup at import to prevent OOM
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 # --- Auto-merge split safetensors if merge.py exists ---
 try:
@@ -146,7 +151,10 @@ def unload_models():
     _model_cache["transformer"] = None
     _model_cache["pipeline"] = None
     _model_cache["scheduler"] = None
-    torch.cuda.empty_cache()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
     print("🧹 Cleared Qwen models and freed GPU memory.")
 
 
@@ -185,6 +193,13 @@ def run_inference_qwen_image(job_id: str, prompt: str, params: Dict[str, Any]) -
     Returns local path to upscaled PNG output.
     """
     print(f"🧩 Starting Qwen Image inference job: {job_id}")
+    
+    # Pre-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
     output_dir = params.get("output_dir", "./outputs")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -197,16 +212,24 @@ def run_inference_qwen_image(job_id: str, prompt: str, params: Dict[str, Any]) -
     print(f"⚙️ Running Qwen Image | Steps={inference_steps}, CFG={cfg}, Size={width}x{height}")
     print(f"🪶 Prompt: {prompt}")
 
-    output = pipeline(
-        prompt=prompt,
-        width=width,
-        height=height,
-        num_inference_steps=inference_steps,
-        true_cfg_scale=cfg,
-    ).images[0]
+    with torch.inference_mode():
+        output = pipeline(
+            prompt=prompt,
+            width=width,
+            height=height,
+            num_inference_steps=inference_steps,
+            true_cfg_scale=cfg,
+        ).images[0]
 
     out_path = os.path.join(output_dir, f"qwen_image_{job_id}_lightning.png")
     output.save(out_path)
+    
+    # Post-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
     print(f"🖼️ Saved generated image to {out_path}")
 
     # -------------------------

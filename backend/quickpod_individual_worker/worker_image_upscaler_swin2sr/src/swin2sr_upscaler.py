@@ -1,12 +1,20 @@
 # upscale_swin_dynamic.py
+# ✅ Lazy-loading implementation with GPU memory optimizations
 
 import base64
+import gc
 import os
 from io import BytesIO
 from typing import Dict, Any, Optional, Union
 from PIL import Image
 import torch
 from transformers import AutoImageProcessor, Swin2SRForImageSuperResolution
+
+# Aggressive GPU cleanup at import to prevent OOM
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 # -------------------------
 # Config / paths
@@ -70,12 +78,34 @@ def _get_model(scale: str):
     model.eval()
 
     LOADED_MODELS[scale] = (processor, model, device)
+    print(f"✅ Swin2SR model '{scale}' loaded and cached.")
     return processor, model, device
+
+
+def unload_swin2sr_models():
+    """
+    Optional cleanup: unload Swin2SR models and free VRAM/CPU cache.
+    """
+    global LOADED_MODELS
+    LOADED_MODELS.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    print("🧹 Swin2SR model cache cleared and GPU memory freed.")
 
 # -------------------------
 # Main Upscale function
 # -------------------------
 def run_inference_swin2sr(job_id: str, params: Dict[str, Any]) -> str:
+    print(f"🧩 Starting Swin2SR upscale job: {job_id}")
+    
+    # Pre-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
     input_image = _load_image(params.get("init_image"))
     if input_image is None:
         raise ValueError("init_image is required for upscaling")
@@ -91,7 +121,7 @@ def run_inference_swin2sr(job_id: str, params: Dict[str, Any]) -> str:
     inputs = processor(input_image, return_tensors="pt").to(device)
 
     # Forward pass
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model(**inputs)
 
     # Postprocess
@@ -100,6 +130,14 @@ def run_inference_swin2sr(job_id: str, params: Dict[str, Any]) -> str:
     out_img = Image.fromarray(out_img.transpose(1, 2, 0))  # C,H,W -> H,W,C
 
     out_img.save(out_path)
+
+    # Post-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+    print(f"✅ Upscaled image saved to {out_path}")
     return out_path
 
 # -------------------------

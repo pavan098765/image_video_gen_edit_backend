@@ -1,4 +1,7 @@
 # upscale_realesrgan_local.py
+# ✅ Lazy-loading implementation with GPU memory optimizations
+
+import gc
 import sys
 import os
 import base64
@@ -8,6 +11,12 @@ import numpy as np
 import cv2
 from PIL import Image
 import torch
+
+# Aggressive GPU cleanup at import to prevent OOM
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 # --- Compatibility shim for basicsr + newer torchvision ---
 try:
@@ -124,7 +133,21 @@ def _get_model(model_name: str, params: Dict[str, Any]) -> RealESRGANer:
     )
 
     LOADED_MODELS[model_name] = upsampler
+    print(f"✅ RealESRGAN model '{model_name}' loaded and cached.")
     return upsampler
+
+
+def unload_realesrgan_models():
+    """
+    Optional cleanup: unload RealESRGAN models and free VRAM/CPU cache.
+    """
+    global LOADED_MODELS
+    LOADED_MODELS.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    print("🧹 RealESRGAN model cache cleared and GPU memory freed.")
 
 
 # -------------------------
@@ -135,6 +158,14 @@ def run_inference_realesrgan(job_id: str, params: Dict[str, Any]) -> str:
     Run RealESRGAN (optionally with GFPGAN) and return output path.
     Supports all models listed in MODEL_MAP.
     """
+    print(f"🧩 Starting RealESRGAN upscale job: {job_id}")
+    
+    # Pre-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
     input_image = _load_image(params.get("init_image"))
     if input_image is None:
         raise ValueError("❌ 'init_image' parameter required")
@@ -166,12 +197,13 @@ def run_inference_realesrgan(job_id: str, params: Dict[str, Any]) -> str:
         # Convert input RGB → BGR for OpenCV / RealESRGAN
         np_input = cv2.cvtColor(np.array(input_image), cv2.COLOR_RGB2BGR)
 
-        if face_enhancer:
-            _, _, output = face_enhancer.enhance(
-                np_input, has_aligned=False, only_center_face=False, paste_back=True
-            )
-        else:
-            output, _ = upsampler.enhance(np_input, outscale=outscale)
+        with torch.inference_mode():
+            if face_enhancer:
+                _, _, output = face_enhancer.enhance(
+                    np_input, has_aligned=False, only_center_face=False, paste_back=True
+                )
+            else:
+                output, _ = upsampler.enhance(np_input, outscale=outscale)
 
         # Convert BGR → RGB for correct color display
         output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
@@ -184,6 +216,13 @@ def run_inference_realesrgan(job_id: str, params: Dict[str, Any]) -> str:
     except Exception as e:
         raise RuntimeError(f"❌ Inference failed (try smaller tile or fp32=True): {e}")
 
+    # Post-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+    print(f"✅ Upscaled image saved to {out_path}")
     return out_path
 
 

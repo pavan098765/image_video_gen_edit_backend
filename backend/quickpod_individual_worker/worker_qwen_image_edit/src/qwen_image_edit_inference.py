@@ -1,11 +1,13 @@
 # qwen_image_edit_diffusers.py
 # ✅ Lazy-loading + caching implementation
+# ✅ GPU memory cleanup before/after inference (OOM prevention)
 # Dynamic resolution (keeps aspect ratio, multiple-of-64)
 # Fixed rank=128 and 8 steps (Lightning LoRA fused)
 
 import os
 import math
 import base64
+import gc
 from io import BytesIO
 from typing import Dict, Any
 from PIL import Image
@@ -16,8 +18,6 @@ from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPipeline
 from nunchaku.models.transformers.transformer_qwenimage import NunchakuQwenImageTransformer2DModel
 from nunchaku.utils import get_gpu_memory, get_precision
 from upscaler import upscale_image
-
-torch.cuda.empty_cache()
 
 # --- Auto-merge split safetensors if merge.py exists ---
 try:
@@ -70,63 +70,65 @@ scheduler_config = {
 }
 
 # -------------------------
-# Lazy Loader Cache
+# Lazy Pipeline Global
 # -------------------------
-_model_cache = {
-    "transformer": None,
-    "pipeline": None,
-    "scheduler": None
-}
-
-# -------------------------
-# Lazy Load Functions
-# -------------------------
-def get_scheduler():
-    """Return cached FlowMatchEulerDiscreteScheduler."""
-    global _model_cache
-    if _model_cache["scheduler"] is not None:
-        return _model_cache["scheduler"]
-
-    print("🧩 Initializing Qwen scheduler...")
-    scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
-    _model_cache["scheduler"] = scheduler
-    return scheduler
-
-
-def get_transformer():
-    """Lazily load Nunchaku Qwen Transformer."""
-    global _model_cache
-    if _model_cache["transformer"] is not None:
-        return _model_cache["transformer"]
-
-    print("🧠 Loading Nunchaku Qwen Transformer model...")
-    transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(TRANSFORMER_PATH)
-    _model_cache["transformer"] = transformer
-    print("✅ Transformer loaded and cached.")
-    return transformer
+_pipeline = None
 
 
 def get_pipeline():
-    """Lazily load Qwen Image Edit pipeline with proper scheduler and offload."""
-    global _model_cache
-    if _model_cache["pipeline"] is not None:
-        return _model_cache["pipeline"]
+    """Lazy-initialize the pipeline only once to prevent duplicate GPU memory usage."""
+    global _pipeline
+    if _pipeline is not None:
+        return _pipeline
 
-    print("🚀 Loading Qwen Image Edit pipeline...")
-    transformer = get_transformer()
-    scheduler = get_scheduler()
+    import time
+    total_start = time.time()
 
+    # CRITICAL: Clear GPU cache before loading to maximize free memory
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    print("🧩 Initializing Qwen scheduler...")
+    scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
+
+    print(f"🧠 Loading Nunchaku Qwen Transformer from {TRANSFORMER_PATH}...")
+    transformer_start = time.time()
+    transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(TRANSFORMER_PATH)
+    transformer_time = time.time() - transformer_start
+    print(f"✅ Transformer loaded in {transformer_time:.1f}s")
+
+    print(f"🚀 Loading Qwen Image Edit pipeline from {QWEN_LOCAL_PATH}...")
+    pipeline_start = time.time()
     pipeline = QwenImageEditPipeline.from_pretrained(
         QWEN_LOCAL_PATH,
         transformer=transformer,
         scheduler=scheduler,
         torch_dtype=torch.bfloat16,
     )
+    pipeline_time = time.time() - pipeline_start
+    print(f"✅ Pipeline built in {pipeline_time:.1f}s")
 
-    gpu_mem = get_gpu_memory()
+    try:
+        gpu_mem = get_gpu_memory()
+    except Exception:
+        gpu_mem = 8
     print(f"💾 GPU memory detected: {gpu_mem} GB")
 
-    if gpu_mem > 18:
+    # VRAM-aware offloading
+    if gpu_mem >= 40:
+        print("🧠 Very High VRAM (>=40GB) → enabling simple CPU offload")
+        pipeline.enable_model_cpu_offload()
+    elif gpu_mem >= 24:
+        print("🧠 24GB VRAM → enabling aggressive sequential offload (1 block, no pin memory)")
+        transformer.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=1)
+        pipeline._exclude_from_cpu_offload.append("transformer")
+        pipeline.enable_sequential_cpu_offload()
+        try:
+            pipeline.enable_xformers_memory_efficient_attention()
+            print("✅ XFormers memory efficient attention enabled")
+        except Exception as e:
+            print(f"ℹ️ XFormers not available: {e}")
+    elif gpu_mem >= 18:
         print("⚙️ Enabling model CPU offload...")
         pipeline.enable_model_cpu_offload()
     else:
@@ -135,17 +137,17 @@ def get_pipeline():
         pipeline._exclude_from_cpu_offload.append("transformer")
         pipeline.enable_sequential_cpu_offload()
 
-    _model_cache["pipeline"] = pipeline
-    print("✅ Pipeline loaded and cached.")
-    return pipeline
+    _pipeline = pipeline
+    total_time = time.time() - total_start
+    print(f"✅ Pipeline initialized in {total_time:.1f}s")
+    return _pipeline
 
 
 def unload_models():
-    """Manually clear all cached models and free VRAM."""
-    global _model_cache
-    _model_cache["transformer"] = None
-    _model_cache["pipeline"] = None
-    _model_cache["scheduler"] = None
+    """Manually clear cached models and free VRAM."""
+    global _pipeline
+    _pipeline = None
+    gc.collect()
     torch.cuda.empty_cache()
     print("🧹 Cleared Qwen models and freed GPU memory.")
 
@@ -201,17 +203,35 @@ def run_inference_qwen_image_edit(job_id: str, prompt: str, params: Dict[str, An
 
     pipeline = get_pipeline()
 
+    # CRITICAL: Clear GPU memory before inference to maximize available VRAM
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    # Log memory state before inference
+    try:
+        free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+        print(f"🔍 GPU memory before inference: {free_mem / 1024**3:.2f} GB free")
+    except Exception:
+        pass
+
     print(f"⚙️ Running Qwen Image Edit | Steps={inference_steps}, CFG={cfg}, Size={width}x{height}")
 
-    output = pipeline(
-        image=image,
-        prompt=prompt,
-        true_cfg_scale=cfg,
-        negative_prompt=negative_prompt,
-        num_inference_steps=inference_steps,
-        width=width,
-        height=height,
-    ).images[0]
+    try:
+        with torch.inference_mode():
+            output = pipeline(
+                image=image,
+                prompt=prompt,
+                true_cfg_scale=cfg,
+                negative_prompt=negative_prompt,
+                num_inference_steps=inference_steps,
+                width=width,
+                height=height,
+            ).images[0]
+    finally:
+        # CRITICAL: Clean up GPU memory after inference
+        gc.collect()
+        torch.cuda.empty_cache()
 
     out_path = os.path.join(output_dir, f"qwen_image_edit_{job_id}_4_step_on_8_step_lora.png")
     output.save(out_path)
@@ -224,7 +244,7 @@ def run_inference_qwen_image_edit(job_id: str, prompt: str, params: Dict[str, An
     scale_factor = params.get("scale_factor", 2) if scale_image else 0
     model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
 
-    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
+    upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
 
     upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
     upscaled.save(upscaled_path)

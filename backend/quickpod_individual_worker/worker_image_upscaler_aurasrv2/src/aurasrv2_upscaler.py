@@ -1,8 +1,9 @@
 # aurasrv2_upscaler.py
-# ✅ Lazy-loading implementation for AuraSR-v2
+# ✅ Lazy-loading implementation with GPU memory optimizations for AuraSR-v2
 # Supports 2x or 4x upscale, auto-handles multiple calls efficiently.
 
 import base64
+import gc
 import os
 from typing import Dict, Any, Optional, Union
 from io import BytesIO
@@ -11,7 +12,11 @@ import httpx
 import numpy as np
 import torch
 
-torch.cuda.empty_cache()
+# Aggressive GPU cleanup at import to prevent OOM
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 from aura_sr import AuraSR
 
@@ -55,7 +60,10 @@ def unload_aura_sr():
     """
     global _model_cache
     _model_cache["aura_sr"] = None
-    torch.cuda.empty_cache()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
     print("🧹 AuraSR model cache cleared and GPU memory freed.")
 
 
@@ -93,7 +101,8 @@ def upscale_image(input_image: np.ndarray, scale: int = 4) -> np.ndarray:
     pil_image = Image.fromarray(input_image)
 
     print(f"⚙️ Running AuraSR upscale ({scale}x)...")
-    upscaled_image = aura_sr.upscale_4x(pil_image)
+    with torch.inference_mode():
+        upscaled_image = aura_sr.upscale_4x(pil_image)
 
     if scale == 2:
         w, h = upscaled_image.size
@@ -112,6 +121,13 @@ def run_inference_aurasr_upscale(job_id: str, params: Dict[str, Any]) -> str:
     Returns path to the upscaled image.
     """
     print(f"🧩 Starting AuraSR upscale job: {job_id}")
+    
+    # Pre-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
     init_image = _load_image(params.get("init_image"))
     if init_image is None:
         raise ValueError("init_image is required for upscaling")
@@ -126,6 +142,12 @@ def run_inference_aurasr_upscale(job_id: str, params: Dict[str, Any]) -> str:
 
     result = upscale_image(np.array(init_image), scale=scale)
     Image.fromarray(result).save(out_path)
+
+    # Post-inference GPU cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     print(f"✅ Upscaled image saved to {out_path}")
     return os.path.abspath(out_path)

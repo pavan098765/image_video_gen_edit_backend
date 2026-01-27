@@ -1,16 +1,16 @@
 # sd35_t2i_inference.py
 # ✅ Lazy-loading implementation
+# ✅ GPU memory cleanup before/after inference (OOM prevention)
 # SD 3.5 Text-to-Image using pre-downloaded GGUF + text encoders (GPU-only, baked models)
 
 import os
+import gc
 from typing import Dict, Any
 from PIL import Image
 import torch
 
 from stable_diffusion_cpp import StableDiffusion
 from upscaler import upscale_image
-
-torch.cuda.empty_cache()
 
 # -------------------------
 # Model Paths
@@ -40,20 +40,23 @@ for key, path in MODEL_PATHS.items():
         print(f"✓ {key} found at {path}")
 
 # -------------------------
-# Lazy Loader Cache
+# Lazy Pipeline Global
 # -------------------------
-_model_cache = {
-    "sd35_t2i": None
-}
+_pipeline = None
+
 
 def get_sd35_t2i() -> StableDiffusion:
-    """
-    Lazily load the Stable Diffusion 3.5 Text-to-Image model.
-    Cached globally for reuse across multiple inference calls.
-    """
-    global _model_cache
-    if _model_cache["sd35_t2i"] is not None:
-        return _model_cache["sd35_t2i"]
+    """Lazy-load the Stable Diffusion 3.5 Text-to-Image model."""
+    global _pipeline
+    if _pipeline is not None:
+        return _pipeline
+
+    import time
+    total_start = time.time()
+
+    # CRITICAL: Clear GPU cache before loading to maximize free memory
+    gc.collect()
+    torch.cuda.empty_cache()
 
     print("🧠 Loading Stable Diffusion 3.5 T2I model (GGUF + CLIP + T5)...")
     sd = StableDiffusion(
@@ -61,21 +64,21 @@ def get_sd35_t2i() -> StableDiffusion:
         clip_l_path=MODEL_PATHS["CLIP_L_PATH"],
         clip_g_path=MODEL_PATHS["CLIP_G_PATH"],
         t5xxl_path=MODEL_PATHS["T5XXL_PATH"],
-        vae_decode_only=True,  # safe since it's T2I
+        vae_decode_only=True,
         keep_vae_on_cpu=True,
         keep_clip_on_cpu=True
     )
-    _model_cache["sd35_t2i"] = sd
-    print("✅ Stable Diffusion 3.5 T2I model loaded and cached.")
+    _pipeline = sd
+    total_time = time.time() - total_start
+    print(f"✅ Stable Diffusion 3.5 T2I model loaded in {total_time:.1f}s")
     return sd
 
 
 def unload_sd35_t2i():
-    """
-    Optional cleanup: unload the T2I model and free GPU/CPU memory.
-    """
-    global _model_cache
-    _model_cache["sd35_t2i"] = None
+    """Optional cleanup: unload the T2I model and free GPU/CPU memory."""
+    global _pipeline
+    _pipeline = None
+    gc.collect()
     torch.cuda.empty_cache()
     print("🧹 SD3.5 T2I model cache cleared and GPU memory freed.")
 
@@ -101,18 +104,36 @@ def run_inference_sd35_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     output_dir = params.get("output_dir", "./outputs")
 
     os.makedirs(output_dir, exist_ok=True)
+
+    # CRITICAL: Clear GPU memory before inference to maximize available VRAM
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    # Log memory state before inference
+    try:
+        free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+        print(f"🔍 GPU memory before inference: {free_mem / 1024**3:.2f} GB free")
+    except Exception:
+        pass
+
     print(f"⚙️ Generating Image | Steps={steps}, CFG={cfg}, Size={width}x{height}, Method={method}, Seed={seed}")
 
-    output = stable_diffusion.generate_image(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        width=width,
-        height=height,
-        sample_steps=steps,
-        cfg_scale=cfg,
-        sample_method=method,
-        seed=seed,
-    )
+    try:
+        output = stable_diffusion.generate_image(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            sample_steps=steps,
+            cfg_scale=cfg,
+            sample_method=method,
+            seed=seed,
+        )
+    finally:
+        # CRITICAL: Clean up GPU memory after inference
+        gc.collect()
+        torch.cuda.empty_cache()
 
     out_path = os.path.join(output_dir, f"sd35_t2i_{job_id}.png")
 
@@ -133,7 +154,7 @@ def run_inference_sd35_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     scale_factor = params.get("scale_factor", 2) if scale_image else 0
     model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
 
-    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
+    upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
 
     upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
     upscaled.save(upscaled_path)

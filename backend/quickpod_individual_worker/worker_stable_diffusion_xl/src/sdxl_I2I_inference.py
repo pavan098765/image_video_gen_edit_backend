@@ -1,9 +1,11 @@
 # realism_illustrious_img2img.py
 # ✅ Lazy-loading implementation
+# ✅ GPU memory cleanup before/after inference (OOM prevention)
 # SDXL Img2Img with dynamic resolution + embedding auto-prepend (GPU-only, baked local models)
 
 import base64
 import os
+import gc
 import random
 from io import BytesIO
 from typing import Dict, Any, Optional, Union
@@ -15,8 +17,6 @@ from diffusers import (
     EulerAncestralDiscreteScheduler,
 )
 from upscaler import upscale_image
-
-torch.cuda.empty_cache()
 
 # -------------------------
 # Paths / Config
@@ -38,19 +38,24 @@ DEFAULT_OUTPUT_DIR = "./outputs"
 os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
 # -------------------------
-# Lazy Loader Cache
+# Lazy Pipeline Global
 # -------------------------
-_model_cache = {"sdxl_pipe": None, "default_scheduler_config": None}
+_pipeline = None
+_scheduler_config = None
 
 
 def get_sdxl_pipe():
-    """
-    Lazily loads the SDXL Img2Img pipeline and caches it.
-    Loads embeddings (if available) and sets default scheduler.
-    """
-    global _model_cache
-    if _model_cache["sdxl_pipe"] is not None:
-        return _model_cache["sdxl_pipe"], _model_cache["default_scheduler_config"]
+    """Lazy-load the SDXL Img2Img pipeline and cache it."""
+    global _pipeline, _scheduler_config
+    if _pipeline is not None:
+        return _pipeline, _scheduler_config
+
+    import time
+    total_start = time.time()
+
+    # CRITICAL: Clear GPU cache before loading to maximize free memory
+    gc.collect()
+    torch.cuda.empty_cache()
 
     print("🧠 Loading SDXL Img2Img pipeline...")
     pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
@@ -64,23 +69,31 @@ def get_sdxl_pipe():
 
     # Load embeddings (optional)
     if os.path.exists(POS_EMBED_PATH):
-        pipe.load_textual_inversion(POS_EMBED_PATH, token=POS_TOKEN)
-        print(f"✅ Loaded positive embedding: {POS_EMBED_PATH}")
+        try:
+            pipe.load_textual_inversion(POS_EMBED_PATH, token=POS_TOKEN)
+            print(f"✅ Loaded positive embedding: {POS_EMBED_PATH}")
+        except Exception as e:
+            print(f"⚠️ Failed to load POS embedding: {e}")
     if os.path.exists(NEG_EMBED_PATH):
-        pipe.load_textual_inversion(NEG_EMBED_PATH, token=NEG_TOKEN)
-        print(f"✅ Loaded negative embedding: {NEG_EMBED_PATH}")
+        try:
+            pipe.load_textual_inversion(NEG_EMBED_PATH, token=NEG_TOKEN)
+            print(f"✅ Loaded negative embedding: {NEG_EMBED_PATH}")
+        except Exception as e:
+            print(f"⚠️ Failed to load NEG embedding: {e}")
 
-    _model_cache["sdxl_pipe"] = pipe
-    _model_cache["default_scheduler_config"] = default_scheduler_config
-    print("✅ SDXL Img2Img pipeline loaded and cached.")
+    _pipeline = pipe
+    _scheduler_config = default_scheduler_config
+    total_time = time.time() - total_start
+    print(f"✅ SDXL Img2Img pipeline loaded in {total_time:.1f}s")
     return pipe, default_scheduler_config
 
 
 def unload_sdxl_pipe():
     """Optional cleanup: unload SDXL pipeline and free GPU/CPU memory."""
-    global _model_cache
-    _model_cache["sdxl_pipe"] = None
-    _model_cache["default_scheduler_config"] = None
+    global _pipeline, _scheduler_config
+    _pipeline = None
+    _scheduler_config = None
+    gc.collect()
     torch.cuda.empty_cache()
     print("🧹 SDXL pipeline cache cleared and GPU memory freed.")
 
@@ -162,22 +175,40 @@ def run_inference_sdxl_i2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
     os.makedirs(output_dir, exist_ok=True)
 
+    # CRITICAL: Clear GPU memory before inference to maximize available VRAM
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    # Log memory state before inference
+    try:
+        free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+        print(f"🔍 GPU memory before inference: {free_mem / 1024**3:.2f} GB free")
+    except Exception:
+        pass
+
     print(f"⚙️ Running Img2Img | Steps={steps}, CFG={cfg}, Strength={strength}, Sampler={sampler_name}, Seed={seed}")
     generator = torch.manual_seed(seed) if seed >= 0 else None
 
-    result = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        image=init_image,
-        width=width,
-        height=height,
-        num_inference_steps=steps,
-        guidance_scale=cfg,
-        strength=strength,
-        generator=generator,
-    )
+    try:
+        with torch.inference_mode():
+            result = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                image=init_image,
+                width=width,
+                height=height,
+                num_inference_steps=steps,
+                guidance_scale=cfg,
+                strength=strength,
+                generator=generator,
+            )
+            image = result.images[0]
+    finally:
+        # CRITICAL: Clean up GPU memory after inference
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    image = result.images[0]
     out_path = os.path.join(output_dir, f"sdxl_i2i_{job_id}.png")
     image.save(out_path)
     print(f"🖼️ Base image saved at {out_path}")
@@ -189,7 +220,7 @@ def run_inference_sdxl_i2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     scale_factor = params.get("scale_factor", 2) if scale_image else 0
     model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
 
-    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
+    upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
 
     upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
     upscaled.save(upscaled_path)
@@ -218,7 +249,7 @@ if __name__ == "__main__":
         "strength": 0.65,
         "output_dir": "./outputs",
         "negative_prompt": "lowres, blurry, bad anatomy, extra limbs",
-        "init_imagege": img_b64,
+        "init_image": img_b64,
         "sampler": "DPMSolverMultistep",
     }
 
