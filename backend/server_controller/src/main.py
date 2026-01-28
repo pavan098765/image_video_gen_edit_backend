@@ -401,11 +401,48 @@ class AppState:
                                 ).count()
                                 
                                 if pending > 0:
-                                    logger.debug(
-                                        f"Model {w.model} has {pending} pending job(s), "
-                                        f"keeping worker {w.worker_id} alive"
-                                    )
-                                    continue
+                                    # CRITICAL FIX: Don't blindly keep all workers alive.
+                                    # If there are multiple workers for this model and another worker
+                                    # is actively processing jobs, this worker might be excess.
+                                    
+                                    # Count ready/busy workers for this model
+                                    workers_for_model = db.query(Worker).filter(
+                                        Worker.model == w.model,
+                                        Worker.status.in_(["ready", "busy", "dispatching"])
+                                    ).count()
+                                    
+                                    # If we have more workers than pending jobs AND this worker
+                                    # has been idle for a while, it's excess
+                                    last_job_time = w.last_job_finished_at or w.created_at or w.last_active
+                                    idle_seconds = (now - last_job_time).total_seconds() if last_job_time else 0
+                                    
+                                    if workers_for_model > 1 and idle_seconds > 60:
+                                        # Check if OTHER workers are processing jobs (not idle)
+                                        active_other_workers = db.query(Worker).filter(
+                                            Worker.model == w.model,
+                                            Worker.worker_id != w.worker_id,
+                                            Worker.status.in_(["busy", "dispatching"])
+                                        ).count()
+                                        
+                                        if active_other_workers > 0:
+                                            logger.info(
+                                                f"Worker {w.worker_id} idle for {idle_seconds:.0f}s while "
+                                                f"{active_other_workers} other worker(s) are active. "
+                                                f"Marking as excess (pending={pending}, workers={workers_for_model})"
+                                            )
+                                            # Don't skip - continue to idle timeout check below
+                                        else:
+                                            logger.debug(
+                                                f"Model {w.model} has {pending} pending job(s) and "
+                                                f"{workers_for_model} workers, keeping worker {w.worker_id} alive"
+                                            )
+                                            continue
+                                    else:
+                                        logger.debug(
+                                            f"Model {w.model} has {pending} pending job(s), "
+                                            f"keeping worker {w.worker_id} alive"
+                                        )
+                                        continue
                                 
                                 # Check idle time
                                 last_job = w.last_job_finished_at or w.created_at or w.last_active

@@ -1308,9 +1308,42 @@ class PodManager:
             except WorkerTimeoutError:
                 logger.warning(
                     f"Timeout waiting for STARTING pod {starting_pod_uuid}, "
-                    f"will create new pod for job {job_id}"
+                    f"will re-check for READY pods before creating new pod for job {job_id}"
                 )
-                # Fall through to check for busy pods or create a new pod
+                # CRITICAL FIX: Re-check for READY pods after timeout.
+                # The pod we were waiting for may have been destroyed, but another pod
+                # (that was BUSY when we started) may now be READY.
+                async with self._lock:
+                    candidates_after_timeout = list(self.individual_pods.items())
+                
+                for pod_uuid, info in candidates_after_timeout:
+                    if info.machine_id and self.is_machine_bad(info.machine_id):
+                        continue
+                    if self.lifecycle.is_recently_destroyed(pod_uuid):
+                        continue
+                    if info.model == model and info.status == PodStatus.READY:
+                        reserved = await self.reserve_slot_on_pod(pod_uuid, job_id)
+                        if not reserved:
+                            continue
+                        with SessionLocal() as db:
+                            worker = (
+                                db.query(Worker)
+                                .filter(Worker.container_id == pod_uuid, Worker.model == model)
+                                .first()
+                            )
+                            if worker and worker.status == "ready":
+                                worker.status = "dispatching"
+                                worker.last_active = datetime.utcnow()
+                                db.commit()
+                                logger.info(
+                                    f"After timeout, found READY pod {pod_uuid} for job {job_id} "
+                                    f"(avoiding unnecessary pod creation)"
+                                )
+                                return worker.worker_id
+                            else:
+                                await self.release_slot_on_pod(pod_uuid, job_id)
+                
+                # No READY pods found after timeout, fall through to create new pod
         
         # === PHASE 2.5: Wait for BUSY pod to become available ===
         # If there are existing pods for this model but all are busy (max_jobs reached),
@@ -1456,6 +1489,27 @@ class PodManager:
         worker_found_starting = False  # Track if we found a starting worker
         
         while time.time() - start < timeout:
+            # CRITICAL: Check if pod was destroyed while we're waiting
+            # This prevents waiting the full timeout for a pod that no longer exists
+            if self.lifecycle.is_recently_destroyed(pod_uuid):
+                elapsed = time.time() - start
+                logger.warning(
+                    f"Pod {pod_uuid} was destroyed while waiting for worker registration "
+                    f"(waited {elapsed:.1f}s), raising timeout to re-check for other pods"
+                )
+                raise WorkerTimeoutError(f"Pod {pod_uuid} was destroyed during wait")
+            
+            # Also check if pod is still tracked (might be removed without going through destroy)
+            async with self._lock:
+                still_tracked = pod_uuid in self.individual_pods
+            if not still_tracked:
+                elapsed = time.time() - start
+                logger.warning(
+                    f"Pod {pod_uuid} no longer tracked while waiting for worker registration "
+                    f"(waited {elapsed:.1f}s), raising timeout to re-check for other pods"
+                )
+                raise WorkerTimeoutError(f"Pod {pod_uuid} no longer tracked during wait")
+            
             with SessionLocal() as db:
                 # RACE CONDITION FIX: Check if job is still in a dispatchable state
                 # Another dispatch task might have already assigned this job
