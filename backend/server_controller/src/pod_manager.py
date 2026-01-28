@@ -704,6 +704,7 @@ class PodManager:
     def _load_template_uuids(self) -> Dict[str, Optional[str]]:
         """Load template UUIDs from environment"""
         return {
+            "z_image_turbo": os.getenv("Z_IMAGE_TURBO_TEMPLATE_UUID"),
             "sd15": os.getenv("SD15_TEMPLATE_UUID"),
             "sd35": os.getenv("SD35_TEMPLATE_UUID"),
             "sdxl": os.getenv("SDXL_TEMPLATE_UUID"),
@@ -715,6 +716,7 @@ class PodManager:
             "qwen_image_edit_int4": os.getenv("QWEN_IMAGE_EDIT_INT4_TEMPLATE_UUID"),
             "qwen_image_edit_2509_int4": os.getenv("QWEN_IMAGE_EDIT_2509_INT4_TEMPLATE_UUID"),
             "flux_kontext_dev_int4": os.getenv("FLUX_KONTEXT_DEV_INT4_TEMPLATE_UUID"),
+            "z_image_turbo_int4": os.getenv("Z_IMAGE_TURBO_INT4_TEMPLATE_UUID"),
             "fastwan_21_1b": os.getenv("FASTWAN_21_1B_TEMPLATE_UUID"),
             "fastwan_22_5b": os.getenv("FASTWAN_22_5B_TEMPLATE_UUID"),
             "aurasrv2": os.getenv("AURASRV2_TEMPLATE_UUID"),
@@ -736,10 +738,12 @@ class PodManager:
             "qwen_image_edit": 80,
             "qwen_image_edit_2509": 85,
             "flux_kontext_dev": 45,
+            "z_image_turbo": 80,
             "qwen_image_int4": 80,
             "qwen_image_edit_int4": 80,
             "qwen_image_edit_2509_int4": 85,
             "flux_kontext_dev_int4": 45,
+            "z_image_turbo_int4": 80,
             "fastwan_21_1b": 60,
             "fastwan_22_5b": 60,
             "aurasrv2": 30,

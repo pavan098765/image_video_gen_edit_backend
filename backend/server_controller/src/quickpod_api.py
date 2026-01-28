@@ -1154,6 +1154,7 @@ if __name__ == "__main__":
         print(f"    → GET {manager.base}/templates")
         templates = manager.get_templates()
         print(f"    ✓ Found {len(templates)} templates")
+        print(f"    Templates: {json.dumps(templates, indent=2)}")
         if templates:
             template = templates[0]
             template_uuid = template.get("template_uuid")

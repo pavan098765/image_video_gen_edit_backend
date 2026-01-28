@@ -23,6 +23,30 @@
             "int4": ["4090", "4080", "4070"]
         }
     },
+    "z_image_turbo": {
+        "preferred_variant": "fp4",
+        "fallback_variants": [
+            "int4"
+        ],
+        "min_tflops": 100,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "variant_template_key": {
+            "fp4": "z_image_turbo",
+            "int4": "z_image_turbo_int4"
+        },
+        "variant_disk_size": {
+            "fp4": 80,
+            "int4": 80
+        },
+        "variant_allowed_gpus": {
+            "fp4": ["5090"],
+            "int4": ["4090", "4080", "4070"]
+        }
+    },
     "flux_kontext_dev": {
         "preferred_variant": "fp4",
         "fallback_variants": [
