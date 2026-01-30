@@ -623,6 +623,22 @@ class PodManager:
     - Autoscaling
     """
     
+    # Model aliases: maps variant model IDs to their base worker model
+    # This allows multiple model IDs to use the same worker/template
+    MODEL_ALIASES: Dict[str, str] = {
+        "realesrgan_anime": "realesrgan",
+        "realesrgan_face": "realesrgan",
+        "realesrgan_denoise": "realesrgan",
+    }
+    
+    @classmethod
+    def resolve_model_alias(cls, model: str) -> str:
+        """Resolve model alias to base model for worker routing.
+        
+        Returns the base model if an alias exists, otherwise returns the original model.
+        """
+        return cls.MODEL_ALIASES.get(model, model)
+    
     def __init__(
         self,
         email: str,
@@ -864,7 +880,9 @@ class PodManager:
         - fp4 variants are for 5090 only
         - int4 variants are for other GPUs (4090, 4080, 4070)
         """
-        req = self.model_requirements.get(model, {})
+        # Resolve model alias to base model for lookups
+        base_model = self.resolve_model_alias(model)
+        req = self.model_requirements.get(base_model, {})
         
         preferred = req.get("preferred_variant")
         fallbacks = req.get("fallback_variants", [])
@@ -894,23 +912,27 @@ class PodManager:
     
     def get_template_for_variant(self, model: str, variant: Optional[str]) -> Optional[str]:
         """Get template UUID for a model/variant combination"""
-        req = self.model_requirements.get(model, {})
+        # Resolve model alias to base model for lookups
+        base_model = self.resolve_model_alias(model)
+        req = self.model_requirements.get(base_model, {})
         
         if variant and "variant_template_key" in req:
-            template_key = req["variant_template_key"].get(variant, model)
+            template_key = req["variant_template_key"].get(variant, base_model)
         else:
-            template_key = model
+            template_key = base_model
         
         return self.template_uuids.get(template_key)
     
     def get_disk_size_for_variant(self, model: str, variant: Optional[str]) -> int:
         """Get disk size for a model/variant combination"""
-        req = self.model_requirements.get(model, {})
+        # Resolve model alias to base model for lookups
+        base_model = self.resolve_model_alias(model)
+        req = self.model_requirements.get(base_model, {})
         
         if variant and "variant_disk_size" in req:
-            return req["variant_disk_size"].get(variant, self.template_disk_sizes.get(model, 50))
+            return req["variant_disk_size"].get(variant, self.template_disk_sizes.get(base_model, 50))
         
-        return self.template_disk_sizes.get(model, 50)
+        return self.template_disk_sizes.get(base_model, 50)
     
     # -------------------------------------------------------------------------
     # Machine Management
@@ -1769,15 +1791,18 @@ class PodManager:
         """Create an individual pod using simple template selection with cost tracking"""
         await self._ensure_global_login()
         
-        template_uuid = self.template_uuids.get(model)
+        # Resolve model alias to base model for template/config lookups
+        base_model = self.resolve_model_alias(model)
+        
+        template_uuid = self.template_uuids.get(base_model)
         if not template_uuid:
             template_uuid = self.template_uuids.get("default")
         
         if not template_uuid:
-            logger.error(f"No template found for model {model}")
+            logger.error(f"No template found for model {model} (base: {base_model})")
             return None
         
-        disk_size = self.template_disk_sizes.get(model, 50)
+        disk_size = self.template_disk_sizes.get(base_model, 50)
         
         try:
             # Get best offer with full details including pricing
@@ -1878,7 +1903,9 @@ class PodManager:
             candidates = []
             
             # Get cached machines for this model (sorted by score/success rate)
-            cached = self.machine_cache.get_cached_machines_for_model(model)
+            # Use base model for cache lookup (aliases share the same cache entry)
+            base_model = self.resolve_model_alias(model)
+            cached = self.machine_cache.get_cached_machines_for_model(base_model)
             for mid, score in cached:
                 mid_str = str(mid)
                 # Skip blacklisted machines
@@ -1887,10 +1914,16 @@ class PodManager:
                     continue
                 candidates.append((mid_str, f"cached (score={score})"))
             
-            logger.info(
-                f"Candidates for {model} (from cache, blacklist-filtered): "
-                f"{[c[0] for c in candidates]}"
-            )
+            if model != base_model:
+                logger.info(
+                    f"Candidates for {model} (alias of {base_model}, from cache, blacklist-filtered): "
+                    f"{[c[0] for c in candidates]}"
+                )
+            else:
+                logger.info(
+                    f"Candidates for {model} (from cache, blacklist-filtered): "
+                    f"{[c[0] for c in candidates]}"
+                )
             
             # If no cached candidates, we'll rely on global fallback
             
@@ -1906,8 +1939,9 @@ class PodManager:
                     if self.is_machine_bad(mid):
                         continue
                     
-                    # Check requirements
-                    req = self.model_requirements.get(model, {})
+                    # Check requirements (use base model for alias resolution)
+                    base_model = self.resolve_model_alias(model)
+                    req = self.model_requirements.get(base_model, {})
                     min_tflops = req.get("min_tflops", 0)
                     
                     # Get template and disk size
@@ -1988,7 +2022,9 @@ class PodManager:
                 )
                 
                 try:
-                    req = self.model_requirements.get(model, {})
+                    # Resolve model alias for requirements lookup
+                    base_model = self.resolve_model_alias(model)
+                    req = self.model_requirements.get(base_model, {})
                     min_tflops = req.get("min_tflops", 0)
                     
                     # Get offer with full details including pricing
@@ -2021,7 +2057,7 @@ class PodManager:
                     disk_size = self.get_disk_size_for_variant(model, variant)
                     
                     if not template_uuid:
-                        template_uuid = self.template_uuids.get(model) or self.template_uuids.get("default")
+                        template_uuid = self.template_uuids.get(base_model) or self.template_uuids.get("default")
                     
                     if template_uuid:
                         logger.info(

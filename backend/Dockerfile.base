@@ -1,0 +1,224 @@
+# ============================================================
+# MODULAR BASE DEPS DOCKERFILE
+# Python 3.11 + CUDA (12.8, 12.9, or 13.0) - Configurable
+# ============================================================
+#
+# Usage:
+#   Build for CUDA 12.9 (default):
+#     docker build -t deps-base:py311-cu129 -f Dockerfile.base .
+#
+#   Build for CUDA 12.8:
+#     docker build --build-arg CUDA_VERSION=12.8 --build-arg CUDA_SHORT=128 \
+#                  -t deps-base:py311-cu128 -f Dockerfile.base .
+#
+#   Build for CUDA 13.0:
+#     docker build --build-arg CUDA_VERSION=13.0 --build-arg CUDA_SHORT=130 \
+#                  -t deps-base:py311-cu130 -f Dockerfile.base .
+#
+# ============================================================
+
+# =========================
+# Build Arguments (Configurable)
+# =========================
+ARG CUDA_VERSION=12.9
+ARG CUDA_SHORT=129
+ARG PYTHON_VERSION=3.11
+ARG PYTORCH_VERSION=2.7.1
+ARG USE_WHEELS=false
+
+# =========================
+# Stage 1: Builder
+# =========================
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ARG CUDA_VERSION
+ARG CUDA_SHORT
+ARG PYTORCH_VERSION
+ARG USE_WHEELS
+
+# Install build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget unzip curl ca-certificates \
+    build-essential cmake ninja-build \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create virtual environment
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Upgrade pip and build tools
+RUN pip install --no-cache-dir --upgrade pip wheel setuptools
+
+WORKDIR /deps
+
+# ============================================================
+# PyTorch Installation (Flexible: Wheels or PyPI)
+# ============================================================
+RUN if [ "$USE_WHEELS" = "true" ] && [ -d "/deps/wheels" ]; then \
+        echo "Installing PyTorch from local wheels (CUDA ${CUDA_VERSION})..."; \
+        pip install --no-cache-dir /deps/wheels/torch-*.whl && \
+        pip install --no-cache-dir /deps/wheels/nvidia_*.whl; \
+    else \
+        echo "Installing PyTorch from PyPI (CUDA ${CUDA_VERSION})..."; \
+        pip install --no-cache-dir \
+            torch==${PYTORCH_VERSION} \
+            torchvision \
+            torchaudio \
+            --index-url https://download.pytorch.org/whl/cu${CUDA_SHORT}; \
+    fi && \
+    rm -rf /root/.cache/pip /tmp/*
+
+# ============================================================
+# NVIDIA CUDA Libraries (if not using wheels)
+# ============================================================
+RUN if [ "$USE_WHEELS" != "true" ] || [ ! -d "/deps/wheels" ]; then \
+        echo "Installing NVIDIA CUDA libraries from PyPI..."; \
+        pip install --no-cache-dir \
+            nvidia-cublas-cu12 \
+            nvidia-cudnn-cu12 \
+            nvidia-cuda-runtime-cu12 \
+            nvidia-cusolver-cu12 \
+            nvidia-cusparse-cu12 \
+            nvidia-nccl-cu12 \
+            nvidia-nvtx-cu12; \
+    fi && \
+    rm -rf /root/.cache/pip /tmp/*
+
+# ============================================================
+# Core ML/AI Dependencies (Version Pinned for Stability)
+# ============================================================
+RUN pip install --no-cache-dir \
+    numpy \
+    accelerate==1.10.1 \
+    diffusers==0.35.1 \
+    transformers==4.56.2 \
+    huggingface-hub==0.35.0 \
+    safetensors==0.6.2 \
+    tokenizers==0.22.1 \
+    sentencepiece==0.2.1 \
+    && rm -rf /root/.cache/pip /tmp/*
+
+# ============================================================
+# Web Framework & Utilities
+# ============================================================
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    uvloop \
+    httpx \
+    requests \
+    tenacity \
+    && rm -rf /root/.cache/pip /tmp/*
+
+# ============================================================
+# Image Processing Libraries
+# ============================================================
+RUN pip install --no-cache-dir \
+    pillow \
+    opencv-python \
+    imageio-ffmpeg \
+    tqdm \
+    && rm -rf /root/.cache/pip /tmp/*
+
+# ============================================================
+# Specialized ML Packages
+# ============================================================
+RUN pip install --no-cache-dir \
+    simple-lama-inpainting \
+    aura-sr \
+    gfpgan==1.3.8 \
+    gguf==0.17.1 \
+    ftfy \
+    && rm -rf /root/.cache/pip /tmp/*
+
+# ============================================================
+# Real-ESRGAN (from source if available, else skip)
+# ============================================================
+RUN if [ -d "/deps/realesrgan" ]; then \
+        echo "Installing Real-ESRGAN from source..."; \
+        pip install --no-cache-dir ./realesrgan && \
+        rm -rf /root/.cache/pip /tmp/* /deps/realesrgan/.git; \
+    else \
+        echo "Real-ESRGAN source not found, skipping..."; \
+    fi
+
+# ============================================================
+# Nunchaku (Optional - for INT4/FP4 quantization)
+# Set INSTALL_NUNCHAKU=true to include
+# ============================================================
+ARG INSTALL_NUNCHAKU=false
+ARG NUNCHAKU_VERSION=1.2.1
+ARG NUNCHAKU_TORCH_VERSION=2.10
+
+RUN if [ "$INSTALL_NUNCHAKU" = "true" ]; then \
+        echo "Installing Nunchaku (CUDA ${CUDA_VERSION})..."; \
+        export TORCH_CUDA_ARCH_LIST="8.9" && \
+        export TORCH_NVCC_FLAGS="--disable-gpu-arch-detection" && \
+        export CUDA_VISIBLE_DEVICES="" && \
+        export NUNCHAKU_INSTALL_MODE=LIMITED && \
+        pip install --no-cache-dir \
+            https://github.com/nunchaku-tech/nunchaku/releases/download/v${NUNCHAKU_VERSION}/nunchaku-${NUNCHAKU_VERSION}+cu${CUDA_SHORT}torch${NUNCHAKU_TORCH_VERSION}-cp311-cp311-linux_x86_64.whl || \
+        echo "Nunchaku wheel not available for CUDA ${CUDA_VERSION}, skipping..."; \
+    fi && \
+    rm -rf /root/.cache/pip /tmp/*
+
+# Clean up wheels directory if used
+RUN if [ -d "/deps/wheels" ]; then rm -rf /deps/wheels; fi
+
+# =========================
+# Stage 2: Final Runtime (Minimal)
+# =========================
+FROM python:${PYTHON_VERSION}-slim
+
+ARG CUDA_VERSION
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Minimal runtime dependencies (no build tools)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget curl ca-certificates \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libstdc++6 \
+    libssl3 \
+    libffi8 \
+    libtiff6 \
+    libjpeg62-turbo \
+    libpng16-16 \
+    libwebp7 \
+    libopenjp2-7 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Cleanup: Remove tests, docs, and strip debug symbols
+RUN find /opt/venv/lib/python${PYTHON_VERSION}/site-packages -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true && \
+    find /opt/venv/lib/python${PYTHON_VERSION}/site-packages -type d -name "docs" -exec rm -rf {} + 2>/dev/null || true && \
+    find /opt/venv -name "*.so" -exec strip --strip-unneeded {} + 2>/dev/null || true
+
+WORKDIR /app
+
+# ============================================================
+# Environment Variables (PyTorch & HuggingFace Optimizations)
+# ============================================================
+ENV XFORMERS_OFFLOAD_CPU="1" \
+    PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.6,max_split_size_mb:512,expandable_segments:True" \
+    CUDA_VERSION="${CUDA_VERSION}"
+
+# Labels for metadata
+LABEL maintainer="Your Name" \
+      python.version="${PYTHON_VERSION}" \
+      cuda.version="${CUDA_VERSION}" \
+      pytorch.version="${PYTORCH_VERSION}" \
+      description="Base dependencies image for ML inference workers"
+
+# No ENTRYPOINT (QuickPod compatible - workers define their own)

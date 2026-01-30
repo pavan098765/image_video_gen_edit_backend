@@ -7,31 +7,31 @@ from io import BytesIO
 from PIL import Image
 import numpy as np
 import torch
-from transformers import pipeline
+import torch.nn.functional as F
+from torchvision.transforms.functional import normalize
 from upscaler import upscale_image
 
 # -------------------------
 # Config: model location
 # -------------------------
-# If you bake RMBG into the container, set RMBG_LOCAL_PATH accordingly.
 RMBG_LOCAL_PATH = os.environ.get("RMBG_LOCAL_PATH", "/models/rmbg").strip()
 
 # -------------------------
-# Initialize RMBG model (GPU only)
+# Initialize RMBG model (GPU only) - using direct model loading like official HF space
 # -------------------------
-_model_source = RMBG_LOCAL_PATH or "briaai/RMBG-1.4"
+from briarmbg import BriaRMBG
+
+_model_source = RMBG_LOCAL_PATH if RMBG_LOCAL_PATH and os.path.exists(RMBG_LOCAL_PATH) else "briaai/RMBG-1.4"
 
 try:
-    bg_remover = pipeline(
-        task="image-segmentation",
-        model=_model_source,
-        trust_remote_code=True,
-        device=0,  # force GPU index 0
-    )
-    print(f"✅ RMBG pipeline initialized from: {_model_source}")
+    _rmbg_model = BriaRMBG.from_pretrained(_model_source)
+    _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _rmbg_model.to(_device)
+    _rmbg_model.eval()
+    print(f"✅ RMBG model initialized from: {_model_source} on {_device}")
 except Exception as e:
     raise RuntimeError(
-        f"❌ Failed to initialize RMBG pipeline from {_model_source}. "
+        f"❌ Failed to initialize RMBG model from {_model_source}. "
         f"Ensure the model is baked into the container. Error: {e}"
     )
 
@@ -54,6 +54,47 @@ def _load_image(img: Optional[str | Image.Image | bytes]) -> Optional[Image.Imag
     except Exception as e:
         raise ValueError(f"Unable to decode image from input: {e}")
 
+
+def _preprocess_image(image: Image.Image) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Preprocess image for RMBG model - matches official HF space implementation."""
+    orig_size = image.size  # (w, h)
+    
+    # Resize to model input size
+    model_input_size = (1024, 1024)
+    image_resized = image.resize(model_input_size, Image.BILINEAR)
+    
+    # Convert to tensor
+    im_np = np.array(image_resized)
+    im_tensor = torch.tensor(im_np, dtype=torch.float32).permute(2, 0, 1)
+    im_tensor = torch.unsqueeze(im_tensor, 0)
+    im_tensor = torch.divide(im_tensor, 255.0)
+    im_tensor = normalize(im_tensor, [0.5, 0.5, 0.5], [1.0, 1.0, 1.0])
+    
+    if torch.cuda.is_available():
+        im_tensor = im_tensor.cuda()
+    
+    return im_tensor, orig_size
+
+
+def _postprocess_mask(result: torch.Tensor, orig_size: tuple[int, int]) -> Image.Image:
+    """Postprocess model output to mask - matches official HF space implementation."""
+    w, h = orig_size
+    
+    # Get first output and interpolate to original size
+    result = torch.squeeze(F.interpolate(result[0][0], size=(h, w), mode='bilinear'), 0)
+    
+    # Normalize mask values
+    ma = torch.max(result)
+    mi = torch.min(result)
+    result = (result - mi) / (ma - mi)
+    
+    # Convert to PIL mask
+    result_array = (result * 255).cpu().data.numpy().astype(np.uint8)
+    pil_mask = Image.fromarray(np.squeeze(result_array))
+    
+    return pil_mask
+
+
 # -------------------------
 # Core background remover
 # -------------------------
@@ -69,20 +110,24 @@ def remove_background(input_image: np.ndarray, return_mask: bool = False) -> np.
     pil_image = Image.fromarray(input_image).convert("RGB")
 
     try:
+        # Preprocess
+        im_tensor, orig_size = _preprocess_image(pil_image)
+        
+        # Inference
+        with torch.no_grad():
+            result = _rmbg_model(im_tensor)
+        
+        # Postprocess to get mask
+        pil_mask = _postprocess_mask(result, orig_size)
+        
         if return_mask:
-            mask = bg_remover(pil_image, return_mask=True)
-            if isinstance(mask, (list, tuple)) and len(mask) > 0:
-                mask = mask[0]
-            if hasattr(mask, "convert"):
-                return np.array(mask.convert("L"))
-            return np.array(mask)
+            return np.array(pil_mask)
         else:
-            result = bg_remover(pil_image)
-            if isinstance(result, (list, tuple)) and len(result) > 0:
-                result = result[0]
-            if hasattr(result, "convert"):
-                return np.array(result.convert("RGBA"))
-            return np.array(result)
+            # Apply mask as alpha channel to original image
+            result_image = pil_image.copy()
+            result_image.putalpha(pil_mask)
+            return np.array(result_image)
+            
     except Exception as e:
         raise RuntimeError(f"RMBG inference failed: {e}")
 

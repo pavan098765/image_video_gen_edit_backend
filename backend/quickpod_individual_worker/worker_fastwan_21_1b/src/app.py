@@ -61,7 +61,7 @@ from fastwan_1b_inference import run_inference_wan_1b_t2i, run_inference_wan_1b_
 # Model Registry
 # -----------------------
 MODEL_REGISTRY = {
-    "fastwan": {
+    "fastwan_21_1b": {
         "t2i": run_inference_wan_1b_t2i,
         "t2v": run_inference_wan_1b_t2v,
     }
@@ -299,7 +299,7 @@ async def run_autotest():
         t2i_job_id = f"autotest-t2i-{uuid.uuid4()}"
         resp = await client.post("http://127.0.0.1:8000/run", json={
             "job_id": t2i_job_id, "prompt": "A cinematic portrait of a woman, ultra realistic",
-            "model": "fastwan", "mode": "t2i",
+            "model": "fastwan_21_1b", "mode": "t2i",
             "params": {"steps": 10, "guidance_scale": 0.0, "height": 896, "width": 896},
             "upload_url": "http://dummy-upload/skip", "result_key": f"{t2i_job_id}.png"})
         logger.info(f"🔥 T2I: {resp.status_code}")
@@ -308,7 +308,7 @@ async def run_autotest():
         t2v_job_id = f"autotest-t2v-{uuid.uuid4()}"
         resp = await client.post("http://127.0.0.1:8000/run", json={
             "job_id": t2v_job_id, "prompt": "A cinematic shot of a beach at sunset",
-            "model": "fastwan", "mode": "t2v",
+            "model": "fastwan_21_1b", "mode": "t2v",
             "params": {"steps": 8, "guidance_scale": 0.0, "height": 896, "width": 896, "duration_seconds": 5},
             "upload_url": "http://dummy-upload/skip", "result_key": f"{t2v_job_id}.mp4"})
         logger.info(f"🔥 T2V: {resp.status_code}")

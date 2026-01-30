@@ -58,9 +58,37 @@ def cleanup_gpu(verbose: bool = False):
 from realesrgan_upscaler import run_inference_realesrgan
 
 # -----------------------
+# Model variant wrappers with default parameters
+# -----------------------
+def run_realesrgan_anime(job_id: str, params: Dict[str, Any]) -> str:
+    """RealESRGAN with anime-optimized model (6B architecture)"""
+    params = params.copy()
+    params.setdefault("model_name", "RealESRGAN_x4plus_anime_6B")
+    return run_inference_realesrgan(job_id, params)
+
+def run_realesrgan_face(job_id: str, params: Dict[str, Any]) -> str:
+    """RealESRGAN with face enhancement via GFPGAN"""
+    params = params.copy()
+    params.setdefault("model_name", "RealESRGAN_x4plus")
+    params.setdefault("face_enhance", True)
+    return run_inference_realesrgan(job_id, params)
+
+def run_realesrgan_denoise(job_id: str, params: Dict[str, Any]) -> str:
+    """RealESRGAN with denoising model (general-x4v3 with wdn blending)"""
+    params = params.copy()
+    params.setdefault("model_name", "realesr-general-x4v3")
+    params.setdefault("denoise_strength", 0.5)  # balanced denoising
+    return run_inference_realesrgan(job_id, params)
+
+# -----------------------
 # Model Registry
 # -----------------------
-MODEL_REGISTRY = {"realesrgan": run_inference_realesrgan}
+MODEL_REGISTRY = {
+    "realesrgan": run_inference_realesrgan,
+    "realesrgan_anime": run_realesrgan_anime,
+    "realesrgan_face": run_realesrgan_face,
+    "realesrgan_denoise": run_realesrgan_denoise,
+}
 
 # -----------------------
 # Logging

@@ -5,6 +5,7 @@ import gc
 import os
 import io
 import base64
+import hashlib
 from typing import Any, Dict
 import torch
 from diffusers import AutoencoderKL, TCDScheduler
@@ -443,9 +444,9 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
         print(f"[Custom Mode] Expansion edges - left:{overlap_left}, right:{overlap_right}, top:{overlap_top}, bottom:{overlap_bottom}")
     else:
         # Existing behavior: compute canvas based on alignment/aspect_ratio
-    aspect_ratio = params.get("aspect_ratio", "9:16")
-    expansion_factor = float(params.get("expansion_factor", 1.25))
-    canvas = compute_target_canvas(image, aspect_ratio, alignment, max_dim, expansion_factor)
+        aspect_ratio = params.get("aspect_ratio", "9:16")
+        expansion_factor = float(params.get("expansion_factor", 1.25))
+        canvas = compute_target_canvas(image, aspect_ratio, alignment, max_dim, expansion_factor)
         
         # Use params for overlap flags in non-custom mode
         overlap_left = params.get("overlap_left", False)
@@ -461,7 +462,7 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
         image=image,
         width=canvas["target_w"],
         height=canvas["target_h"],
-        overlap_percentage=params.get("overlap_percentage", 1),
+        overlap_percentage=params.get("overlap_percentage", 5),
         resize_option=params.get("resize_option", "Full"),
         custom_resize_percentage=params.get("custom_resize_percentage", 100),
         alignment=alignment,
@@ -483,27 +484,39 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
 
     final_prompt = f"{prompt}, high quality, 4k"
 
+    # Generate unique seed from job_id to ensure different results per job
+    # Use explicit seed param if provided, otherwise derive from job_id
+    if "seed" in params and params["seed"] is not None:
+        seed = int(params["seed"])
+    else:
+        # Create deterministic but unique seed from job_id
+        seed = int(hashlib.sha256(job_id.encode()).hexdigest()[:8], 16)
+    
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    print(f"[SDXL Outpaint] Using seed: {seed} for job: {job_id}")
+
     with torch.inference_mode():
-    (
-        prompt_embeds,
-        negative_prompt_embeds,
-        pooled_prompt_embeds,
-        negative_pooled_prompt_embeds,
-    ) = pipe.encode_prompt(final_prompt, "cuda", True)
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+            pooled_prompt_embeds,
+            negative_pooled_prompt_embeds,
+        ) = pipe.encode_prompt(final_prompt, "cuda", True)
 
-    generated_image = None
-    for image in pipe(
-        prompt_embeds=prompt_embeds,
-        negative_prompt_embeds=negative_prompt_embeds,
-        pooled_prompt_embeds=pooled_prompt_embeds,
-        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-        image=cnet_image,
-        num_inference_steps=int(params.get("num_inference_steps", 12)),
-    ):
-        generated_image = image
+        generated_image = None
+        for image in pipe(
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            image=cnet_image,
+            num_inference_steps=int(params.get("num_inference_steps", 12)),
+            generator=generator,
+        ):
+            generated_image = image
 
-    if generated_image is None:
-        raise RuntimeError("Generation failed: No image returned.")
+        if generated_image is None:
+            raise RuntimeError("Generation failed: No image returned.")
     
     # Post-inference GPU cleanup
     gc.collect()

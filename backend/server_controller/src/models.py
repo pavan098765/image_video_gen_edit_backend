@@ -158,6 +158,21 @@ class SubmitRequest(BaseModel):
         description="Flag indicating this is a bulk edit request (requires VIP)"
     )
     
+    # Per-image masks for bulk inpaint/erase (each image can have its own mask)
+    bulk_masks: Optional[List[Optional[str]]] = Field(
+        default=None,
+        description="List of base64-encoded masks for bulk inpaint/erase. "
+                    "Must align with bulk_images array. Use null for images without masks."
+    )
+    
+    # Per-image outpaint configs for bulk expand scene (each image needs placement)
+    bulk_outpaint_configs: Optional[List[Optional[Dict[str, Any]]]] = Field(
+        default=None,
+        description="List of outpaint configurations for bulk expand scene. "
+                    "Each config can contain: alignment, aspect_ratio, is_custom_mode, "
+                    "custom_scale, norm_offset_x, norm_offset_y. Must align with bulk_images array."
+    )
+    
     @field_validator("model")
     @classmethod
     def validate_model_name(cls, v: str) -> str:

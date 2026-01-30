@@ -1,5 +1,6 @@
 """
 Simple LaMa inpainting wrapper with outpainting-friendly mask preparation.
+Optimized for GPU performance with FP16 and inference mode.
 """
 
 import base64
@@ -7,8 +8,9 @@ import os
 from io import BytesIO
 from typing import Dict, Any, Optional, Union
 from PIL import Image
+import numpy as np
 import torch
-from simple_lama_inpainting import SimpleLama
+import torch.nn.functional as F
 from upscaler import upscale_image
 
 # ----------------------------
@@ -20,16 +22,110 @@ os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
 # Local baked TorchScript path (set in container build or startup)
 LAMA_LOCAL_PATH = os.environ.get("LAMA_LOCAL_PATH", "/app/models/basic_utils/lama/lama.pt").strip()
-os.environ["LAMA_MODEL"] = LAMA_LOCAL_PATH
 
-# Initialize model once
-try:
+# Global model reference
+_LAMA_MODEL = None
+
+def get_lama_model():
+    """
+    Lazily load and cache the LaMa model with optimizations.
+    Uses FP16 for faster inference on modern GPUs.
+    """
+    global _LAMA_MODEL
+    if _LAMA_MODEL is not None:
+        return _LAMA_MODEL
+    
     if not os.path.exists(LAMA_LOCAL_PATH):
         raise FileNotFoundError(f"❌ LaMa model file not found at {LAMA_LOCAL_PATH}")
-    SIMPLE_LAMA = SimpleLama()
-    print(f"✅ SimpleLama initialized from: {LAMA_LOCAL_PATH}")
+    
+    print(f"🧠 Loading LaMa model from: {LAMA_LOCAL_PATH}")
+    
+    # Load TorchScript model
+    _LAMA_MODEL = torch.jit.load(LAMA_LOCAL_PATH, map_location=DEVICE)
+    _LAMA_MODEL = _LAMA_MODEL.to(DEVICE)
+    _LAMA_MODEL.eval()
+    
+    # Try to convert to half precision for faster inference
+    try:
+        _LAMA_MODEL = _LAMA_MODEL.half()
+        print("✅ LaMa model loaded with FP16 optimization")
+    except Exception as e:
+        print(f"⚠️ FP16 not supported, using FP32: {e}")
+    
+    # Warm up the model with a dummy inference
+    try:
+        with torch.inference_mode():
+            dummy_img = torch.zeros(1, 3, 512, 512, device=DEVICE, dtype=_LAMA_MODEL.parameters().__next__().dtype if hasattr(_LAMA_MODEL, 'parameters') else torch.float16)
+            dummy_mask = torch.zeros(1, 1, 512, 512, device=DEVICE, dtype=dummy_img.dtype)
+            _ = _LAMA_MODEL(dummy_img, dummy_mask)
+        print("✅ LaMa model warmed up successfully")
+    except Exception as e:
+        print(f"⚠️ Warmup failed (non-critical): {e}")
+    
+    return _LAMA_MODEL
+
+
+def _run_lama_inference(image: Image.Image, mask: Image.Image) -> Image.Image:
+    """
+    Run optimized LaMa inference on a single image-mask pair.
+    """
+    model = get_lama_model()
+    
+    # Determine model dtype
+    try:
+        model_dtype = next(model.parameters()).dtype
+    except (StopIteration, AttributeError):
+        model_dtype = torch.float16
+    
+    orig_size = image.size  # (W, H)
+    
+    # Pad to multiple of 8 for model compatibility
+    def pad_to_multiple(img, multiple=8):
+        w, h = img.size
+        new_w = ((w + multiple - 1) // multiple) * multiple
+        new_h = ((h + multiple - 1) // multiple) * multiple
+        if new_w == w and new_h == h:
+            return img, (0, 0)
+        padded = Image.new(img.mode, (new_w, new_h), 0 if img.mode == 'L' else (0, 0, 0))
+        padded.paste(img, (0, 0))
+        return padded, (new_w - w, new_h - h)
+    
+    image_padded, img_pad = pad_to_multiple(image.convert("RGB"))
+    mask_padded, _ = pad_to_multiple(mask.convert("L"))
+    
+    # Convert to tensors
+    img_np = np.array(image_padded).astype(np.float32) / 255.0
+    mask_np = np.array(mask_padded).astype(np.float32) / 255.0
+    
+    # Ensure mask is binary (threshold at 0.5)
+    mask_np = (mask_np > 0.5).astype(np.float32)
+    
+    # To tensor: (H, W, C) -> (1, C, H, W)
+    img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(DEVICE, dtype=model_dtype)
+    mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(DEVICE, dtype=model_dtype)
+    
+    # Run inference with optimizations
+    with torch.inference_mode():
+        with torch.cuda.amp.autocast(enabled=(model_dtype == torch.float16)):
+            result = model(img_tensor, mask_tensor)
+    
+    # Convert back to PIL
+    result = result.squeeze(0).permute(1, 2, 0).cpu().float().numpy()
+    result = np.clip(result * 255, 0, 255).astype(np.uint8)
+    result_img = Image.fromarray(result)
+    
+    # Crop back to original size if padded
+    if img_pad != (0, 0):
+        result_img = result_img.crop((0, 0, orig_size[0], orig_size[1]))
+    
+    return result_img
+
+
+# Initialize model at import time for faster first request
+try:
+    get_lama_model()
 except Exception as e:
-    raise RuntimeError(f"❌ Failed to initialize SimpleLama. Error: {e}")
+    print(f"⚠️ LaMa model lazy init deferred: {e}")
 
 # ----------------------------
 # Helpers
@@ -71,10 +167,10 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]], force_gray: bool 
 
 
 def process_with_lama(job_id: str, init_image: Image.Image, mask_image: Image.Image, output_dir: str, params: Dict[str, Any]) -> str:
-    """Run LaMa inpainting given an image and mask."""
+    """Run optimized LaMa inpainting given an image and mask."""
 
     out_path = os.path.join(output_dir, f"lama_inpaint_{job_id}.png")
-    result = SIMPLE_LAMA(init_image, mask_image)
+    result = _run_lama_inference(init_image, mask_image)
     result.save(out_path)
 
     # -------------------------

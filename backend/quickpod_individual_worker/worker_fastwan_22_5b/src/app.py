@@ -64,7 +64,7 @@ from fastwan_5b_inference import run_inference_wan_5b_t2i, run_inference_wan_5b_
 # Model Registry
 # -----------------------
 MODEL_REGISTRY = {
-    "fastwan": {
+    "fastwan_22_5b": {
         "t2i": run_inference_wan_5b_t2i,
         "t2v": run_inference_wan_5b_t2v,
         "i2v": run_inference_wan_5b_t2v,
@@ -206,7 +206,7 @@ async def run_inference_and_save(job_id: str, prompt: str, model: str, mode: Opt
         cleanup_gpu()
 
     try:
-        if model == "fastwan" and mode == "i2v":
+        if model == "fastwan_22_5b" and mode == "i2v":
             init_image_b64 = params.pop("init_image", None)
             init_image = None
             if init_image_b64:
@@ -316,7 +316,7 @@ async def run_autotest():
         t2i_job_id = f"autotest-t2i-{uuid.uuid4()}"
         resp = await client.post("http://127.0.0.1:8000/run", json={
             "job_id": t2i_job_id, "prompt": "A cinematic portrait of a woman, ultra realistic",
-            "model": "fastwan", "mode": "t2i",
+            "model": "fastwan_22_5b", "mode": "t2i",
             "params": {"steps": 6, "guidance_scale": 0.0, "height": 512, "width": 512},
             "upload_url": "http://dummy-upload/skip", "result_key": f"{t2i_job_id}.png"})
         logger.info(f"🔥 T2I: {resp.status_code}")
@@ -325,7 +325,7 @@ async def run_autotest():
         t2v_job_id = f"autotest-t2v-{uuid.uuid4()}"
         resp = await client.post("http://127.0.0.1:8000/run", json={
             "job_id": t2v_job_id, "prompt": "A cinematic shot of a beach at sunset",
-            "model": "fastwan", "mode": "t2v",
+            "model": "fastwan_22_5b", "mode": "t2v",
             "params": {"steps": 4, "guidance_scale": 0.0, "height": 512, "width": 512, "duration_seconds": 3},
             "upload_url": "http://dummy-upload/skip", "result_key": f"{t2v_job_id}.mp4"})
         logger.info(f"🔥 T2V: {resp.status_code}")
@@ -338,7 +338,7 @@ async def run_autotest():
             i2v_job_id = f"autotest-i2v-{uuid.uuid4()}"
             resp = await client.post("http://127.0.0.1:8000/run", json={
                 "job_id": i2v_job_id, "prompt": "Animate this image with cinematic motion",
-                "model": "fastwan", "mode": "i2v",
+                "model": "fastwan_22_5b", "mode": "i2v",
                 "params": {"steps": 4, "guidance_scale": 0.0, "height": 512, "width": 512, "duration_seconds": 3, "init_image": img_b64},
                 "upload_url": "http://dummy-upload/skip", "result_key": f"{i2v_job_id}.mp4"})
             logger.info(f"🔥 I2V: {resp.status_code}")

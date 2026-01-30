@@ -840,12 +840,26 @@ class QuickPodManager:
             except (ValueError, TypeError):
                 return False
         
+        def has_allowed_geolocation(o: Dict) -> bool:
+            """Require geolocation to be US or NZ."""
+            allowed = {"US", "NZ"}
+            # Check nested _machines.geolocation
+            machines = o.get("_machines", {})
+            if isinstance(machines, dict):
+                geo = machines.get("geolocation", "")
+                if geo in allowed:
+                    return True
+            # Fallback: check top-level geolocation if present
+            geo = o.get("geolocation", "")
+            return geo in allowed
+        
         def is_valid_offer(o: Dict) -> bool:
             return (
                 not is_multi_gpu_offer(o) and
                 has_valid_tflops(o) and
                 matches_gpu_name(o) and
                 has_sufficient_memory(o) and  # Require >30GB RAM
+                has_allowed_geolocation(o) and  # Require US or NZ geolocation
                 not is_blacklisted(o)  # Filter out blacklisted machines
             )
         
@@ -987,12 +1001,26 @@ class QuickPodManager:
             except (ValueError, TypeError):
                 return False
         
+        def has_allowed_geolocation(o: Dict) -> bool:
+            """Require geolocation to be US or NZ."""
+            allowed = {"US", "NZ"}
+            # Check nested _machines.geolocation
+            machines = o.get("_machines", {})
+            if isinstance(machines, dict):
+                geo = machines.get("geolocation", "")
+                if geo in allowed:
+                    return True
+            # Fallback: check top-level geolocation if present
+            geo = o.get("geolocation", "")
+            return geo in allowed
+        
         def is_valid_offer(o: Dict) -> bool:
             return (
                 not is_multi_gpu_offer(o) and
                 has_valid_tflops(o) and
                 matches_gpu_name(o) and
                 has_sufficient_memory(o) and
+                has_allowed_geolocation(o) and  # Require US or NZ geolocation
                 not is_blacklisted(o)
             )
         
@@ -1038,12 +1066,22 @@ class QuickPodManager:
                 except ValueError:
                     pass
         
-        # 3. Fallback by GPU tier
-        gpu_tiers = ["5090", "4090", "4080TI", "4080", "4070"]
+        # 3. Fallback by GPU tier - prioritize allowed_gpu_names if provided
+        # This ensures upscalers (which allow 3090/3060) actually get those GPUs
+        # instead of always falling back to 4090
+        default_gpu_tiers = ["5090", "4090", "4080TI", "4080", "4070", "3090", "3060"]
+        
+        # If allowed_gpu_names is specified, use that order first (cheapest GPUs for the model)
+        # then fall back to the default tier order for any remaining GPUs
+        if allowed_gpu_names:
+            gpu_tiers = list(allowed_gpu_names) + [g for g in default_gpu_tiers if g not in allowed_gpu_names]
+        else:
+            gpu_tiers = default_gpu_tiers
+        
         for tier in gpu_tiers:
             tier_offers = [
                 o for o in offers
-                if tier in str(o.get("offer_name", "")).upper()
+                if tier.upper() in str(o.get("offer_name", "")).upper()
                 and is_valid_offer(o)
             ]
             tier_offers.sort(key=extract_price)
@@ -1155,6 +1193,8 @@ if __name__ == "__main__":
         templates = manager.get_templates()
         print(f"    ✓ Found {len(templates)} templates")
         print(f"    Templates: {json.dumps(templates, indent=2)}")
+        with open("templates.json", "w") as f:
+            json.dump(templates, f, indent=2)
         if templates:
             template = templates[0]
             template_uuid = template.get("template_uuid")
@@ -1185,8 +1225,8 @@ if __name__ == "__main__":
         print()
         
         # Wait a moment
-        print("[6] Waiting 45 seconds before destroying...")
-        time.sleep(45)
+        print("[6] Waiting 15 seconds before destroying...")
+        time.sleep(15)
         print()
         
         # Destroy pod

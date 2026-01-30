@@ -123,9 +123,10 @@
     "sdxl": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 60,
+        "min_tflops": 20,
         "allowed_gpu_names": [
-            "4080",
+            "3090",
+            "5060",
             "4090",
             "5090"
         ],
@@ -134,21 +135,25 @@
     "basic_utils": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 30,
+        "min_tflops": 20,
         "allowed_gpu_names": [
-            "4070",
-            "4080",
+            "A4000",
+            "3060",
+            "5060",
+            "3090",
             "4090"
         ]
     },
     "diffusers_outpaint": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 60,
+        "min_tflops": 20,
         "allowed_gpu_names": [
-            "4080",
-            "4090",
-            "5090"
+            "A4000",
+            "3060",
+            "5060",
+            "3090",
+            "4090"
         ],
         "min_gpu_count": 1
     },
@@ -175,10 +180,11 @@
     "aurasrv2": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 30,
+        "min_tflops": 20,
         "allowed_gpu_names": [
-            "4070",
-            "4080",
+            "5060",
+            "3090",
+            "3060",
             "4090"
         ],
         "min_gpu_count": 1
@@ -186,10 +192,51 @@
     "realesrgan": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 30,
+        "min_tflops": 20,
         "allowed_gpu_names": [
-            "4070",
-            "4080",
+            "A4000",
+            "3060",
+            "5060",
+            "3090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "realesrgan_anime": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 20,
+        "allowed_gpu_names": [
+            "A4000",
+            "3060",
+            "5060",
+            "3090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "realesrgan_face": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 20,
+        "allowed_gpu_names": [
+            "A4000",
+            "3060",
+            "5060",
+            "3090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "realesrgan_denoise": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 20,
+        "allowed_gpu_names": [
+            "A4000",
+            "3060",
+            "5060",
+            "3090",
             "4090"
         ],
         "min_gpu_count": 1
@@ -197,10 +244,12 @@
     "swin2sr": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 30,
+        "min_tflops": 20,
         "allowed_gpu_names": [
-            "4070",
-            "4080",
+            "A4000",
+            "3060",
+            "5060",
+            "3090",
             "4090"
         ],
         "min_gpu_count": 1

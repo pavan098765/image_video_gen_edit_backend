@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Generator
 
 import cv2
 import PIL.Image
@@ -348,7 +348,7 @@ class StableDiffusionXLFillPipeline(DiffusionPipeline, StableDiffusionMixin):
         return image
 
     def prepare_latents(
-        self, batch_size, num_channels_latents, height, width, dtype, device
+        self, batch_size, num_channels_latents, height, width, dtype, device, generator=None
     ):
         shape = (
             batch_size,
@@ -357,7 +357,7 @@ class StableDiffusionXLFillPipeline(DiffusionPipeline, StableDiffusionMixin):
             int(width) // self.vae_scale_factor,
         )
 
-        latents = randn_tensor(shape, device=device, dtype=dtype)
+        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
 
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
@@ -389,6 +389,7 @@ class StableDiffusionXLFillPipeline(DiffusionPipeline, StableDiffusionMixin):
         num_inference_steps: int = 8,
         guidance_scale: float = 1.5,
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
+        generator: Optional[torch.Generator] = None,
     ):
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -433,6 +434,7 @@ class StableDiffusionXLFillPipeline(DiffusionPipeline, StableDiffusionMixin):
             width,
             prompt_embeds.dtype,
             device,
+            generator=generator,
         )
 
         # 7 Prepare added time ids & embeddings

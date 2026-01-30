@@ -358,17 +358,25 @@ def create_presigned_put_url(key: str, expires_in: int = 3600) -> Optional[str]:
 
 
 def validate_model(model: str) -> str:
-    """Validate model name against requirements"""
+    """Validate model name against requirements or known aliases"""
+    from pod_manager import PodManager
+    
     model_lower = model.lower()
     
     if not _model_requirements:
         return model_lower
     
-    if model_lower not in _model_requirements and model_lower != "default":
-        available = list(_model_requirements.keys())
-        raise InvalidModelError(model, available)
+    # Check if model is directly in requirements
+    if model_lower in _model_requirements or model_lower == "default":
+        return model_lower
     
-    return model_lower
+    # Check if model is a known alias that maps to a valid base model
+    base_model = PodManager.resolve_model_alias(model_lower)
+    if base_model != model_lower and base_model in _model_requirements:
+        return model_lower  # Return original model name (alias) - routing handles the rest
+    
+    available = list(_model_requirements.keys()) + list(PodManager.MODEL_ALIASES.keys())
+    raise InvalidModelError(model, available)
 
 
 async def send_fcm_notification(token: str, title: str, body: str, data: Dict = None):
@@ -2967,6 +2975,37 @@ async def submit_job(
                 if image_data:
                     job_full_params["init_image"] = image_data
                 
+                # Apply per-image outpaint config (for expand scene bulk edit)
+                if payload.bulk_outpaint_configs and image_idx < len(payload.bulk_outpaint_configs):
+                    outpaint_config = payload.bulk_outpaint_configs[image_idx]
+                    if outpaint_config:
+                        # Apply outpaint-specific params from per-image config
+                        for key in ["alignment", "aspect_ratio", "is_custom_mode",
+                                    "custom_scale", "norm_offset_x", "norm_offset_y",
+                                    "overlap_left", "overlap_right", "overlap_top", "overlap_bottom"]:
+                            if key in outpaint_config:
+                                value = outpaint_config[key]
+                                # Convert string booleans to actual booleans
+                                if value == "true":
+                                    value = True
+                                elif value == "false":
+                                    value = False
+                                # Convert numeric strings to floats where needed
+                                elif key in ["custom_scale", "norm_offset_x", "norm_offset_y"]:
+                                    try:
+                                        value = float(value)
+                                    except (ValueError, TypeError):
+                                        pass
+                                job_full_params[key] = value
+                        logger.debug(f"[BULK] Applied outpaint config for image {image_idx}: {outpaint_config}")
+                
+                # Apply per-image mask (for inpaint/erase bulk edit)
+                if payload.bulk_masks and image_idx < len(payload.bulk_masks):
+                    mask_data = payload.bulk_masks[image_idx]
+                    if mask_data:
+                        job_full_params["mask_image"] = mask_data
+                        logger.debug(f"[BULK] Applied mask for image {image_idx}")
+                
                 # Store for later dispatch (includes full base64 image)
                 job_full_params_map[job_id] = job_full_params
                 
@@ -5039,8 +5078,25 @@ async def register_worker(
     # Add IP to trusted workers
     ip_ban_manager.add_trusted_worker_ip(ip)
     
-    # Get first model (workers typically register with one model)
-    model = payload.models[0] if payload.models else "unknown"
+    # Get model name - CRITICAL: prefer tracked pod's model over worker's reported model
+    # Workers may report generic model names (e.g., "fastwan") while jobs need specific 
+    # model names (e.g., "fastwan_22_5b"). The pod was created for a specific model,
+    # so use that to ensure job dispatch can match correctly.
+    model = None
+    if _pod_manager and pod_uuid and pod_uuid in _pod_manager.individual_pods:
+        tracked_model = _pod_manager.individual_pods[pod_uuid].model
+        if tracked_model and tracked_model != "unknown":
+            model = tracked_model
+            if payload.models and payload.models[0] != tracked_model:
+                logger.info(
+                    f"Worker {payload.worker_id} reported model '{payload.models[0]}' but "
+                    f"tracked pod {pod_uuid} was created for model '{tracked_model}'. "
+                    f"Using tracked model for correct job dispatch."
+                )
+    
+    # Fallback to worker's reported model if no tracked pod model
+    if not model:
+        model = payload.models[0] if payload.models else "unknown"
     
     # Upsert worker with comprehensive error handling
     # CRITICAL: Use try/except to prevent 500 errors on weak servers
