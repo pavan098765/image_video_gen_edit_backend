@@ -435,11 +435,11 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
         target_w = canvas["target_w"]
         target_h = canvas["target_h"]
         
-        # Check if there's space on each side (threshold of 5 pixels)
-        overlap_left = paste_x > 5
-        overlap_right = (paste_x + img_w) < (target_w - 5)
-        overlap_top = paste_y > 5
-        overlap_bottom = (paste_y + img_h) < (target_h - 5)
+        # Check if there's space on each side (threshold of 15 pixels)
+        overlap_left = paste_x > 15
+        overlap_right = (paste_x + img_w) < (target_w - 15)
+        overlap_top = paste_y > 15
+        overlap_bottom = (paste_y + img_h) < (target_h - 15)
         
         print(f"[Custom Mode] Expansion edges - left:{overlap_left}, right:{overlap_right}, top:{overlap_top}, bottom:{overlap_bottom}")
     else:

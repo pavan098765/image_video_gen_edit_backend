@@ -2866,6 +2866,25 @@ async def submit_job(
     full_params = dict(payload.params) if payload.params else {}
     
     # ==========================================================================
+    # PARAM KEY NORMALIZATION
+    # ==========================================================================
+    # Frontend may send "mask" but workers expect "mask_image"
+    # Normalize key names to match worker expectations
+    if "mask" in full_params and "mask_image" not in full_params:
+        full_params["mask_image"] = full_params.pop("mask")
+        logger.debug("[PARAMS] Mapped 'mask' → 'mask_image'")
+    
+    # Frontend may send "is_custom" (string) but workers expect "is_custom_mode" (boolean)
+    if "is_custom" in full_params and "is_custom_mode" not in full_params:
+        is_custom_val = full_params.pop("is_custom")
+        # Convert string to boolean
+        if is_custom_val == "true" or is_custom_val is True:
+            full_params["is_custom_mode"] = True
+        elif is_custom_val == "false" or is_custom_val is False:
+            full_params["is_custom_mode"] = False
+        logger.debug(f"[PARAMS] Mapped 'is_custom' → 'is_custom_mode': {full_params.get('is_custom_mode')}")
+    
+    # ==========================================================================
     # VARIATIONS: VIP Feature - Max 2 for non-VIP, Max 4 for VIP
     # ==========================================================================
     max_variations = 4 if is_vip else 2
@@ -2979,10 +2998,22 @@ async def submit_job(
                 if payload.bulk_outpaint_configs and image_idx < len(payload.bulk_outpaint_configs):
                     outpaint_config = payload.bulk_outpaint_configs[image_idx]
                     if outpaint_config:
+                        # Map frontend keys to worker-expected keys
+                        # Frontend sends "is_custom" (string), worker expects "is_custom_mode" (boolean)
+                        key_mapping = {
+                            "is_custom": "is_custom_mode",  # Frontend → Worker key mapping
+                        }
+                        
+                        # Keys to extract from outpaint_config
+                        extract_keys = [
+                            "alignment", "aspect_ratio", "is_custom", "is_custom_mode",
+                            "custom_scale", "norm_offset_x", "norm_offset_y",
+                            "overlap_left", "overlap_right", "overlap_top", "overlap_bottom",
+                            "canvas_width", "canvas_height",
+                        ]
+                        
                         # Apply outpaint-specific params from per-image config
-                        for key in ["alignment", "aspect_ratio", "is_custom_mode",
-                                    "custom_scale", "norm_offset_x", "norm_offset_y",
-                                    "overlap_left", "overlap_right", "overlap_top", "overlap_bottom"]:
+                        for key in extract_keys:
                             if key in outpaint_config:
                                 value = outpaint_config[key]
                                 # Convert string booleans to actual booleans
@@ -2991,12 +3022,17 @@ async def submit_job(
                                 elif value == "false":
                                     value = False
                                 # Convert numeric strings to floats where needed
-                                elif key in ["custom_scale", "norm_offset_x", "norm_offset_y"]:
+                                elif key in ["custom_scale", "norm_offset_x", "norm_offset_y", 
+                                            "canvas_width", "canvas_height"]:
                                     try:
                                         value = float(value)
                                     except (ValueError, TypeError):
                                         pass
-                                job_full_params[key] = value
+                                
+                                # Apply key mapping (e.g., is_custom → is_custom_mode)
+                                target_key = key_mapping.get(key, key)
+                                job_full_params[target_key] = value
+                        
                         logger.debug(f"[BULK] Applied outpaint config for image {image_idx}: {outpaint_config}")
                 
                 # Apply per-image mask (for inpaint/erase bulk edit)

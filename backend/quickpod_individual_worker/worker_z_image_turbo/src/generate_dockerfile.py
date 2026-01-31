@@ -7,7 +7,7 @@ import os
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-BASE_IMAGE = "pavanalur3/deps-base-extended:py311-cu129"
+BASE_IMAGE = "pavanalur3/deps-base-new:py311-cu128"
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 WORKER_DIR = os.path.join(PROJECT_ROOT, "src")
 OUT_DOCKERFILE = os.path.join(PROJECT_ROOT, "Dockerfile")
@@ -67,12 +67,9 @@ def write_rest(f):
     f.write("\n# Worker code (last to leverage cache)\n")
     f.write("COPY src /app/worker/src\n\n")
 
-    # Install core runtime deps (minimal)
-    f.write("RUN apt-get update && apt-get install -y --no-install-recommends git \\\n")
-    f.write("    && pip install --no-cache-dir git+https://github.com/huggingface/diffusers.git \\\n")
-    # f.write("    && pip install --no-cache-dir sageattention \\\n") 
-    f.write("    && apt-get purge -y git \\\n")
-    f.write("    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*\n\n")
+    # NOTE: Base image already has diffusers installed 0.36
+    # Do NOT install from git - dev versions (0.37+) have breaking API changes
+    # that are incompatible with nunchaku's z-image transformer.
     
     # Environment variables
     f.write('ENV Z_IMAGE_TURBO_LOCAL_PATH="/app/models/z_image_turbo"\n')
