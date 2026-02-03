@@ -745,6 +745,8 @@ class PodManager:
             "fastwan_21_1b": os.getenv("FASTWAN_21_1B_TEMPLATE_UUID"),
             "fastwan_22_5b": os.getenv("FASTWAN_22_5B_TEMPLATE_UUID"),
 
+            "ltx2_video": os.getenv("LTX2_VIDEO_TEMPLATE_UUID"),
+
             "aurasrv2": os.getenv("AURASRV2_TEMPLATE_UUID"),
             "realesrgan": os.getenv("REALESRGAN_TEMPLATE_UUID"),
             "swin2sr": os.getenv("SWIN2SR_TEMPLATE_UUID"),
@@ -773,6 +775,7 @@ class PodManager:
             "z_image_turbo_int4": 80,
             "fastwan_21_1b": 60,
             "fastwan_22_5b": 60,
+            "ltx2_video": 85,  # FP4 model ~20GB + Gemma ~2GB + workspace
             "aurasrv2": 30,
             "realesrgan": 30,
             "swin2sr": 30,

@@ -2831,17 +2831,50 @@ async def submit_job(
     Returns job ID and optionally dispatches immediately if a worker is ready.
     For variations > 1 or bulk edit, returns batch_id and all job_ids.
     """
+    import datetime
+    import os
+    import json
+
     ip = get_client_ip(request)
     user_id = auth.get("user_id")
     is_vip = auth.get("is_vip", False)
-    
+
+    # Dump the request payload as JSON file (for debugging/audit)
+    try:
+        dump_dir = os.environ.get("FRONTEND_SUBMIT_DUMPS_PATH", "./frontend_submit_dumps")
+        os.makedirs(dump_dir, exist_ok=True)
+        now_str = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"{user_id or 'anon'}_{now_str}.json"
+        dump_path = os.path.join(dump_dir, filename)
+        # use payload.dict() if it's a Pydantic model
+        try:
+            payload_data = payload.dict()
+        except Exception:
+            payload_data = dict(payload)
+        # include metadata as well if needed
+        request_metadata = {
+            "ip": ip,
+            "user_id": user_id,
+            "is_vip": is_vip,
+            "timestamp_utc": now_str,
+            "auth_info": {k: v for k, v in auth.items() if k != "firebase_token"},
+        }
+        dump_contents = {
+            "metadata": request_metadata,
+            "payload": payload_data,
+        }
+        with open(dump_path, "w") as f:
+            json.dump(dump_contents, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to dump submit request to file: {e}")
+
     # Check if user account is active
     if not auth.get("is_active", True):
         raise HTTPException(
             status_code=403,
             detail="Account is disabled. Please contact support."
         )
-    
+
     # ==========================================================================
     # BULK EDIT: VIP Feature Check
     # ==========================================================================
@@ -2909,6 +2942,16 @@ async def submit_job(
         # Bulk edit: use all images from bulk_images array
         images_to_process = payload.bulk_images[:10]  # Max 10 images
         logger.info(f"[BULK] Processing {len(images_to_process)} images in bulk edit")
+        
+        # Log bulk configs for debugging
+        if payload.bulk_outpaint_configs:
+            logger.info(f"[BULK] Received {len(payload.bulk_outpaint_configs)} outpaint configs")
+            for i, cfg in enumerate(payload.bulk_outpaint_configs):
+                if cfg:
+                    logger.debug(f"[BULK] Outpaint config {i}: {cfg}")
+        if payload.bulk_masks:
+            mask_count = sum(1 for m in payload.bulk_masks if m)
+            logger.info(f"[BULK] Received {mask_count} non-null masks out of {len(payload.bulk_masks)}")
     else:
         # Single image: use init_image from params (or None for text-to-image)
         single_image = full_params.get("init_image")
@@ -2981,13 +3024,19 @@ async def submit_job(
     try:
         now = utc_naive_now()
         
+        # Determine output extension based on model type
+        # Video models output .mp4, image models output .png
+        VIDEO_MODELS = {"ltx2_video", "fastwan_21_1b", "fastwan_22_5b", "wan21", "wan22"}
+        is_video_model = model.lower() in VIDEO_MODELS or "video" in model.lower()
+        output_extension = ".mp4" if is_video_model else ".png"
+        
         # Loop through images (for bulk edit) and variations
         job_index = 0
         for image_idx, image_data in enumerate(images_to_process):
             for variation_idx in range(variations):
                 # Generate unique job ID for each job
                 job_id = str(uuid.uuid4())
-                result_key = f"{_image_prefix}/{job_id}.png"
+                result_key = f"{_image_prefix}/{job_id}{output_extension}"
                 
                 # Build full params for this specific job (with specific image)
                 job_full_params = dict(full_params)
@@ -3010,7 +3059,17 @@ async def submit_job(
                             "custom_scale", "norm_offset_x", "norm_offset_y",
                             "overlap_left", "overlap_right", "overlap_top", "overlap_bottom",
                             "canvas_width", "canvas_height",
+                            # Additional keys that might be in the config
+                            "image_width", "image_height", "image_left", "image_top",
+                            "fitted_width", "fitted_height", "offset_x", "offset_y",
                         ]
+                        
+                        # IMPORTANT: First REMOVE any existing outpaint keys from base params
+                        # This ensures per-image config always takes precedence
+                        for key in extract_keys:
+                            target_key = key_mapping.get(key, key)
+                            if target_key in job_full_params:
+                                del job_full_params[target_key]
                         
                         # Apply outpaint-specific params from per-image config
                         for key in extract_keys:
@@ -3023,7 +3082,9 @@ async def submit_job(
                                     value = False
                                 # Convert numeric strings to floats where needed
                                 elif key in ["custom_scale", "norm_offset_x", "norm_offset_y", 
-                                            "canvas_width", "canvas_height"]:
+                                            "canvas_width", "canvas_height",
+                                            "image_width", "image_height", "image_left", "image_top",
+                                            "fitted_width", "fitted_height", "offset_x", "offset_y"]:
                                     try:
                                         value = float(value)
                                     except (ValueError, TypeError):
@@ -3033,14 +3094,18 @@ async def submit_job(
                                 target_key = key_mapping.get(key, key)
                                 job_full_params[target_key] = value
                         
-                        logger.debug(f"[BULK] Applied outpaint config for image {image_idx}: {outpaint_config}")
+                        logger.info(f"[BULK] Applied outpaint config for image {image_idx}: alignment={outpaint_config.get('alignment')}, aspect={outpaint_config.get('aspect_ratio')}, is_custom={outpaint_config.get('is_custom')}")
                 
                 # Apply per-image mask (for inpaint/erase bulk edit)
                 if payload.bulk_masks and image_idx < len(payload.bulk_masks):
                     mask_data = payload.bulk_masks[image_idx]
                     if mask_data:
+                        # IMPORTANT: Remove any existing mask from base params first
+                        # This ensures per-image mask always takes precedence
+                        job_full_params.pop("mask_image", None)
+                        job_full_params.pop("mask", None)
                         job_full_params["mask_image"] = mask_data
-                        logger.debug(f"[BULK] Applied mask for image {image_idx}")
+                        logger.info(f"[BULK] Applied mask for image {image_idx} (mask size: {len(mask_data)} chars)")
                 
                 # Store for later dispatch (includes full base64 image)
                 job_full_params_map[job_id] = job_full_params

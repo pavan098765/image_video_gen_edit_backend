@@ -1195,6 +1195,8 @@ if __name__ == "__main__":
         print(f"    Templates: {json.dumps(templates, indent=2)}")
         with open("templates.json", "w") as f:
             json.dump(templates, f, indent=2)
+
+        exit()
         if templates:
             template = templates[0]
             template_uuid = template.get("template_uuid")

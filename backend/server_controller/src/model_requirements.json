@@ -177,11 +177,23 @@
         ],
         "min_gpu_count": 1
     },
+    "ltx2_video": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 120,
+        "allowed_gpu_names": [
+            "5090"
+        ],
+        "min_gpu_count": 1,
+        "max_jobs_per_pod": 1,
+        "comment": "LTX-2 Video: FP4 model (20GB), works on 5090 without OOM"
+    },
     "aurasrv2": {
         "preferred_variant": null,
         "fallback_variants": [],
         "min_tflops": 20,
         "allowed_gpu_names": [
+            "A4000",
             "5060",
             "3090",
             "3060",
