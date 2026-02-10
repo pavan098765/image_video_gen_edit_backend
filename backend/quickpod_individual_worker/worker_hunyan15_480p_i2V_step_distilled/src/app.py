@@ -1,13 +1,5 @@
-# app.py
-# ✅ LTX-2 Video Generation Worker - FastAPI Application
-# Production-ready worker with advanced features:
-# - Lazy model loading with background preloading
-# - GPU memory management for RTX 4090/5090
-# - Comprehensive health monitoring
-# - Job queue with status tracking
-# - Controller integration with heartbeat
-
 import os
+import sys
 import time
 import json
 import logging
@@ -48,8 +40,12 @@ IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 # -----------------------
 # GPU cleanup
 # -----------------------
+
 def cleanup_gpu(verbose: bool = False):
-    """Fully frees GPU memory and CUDA context."""
+    """
+    Fully frees GPU memory and CUDA context.
+    Use this between model loads to ensure a clean slate.
+    """
     try:
         if verbose:
             allocated = torch.cuda.memory_allocated() / 1024**2
@@ -80,8 +76,8 @@ def cleanup_gpu(verbose: bool = False):
 # -----------------------
 # Import inference functions
 # -----------------------
-from ltx2_video_inference import (
-    run_inference_ltx2_video,
+from hunyan15_video_inference import (
+    run_inference_hunyan15_i2v,
     preload_pipeline,
     unload_pipeline,
     get_gpu_info,
@@ -91,21 +87,58 @@ from ltx2_video_inference import (
 # Model Registry
 # -----------------------
 MODEL_REGISTRY = {
-    "ltx2_video": run_inference_ltx2_video,
-    "ltx2-video": run_inference_ltx2_video,
-    "ltx2_t2v": run_inference_ltx2_video,
-    "ltx2_i2v": run_inference_ltx2_video,
-    "ltx2_v2v": run_inference_ltx2_video,
+    "hunyan15_480p_i2v_step_distilled": run_inference_hunyan15_i2v,
 }
 
 # -----------------------
 # Logging
 # -----------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger("ltx2-worker")
+# Configure logging to write to both console and file
+LOG_FILE = os.getenv("LOG_FILE", "/app/worker/uvicorn.log")
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+
+# Create file handler
+file_handler = logging.FileHandler(LOG_FILE, mode='a')
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+file_handler.setFormatter(file_formatter)
+
+# Create console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+console_handler.setFormatter(console_formatter)
+
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+# Remove any existing handlers to avoid duplicates
+root_logger.handlers = []
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
+# Get worker logger
+logger = logging.getLogger("worker")
+
+# Create a custom print function that logs to file and prints to console
+_original_print = print
+def log_print(*args, **kwargs):
+    """Print that also writes to log file."""
+    message = ' '.join(str(arg) for arg in args)
+    # Write to log file via logger
+    logger.info(f"[PRINT] {message}")
+    # Also print to stdout (which uvicorn will capture)
+    _original_print(*args, **kwargs, file=sys.stdout, flush=True)
+
+# Store original print for internal use if needed
+import builtins
+builtins._original_print = _original_print
+
+# Replace print in this module's namespace
+print = log_print
+
+logger.info(f"Logging configured: console + file ({LOG_FILE})")
+print(f"Logging initialized: writing to {LOG_FILE}")
 
 # -----------------------
 # Configuration from env
@@ -115,7 +148,7 @@ POD_UUID = CONTAINER_ID
 PUBLIC_IPADDR = os.getenv("PUBLIC_IPADDR")
 WORKER_ID = POD_UUID
 
-MODEL_KEY = os.getenv("MODEL_KEY", "LTX2-Video")
+MODEL_KEY = os.getenv("MODEL_KEY", "hunyan15_480p_i2v_step_distilled")
 CONTROLLER_URL = os.getenv("CONTROLLER_URL", "").strip()
 CONTROLLER_SHARED_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "")
 CONTROLLER_API_KEY = os.getenv("CONTROLLER_API_KEY", "")
@@ -126,7 +159,7 @@ PORT = int(EXTERNAL_PORT) if EXTERNAL_PORT else INTERNAL_PORT
 
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "20"))
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
-DEFAULT_PIPELINE = os.getenv("LTX2_DEFAULT_PIPELINE", "distilled")
+DEFAULT_PIPELINE = os.getenv("HUNYAN15_DEFAULT_PIPELINE", "i2v")
 
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
@@ -153,8 +186,8 @@ class RunRequest(BaseModel):
     """Request model for video generation jobs."""
     job_id: str = Field(..., description="Unique job identifier")
     prompt: str = Field(..., description="Text prompt for video generation")
-    model: str = Field(..., description="Model key (ltx2_video, ltx2_t2v, ltx2_i2v, ltx2_v2v)")
-    mode: Optional[str] = Field(None, description="Generation mode: text-to-video, image-to-video, video-to-video, keyframe-interpolation")
+    model: str = Field(..., description="Model key (hunyan15_480p_i2v_step_distilled)")
+    mode: Optional[str] = Field(None, description="Generation mode: image-to-video step distilled 480p")
     params: Dict[str, Any] = Field(default_factory=dict, description="Generation parameters")
     upload_url: str = Field(..., description="URL to upload result")
     result_key: str = Field(..., description="R2 key for result")
@@ -332,7 +365,16 @@ def resolve_inference_callable(model: str, mode: Optional[str]):
 async def run_inference_and_save(
     job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]
 ) -> str:
-    """Run inference in dedicated thread pool."""
+    """Run inference in dedicated thread pool.
+    Params for model:
+            - num_frames (int): Number of frames (default: 121)
+            - num_inference_steps (int): Denoising steps (default: 12)
+            - seed (int): Random seed
+            - fps (int): Frames per second (default: 24)
+            - output_dir (str): Output directory
+            - init_image (str): Base64 encoded image (required for i2v)
+            Note: guidance_scale is not supported by HunyuanVideo15ImageToVideoPipeline
+    """
     global last_model_key
     loop = asyncio.get_event_loop()
     params = params.copy()
@@ -350,7 +392,26 @@ async def run_inference_and_save(
         cleanup_gpu()
 
     try:
-        out_path = await loop.run_in_executor(INFERENCE_EXECUTOR, inference_func, job_id, prompt, params)
+        # Extract image_input from params for i2v models
+        # The image can be passed as "init_image" or "image" in params
+        image_input = params.pop("init_image", None) or params.pop("image", None)
+        
+        # For i2v models, image_input is required
+        if model == "hunyan15_480p_i2v_step_distilled":
+            if not image_input:
+                raise ValueError(
+                    "image_input is required for i2v models. "
+                    "Provide 'init_image' or 'image' in params (base64 encoded image or URL)."
+                )
+            # Pass image_input as separate argument for i2v models
+            out_path = await loop.run_in_executor(
+                INFERENCE_EXECUTOR, inference_func, job_id, prompt, image_input, params
+            )
+        else:
+            # For models that don't need image_input, call without it
+            out_path = await loop.run_in_executor(
+                INFERENCE_EXECUTOR, inference_func, job_id, prompt, params
+            )
         return out_path
     finally:
         last_model_key = model_key
@@ -383,8 +444,23 @@ async def process_job_item(item: Dict[str, Any]):
     try:
         async with semaphore:
             logger.info(f"[{job_id}] Starting inference...")
-            out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
-            logger.info(f"[{job_id}] Inference completed, output: {out_local}")
+            logger.info(f"[{job_id}] Inference parameters: model={model}, mode={mode}, output_dir={params.get('output_dir', 'default')}")
+            try:
+                out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
+                logger.info(f"[{job_id}] ✅ Inference completed successfully, output: {out_local}")
+                
+                # Verify output file exists
+                if out_local and os.path.exists(out_local):
+                    file_size = os.path.getsize(out_local) / 1024 / 1024  # MB
+                    logger.info(f"[{job_id}] ✅ Output file verified: {out_local} ({file_size:.2f} MB)")
+                else:
+                    logger.warning(f"[{job_id}] ⚠️ Output file not found: {out_local}")
+            except Exception as inference_error:
+                error_type = type(inference_error).__name__
+                error_msg = str(inference_error)
+                logger.error(f"[{job_id}] ❌ Inference error: {error_type}: {error_msg}")
+                logger.exception(f"[{job_id}] Full inference traceback (logged to uvicorn.log):")
+                raise
 
             # Upload result
             if upload_url.startswith("http://dummy-upload"):
@@ -572,13 +648,15 @@ async def run_autotest():
     Run comprehensive auto-test to verify all worker modes are functioning.
     
     Tests:
-    1. Text-to-Video (T2V) - Basic text prompt to video
-    2. Image-to-Video (I2V) - Animate an image (downloads and converts to base64)
-    3. Video-to-Video (V2V) - Transform a video (skipped - no test video)
-    4. Keyframe Interpolation - Interpolate between keyframes (downloads and converts to base64)
+    1. Image-to-Video (I2V) - Animate an image (downloads and converts to base64)
     """
+    logger.info("🚀 Autotest function called - starting in 5 seconds...")
+    print("AUTOTEST: Function called - starting in 5 seconds...")
     await asyncio.sleep(5)
-    logger.info("🚀 Starting LTX-2 Video comprehensive auto-test")
+    logger.info("🚀 Starting Hunyan15 480p I2V Step Distilled Video comprehensive auto-test")
+    print("=" * 80)
+    print("AUTOTEST: Starting comprehensive auto-test")
+    print("=" * 80)
     
     # Check GPU VRAM
     try:
@@ -595,10 +673,9 @@ async def run_autotest():
     TEST_VIDEO_URL = None  # V2V test will be skipped if no test video available
     
     autotest_results = {
-        "t2v": None,
+       
         "i2v": None,
-        "v2v": None,
-        "keyframe": None,
+      
     }
 
     async with httpx.AsyncClient(timeout=600.0) as client:
@@ -606,8 +683,7 @@ async def run_autotest():
         # Pre-download test images and convert to base64
         logger.info("📥 Downloading test images...")
         test_image_b64 = None
-        keyframe1_b64 = None
-        keyframe2_b64 = None
+       
         
         try:
             test_image_b64 = await download_image_as_base64(TEST_IMAGE_URL, client)
@@ -615,73 +691,30 @@ async def run_autotest():
         except Exception as e:
             logger.error(f"❌ Failed to download test image: {e}")
         
-        try:
-            KEYFRAME_1_URL = "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=768&h=512&fit=crop"
-            KEYFRAME_2_URL = "https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?w=768&h=512&fit=crop"
-            keyframe1_b64 = await download_image_as_base64(KEYFRAME_1_URL, client)
-            keyframe2_b64 = await download_image_as_base64(KEYFRAME_2_URL, client)
-            logger.info(f"✅ Keyframe images downloaded")
-        except Exception as e:
-            logger.error(f"❌ Failed to download keyframe images: {e}")
-        
         # ═══════════════════════════════════════════════════════════════
-        # TEST 1: Text-to-Video (T2V)
+        # TEST 1: Image-to-Video (I2V)
         # ═══════════════════════════════════════════════════════════════
         logger.info("━" * 50)
-        logger.info("🎬 TEST 1/4: Text-to-Video (T2V)")
-        logger.info("━" * 50)
-        
-        t2v_job_id = f"autotest-ltx2-t2v-{uuid.uuid4().hex[:8]}"
-        t2v_params = {
-            "mode": "text-to-video",
-            "height": 512,
-            "width": 768,
-            "duration": 2.0,
-            "num_inference_steps": 8,
-            "guidance_scale": 3.0,
-            "output_dir": "./outputs",
-        }
-        
-        try:
-            resp = await client.post(
-                "http://127.0.0.1:8000/run",
-                json={
-                    "job_id": t2v_job_id,
-                    "prompt": "A cinematic drone shot of mountains at sunrise, smooth camera movement, golden hour lighting",
-                    "model": "ltx2_video",
-                    "mode": "text-to-video",
-                    "params": t2v_params,
-                    "upload_url": "http://dummy-upload/skip",
-                    "result_key": f"{t2v_job_id}.mp4",
-                },
-            )
-            autotest_results["t2v"] = resp.status_code == 200
-            logger.info(f"{'✅' if resp.status_code == 200 else '❌'} T2V test: {resp.status_code}")
-        except Exception as e:
-            autotest_results["t2v"] = False
-            logger.error(f"❌ T2V test failed: {e}")
-        
-        # Wait for T2V to complete before next test
-        await asyncio.sleep(30)
-        
-        # ═══════════════════════════════════════════════════════════════
-        # TEST 2: Image-to-Video (I2V)
-        # ═══════════════════════════════════════════════════════════════
-        logger.info("━" * 50)
-        logger.info("🖼️ TEST 2/4: Image-to-Video (I2V)")
+        logger.info("🖼️ TEST 1/1: Image-to-Video (I2V)")
         logger.info("━" * 50)
         
         if test_image_b64:
-            i2v_job_id = f"autotest-ltx2-i2v-{uuid.uuid4().hex[:8]}"
+            i2v_job_id = f"autotest-hunyan15_480p_i2V_step_distilled-i2v-{uuid.uuid4().hex[:8]}"
+            
+            # Create autotest output directory with absolute path
+            autotest_output_dir = os.path.join(WORKSPACE_DIR, "autotest_outputs")
+            os.makedirs(autotest_output_dir, exist_ok=True)
+            logger.info(f"📁 Autotest output directory: {autotest_output_dir}")
+            
             i2v_params = {
-                "mode": "image-to-video",
-                "height": 512,
+                "mode": "image-to-video 480p i2v step distilled",
+                "height": 480,
                 "width": 768,
-                "duration": 2.0,
-                "num_inference_steps": 8,
-                "guidance_scale": 3.0,
+                "duration": 5.0,
+                "num_inference_steps": 12,
+                "cfg_scale": 7.5,
                 "init_image": test_image_b64,  # Base64 encoded image
-                "output_dir": "./outputs",
+                "output_dir": autotest_output_dir,  # Use absolute path
             }
             
             try:
@@ -690,7 +723,7 @@ async def run_autotest():
                     json={
                         "job_id": i2v_job_id,
                         "prompt": "The mountains come alive with flowing clouds and gentle wind, cinematic movement",
-                        "model": "ltx2_i2v",
+                        "model": "hunyan15_480p_i2v_step_distilled",
                         "mode": "image-to-video",
                         "params": i2v_params,
                         "upload_url": "http://dummy-upload/skip",
@@ -699,106 +732,112 @@ async def run_autotest():
                 )
                 autotest_results["i2v"] = resp.status_code == 200
                 logger.info(f"{'✅' if resp.status_code == 200 else '❌'} I2V test: {resp.status_code}")
+                
+                if resp.status_code == 200:
+                    # Wait for job to complete and check if video file exists
+                    expected_video_path = os.path.join(autotest_output_dir, f"i2v_{i2v_job_id}.mp4")
+                    logger.info(f"⏳ Waiting for video generation... (checking: {expected_video_path})")
+                    
+                    # Wait up to 5 minutes for video to be generated (video generation can take 2-4 minutes)
+                    max_wait = 300
+                    waited = 0
+                    video_found = False
+                    job_completed = False
+                    
+                    while waited < max_wait:
+                        await asyncio.sleep(5)
+                        waited += 5
+                        
+                        # Check if video file exists
+                        if os.path.exists(expected_video_path):
+                            file_size = os.path.getsize(expected_video_path)
+                            logger.info(f"✅ Autotest video saved: {expected_video_path} ({file_size / 1024 / 1024:.2f} MB)")
+                            video_found = True
+                            break
+                        
+                        # Check job status
+                        async with job_status_lock:
+                            job_info = job_status.get(i2v_job_id, {})
+                            job_status_str = job_info.get("status", "unknown")
+                            
+                            if job_status_str == "completed":
+                                job_completed = True
+                                if not video_found:
+                                    # Job completed but video not found - check for errors
+                                    if "error" in job_info:
+                                        error_msg = job_info.get("error", "Unknown error")
+                                        error_type = job_info.get("error_type", "Unknown")
+                                        logger.error(f"❌ Job completed with error: {error_type}: {error_msg}")
+                                        autotest_results["i2v"] = False
+                                    else:
+                                        logger.warning(f"⚠️ Job marked as completed but video file not found")
+                                        autotest_results["i2v"] = False
+                                else:
+                                    # Job completed and video found
+                                    autotest_results["i2v"] = True
+                                break
+                            elif job_status_str == "failed":
+                                error_msg = job_info.get("error", "Unknown error")
+                                error_type = job_info.get("error_type", "Unknown")
+                                processing_time = job_info.get("processing_time", 0)
+                                logger.error(f"❌ Job failed after {processing_time:.1f}s: {error_type}: {error_msg}")
+                                logger.error(f"❌ Full error details logged to uvicorn.log")
+                                autotest_results["i2v"] = False
+                                break
+                        
+                        if waited % 30 == 0:
+                            logger.info(f"⏳ Still waiting for video... ({waited}s elapsed, job status: {job_status_str if 'job_status_str' in locals() else 'checking...'})")
+                    
+                    # Final status check
+                    if not video_found and not job_completed:
+                        # Check job status one more time
+                        async with job_status_lock:
+                            final_job_info = job_status.get(i2v_job_id, {})
+                            final_status = final_job_info.get("status", "unknown")
+                            
+                            if final_status == "failed":
+                                error_msg = final_job_info.get("error", "Unknown error")
+                                error_type = final_job_info.get("error_type", "Unknown")
+                                logger.error(f"❌ Job failed: {error_type}: {error_msg}")
+                                logger.error(f"❌ Check uvicorn.log for full error traceback")
+                                autotest_results["i2v"] = False
+                            elif final_status == "completed":
+                                logger.warning(f"⚠️ Job completed but video file not found: {expected_video_path}")
+                                autotest_results["i2v"] = False
+                            else:
+                                logger.warning(f"⚠️ Video file not found after {max_wait}s: {expected_video_path}")
+                                logger.warning(f"⚠️ Job status: {final_status} (may still be processing)")
+                                autotest_results["i2v"] = False
+                        
+                        # List files in output directory for debugging
+                        if os.path.exists(autotest_output_dir):
+                            files = os.listdir(autotest_output_dir)
+                            logger.info(f"📂 Files in output directory: {files}")
+                        else:
+                            logger.warning(f"⚠️ Output directory does not exist: {autotest_output_dir}")
+                        
+                        # Check all files in workspace for debugging
+                        if os.path.exists(WORKSPACE_DIR):
+                            all_files = []
+                            for root, dirs, files in os.walk(WORKSPACE_DIR):
+                                for f in files:
+                                    if f.endswith('.mp4'):
+                                        all_files.append(os.path.join(root, f))
+                            if all_files:
+                                logger.info(f"📂 Found MP4 files in workspace: {all_files}")
+                else:
+                    logger.error(f"❌ I2V test failed with status {resp.status_code}")
+                    
             except Exception as e:
                 autotest_results["i2v"] = False
                 logger.error(f"❌ I2V test failed: {e}")
-            
-            # Wait for I2V to complete
-            await asyncio.sleep(30)
+                import traceback
+                logger.exception("Full traceback:")
         else:
             logger.info("⏩ I2V test skipped (failed to download test image)")
             autotest_results["i2v"] = "skipped"
         
-        # ═══════════════════════════════════════════════════════════════
-        # TEST 3: Video-to-Video (V2V)
-        # ═══════════════════════════════════════════════════════════════
-        logger.info("━" * 50)
-        logger.info("🎥 TEST 3/4: Video-to-Video (V2V)")
-        logger.info("━" * 50)
         
-        if TEST_VIDEO_URL:
-            v2v_job_id = f"autotest-ltx2-v2v-{uuid.uuid4().hex[:8]}"
-            v2v_params = {
-                "mode": "video-to-video",
-                "height": 512,
-                "width": 768,
-                "num_inference_steps": 8,
-                "guidance_scale": 3.0,
-                "init_video": TEST_VIDEO_URL,
-                "strength": 0.7,  # How much to transform the video
-                "output_dir": "./outputs",
-            }
-            
-            try:
-                resp = await client.post(
-                    "http://127.0.0.1:8000/run",
-                    json={
-                        "job_id": v2v_job_id,
-                        "prompt": "Transform into an oil painting style with vibrant colors",
-                        "model": "ltx2_v2v",
-                        "mode": "video-to-video",
-                        "params": v2v_params,
-                        "upload_url": "http://dummy-upload/skip",
-                        "result_key": f"{v2v_job_id}.mp4",
-                    },
-                )
-                autotest_results["v2v"] = resp.status_code == 200
-                logger.info(f"{'✅' if resp.status_code == 200 else '❌'} V2V test: {resp.status_code}")
-            except Exception as e:
-                autotest_results["v2v"] = False
-                logger.error(f"❌ V2V test failed: {e}")
-            
-            await asyncio.sleep(30)
-        else:
-            logger.info("⏩ V2V test skipped (no TEST_VIDEO_URL configured)")
-            autotest_results["v2v"] = "skipped"
-        
-        # ═══════════════════════════════════════════════════════════════
-        # TEST 4: Keyframe Interpolation
-        # ═══════════════════════════════════════════════════════════════
-        logger.info("━" * 50)
-        logger.info("🔀 TEST 4/4: Keyframe Interpolation")
-        logger.info("━" * 50)
-        
-        if keyframe1_b64 and keyframe2_b64:
-            keyframe_job_id = f"autotest-ltx2-keyframe-{uuid.uuid4().hex[:8]}"
-            # Keyframes format: list of dicts with image (base64), frame_index, strength
-            keyframe_params = {
-                "mode": "keyframe-interpolation",
-                "height": 512,
-                "width": 768,
-                "num_frames": 49,  # About 2 seconds at 25fps
-                "num_inference_steps": 8,
-                "guidance_scale": 3.0,
-                "keyframes": [
-                    {"image": keyframe1_b64, "frame_index": 0, "strength": 1.0},
-                    {"image": keyframe2_b64, "frame_index": 48, "strength": 1.0},
-                ],
-                "output_dir": "./outputs",
-            }
-            
-            try:
-                resp = await client.post(
-                    "http://127.0.0.1:8000/run",
-                    json={
-                        "job_id": keyframe_job_id,
-                        "prompt": "Smooth cinematic transition between mountain landscapes, flowing clouds",
-                        "model": "ltx2_video",
-                        "mode": "keyframe-interpolation",
-                        "params": keyframe_params,
-                        "upload_url": "http://dummy-upload/skip",
-                        "result_key": f"{keyframe_job_id}.mp4",
-                    },
-                )
-                autotest_results["keyframe"] = resp.status_code == 200
-                logger.info(f"{'✅' if resp.status_code == 200 else '❌'} Keyframe test: {resp.status_code}")
-            except Exception as e:
-                autotest_results["keyframe"] = False
-                logger.error(f"❌ Keyframe test failed: {e}")
-        else:
-            logger.info("⏩ Keyframe test skipped (failed to download keyframe images)")
-            autotest_results["keyframe"] = "skipped"
-    
     # ═══════════════════════════════════════════════════════════════
     # SUMMARY
     # ═══════════════════════════════════════════════════════════════
@@ -837,24 +876,40 @@ def _preload_model_sync():
     global _model_loading_complete, _model_loading_error
     
     try:
-        logger.info("🔄 Starting model preload in background thread...")
+        logger.info(f"🔄 Starting model preload in background thread... (pipeline={DEFAULT_PIPELINE})")
+        print(f"MODEL PRELOAD: Starting in background thread (pipeline={DEFAULT_PIPELINE})")
+        sys.stdout.flush()
         start_time = time.time()
         
+        logger.info(f"📞 Calling preload_pipeline('{DEFAULT_PIPELINE}')...")
+        print(f"MODEL PRELOAD: Calling preload_pipeline('{DEFAULT_PIPELINE}')...")
+        sys.stdout.flush()
         success = preload_pipeline(DEFAULT_PIPELINE)
+        logger.info(f"📞 preload_pipeline returned: {success}")
+        print(f"MODEL PRELOAD: preload_pipeline returned {success}")
+        sys.stdout.flush()
         
         elapsed = time.time() - start_time
         
         if success:
             logger.info(f"✅ Model preloaded successfully in {elapsed:.1f}s")
+            print(f"MODEL PRELOAD: SUCCESS in {elapsed:.1f}s")
+            sys.stdout.flush()
             _model_loading_complete = True
             _model_loading_error = None
         else:
             logger.error("❌ Model preload returned failure")
+            print("MODEL PRELOAD: FAILED - preload_pipeline returned False")
+            sys.stdout.flush()
             _model_loading_error = "Preload returned False"
             _model_loading_complete = False
             
     except Exception as e:
         logger.exception(f"❌ Model preload failed: {e}")
+        print(f"MODEL PRELOAD: EXCEPTION - {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
         _model_loading_error = str(e)
         _model_loading_complete = False
 
@@ -885,8 +940,10 @@ async def _wait_for_model_and_register():
     
     if startup_completed:
         logger.info("✅ Model loaded, worker is now READY")
+        logger.info(f"✅ startup_completed={startup_completed}, _model_loading_complete={_model_loading_complete}")
     else:
         logger.warning("⚠️ Worker starting but model not fully loaded")
+        logger.warning(f"⚠️ startup_completed={startup_completed}, _model_loading_complete={_model_loading_complete}, _model_loading_error={_model_loading_error}")
     
     # Register with controller
     try:
@@ -896,8 +953,20 @@ async def _wait_for_model_and_register():
         logger.exception("Failed to register worker: %s", e)
     
     # Run autotest
-    if startup_completed and os.getenv("ENABLE_AUTOTEST", "1") == "1":
+    enable_autotest = os.getenv("ENABLE_AUTOTEST", "1") == "1"
+    logger.info(f"🔍 Autotest check: startup_completed={startup_completed}, ENABLE_AUTOTEST={os.getenv('ENABLE_AUTOTEST', '1')}, enable_autotest={enable_autotest}")
+    print(f"AUTOTEST CHECK: startup_completed={startup_completed}, ENABLE_AUTOTEST={os.getenv('ENABLE_AUTOTEST', '1')}, enable_autotest={enable_autotest}")
+    if startup_completed and enable_autotest:
+        logger.info("✅ Starting autotest task...")
+        print("AUTOTEST: Starting autotest task...")
         asyncio.create_task(run_autotest())
+    else:
+        if not startup_completed:
+            logger.warning("⚠️ Autotest skipped: startup_completed is False (model may not have loaded)")
+            print(f"AUTOTEST: SKIPPED - startup_completed={startup_completed}, _model_loading_complete={_model_loading_complete}")
+        if not enable_autotest:
+            logger.info("ℹ️ Autotest disabled via ENABLE_AUTOTEST env var")
+            print("AUTOTEST: DISABLED via ENABLE_AUTOTEST env var")
 
 
 # -----------------------
@@ -973,7 +1042,10 @@ async def _record_job_status_later(job_id: str, model: str):
 async def lifespan(app: FastAPI):
     global startup_completed
     
-    logger.info("🚀 LTX-2 Video Worker starting up...")
+    logger.info("🚀 Hunyan15 480p I2V Step Distilled Worker starting up...")
+    print("=" * 80)
+    print("WORKER STARTUP: Hunyan15 480p I2V Step Distilled Worker")
+    print("=" * 80)
     
     # Start background tasks
     asyncio.create_task(worker_loop())
@@ -984,13 +1056,17 @@ async def lifespan(app: FastAPI):
     
     # Start model loading in dedicated thread
     loop = asyncio.get_event_loop()
-    logger.info("🔄 Starting model preload in INFERENCE_EXECUTOR thread...")
+    logger.info(f"🔄 Starting model preload in INFERENCE_EXECUTOR thread... (DEFAULT_PIPELINE={DEFAULT_PIPELINE})")
+    logger.info(f"🔄 ENABLE_AUTOTEST={os.getenv('ENABLE_AUTOTEST', '1')}")
+    print(f"MODEL PRELOAD: Starting with DEFAULT_PIPELINE={DEFAULT_PIPELINE}")
+    print(f"AUTOTEST: ENABLE_AUTOTEST={os.getenv('ENABLE_AUTOTEST', '1')}")
     loop.run_in_executor(INFERENCE_EXECUTOR, _preload_model_sync)
     
     # Wait for model and register
     asyncio.create_task(_wait_for_model_and_register())
     
     logger.info("📡 Worker starting - model loading in background, health endpoint responding")
+    print("WORKER: Background tasks started, model loading in progress...")
     
     yield
     
@@ -1024,7 +1100,7 @@ async def lifespan(app: FastAPI):
 # -----------------------
 app = FastAPI(
     title=f"QuickPod Worker ({MODEL_KEY})",
-    description="LTX-2 Video Generation Worker - Text-to-Video, Image-to-Video, Video-to-Video",
+    description="Hunyan15 480p Image-to-Video Step Distilled Worker",
     version="2.0.0",
     lifespan=lifespan
 )

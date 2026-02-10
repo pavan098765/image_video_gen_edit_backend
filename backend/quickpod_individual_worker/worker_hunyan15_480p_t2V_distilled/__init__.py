@@ -1,1 +1,1 @@
-# LTX-2 Video Generation Worker
+# Hunyan15 480p T2V Distilled Worker

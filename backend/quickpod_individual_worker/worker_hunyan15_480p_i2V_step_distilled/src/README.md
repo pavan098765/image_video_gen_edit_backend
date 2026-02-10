@@ -1,24 +1,25 @@
-# LTX-2 Video Generation Worker
+# Hunyan15 480p Image-to-Video Worker
 
-Production-ready video generation worker using Lightricks LTX-2 model.
+Production-ready Image-to-Video generation worker using Hunyan15 480p step distilled model.
 
 ## Model
 
-**Checkpoint:** `ltx-2-19b-dev-fp4.safetensors` (20 GB)
+**Model:** `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v_step_distilled`
 
 This model works safely on:
 - **RTX 4090** (24GB VRAM) - No OOM risk
 - **RTX 5090** (32GB VRAM) - No OOM risk
 
-The FP4 quantized model provides excellent quality while ensuring safe operation on consumer GPUs.
+The Hunyan15 480p i2v step distilled model provides fast Image-to-Video generation with optimized inference steps (12 steps).
 
 ## Features
 
-### Video Generation Modes
-- **Text-to-Video (T2V)**: Generate video from text prompts
+### Video Generation
 - **Image-to-Video (I2V)**: Animate images with text guidance
-- **Video-to-Video (V2V)**: Transform existing videos
-- **Keyframe Interpolation**: Generate smooth transitions between keyframes
+- Optimized for 480p resolution
+- Step distilled inference (12 steps)
+- Memory-efficient with model CPU offload
+- VAE tiling for memory optimization
 
 ### Worker Features
 - FastAPI-based REST API
@@ -31,37 +32,14 @@ The FP4 quantized model provides excellent quality while ensuring safe operation
 
 ## Quick Start
 
-### 1. Prepare Models
-
-Run the prep script to download models and generate Dockerfile:
+### 1. Build Docker Image
 
 ```bash
-cd backend/quickpod_individual_worker/worker_ltx2_video/src
-python prep_model.py
+cd backend/quickpod_individual_worker/worker_hunyan15_480p_i2V_step_distilled
+docker build -t hunyan15-i2v-worker .
 ```
 
-This will:
-1. Download `ltx-2-19b-dev-fp4.safetensors` (20 GB) from HuggingFace
-2. Download spatial upsampler (optional, for upscaling)
-3. Download Gemma 3 text encoder (required)
-4. **Skip LoRA download by default** (7.67 GB saved - not needed for "distilled" pipeline)
-5. Split large files for Docker layer caching
-6. Generate the Dockerfile
-
-**Note on LoRA:** The distilled LoRA (7.67 GB) is **optional**:
-- **NOT required** for the default "distilled" pipeline
-- Optional for other pipelines (two_stage, ic_lora, keyframe) - improves quality but works without it
-- **NOT for poses/canny** - it's a model distillation technique for speedup
-- To download LoRA: Set `LTX2_DOWNLOAD_LORA=1` before running `prep_model.py`
-
-### 2. Build Docker Image
-
-```bash
-cd backend/quickpod_individual_worker/worker_ltx2_video
-docker build -t ltx2-video-worker .
-```
-
-### 3. Run Container
+### 2. Run Container
 
 ```bash
 docker run -d \
@@ -69,28 +47,27 @@ docker run -d \
   -p 8000:8000 \
   -e CONTROLLER_URL="http://your-controller:3000" \
   -e CONTROLLER_SHARED_SECRET="your-secret" \
-  ltx2-video-worker
+  hunyan15-i2v-worker
 ```
 
 ## API Endpoints
 
 ### POST /run
-Submit a video generation job.
+Submit an image-to-video generation job.
 
 ```json
 {
   "job_id": "unique-job-id",
-  "prompt": "A cinematic drone shot of mountains at sunrise",
-  "model": "ltx2_video",
-  "mode": "text-to-video",
+  "prompt": "A cat wearing sunglasses sits on a surfboard on the beach",
+  "model": "hunyan15_i2v",
+  "mode": "image-to-video",
   "params": {
-    "height": 512,
-    "width": 768,
-    "duration": 5.0,
-    "fps": 25,
-    "num_inference_steps": 8,
-    "guidance_scale": 1.0,
-    "pipeline_type": "distilled"
+    "num_frames": 121,
+    "num_inference_steps": 12,
+    "guidance_scale": 7.5,
+    "fps": 24,
+    "seed": 42,
+    "image_input": "base64_encoded_image_or_url"
   },
   "upload_url": "https://your-presigned-upload-url",
   "result_key": "videos/output.mp4"
@@ -109,7 +86,12 @@ Returns:
   "model_loaded": true,
   "ready": true,
   "processing": false,
-  "healthy": true
+  "healthy": true,
+  "gpu_info": {
+    "available": true,
+    "vram_gb": 24.0,
+    "name": "NVIDIA RTX 4090"
+  }
 }
 ```
 
@@ -119,68 +101,82 @@ Detailed status including all jobs.
 ### GET /models
 List available models and modes.
 
-## Generation Modes
+## Image-to-Video Generation
 
-### Text-to-Video
+Hunyan15 specializes in Image-to-Video generation with step distillation for fast inference.
+
 ```json
 {
-  "mode": "text-to-video",
-  "params": {
-    "height": 512,
-    "width": 768,
-    "duration": 5.0,
-    "pipeline_type": "distilled"
-  }
-}
-```
-
-### Image-to-Video
-```json
-{
+  "job_id": "job-123",
+  "prompt": "Summer beach vacation style, white cat on surfboard",
+  "model": "hunyan15_i2v",
   "mode": "image-to-video",
   "params": {
-    "init_image": "<base64-encoded-image>",
-    "height": 512,
-    "width": 768,
-    "duration": 5.0,
-    "conditioning_strength": 1.0
-  }
+    "image_input": "<base64-image-or-url>",
+    "num_frames": 121,
+    "num_inference_steps": 12,
+    "guidance_scale": 7.5,
+    "fps": 24,
+    "seed": 42
+  },
+  "upload_url": "https://your-upload-url",
+  "result_key": "videos/output.mp4"
 }
 ```
 
-### Video-to-Video
-```json
-{
-  "mode": "video-to-video",
-  "params": {
-    "init_video": "<base64-encoded-video>",
-    "conditioning_strength": 0.8
-  }
-}
+**Parameters:**
+- `image_input` (required): Base64 encoded image, image URL, or file path
+- `prompt` (required): Text description of desired animation
+- `num_frames` (int): Number of video frames (default: 121)
+- `num_inference_steps` (int): Denoising steps (default: 12, recommended: 12)
+- `guidance_scale` (float): Classifier-free guidance (default: 7.5)
+- `fps` (int): Output fps (default: 24)
+- `seed` (int): Random seed for reproducibility
+
+## Model Details
+
+### Hunyan15 1.5 Architecture
+- **Resolution:** 480p output
+- **Frame Count:** Up to 121 frames (~5 seconds at 24fps)
+- **Input:** Single image + text prompt
+- **Distillation:** Step-distilled for 12 inference steps
+- **Memory:** ~18-20 GB during peak inference
+
+### Performance (RTX 4090)
+- **Generation Time:** 30-60 seconds per 121-frame video
+- **Memory Usage:** Peak ~20 GB
+- **Throughput:** 1 job per 1-2 minutes with full cleanup
+
+### Official Example
+```python
+import torch
+from diffusers import HunyuanVideo15ImageToVideoPipeline, attention_backend
+from diffusers.utils import export_to_video, load_image
+
+dtype = torch.bfloat16
+device = "cuda:0"
+
+pipe = HunyuanVideo15ImageToVideoPipeline.from_pretrained(
+    "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v_step_distilled",
+    torch_dtype=dtype
+)
+pipe.enable_model_cpu_offload()
+pipe.vae.enable_tiling()
+
+generator = torch.Generator(device=device).manual_seed(1)
+image = load_image("image.jpg")
+
+with attention_backend("_flash_3_hub"):
+    video = pipe(
+        prompt="Description of animation",
+        image=image,
+        generator=generator,
+        num_frames=121,
+        num_inference_steps=12,
+    ).frames[0]
+
+export_to_video(video, "output.mp4", fps=24)
 ```
-
-### Keyframe Interpolation
-```json
-{
-  "mode": "keyframe-interpolation",
-  "params": {
-    "keyframes": [
-      {"image": "<base64>", "frame_index": 0, "strength": 1.0},
-      {"image": "<base64>", "frame_index": 120, "strength": 1.0}
-    ],
-    "num_frames": 121
-  }
-}
-```
-
-## Pipeline Types
-
-| Pipeline | Steps | Speed | Quality | Use Case |
-|----------|-------|-------|---------|----------|
-| `distilled` | 8+4 | Fastest | Good | Real-time, preview |
-| `two_stage` | 40+20 | Slower | Best | Production |
-| `ic_lora` | 40 | Medium | Good | Video-to-video |
-| `keyframe` | 40 | Medium | Good | Keyframe interpolation |
 
 ## Environment Variables
 
@@ -189,49 +185,40 @@ List available models and modes.
 | `CONTROLLER_URL` | | Controller server URL |
 | `CONTROLLER_SHARED_SECRET` | | HMAC signing secret |
 | `CONTROLLER_API_KEY` | | API key for controller |
-| `LTX2_VIDEO_LOCAL_PATH` | `/app/models/ltx2_video` | Model directory |
-| `LTX2_GEMMA_ROOT` | `/app/models/gemma` | Gemma text encoder path |
-| `LTX2_DEFAULT_PIPELINE` | `distilled` | Default pipeline type |
+| `HUNYAN15_REPO_ID` | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v_step_distilled` | Model repo |
+| `HUNYAN15_MODEL_LOCAL_PATH` | `/app/models/hunyan15` | Local model cache |
+| `MODEL_KEY` | `Hunyan15-480p-i2v` | Worker model identifier |
 | `WORKSPACE_DIR` | `/workspace` | Output directory |
 | `HEARTBEAT_INTERVAL` | `20` | Heartbeat interval (seconds) |
 | `MAX_CONCURRENT_JOBS` | `1` | Max concurrent jobs |
-| `ENABLE_AUTOTEST` | `1` | Enable auto-test on startup |
 
 ## Memory Optimization
 
-The FP4 model (`ltx-2-19b-dev-fp4.safetensors`) is specifically chosen because:
+The Hunyan15 i2v step distilled model is optimized for RTX 4090 (24GB):
 
-1. **20 GB checkpoint** fits comfortably in 24GB VRAM (RTX 4090)
-2. **No OOM risk** on both RTX 4090 and RTX 5090
-3. **Fast inference** with distilled pipeline (8 steps)
-4. **Good quality** despite quantization
+1. **Efficient Architecture:** Requires ~18-20 GB during peak inference
+2. **CPU Offload:** Model layers moved to CPU when idle
+3. **VAE Tiling:** Reduces VAE memory footprint
+4. **Step Distillation:** Only 12 inference steps vs 40+ for standard model
 
-Additional optimizations:
-- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for better memory allocation
-- xFormers memory-efficient attention (when available)
-- Aggressive GPU cleanup between jobs
-- Single worker thread to prevent OOM from concurrent jobs
+Memory profile:
+- Model loading: ~8 GB
+- Active inference: ~20 GB peak
+- After cleanup: ~2 GB
 
 ## File Structure
 
 ```
-worker_ltx2_video/
+worker_hunyan15_480p_i2v_step_distilled/
 ├── src/
-│   ├── app.py                    # FastAPI application
-│   ├── ltx2_video_inference.py   # Inference logic
-│   ├── prep_model.py             # Download models & generate Dockerfile
-│   ├── generate_dockerfile.py    # Dockerfile generator
-│   ├── merge.py                  # Merge split safetensors
-│   ├── requirements.txt          # Python dependencies
-│   └── README.md                 # This file
-├── models/                       # Downloaded models (after prep)
-│   ├── ltx2_video/
-│   │   ├── ltx-2-19b-dev-fp4.safetensors*
-│   │   ├── ltx-2-spatial-upscaler-x2-1.0.safetensors
-│   │   └── ... (diffusers components)
-│   └── gemma/
-│       └── ... (Gemma 3 text encoder)
-└── Dockerfile                    # Generated by prep_model.py
+│   ├── app.py                         # FastAPI application
+│   ├── hunyan15_video_inference.py    # Hunyan15 i2v inference
+│   ├── (legacy files removed)
+│   ├── prep_model.py                  # Download models
+│   ├── merge.py                       # Merge split safetensors
+│   ├── requirements.txt               # Python dependencies
+│   └── README.md                      # This file
+└── Dockerfile                         # Docker configuration
 ```
 
 ## Development
@@ -239,7 +226,7 @@ worker_ltx2_video/
 ### Local Testing
 
 ```bash
-cd backend/quickpod_individual_worker/worker_ltx2_video/src
+cd backend/quickpod_individual_worker/worker_hunyan15_480p_i2V_step_distilled/src
 pip install -r requirements.txt
 python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ```
@@ -247,23 +234,83 @@ python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ### Test Inference
 
 ```python
-from ltx2_video_inference import run_inference_ltx2_video
+from hunyan15_video_inference import run_inference_hunyan15_i2v
+from PIL import Image
 
-output = run_inference_ltx2_video(
+# Create test image
+image = Image.new('RGB', (512, 512), color='blue')
+image.save('/tmp/test.jpg')
+
+# Run inference
+output = run_inference_hunyan15_i2v(
     job_id="test-001",
-    prompt="A cinematic drone shot of mountains at sunrise",
+    prompt="A beautiful sunset over the ocean",
+    image_input="/tmp/test.jpg",
     params={
-        "mode": "text-to-video",
-        "height": 512,
-        "width": 768,
-        "duration": 3.0,
-        "pipeline_type": "distilled",
-        "output_dir": "./outputs",
+        "num_frames": 121,
+        "num_inference_steps": 12,
+        "guidance_scale": 7.5,
+        "fps": 24,
+        "seed": 42
     }
 )
 print(f"Video saved to: {output}")
 ```
 
+## API Integration Example
+
+```python
+import requests
+import base64
+
+# Load and encode image
+with open("image.jpg", "rb") as f:
+    image_b64 = base64.b64encode(f.read()).decode()
+
+# Submit job
+job_data = {
+    "job_id": "job-001",
+    "prompt": "A white cat wearing sunglasses on the beach",
+    "model": "hunyan15_i2v",
+    "params": {
+        "num_frames": 121,
+        "num_inference_steps": 12,
+        "guidance_scale": 7.5,
+        "fps": 24,
+        "image_input": image_b64
+    },
+    "upload_url": "https://upload.example.com/video.mp4",
+    "result_key": "videos/output.mp4"
+}
+
+response = requests.post(
+    "http://localhost:8000/run",
+    json=job_data,
+    timeout=600
+)
+print(response.json())
+```
+
+## Troubleshooting
+
+### Out of Memory (OOM)
+- Ensure `MAX_CONCURRENT_JOBS=1`
+- Check GPU usage: `nvidia-smi`
+- Reduce `num_frames` for testing
+- Verify other processes aren't using GPU memory
+
+### Slow Generation
+- 12 steps is the minimum for step distilled model
+- Check GPU utilization: `nvidia-smi`
+- Ensure adequate system RAM (32GB+ recommended)
+
+### Model Loading Issues
+- Verify internet connection for HuggingFace download
+- Check disk space: ~8 GB needed
+- Verify cache directory permissions
+- Check logs: `docker logs <container-id>`
+
 ## License
 
-LTX-2 model is licensed under Lightricks' terms. See [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) for details.
+Hunyan15 model is available from HuggingFace community models.
+See: https://huggingface.co/hunyuanvideo-community

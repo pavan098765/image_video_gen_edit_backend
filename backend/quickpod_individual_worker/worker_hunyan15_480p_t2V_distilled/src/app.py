@@ -1,13 +1,5 @@
-# app.py
-# ✅ LTX-2 Video Generation Worker - FastAPI Application
-# Production-ready worker with advanced features:
-# - Lazy model loading with background preloading
-# - GPU memory management for RTX 4090/5090
-# - Comprehensive health monitoring
-# - Job queue with status tracking
-# - Controller integration with heartbeat
-
 import os
+import sys
 import time
 import json
 import logging
@@ -35,26 +27,31 @@ import torch
 # CRITICAL: Use dedicated executor for inference to avoid blocking FastAPI
 # Only 1 worker to prevent OOM on 24GB cards (4090/5090)
 INFERENCE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=1,
-    thread_name_prefix="inference"
+    max_workers=1, thread_name_prefix="inference"
 )
 
 # IO-bound work (uploads, controller callbacks, HTTP)
 IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4,
-    thread_name_prefix="io"
+    max_workers=4, thread_name_prefix="io"
 )
 
 # -----------------------
 # GPU cleanup
 # -----------------------
+
+
 def cleanup_gpu(verbose: bool = False):
-    """Fully frees GPU memory and CUDA context."""
+    """
+    Fully frees GPU memory and CUDA context.
+    Use this between model loads to ensure a clean slate.
+    """
     try:
         if verbose:
             allocated = torch.cuda.memory_allocated() / 1024**2
             reserved = torch.cuda.memory_reserved() / 1024**2
-            print(f"[GPU] Before cleanup: {allocated:.2f} MB allocated, {reserved:.2f} MB reserved")
+            print(
+                f"[GPU] Before cleanup: {allocated:.2f} MB allocated, {reserved:.2f} MB reserved"
+            )
 
         for obj in gc.get_objects():
             try:
@@ -73,15 +70,18 @@ def cleanup_gpu(verbose: bool = False):
         torch.cuda.empty_cache()
 
         if verbose:
-            print(f"[GPU] After cleanup: {torch.cuda.memory_allocated()/1024**2:.2f} MB allocated")
+            print(
+                f"[GPU] After cleanup: {torch.cuda.memory_allocated()/1024**2:.2f} MB allocated"
+            )
     except Exception as e:
         print(f"[GPU] Cleanup warning: {e}")
+
 
 # -----------------------
 # Import inference functions
 # -----------------------
-from ltx2_video_inference import (
-    run_inference_ltx2_video,
+from hunyan15_video_inference import (
+    run_inference_hunyan15_t2v,
     preload_pipeline,
     unload_pipeline,
     get_gpu_info,
@@ -91,21 +91,64 @@ from ltx2_video_inference import (
 # Model Registry
 # -----------------------
 MODEL_REGISTRY = {
-    "ltx2_video": run_inference_ltx2_video,
-    "ltx2-video": run_inference_ltx2_video,
-    "ltx2_t2v": run_inference_ltx2_video,
-    "ltx2_i2v": run_inference_ltx2_video,
-    "ltx2_v2v": run_inference_ltx2_video,
+    "hunyan15_480p_t2v_distilled": run_inference_hunyan15_t2v,
 }
 
 # -----------------------
 # Logging
 # -----------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+# Configure logging to write to both console and file
+LOG_FILE = os.getenv("LOG_FILE", "/app/worker/uvicorn.log")
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+
+# Create file handler
+file_handler = logging.FileHandler(LOG_FILE, mode="a")
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+file_handler.setFormatter(file_formatter)
+
+# Create console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-logger = logging.getLogger("ltx2-worker")
+console_handler.setFormatter(console_formatter)
+
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+# Remove any existing handlers to avoid duplicates
+root_logger.handlers = []
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
+# Get worker logger
+logger = logging.getLogger("worker")
+
+# Create a custom print function that logs to file and prints to console
+_original_print = print
+
+
+def log_print(*args, **kwargs):
+    """Print that also writes to log file."""
+    message = " ".join(str(arg) for arg in args)
+    # Write to log file via logger
+    logger.info(f"[PRINT] {message}")
+    # Also print to stdout (which uvicorn will capture)
+    _original_print(*args, **kwargs, file=sys.stdout, flush=True)
+
+
+# Store original print for internal use if needed
+import builtins
+
+builtins._original_print = _original_print
+
+# Replace print in this module's namespace
+print = log_print
+
+logger.info(f"Logging configured: console + file ({LOG_FILE})")
+print(f"Logging initialized: writing to {LOG_FILE}")
 
 # -----------------------
 # Configuration from env
@@ -115,7 +158,7 @@ POD_UUID = CONTAINER_ID
 PUBLIC_IPADDR = os.getenv("PUBLIC_IPADDR")
 WORKER_ID = POD_UUID
 
-MODEL_KEY = os.getenv("MODEL_KEY", "LTX2-Video")
+MODEL_KEY = os.getenv("MODEL_KEY", "Hunyan15-480p-t2v")
 CONTROLLER_URL = os.getenv("CONTROLLER_URL", "").strip()
 CONTROLLER_SHARED_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "")
 CONTROLLER_API_KEY = os.getenv("CONTROLLER_API_KEY", "")
@@ -126,7 +169,7 @@ PORT = int(EXTERNAL_PORT) if EXTERNAL_PORT else INTERNAL_PORT
 
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "20"))
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
-DEFAULT_PIPELINE = os.getenv("LTX2_DEFAULT_PIPELINE", "distilled")
+DEFAULT_PIPELINE = os.getenv("HUNYAN15_DEFAULT_PIPELINE", "t2v")
 
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
@@ -146,22 +189,30 @@ startup_completed = False
 _model_loading_complete = False
 _model_loading_error: Optional[str] = None
 
+
 # -----------------------
 # Request Models
 # -----------------------
 class RunRequest(BaseModel):
     """Request model for video generation jobs."""
+
     job_id: str = Field(..., description="Unique job identifier")
     prompt: str = Field(..., description="Text prompt for video generation")
-    model: str = Field(..., description="Model key (ltx2_video, ltx2_t2v, ltx2_i2v, ltx2_v2v)")
-    mode: Optional[str] = Field(None, description="Generation mode: text-to-video, image-to-video, video-to-video, keyframe-interpolation")
-    params: Dict[str, Any] = Field(default_factory=dict, description="Generation parameters")
+    model: str = Field(..., description="Model key (hunyan15_480p_t2v_distilled)")
+    mode: Optional[str] = Field(
+        None,
+        description="Generation mode: text-to-video, image-to-video, video-to-video, keyframe-interpolation",
+    )
+    params: Dict[str, Any] = Field(
+        default_factory=dict, description="Generation parameters"
+    )
     upload_url: str = Field(..., description="URL to upload result")
     result_key: str = Field(..., description="R2 key for result")
 
 
 class HealthResponse(BaseModel):
     """Health check response model."""
+
     status: str
     worker_id: str
     queue_size: int
@@ -197,11 +248,13 @@ def signed_headers(payload: dict) -> Dict[str, str]:
     return headers
 
 
-def post_signed_json(url: str, payload: dict, timeout: int = 10, max_retries: int = 3) -> requests.Response:
+def post_signed_json(
+    url: str, payload: dict, timeout: int = 10, max_retries: int = 3
+) -> requests.Response:
     """Post signed JSON with retry logic."""
     headers = signed_headers(payload)
     last_error = None
-    
+
     for attempt in range(max_retries):
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
@@ -210,14 +263,18 @@ def post_signed_json(url: str, payload: dict, timeout: int = 10, max_retries: in
         except requests.exceptions.Timeout as e:
             last_error = e
             if attempt < max_retries - 1:
-                backoff = 2 ** attempt
-                logger.warning(f"POST to {url} timeout (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s...")
+                backoff = 2**attempt
+                logger.warning(
+                    f"POST to {url} timeout (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s..."
+                )
                 time.sleep(backoff)
         except requests.exceptions.ConnectionError as e:
             last_error = e
             if attempt < max_retries - 1:
-                backoff = 2 ** attempt
-                logger.warning(f"POST to {url} connection error (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s...")
+                backoff = 2**attempt
+                logger.warning(
+                    f"POST to {url} connection error (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s..."
+                )
                 time.sleep(backoff)
         except requests.exceptions.HTTPError as e:
             if e.response and 400 <= e.response.status_code < 500:
@@ -225,14 +282,16 @@ def post_signed_json(url: str, payload: dict, timeout: int = 10, max_retries: in
                 raise
             last_error = e
             if attempt < max_retries - 1:
-                backoff = 2 ** attempt
-                logger.warning(f"POST to {url} server error (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s...")
+                backoff = 2**attempt
+                logger.warning(
+                    f"POST to {url} server error (attempt {attempt + 1}/{max_retries}), retrying in {backoff}s..."
+                )
                 time.sleep(backoff)
         except Exception as e:
             last_error = e
             logger.error(f"POST to {url} unexpected error: {e}")
             raise
-    
+
     logger.error(f"POST to {url} failed after {max_retries} attempts: {last_error}")
     raise last_error
 
@@ -246,7 +305,7 @@ def register_with_controller():
     if not CONTROLLER_URL:
         logger.info("No CONTROLLER_URL configured; skipping registration.")
         return {"skipped": True}
-    
+
     register_payload = {
         "worker_id": WORKER_ID,
         "models": list(MODEL_REGISTRY.keys()),
@@ -262,11 +321,11 @@ def register_with_controller():
         },
     }
     url = f"{CONTROLLER_URL.rstrip('/')}/register_worker"
-    
+
     logger.info(f"Registering worker with controller at {CONTROLLER_URL}")
     logger.info(f"Worker endpoint: http://{PUBLIC_IPADDR}:{PORT}")
     logger.info(f"Worker ID: {WORKER_ID}")
-    
+
     try:
         resp = post_signed_json(url, register_payload, timeout=15, max_retries=6)
         result = resp.json()
@@ -282,21 +341,23 @@ def send_heartbeat():
     """Send heartbeat to controller."""
     if not CONTROLLER_URL:
         return {"skipped": True}
-    
+
     try:
         queue_size = job_queue.qsize()
-        active_jobs = sum(1 for j in job_status.values() if j.get("status") == "running")
+        active_jobs = sum(
+            1 for j in job_status.values() if j.get("status") == "running"
+        )
     except Exception:
         queue_size = 0
         active_jobs = 0
-    
+
     if not _model_loading_complete:
         status = "starting"
     elif startup_completed:
         status = "ready"
     else:
         status = "starting"
-    
+
     payload = {
         "worker_id": WORKER_ID,
         "pod_uuid": POD_UUID,
@@ -307,11 +368,11 @@ def send_heartbeat():
             "queue_size": queue_size,
             "active_jobs": active_jobs,
             "max_concurrent": MAX_CONCURRENT_JOBS,
-        }
+        },
     }
-    
+
     url = f"{CONTROLLER_URL.rstrip('/')}/heartbeat"
-    
+
     try:
         resp = post_signed_json(url, payload, timeout=8, max_retries=3)
         return resp.json()
@@ -332,12 +393,20 @@ def resolve_inference_callable(model: str, mode: Optional[str]):
 async def run_inference_and_save(
     job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]
 ) -> str:
-    """Run inference in dedicated thread pool."""
+    """Run inference in dedicated thread pool.
+    Params for model:
+            - num_frames (int): Number of frames (default: 121)
+            - num_inference_steps (int): Denoising steps (default: 50)
+            - seed (int): Random seed
+            - fps (int): Frames per second (default: 24)
+            - output_dir (str): Output directory
+            Note: guidance_scale is not supported by HunyuanVideo15Pipeline
+    """
     global last_model_key
     loop = asyncio.get_event_loop()
     params = params.copy()
     params.setdefault("output_dir", WORKSPACE_DIR)
-    
+
     # Set mode in params if provided
     if mode:
         params.setdefault("mode", mode)
@@ -346,11 +415,15 @@ async def run_inference_and_save(
     model_key = model
 
     if last_model_key and last_model_key != model_key:
-        logger.info(f"Switching model {last_model_key} -> {model_key}, cleaning up GPU first")
+        logger.info(
+            f"Switching model {last_model_key} -> {model_key}, cleaning up GPU first"
+        )
         cleanup_gpu()
 
     try:
-        out_path = await loop.run_in_executor(INFERENCE_EXECUTOR, inference_func, job_id, prompt, params)
+        out_path = await loop.run_in_executor(
+            INFERENCE_EXECUTOR, inference_func, job_id, prompt, params
+        )
         return out_path
     finally:
         last_model_key = model_key
@@ -368,13 +441,15 @@ async def process_job_item(item: Dict[str, Any]):
     params = item.get("params", {})
     upload_url = item["upload_url"]
     result_key = item["result_key"]
-    
+
     start_time = datetime.utcnow()
-    logger.info(f"[{job_id}] Processing job with model={model}, mode={mode or 'default'}")
-    
+    logger.info(
+        f"[{job_id}] Processing job with model={model}, mode={mode or 'default'}"
+    )
+
     async with job_status_lock:
         job_status[job_id] = {
-            "status": "running", 
+            "status": "running",
             "started_at": start_time.isoformat(),
             "model": model,
             "mode": mode,
@@ -383,8 +458,35 @@ async def process_job_item(item: Dict[str, Any]):
     try:
         async with semaphore:
             logger.info(f"[{job_id}] Starting inference...")
-            out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
-            logger.info(f"[{job_id}] Inference completed, output: {out_local}")
+            logger.info(
+                f"[{job_id}] Inference parameters: model={model}, mode={mode}, output_dir={params.get('output_dir', 'default')}"
+            )
+            try:
+                out_local = await run_inference_and_save(
+                    job_id, prompt, model, mode, params
+                )
+                logger.info(
+                    f"[{job_id}] ✅ Inference completed successfully, output: {out_local}"
+                )
+
+                # Verify output file exists
+                if out_local and os.path.exists(out_local):
+                    file_size = os.path.getsize(out_local) / 1024 / 1024  # MB
+                    logger.info(
+                        f"[{job_id}] ✅ Output file verified: {out_local} ({file_size:.2f} MB)"
+                    )
+                else:
+                    logger.warning(f"[{job_id}] ⚠️ Output file not found: {out_local}")
+            except Exception as inference_error:
+                error_type = type(inference_error).__name__
+                error_msg = str(inference_error)
+                logger.error(
+                    f"[{job_id}] ❌ Inference error: {error_type}: {error_msg}"
+                )
+                logger.exception(
+                    f"[{job_id}] Full inference traceback (logged to uvicorn.log):"
+                )
+                raise
 
             # Upload result
             if upload_url.startswith("http://dummy-upload"):
@@ -404,17 +506,23 @@ async def process_job_item(item: Dict[str, Any]):
                 url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
                 try:
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(IO_EXECUTOR, post_signed_json, url, payload, 10, 5)
+                    await loop.run_in_executor(
+                        IO_EXECUTOR, post_signed_json, url, payload, 10, 5
+                    )
                     logger.info(f"[{job_id}] Controller notified successfully")
                 except Exception as notify_error:
-                    logger.error(f"[{job_id}] CRITICAL: Failed to notify controller: {notify_error}")
+                    logger.error(
+                        f"[{job_id}] CRITICAL: Failed to notify controller: {notify_error}"
+                    )
             elif is_autotest:
-                logger.info(f"[{job_id}] Autotest job - skipping controller notification")
+                logger.info(
+                    f"[{job_id}] Autotest job - skipping controller notification"
+                )
 
             # Mark completed
             completion_time = datetime.utcnow()
             processing_time = (completion_time - start_time).total_seconds()
-            
+
             async with job_status_lock:
                 job_status[job_id] = {
                     "status": "completed",
@@ -422,49 +530,64 @@ async def process_job_item(item: Dict[str, Any]):
                     "finished_at": completion_time.isoformat(),
                     "processing_time": processing_time,
                 }
-            
-            logger.info(f"[{job_id}] Job completed successfully in {processing_time:.1f}s")
+
+            logger.info(
+                f"[{job_id}] Job completed successfully in {processing_time:.1f}s"
+            )
             asyncio.create_task(_cleanup_job_status(job_id, delay=30))
             _check_gpu_memory(job_id)
-            
+
     except Exception as e:
         error_str = str(e)
         error_type = type(e).__name__
         completion_time = datetime.utcnow()
         processing_time = (completion_time - start_time).total_seconds()
-        
-        logger.exception(f"[{job_id}] Job failed after {processing_time:.1f}s: {error_type}: {error_str}")
-        
+
+        logger.exception(
+            f"[{job_id}] Job failed after {processing_time:.1f}s: {error_type}: {error_str}"
+        )
+
         is_oom = "out of memory" in error_str.lower() or "oom" in error_str.lower()
         if is_oom:
             logger.error(f"[{job_id}] GPU OOM detected! Cleaning up...")
             cleanup_gpu(verbose=True)
-        
+
         async with job_status_lock:
             job_status[job_id] = {
-                "status": "failed", 
+                "status": "failed",
                 "error": error_str,
                 "error_type": error_type,
                 "is_oom": is_oom,
                 "finished_at": completion_time.isoformat(),
                 "processing_time": processing_time,
             }
-        
+
         is_autotest = job_id.startswith("autotest-")
         if CONTROLLER_URL and not is_autotest:
-            payload = {"job_id": job_id, "result_r2_key": None, "failed": True, "error": error_str}
+            payload = {
+                "job_id": job_id,
+                "result_r2_key": None,
+                "failed": True,
+                "error": error_str,
+            }
             try:
                 url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(IO_EXECUTOR, post_signed_json, url, payload, 10, 5)
+                await loop.run_in_executor(
+                    IO_EXECUTOR, post_signed_json, url, payload, 10, 5
+                )
                 logger.info(f"[{job_id}] Failure notification sent to controller")
             except Exception as notify_error:
-                logger.error(f"[{job_id}] CRITICAL: Failed to notify controller of failure: {notify_error}")
-        
+                logger.error(
+                    f"[{job_id}] CRITICAL: Failed to notify controller of failure: {notify_error}"
+                )
+
         asyncio.create_task(_cleanup_job_status(job_id, delay=60))
 
 
-async def _upload_with_retry(file_path: str, upload_url: str, job_id: str, max_retries: int = 3) -> bool:
+async def _upload_with_retry(
+    file_path: str, upload_url: str, job_id: str, max_retries: int = 3
+) -> bool:
     """Upload file with retry logic."""
     loop = asyncio.get_running_loop()
 
@@ -480,11 +603,15 @@ async def _upload_with_retry(file_path: str, upload_url: str, job_id: str, max_r
             return True
         except Exception as e:
             if attempt < max_retries - 1:
-                backoff = 2 ** attempt
-                logger.warning(f"[{job_id}] Upload failed ({attempt + 1}/{max_retries}): {e}, retrying in {backoff}s")
+                backoff = 2**attempt
+                logger.warning(
+                    f"[{job_id}] Upload failed ({attempt + 1}/{max_retries}): {e}, retrying in {backoff}s"
+                )
                 await asyncio.sleep(backoff)
             else:
-                logger.error(f"[{job_id}] Upload failed after {max_retries} attempts: {e}")
+                logger.error(
+                    f"[{job_id}] Upload failed after {max_retries} attempts: {e}"
+                )
                 return False
     return False
 
@@ -495,11 +622,15 @@ def _check_gpu_memory(job_id: str):
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / 1024**3
             reserved = torch.cuda.memory_reserved() / 1024**3
-            
+
             if allocated > 20:
-                logger.warning(f"[{job_id}] High GPU memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                logger.warning(
+                    f"[{job_id}] High GPU memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+                )
             else:
-                logger.debug(f"[{job_id}] GPU memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                logger.debug(
+                    f"[{job_id}] GPU memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+                )
     except Exception as e:
         logger.debug(f"[{job_id}] GPU memory check failed: {e}")
 
@@ -520,22 +651,28 @@ async def worker_loop():
     logger.info("Starting worker loop")
     consecutive_errors = 0
     max_consecutive_errors = 5
-    
+
     while True:
         try:
             item = await job_queue.get()
             job_id = item.get("job_id", "unknown")
-            
+
             try:
-                logger.debug(f"[{job_id}] Dequeued job (queue size: {job_queue.qsize()})")
+                logger.debug(
+                    f"[{job_id}] Dequeued job (queue size: {job_queue.qsize()})"
+                )
                 await process_job_item(item)
                 consecutive_errors = 0
             except Exception as e:
                 consecutive_errors += 1
-                logger.exception(f"[{job_id}] Critical error (errors: {consecutive_errors}/{max_consecutive_errors}): {e}")
-                
+                logger.exception(
+                    f"[{job_id}] Critical error (errors: {consecutive_errors}/{max_consecutive_errors}): {e}"
+                )
+
                 if consecutive_errors >= max_consecutive_errors:
-                    logger.critical(f"Worker has {consecutive_errors} consecutive errors! Cleaning up GPU...")
+                    logger.critical(
+                        f"Worker has {consecutive_errors} consecutive errors! Cleaning up GPU..."
+                    )
                     try:
                         cleanup_gpu(verbose=True)
                         consecutive_errors = 0
@@ -544,7 +681,7 @@ async def worker_loop():
                         logger.error(f"GPU cleanup failed: {cleanup_error}")
             finally:
                 job_queue.task_done()
-                
+
         except Exception as outer_error:
             logger.exception(f"Critical error in worker loop: {outer_error}")
             await asyncio.sleep(1)
@@ -570,16 +707,13 @@ async def download_image_as_base64(url: str, client: httpx.AsyncClient) -> str:
 async def run_autotest():
     """
     Run comprehensive auto-test to verify all worker modes are functioning.
-    
+
     Tests:
     1. Text-to-Video (T2V) - Basic text prompt to video
-    2. Image-to-Video (I2V) - Animate an image (downloads and converts to base64)
-    3. Video-to-Video (V2V) - Transform a video (skipped - no test video)
-    4. Keyframe Interpolation - Interpolate between keyframes (downloads and converts to base64)
     """
     await asyncio.sleep(5)
-    logger.info("🚀 Starting LTX-2 Video comprehensive auto-test")
-    
+    logger.info("🚀 Starting Hunyan15 480p T2V Distilled comprehensive auto-test")
+
     # Check GPU VRAM
     try:
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -590,239 +724,174 @@ async def run_autotest():
     except Exception as e:
         logger.warning(f"Could not check GPU VRAM: {e}")
 
-    # Test assets (public URLs for testing)
-    TEST_IMAGE_URL = "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=768&h=512&fit=crop"
-    TEST_VIDEO_URL = None  # V2V test will be skipped if no test video available
-    
     autotest_results = {
         "t2v": None,
-        "i2v": None,
-        "v2v": None,
-        "keyframe": None,
     }
 
     async with httpx.AsyncClient(timeout=600.0) as client:
-        
-        # Pre-download test images and convert to base64
-        logger.info("📥 Downloading test images...")
-        test_image_b64 = None
-        keyframe1_b64 = None
-        keyframe2_b64 = None
-        
-        try:
-            test_image_b64 = await download_image_as_base64(TEST_IMAGE_URL, client)
-            logger.info(f"✅ Test image downloaded ({len(test_image_b64)//1024}KB base64)")
-        except Exception as e:
-            logger.error(f"❌ Failed to download test image: {e}")
-        
-        try:
-            KEYFRAME_1_URL = "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=768&h=512&fit=crop"
-            KEYFRAME_2_URL = "https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?w=768&h=512&fit=crop"
-            keyframe1_b64 = await download_image_as_base64(KEYFRAME_1_URL, client)
-            keyframe2_b64 = await download_image_as_base64(KEYFRAME_2_URL, client)
-            logger.info(f"✅ Keyframe images downloaded")
-        except Exception as e:
-            logger.error(f"❌ Failed to download keyframe images: {e}")
-        
+
         # ═══════════════════════════════════════════════════════════════
         # TEST 1: Text-to-Video (T2V)
         # ═══════════════════════════════════════════════════════════════
         logger.info("━" * 50)
-        logger.info("🎬 TEST 1/4: Text-to-Video (T2V)")
+        logger.info("🎬 TEST 1/1: Text-to-Video (T2V)")
         logger.info("━" * 50)
-        
-        t2v_job_id = f"autotest-ltx2-t2v-{uuid.uuid4().hex[:8]}"
+
+        t2v_job_id = f"autotest-hunyan15-480p-t2v-{uuid.uuid4().hex[:8]}"
         t2v_params = {
             "mode": "text-to-video",
             "height": 512,
             "width": 768,
             "duration": 2.0,
-            "num_inference_steps": 8,
-            "guidance_scale": 3.0,
+            "num_inference_steps": 50,
             "output_dir": "./outputs",
         }
         
+        # Expected output path (matches format in hunyan15_video_inference.py)
+        autotest_output_dir = os.path.join(WORKSPACE_DIR, "outputs")
+        os.makedirs(autotest_output_dir, exist_ok=True)
+        expected_video_path = os.path.join(autotest_output_dir, f"t2v_{t2v_job_id}.mp4")
+        logger.info(f"📁 Autotest output directory: {autotest_output_dir}")
+        logger.info(f"📁 Expected video path: {expected_video_path}")
+
         try:
             resp = await client.post(
                 "http://127.0.0.1:8000/run",
                 json={
                     "job_id": t2v_job_id,
                     "prompt": "A cinematic drone shot of mountains at sunrise, smooth camera movement, golden hour lighting",
-                    "model": "ltx2_video",
+                    "model": "hunyan15_480p_t2v_distilled",
                     "mode": "text-to-video",
                     "params": t2v_params,
                     "upload_url": "http://dummy-upload/skip",
                     "result_key": f"{t2v_job_id}.mp4",
                 },
             )
-            autotest_results["t2v"] = resp.status_code == 200
-            logger.info(f"{'✅' if resp.status_code == 200 else '❌'} T2V test: {resp.status_code}")
+            
+            if resp.status_code == 200:
+                logger.info(f"✅ T2V test: Job submitted successfully (status {resp.status_code})")
+                
+                # Wait for job to complete and video to be generated
+                max_wait = 300  # 5 minutes for 50-step inference
+                check_interval = 5
+                waited = 0
+                video_found = False
+                job_completed = False
+                
+                logger.info(f"⏳ Waiting for video generation... (checking: {expected_video_path})")
+                
+                while waited < max_wait:
+                    await asyncio.sleep(check_interval)
+                    waited += check_interval
+                    
+                    # Check if video file exists
+                    if os.path.exists(expected_video_path):
+                        file_size = os.path.getsize(expected_video_path)
+                        logger.info(f"✅ Autotest video saved: {expected_video_path} ({file_size / 1024 / 1024:.2f} MB)")
+                        video_found = True
+                        break
+                    
+                    # Check job status
+                    async with job_status_lock:
+                        job_info = job_status.get(t2v_job_id, {})
+                        job_status_str = job_info.get("status", "unknown")
+                        
+                        if job_status_str == "completed":
+                            job_completed = True
+                            if not video_found:
+                                # Job completed but video not found - check for errors
+                                if "error" in job_info:
+                                    error_msg = job_info.get("error", "Unknown error")
+                                    error_type = job_info.get("error_type", "Unknown")
+                                    logger.error(f"❌ Job completed with error: {error_type}: {error_msg}")
+                                    autotest_results["t2v"] = False
+                                else:
+                                    logger.warning(f"⚠️ Job marked as completed but video file not found")
+                                    autotest_results["t2v"] = False
+                            else:
+                                # Job completed and video found
+                                autotest_results["t2v"] = True
+                            break
+                        elif job_status_str == "failed":
+                            error_msg = job_info.get("error", "Unknown error")
+                            error_type = job_info.get("error_type", "Unknown")
+                            processing_time = job_info.get("processing_time", 0)
+                            logger.error(f"❌ Job failed after {processing_time:.1f}s: {error_type}: {error_msg}")
+                            logger.error(f"❌ Full error details logged to uvicorn.log")
+                            autotest_results["t2v"] = False
+                            break
+                    
+                    if waited % 30 == 0:
+                        logger.info(f"⏳ Still waiting for video... ({waited}s elapsed, job status: {job_status_str if 'job_status_str' in locals() else 'checking...'})")
+                
+                # Final status check
+                if not video_found and not job_completed:
+                    # Check job status one more time
+                    async with job_status_lock:
+                        final_job_info = job_status.get(t2v_job_id, {})
+                        final_status = final_job_info.get("status", "unknown")
+                        
+                        if final_status == "failed":
+                            error_msg = final_job_info.get("error", "Unknown error")
+                            error_type = final_job_info.get("error_type", "Unknown")
+                            logger.error(f"❌ Job failed: {error_type}: {error_msg}")
+                            logger.error(f"❌ Check uvicorn.log for full error traceback")
+                            autotest_results["t2v"] = False
+                        elif final_status == "completed":
+                            logger.warning(f"⚠️ Job completed but video file not found: {expected_video_path}")
+                            autotest_results["t2v"] = False
+                        else:
+                            logger.warning(f"⚠️ Video file not found after {max_wait}s: {expected_video_path}")
+                            logger.warning(f"⚠️ Job status: {final_status} (may still be processing)")
+                            autotest_results["t2v"] = False
+                    
+                    # List files in output directory for debugging
+                    if os.path.exists(autotest_output_dir):
+                        files = os.listdir(autotest_output_dir)
+                        logger.info(f"📂 Files in output directory: {files}")
+                    else:
+                        logger.warning(f"⚠️ Output directory does not exist: {autotest_output_dir}")
+                    
+                    # Check all files in workspace for debugging
+                    if os.path.exists(WORKSPACE_DIR):
+                        all_files = []
+                        for root, dirs, files in os.walk(WORKSPACE_DIR):
+                            for f in files:
+                                if f.endswith('.mp4'):
+                                    all_files.append(os.path.join(root, f))
+                        if all_files:
+                            logger.info(f"📂 Found MP4 files in workspace: {all_files}")
+            else:
+                logger.error(f"❌ T2V test failed with status {resp.status_code}")
+                autotest_results["t2v"] = False
+                
         except Exception as e:
             autotest_results["t2v"] = False
             logger.error(f"❌ T2V test failed: {e}")
-        
-        # Wait for T2V to complete before next test
-        await asyncio.sleep(30)
-        
-        # ═══════════════════════════════════════════════════════════════
-        # TEST 2: Image-to-Video (I2V)
-        # ═══════════════════════════════════════════════════════════════
-        logger.info("━" * 50)
-        logger.info("🖼️ TEST 2/4: Image-to-Video (I2V)")
-        logger.info("━" * 50)
-        
-        if test_image_b64:
-            i2v_job_id = f"autotest-ltx2-i2v-{uuid.uuid4().hex[:8]}"
-            i2v_params = {
-                "mode": "image-to-video",
-                "height": 512,
-                "width": 768,
-                "duration": 2.0,
-                "num_inference_steps": 8,
-                "guidance_scale": 3.0,
-                "init_image": test_image_b64,  # Base64 encoded image
-                "output_dir": "./outputs",
-            }
-            
-            try:
-                resp = await client.post(
-                    "http://127.0.0.1:8000/run",
-                    json={
-                        "job_id": i2v_job_id,
-                        "prompt": "The mountains come alive with flowing clouds and gentle wind, cinematic movement",
-                        "model": "ltx2_i2v",
-                        "mode": "image-to-video",
-                        "params": i2v_params,
-                        "upload_url": "http://dummy-upload/skip",
-                        "result_key": f"{i2v_job_id}.mp4",
-                    },
-                )
-                autotest_results["i2v"] = resp.status_code == 200
-                logger.info(f"{'✅' if resp.status_code == 200 else '❌'} I2V test: {resp.status_code}")
-            except Exception as e:
-                autotest_results["i2v"] = False
-                logger.error(f"❌ I2V test failed: {e}")
-            
-            # Wait for I2V to complete
-            await asyncio.sleep(30)
-        else:
-            logger.info("⏩ I2V test skipped (failed to download test image)")
-            autotest_results["i2v"] = "skipped"
-        
-        # ═══════════════════════════════════════════════════════════════
-        # TEST 3: Video-to-Video (V2V)
-        # ═══════════════════════════════════════════════════════════════
-        logger.info("━" * 50)
-        logger.info("🎥 TEST 3/4: Video-to-Video (V2V)")
-        logger.info("━" * 50)
-        
-        if TEST_VIDEO_URL:
-            v2v_job_id = f"autotest-ltx2-v2v-{uuid.uuid4().hex[:8]}"
-            v2v_params = {
-                "mode": "video-to-video",
-                "height": 512,
-                "width": 768,
-                "num_inference_steps": 8,
-                "guidance_scale": 3.0,
-                "init_video": TEST_VIDEO_URL,
-                "strength": 0.7,  # How much to transform the video
-                "output_dir": "./outputs",
-            }
-            
-            try:
-                resp = await client.post(
-                    "http://127.0.0.1:8000/run",
-                    json={
-                        "job_id": v2v_job_id,
-                        "prompt": "Transform into an oil painting style with vibrant colors",
-                        "model": "ltx2_v2v",
-                        "mode": "video-to-video",
-                        "params": v2v_params,
-                        "upload_url": "http://dummy-upload/skip",
-                        "result_key": f"{v2v_job_id}.mp4",
-                    },
-                )
-                autotest_results["v2v"] = resp.status_code == 200
-                logger.info(f"{'✅' if resp.status_code == 200 else '❌'} V2V test: {resp.status_code}")
-            except Exception as e:
-                autotest_results["v2v"] = False
-                logger.error(f"❌ V2V test failed: {e}")
-            
-            await asyncio.sleep(30)
-        else:
-            logger.info("⏩ V2V test skipped (no TEST_VIDEO_URL configured)")
-            autotest_results["v2v"] = "skipped"
-        
-        # ═══════════════════════════════════════════════════════════════
-        # TEST 4: Keyframe Interpolation
-        # ═══════════════════════════════════════════════════════════════
-        logger.info("━" * 50)
-        logger.info("🔀 TEST 4/4: Keyframe Interpolation")
-        logger.info("━" * 50)
-        
-        if keyframe1_b64 and keyframe2_b64:
-            keyframe_job_id = f"autotest-ltx2-keyframe-{uuid.uuid4().hex[:8]}"
-            # Keyframes format: list of dicts with image (base64), frame_index, strength
-            keyframe_params = {
-                "mode": "keyframe-interpolation",
-                "height": 512,
-                "width": 768,
-                "num_frames": 49,  # About 2 seconds at 25fps
-                "num_inference_steps": 8,
-                "guidance_scale": 3.0,
-                "keyframes": [
-                    {"image": keyframe1_b64, "frame_index": 0, "strength": 1.0},
-                    {"image": keyframe2_b64, "frame_index": 48, "strength": 1.0},
-                ],
-                "output_dir": "./outputs",
-            }
-            
-            try:
-                resp = await client.post(
-                    "http://127.0.0.1:8000/run",
-                    json={
-                        "job_id": keyframe_job_id,
-                        "prompt": "Smooth cinematic transition between mountain landscapes, flowing clouds",
-                        "model": "ltx2_video",
-                        "mode": "keyframe-interpolation",
-                        "params": keyframe_params,
-                        "upload_url": "http://dummy-upload/skip",
-                        "result_key": f"{keyframe_job_id}.mp4",
-                    },
-                )
-                autotest_results["keyframe"] = resp.status_code == 200
-                logger.info(f"{'✅' if resp.status_code == 200 else '❌'} Keyframe test: {resp.status_code}")
-            except Exception as e:
-                autotest_results["keyframe"] = False
-                logger.error(f"❌ Keyframe test failed: {e}")
-        else:
-            logger.info("⏩ Keyframe test skipped (failed to download keyframe images)")
-            autotest_results["keyframe"] = "skipped"
-    
+            import traceback
+            logger.exception("Full traceback:")
+
     # ═══════════════════════════════════════════════════════════════
     # SUMMARY
     # ═══════════════════════════════════════════════════════════════
     logger.info("━" * 50)
     logger.info("📊 AUTO-TEST SUMMARY")
     logger.info("━" * 50)
-    
+
     passed = sum(1 for v in autotest_results.values() if v is True)
-    skipped = sum(1 for v in autotest_results.values() if v == "skipped")
     failed = sum(1 for v in autotest_results.values() if v is False)
     total = len(autotest_results)
-    
+
     for test_name, result in autotest_results.items():
         if result is True:
             status = "✅ PASS"
-        elif result == "skipped":
-            status = "⏩ SKIP"
         else:
             status = "❌ FAIL"
         logger.info(f"  {test_name.upper():12s} : {status}")
-    
+
     logger.info("━" * 50)
-    logger.info(f"📈 Results: {passed}/{total} passed, {skipped} skipped, {failed} failed")
-    
+    logger.info(f"📈 Results: {passed}/{total} passed, {failed} failed")
+
     if failed == 0:
         logger.info("🎉 All tests passed! Worker is fully operational.")
     else:
@@ -835,26 +904,47 @@ async def run_autotest():
 def _preload_model_sync():
     """Preload model synchronously in a thread."""
     global _model_loading_complete, _model_loading_error
-    
+
     try:
-        logger.info("🔄 Starting model preload in background thread...")
+        logger.info(
+            f"🔄 Starting model preload in background thread... (pipeline={DEFAULT_PIPELINE})"
+        )
+        print(
+            f"MODEL PRELOAD: Starting in background thread (pipeline={DEFAULT_PIPELINE})"
+        )
+        sys.stdout.flush()
         start_time = time.time()
-        
+
+        logger.info(f"📞 Calling preload_pipeline('{DEFAULT_PIPELINE}')...")
+        print(f"MODEL PRELOAD: Calling preload_pipeline('{DEFAULT_PIPELINE}')...")
+        sys.stdout.flush()
         success = preload_pipeline(DEFAULT_PIPELINE)
-        
+        logger.info(f"📞 preload_pipeline returned: {success}")
+        print(f"MODEL PRELOAD: preload_pipeline returned {success}")
+        sys.stdout.flush()
+
         elapsed = time.time() - start_time
-        
+
         if success:
             logger.info(f"✅ Model preloaded successfully in {elapsed:.1f}s")
+            print(f"MODEL PRELOAD: SUCCESS in {elapsed:.1f}s")
+            sys.stdout.flush()
             _model_loading_complete = True
             _model_loading_error = None
         else:
             logger.error("❌ Model preload returned failure")
+            print("MODEL PRELOAD: FAILED - preload_pipeline returned False")
+            sys.stdout.flush()
             _model_loading_error = "Preload returned False"
             _model_loading_complete = False
-            
+
     except Exception as e:
         logger.exception(f"❌ Model preload failed: {e}")
+        print(f"MODEL PRELOAD: EXCEPTION - {e}")
+        import traceback
+
+        traceback.print_exc()
+        sys.stdout.flush()
         _model_loading_error = str(e)
         _model_loading_complete = False
 
@@ -862,39 +952,41 @@ def _preload_model_sync():
 async def _wait_for_model_and_register():
     """Wait for model to load, then register."""
     global startup_completed
-    
+
     max_wait = 300
     waited = 0
-    
+
     while not _model_loading_complete and waited < max_wait:
         if _model_loading_error:
             logger.error(f"Model loading failed: {_model_loading_error}")
             break
-        
+
         await asyncio.sleep(2)
         waited += 2
-        
+
         if waited % 30 == 0:
             logger.info(f"⏳ Still waiting for model... ({waited}s elapsed)")
-    
+
     if not _model_loading_complete:
-        logger.error(f"Model loading did not complete within {max_wait}s. Error: {_model_loading_error or 'timeout'}")
-    
+        logger.error(
+            f"Model loading did not complete within {max_wait}s. Error: {_model_loading_error or 'timeout'}"
+        )
+
     startup_completed = _model_loading_complete
     worker_ready.set()
-    
+
     if startup_completed:
         logger.info("✅ Model loaded, worker is now READY")
     else:
         logger.warning("⚠️ Worker starting but model not fully loaded")
-    
+
     # Register with controller
     try:
         register_with_controller()
         logger.info("✅ Worker registered with controller")
     except Exception as e:
         logger.exception("Failed to register worker: %s", e)
-    
+
     # Run autotest
     if startup_completed and os.getenv("ENABLE_AUTOTEST", "1") == "1":
         asyncio.create_task(run_autotest())
@@ -907,18 +999,20 @@ async def _health_monitor_loop():
     """Periodic health monitoring."""
     check_interval = 60
     logger.info("Starting health monitor loop")
-    
+
     while True:
         try:
             await asyncio.sleep(check_interval)
-            
+
             if torch.cuda.is_available():
                 allocated = torch.cuda.memory_allocated() / 1024**3
                 reserved = torch.cuda.memory_reserved() / 1024**3
-                
+
                 if allocated > 22:
-                    logger.warning(f"⚠️ HIGH GPU MEMORY: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
-            
+                    logger.warning(
+                        f"⚠️ HIGH GPU MEMORY: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+                    )
+
             # Check for stuck jobs
             async with job_status_lock:
                 for jid, status in job_status.items():
@@ -927,14 +1021,16 @@ async def _health_monitor_loop():
                         if started_at_str:
                             started_at = datetime.fromisoformat(started_at_str)
                             runtime = (datetime.utcnow() - started_at).total_seconds()
-                            
+
                             if runtime > 600:  # 10 minutes for video
-                                logger.warning(f"⚠️ Job {jid} running for {runtime:.0f}s (>10min)")
-            
+                                logger.warning(
+                                    f"⚠️ Job {jid} running for {runtime:.0f}s (>10min)"
+                                )
+
             queue_size = job_queue.qsize()
             if queue_size > job_queue.maxsize * 0.8:
                 logger.warning(f"⚠️ Queue nearly full: {queue_size}/{job_queue.maxsize}")
-                
+
         except Exception as e:
             logger.error(f"Health monitor error: {e}")
 
@@ -942,14 +1038,14 @@ async def _health_monitor_loop():
 async def _hb_loop():
     """Heartbeat loop."""
     logger.info("Starting heartbeat loop")
-    
+
     while True:
         try:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(IO_EXECUTOR, send_heartbeat)
         except Exception as e:
             logger.exception("Heartbeat failed: %s", e)
-        
+
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
@@ -972,49 +1068,53 @@ async def _record_job_status_later(job_id: str, model: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global startup_completed
-    
-    logger.info("🚀 LTX-2 Video Worker starting up...")
-    
+
+    logger.info("🚀 Hunyan15 480p T2V Distilled Worker starting up...")
+
     # Start background tasks
     asyncio.create_task(worker_loop())
     asyncio.create_task(_hb_loop())
     asyncio.create_task(_health_monitor_loop())
-    
+
     startup_completed = False
-    
+
     # Start model loading in dedicated thread
     loop = asyncio.get_event_loop()
     logger.info("🔄 Starting model preload in INFERENCE_EXECUTOR thread...")
     loop.run_in_executor(INFERENCE_EXECUTOR, _preload_model_sync)
-    
+
     # Wait for model and register
     asyncio.create_task(_wait_for_model_and_register())
-    
-    logger.info("📡 Worker starting - model loading in background, health endpoint responding")
-    
+
+    logger.info(
+        "📡 Worker starting - model loading in background, health endpoint responding"
+    )
+
     yield
-    
+
     # Shutdown
     logger.info("🛑 Worker shutting down gracefully...")
     startup_completed = False
-    
+
     if not job_queue.empty():
         logger.info(f"Waiting for {job_queue.qsize()} remaining jobs...")
         try:
             await asyncio.wait_for(job_queue.join(), timeout=30.0)
             logger.info("All jobs completed")
         except asyncio.TimeoutError:
-            logger.warning(f"Shutdown timeout, {job_queue.qsize()} jobs may be incomplete")
-    
+            logger.warning(
+                f"Shutdown timeout, {job_queue.qsize()} jobs may be incomplete"
+            )
+
     # Unload models
     logger.info("Unloading models...")
     unload_pipeline()
-    
+
     # Shutdown executors
     logger.info("Shutting down inference executor...")
     INFERENCE_EXECUTOR.shutdown(wait=True, cancel_futures=False)
     IO_EXECUTOR.shutdown(wait=False)
-    
+
     cleanup_gpu()
     logger.info("✅ Worker shutdown complete")
 
@@ -1024,9 +1124,9 @@ async def lifespan(app: FastAPI):
 # -----------------------
 app = FastAPI(
     title=f"QuickPod Worker ({MODEL_KEY})",
-    description="LTX-2 Video Generation Worker - Text-to-Video, Image-to-Video, Video-to-Video",
+    description="Hunyan15 480p Text-to-Video Distilled Worker",
     version="2.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 
@@ -1034,54 +1134,62 @@ app = FastAPI(
 async def run_endpoint(req: RunRequest):
     """
     Submit a video generation job.
-    
+
     Modes:
     - text-to-video: Generate video from text prompt
     - image-to-video: Animate an image with text guidance
     - video-to-video: Transform a video with text guidance
     - keyframe-interpolation: Interpolate between keyframe images
     """
-    logger.info(f"[{req.job_id}] Received job request for model={req.model}, mode={req.mode}")
-    
+    logger.info(
+        f"[{req.job_id}] Received job request for model={req.model}, mode={req.mode}"
+    )
+
     try:
         await asyncio.wait_for(job_status_lock.acquire(), timeout=2.0)
         try:
             if req.job_id in job_status:
                 current_status = job_status[req.job_id].get("status")
-                
+
                 if current_status in ("queued", "running"):
                     logger.warning(f"[{req.job_id}] Already {current_status}")
-                    raise HTTPException(status_code=409, detail=f"Job already {current_status}")
-                
+                    raise HTTPException(
+                        status_code=409, detail=f"Job already {current_status}"
+                    )
+
                 if current_status in ("completed", "failed"):
-                    logger.info(f"[{req.job_id}] Was {current_status}, accepting as new job")
+                    logger.info(
+                        f"[{req.job_id}] Was {current_status}, accepting as new job"
+                    )
                     del job_status[req.job_id]
         finally:
             job_status_lock.release()
     except asyncio.TimeoutError:
         logger.warning(f"[{req.job_id}] Lock timeout during duplicate check")
-    
+
     if job_queue.full():
         logger.error(f"[{req.job_id}] Queue full ({job_queue.maxsize})")
         raise HTTPException(status_code=503, detail="Worker queue full")
-    
+
     if not startup_completed:
         if not _model_loading_complete:
             logger.warning(f"[{req.job_id}] Model still loading")
             raise HTTPException(status_code=503, detail="Worker model still loading")
         else:
             logger.warning(f"[{req.job_id}] Worker not fully ready, but model loaded")
-    
+
     if req.model not in MODEL_REGISTRY:
         logger.error(f"[{req.job_id}] Unknown model: {req.model}")
         raise HTTPException(status_code=400, detail=f"Unknown model: {req.model}")
-    
+
     try:
         await job_queue.put(req.dict())
         asyncio.create_task(_record_job_status_later(req.job_id, req.model))
-        
-        logger.info(f"[{req.job_id}] Enqueued successfully (queue size: {job_queue.qsize()})")
-        
+
+        logger.info(
+            f"[{req.job_id}] Enqueued successfully (queue size: {job_queue.qsize()})"
+        )
+
         return {
             "status": "accepted",
             "job_id": req.job_id,
@@ -1097,7 +1205,7 @@ async def run_endpoint(req: RunRequest):
 async def health():
     """
     Health check endpoint - ALWAYS responds quickly.
-    
+
     Returns worker status including:
     - Model loading state
     - Queue status
@@ -1108,15 +1216,19 @@ async def health():
         try:
             await asyncio.wait_for(job_status_lock.acquire(), timeout=1.0)
             try:
-                active_jobs = sum(1 for j in job_status.values() if j.get("status") == "running")
-                queued_jobs = sum(1 for j in job_status.values() if j.get("status") == "queued")
+                active_jobs = sum(
+                    1 for j in job_status.values() if j.get("status") == "running"
+                )
+                queued_jobs = sum(
+                    1 for j in job_status.values() if j.get("status") == "queued"
+                )
             finally:
                 job_status_lock.release()
         except asyncio.TimeoutError:
             logger.warning("Health check: job_status_lock timeout")
             active_jobs = MAX_CONCURRENT_JOBS
             queued_jobs = job_queue.qsize()
-        
+
         # Determine status
         if not _model_loading_complete:
             overall_status = "starting"
@@ -1128,16 +1240,16 @@ async def health():
             overall_status = "busy"
         else:
             overall_status = "ok"
-        
+
         is_processing = active_jobs > 0
-        
+
         # Get GPU info
         gpu_info = None
         try:
             gpu_info = get_gpu_info()
         except Exception:
             pass
-        
+
         return HealthResponse(
             status=overall_status,
             worker_id=WORKER_ID or "unknown",
@@ -1179,7 +1291,7 @@ async def status():
     """Detailed status including all jobs."""
     async with job_status_lock:
         jobs_copy = job_status.copy()
-    
+
     return {
         "queue_size": job_queue.qsize(),
         "queue_capacity": job_queue.maxsize,
@@ -1222,4 +1334,5 @@ async def unload_models():
 # Entry point
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

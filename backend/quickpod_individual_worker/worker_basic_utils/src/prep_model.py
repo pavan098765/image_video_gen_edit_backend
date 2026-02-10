@@ -6,7 +6,7 @@ from huggingface_hub import snapshot_download
 # Config
 # ------------------------
 CACHE_DIR = "/app/models/basic_utils"
-RMBG_REPO = "briaai/RMBG-1.4"
+BIREFNET_REPO = "ZhengPeng7/BiRefNet"
 
 # ------------------------
 # Downloader helper
@@ -32,13 +32,13 @@ def download_model(repo_id: str, target_dir: str):
 # ------------------------
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-rmbg_dir = os.path.join(CACHE_DIR, "rmbg")
+birefnet_dir = os.path.join(CACHE_DIR, "birefnet")
 lama_dir = os.path.join(CACHE_DIR, "lama")
 
-# Only download RMBG, not LaMa (since lama.pt is pre-baked)
-download_model(RMBG_REPO, rmbg_dir)
+# Download BiRefNet, not LaMa (since lama.pt is pre-baked)
+download_model(BIREFNET_REPO, birefnet_dir)
 os.makedirs(lama_dir, exist_ok=True)
 
 print("✅ All models ready:")
-print("   RMBG_LOCAL_PATH =", rmbg_dir)
+print("   BIREFNET_LOCAL_PATH =", birefnet_dir)
 print("   LAMA_LOCAL_PATH =", os.path.join(lama_dir, "lama.pt"))

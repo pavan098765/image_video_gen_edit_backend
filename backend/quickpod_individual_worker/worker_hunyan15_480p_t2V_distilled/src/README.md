@@ -1,10 +1,10 @@
-# LTX-2 Video Generation Worker
+# Hunyan15 480p T2V Distilled Worker
 
-Production-ready video generation worker using Lightricks LTX-2 model.
+Production-ready video generation worker using Hunyan15 480p Text-to-Video Distilled model.
 
 ## Model
 
-**Checkpoint:** `ltx-2-19b-dev-fp4.safetensors` (20 GB)
+**Model:** Hunyan15 480p T2V Distilled from HuggingFace
 
 This model works safely on:
 - **RTX 4090** (24GB VRAM) - No OOM risk
@@ -36,29 +36,20 @@ The FP4 quantized model provides excellent quality while ensuring safe operation
 Run the prep script to download models and generate Dockerfile:
 
 ```bash
-cd backend/quickpod_individual_worker/worker_ltx2_video/src
+cd backend/quickpod_individual_worker/worker_hunyan15_480p_t2V_distilled/src
 python prep_model.py
 ```
 
 This will:
-1. Download `ltx-2-19b-dev-fp4.safetensors` (20 GB) from HuggingFace
-2. Download spatial upsampler (optional, for upscaling)
-3. Download Gemma 3 text encoder (required)
-4. **Skip LoRA download by default** (7.67 GB saved - not needed for "distilled" pipeline)
-5. Split large files for Docker layer caching
-6. Generate the Dockerfile
-
-**Note on LoRA:** The distilled LoRA (7.67 GB) is **optional**:
-- **NOT required** for the default "distilled" pipeline
-- Optional for other pipelines (two_stage, ic_lora, keyframe) - improves quality but works without it
-- **NOT for poses/canny** - it's a model distillation technique for speedup
-- To download LoRA: Set `LTX2_DOWNLOAD_LORA=1` before running `prep_model.py`
+1. Download Hunyan15 480p T2V Distilled model from HuggingFace
+2. Split large files for Docker layer caching
+3. Generate the Dockerfile
 
 ### 2. Build Docker Image
 
 ```bash
-cd backend/quickpod_individual_worker/worker_ltx2_video
-docker build -t ltx2-video-worker .
+cd backend/quickpod_individual_worker/worker_hunyan15_480p_t2V_distilled
+docker build -t hunyan15-480p-t2v-worker .
 ```
 
 ### 3. Run Container
@@ -69,7 +60,7 @@ docker run -d \
   -p 8000:8000 \
   -e CONTROLLER_URL="http://your-controller:3000" \
   -e CONTROLLER_SHARED_SECRET="your-secret" \
-  ltx2-video-worker
+  hunyan15-480p-t2v-worker
 ```
 
 ## API Endpoints
@@ -81,15 +72,14 @@ Submit a video generation job.
 {
   "job_id": "unique-job-id",
   "prompt": "A cinematic drone shot of mountains at sunrise",
-  "model": "ltx2_video",
+  "model": "hunyan15_480p_t2v_distilled",
   "mode": "text-to-video",
   "params": {
     "height": 512,
     "width": 768,
     "duration": 5.0,
     "fps": 25,
-    "num_inference_steps": 8,
-    "guidance_scale": 1.0,
+    "num_inference_steps": 12,  # Step distilled model uses 12 steps
     "pipeline_type": "distilled"
   },
   "upload_url": "https://your-presigned-upload-url",
@@ -189,9 +179,8 @@ List available models and modes.
 | `CONTROLLER_URL` | | Controller server URL |
 | `CONTROLLER_SHARED_SECRET` | | HMAC signing secret |
 | `CONTROLLER_API_KEY` | | API key for controller |
-| `LTX2_VIDEO_LOCAL_PATH` | `/app/models/ltx2_video` | Model directory |
-| `LTX2_GEMMA_ROOT` | `/app/models/gemma` | Gemma text encoder path |
-| `LTX2_DEFAULT_PIPELINE` | `distilled` | Default pipeline type |
+| `HUNYAN15_480P_LOCAL_PATH` | `/app/models/hunyan15_480p` | Model directory |
+| `HUNYAN15_DEFAULT_PIPELINE` | `t2v` | Default pipeline type |
 | `WORKSPACE_DIR` | `/workspace` | Output directory |
 | `HEARTBEAT_INTERVAL` | `20` | Heartbeat interval (seconds) |
 | `MAX_CONCURRENT_JOBS` | `1` | Max concurrent jobs |
@@ -199,7 +188,7 @@ List available models and modes.
 
 ## Memory Optimization
 
-The FP4 model (`ltx-2-19b-dev-fp4.safetensors`) is specifically chosen because:
+The Hunyan15 480p T2V Distilled model is used because:
 
 1. **20 GB checkpoint** fits comfortably in 24GB VRAM (RTX 4090)
 2. **No OOM risk** on both RTX 4090 and RTX 5090
@@ -215,19 +204,18 @@ Additional optimizations:
 ## File Structure
 
 ```
-worker_ltx2_video/
+worker_hunyan15_480p_t2V_distilled/
 ├── src/
 │   ├── app.py                    # FastAPI application
-│   ├── ltx2_video_inference.py   # Inference logic
+│   ├── hunyan15_video_inference.py   # Inference logic
 │   ├── prep_model.py             # Download models & generate Dockerfile
 │   ├── generate_dockerfile.py    # Dockerfile generator
 │   ├── merge.py                  # Merge split safetensors
 │   ├── requirements.txt          # Python dependencies
 │   └── README.md                 # This file
 ├── models/                       # Downloaded models (after prep)
-│   ├── ltx2_video/
-│   │   ├── ltx-2-19b-dev-fp4.safetensors*
-│   │   ├── ltx-2-spatial-upscaler-x2-1.0.safetensors
+│   ├── hunyan15_480p/
+│   │   └── (model files from HuggingFace)
 │   │   └── ... (diffusers components)
 │   └── gemma/
 │       └── ... (Gemma 3 text encoder)
@@ -239,7 +227,7 @@ worker_ltx2_video/
 ### Local Testing
 
 ```bash
-cd backend/quickpod_individual_worker/worker_ltx2_video/src
+cd backend/quickpod_individual_worker/worker_hunyan15_480p_t2V_distilled/src
 pip install -r requirements.txt
 python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ```
@@ -247,9 +235,9 @@ python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ### Test Inference
 
 ```python
-from ltx2_video_inference import run_inference_ltx2_video
+from hunyan15_video_inference import run_inference_hunyan15_t2v
 
-output = run_inference_ltx2_video(
+output = run_inference_hunyan15_t2v(
     job_id="test-001",
     prompt="A cinematic drone shot of mountains at sunrise",
     params={
@@ -266,4 +254,4 @@ print(f"Video saved to: {output}")
 
 ## License
 
-LTX-2 model is licensed under Lightricks' terms. See [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) for details.
+Hunyan15 model is licensed under its respective terms. See the HuggingFace model page for details.

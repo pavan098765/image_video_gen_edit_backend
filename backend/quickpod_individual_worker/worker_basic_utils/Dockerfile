@@ -29,7 +29,7 @@ COPY --from=builder /app/models /app/models
 COPY . /app/worker
 
 # Set env vars so inference loads baked model paths
-ENV RMBG_LOCAL_PATH="/app/models/basic_utils/rmbg" \
+ENV BIREFNET_LOCAL_PATH="/app/models/basic_utils/birefnet" \
     LAMA_LOCAL_PATH="/app/models/basic_utils/lama/lama.pt" \
     LAMA_MODEL="/app/models/basic_utils/lama/lama.pt" \
     PYTHONPATH="/app/worker/src:${PYTHONPATH}"
