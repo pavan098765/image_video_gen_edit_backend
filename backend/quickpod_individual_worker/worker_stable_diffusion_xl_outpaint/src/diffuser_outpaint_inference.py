@@ -395,6 +395,7 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
 
     output_dir = params.get("output_dir", "./outputs")
     os.makedirs(output_dir, exist_ok=True)
@@ -523,6 +524,7 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
 
     output_path = os.path.join(output_dir, f"{job_id}_final.png")
     generated_image.save(output_path)

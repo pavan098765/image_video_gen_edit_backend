@@ -165,10 +165,26 @@ def run_inference_realesrgan(job_id: str, params: Dict[str, Any]) -> str:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
     
     input_image = _load_image(params.get("init_image"))
     if input_image is None:
         raise ValueError("❌ 'init_image' parameter required")
+
+    # Cap output to 4K: resize input if upscaled result would exceed 4K
+    outscale = float(params.get("outscale", 4))
+    max_output_dim = 4096  # 4K cap
+    orig_w, orig_h = input_image.size
+    target_w = int(orig_w * outscale)
+    target_h = int(orig_h * outscale)
+    
+    if max(target_w, target_h) > max_output_dim:
+        # Calculate scale factor to cap at 4K
+        scale_factor = max_output_dim / max(target_w, target_h)
+        new_w = int(orig_w * scale_factor)
+        new_h = int(orig_h * scale_factor)
+        print(f"⚠️ Input image ({orig_w}x{orig_h}) would produce {target_w}x{target_h} output (>4K). Resizing to {new_w}x{new_h} before upscaling.")
+        input_image = input_image.resize((new_w, new_h), Image.LANCZOS)
 
     model_name = params.get("model_name", "RealESRGAN_x4plus")
     upsampler = _get_model(model_name, params)
@@ -190,7 +206,6 @@ def run_inference_realesrgan(job_id: str, params: Dict[str, Any]) -> str:
     output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
     os.makedirs(output_dir, exist_ok=True)
     suffix = params.get("suffix", "out")
-    outscale = float(params.get("outscale", 4))
     out_path = os.path.join(output_dir, f"upscaled_{job_id}_{suffix}.png")
 
     try:
@@ -221,6 +236,7 @@ def run_inference_realesrgan(job_id: str, params: Dict[str, Any]) -> str:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
 
     print(f"✅ Upscaled image saved to {out_path}")
     return out_path

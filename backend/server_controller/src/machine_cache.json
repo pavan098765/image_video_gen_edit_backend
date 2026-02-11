@@ -17,9 +17,9 @@
       "last_seen": "2026-01-24T23:45:29.065595Z",
       "stats": {
         "success": 197,
-        "failure": 106
+        "failure": 112
       },
-      "success_rate": 0.6501650165016502
+      "success_rate": 0.6375404530744336
     },
     "14762": {
       "cached_images": {
@@ -46,8 +46,8 @@
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2025-12-08T22:19:04.848066Z",
-          "score": 80.0,
-          "last_used": "2026-01-26T17:30:23.525191Z"
+          "score": 83.0,
+          "last_used": "2026-01-31T14:46:16.120604Z"
         },
         "fastwan_22_5b": {
           "added_at": "2026-01-30T10:02:17.062425Z",
@@ -56,24 +56,24 @@
         }
       },
       "is_priority": false,
-      "last_seen": "2026-01-30T10:23:34.406786Z",
+      "last_seen": "2026-01-31T14:46:16.120604Z",
       "stats": {
-        "success": 74,
-        "failure": 45
+        "success": 76,
+        "failure": 69
       },
-      "success_rate": 0.6218487394957983
+      "success_rate": 0.5241379310344828
     },
     "283": {
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2025-12-11T09:51:18.934660Z",
-          "score": 153.0,
-          "last_used": "2026-01-28T00:58:44.415886Z"
+          "score": 162.0,
+          "last_used": "2026-02-04T19:44:09.105000Z"
         },
         "qwen_image_edit": {
           "added_at": "2025-12-30T13:08:49.030046Z",
-          "score": 1.0,
-          "last_used": "2025-12-30T13:08:49.030046Z"
+          "score": 2.0,
+          "last_used": "2026-02-03T12:02:24.194401Z"
         },
         "flux_kontext_dev": {
           "added_at": "2026-01-13T23:24:56.509869Z",
@@ -82,12 +82,12 @@
         }
       },
       "is_priority": false,
-      "last_seen": "2026-01-28T00:58:44.415886Z",
+      "last_seen": "2026-02-04T19:44:09.105000Z",
       "stats": {
-        "success": 126,
-        "failure": 40
+        "success": 136,
+        "failure": 43
       },
-      "success_rate": 0.7590361445783133
+      "success_rate": 0.7597765363128491
     },
     "619": {
       "cached_images": {
@@ -121,36 +121,47 @@
           "added_at": "2026-01-24T02:00:50.492688Z",
           "score": 1.0,
           "last_used": "2026-01-24T02:00:50.492688Z"
-        }      },
+        }
+      },
       "last_seen": "2026-01-29T09:14:46.716309Z"
     },
     "300": {
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2025-12-16T20:44:59.451066Z",
-          "score": 3.0,
-          "last_used": "2025-12-16T23:09:49.110138Z"
+          "score": 4.0,
+          "last_used": "2026-02-03T19:30:45.925380Z"
         },
         "flux_kontext_dev": {
           "added_at": "2026-01-24T21:22:45.506883Z",
           "score": 1.0,
           "last_used": "2026-01-24T21:22:45.506883Z"
+        },
+        "z_image_turbo": {
+          "added_at": "2026-02-01T04:15:39.901054Z",
+          "score": 1.0,
+          "last_used": "2026-02-01T04:15:39.901054Z"
+        },
+        "qwen_image_edit": {
+          "added_at": "2026-02-03T12:07:51.985150Z",
+          "score": 1.0,
+          "last_used": "2026-02-03T12:07:51.985150Z"
         }
       },
       "is_priority": false,
-      "last_seen": "2026-01-24T21:22:45.506883Z",
+      "last_seen": "2026-02-03T19:30:45.925380Z",
       "stats": {
-        "success": 4,
-        "failure": 9
+        "success": 6,
+        "failure": 25
       },
-      "success_rate": 0.3076923076923077
+      "success_rate": 0.1935483870967742
     },
     "412": {
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2025-12-21T07:37:58.266447Z",
-          "score": 74.0,
-          "last_used": "2026-01-30T10:08:32.138365Z"
+          "score": 81.0,
+          "last_used": "2026-02-08T01:10:03.385831Z"
         },
         "qwen_image_edit": {
           "added_at": "2025-12-30T13:08:29.752636Z",
@@ -164,29 +175,39 @@
         },
         "fastwan_22_5b": {
           "added_at": "2026-01-30T09:56:01.757890Z",
-          "score": 4.0,
-          "last_used": "2026-01-30T10:04:02.369776Z"
+          "score": 5.0,
+          "last_used": "2026-01-31T18:35:03.831636Z"
+        },
+        "qwen_image": {
+          "added_at": "2026-01-31T15:23:25.782339Z",
+          "score": 3.0,
+          "last_used": "2026-01-31T17:38:28.412439Z"
+        },
+        "fastwan_21_1b": {
+          "added_at": "2026-02-03T22:18:43.528774Z",
+          "score": 2.0,
+          "last_used": "2026-02-10T21:36:47.158806Z"
         }
       },
       "is_priority": false,
-      "last_seen": "2026-01-30T10:08:32.138365Z",
+      "last_seen": "2026-02-10T21:36:47.158806Z",
       "stats": {
-        "success": 74,
-        "failure": 26
+        "success": 87,
+        "failure": 34
       },
-      "success_rate": 0.74
+      "success_rate": 0.71900826446281
     },
     "275": {
       "stats": {
-        "success": 78,
-        "failure": 29
+        "success": 101,
+        "failure": 38
       },
-      "success_rate": 0.7289719626168224,
+      "success_rate": 0.7266187050359713,
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2025-12-21T09:17:07.113498Z",
-          "score": 70.0,
-          "last_used": "2026-01-30T09:36:09.868812Z"
+          "score": 83.0,
+          "last_used": "2026-02-11T08:30:42.554456Z"
         },
         "qwen_image_edit": {
           "added_at": "2025-12-30T12:53:15.339689Z",
@@ -197,21 +218,31 @@
           "added_at": "2026-01-13T22:29:23.845303Z",
           "score": 5.0,
           "last_used": "2026-01-13T23:36:01.210534Z"
+        },
+        "z_image_turbo": {
+          "added_at": "2026-01-30T21:50:20.598846Z",
+          "score": 8.0,
+          "last_used": "2026-02-06T22:28:55.544279Z"
+        },
+        "fastwan_22_5b": {
+          "added_at": "2026-01-31T19:43:34.868700Z",
+          "score": 2.0,
+          "last_used": "2026-02-02T08:04:34.638256Z"
         }
       },
-      "last_seen": "2026-01-30T09:36:09.868812Z"
+      "last_seen": "2026-02-11T08:30:42.554456Z"
     },
     "461": {
       "stats": {
-        "success": 4,
-        "failure": 25
+        "success": 5,
+        "failure": 34
       },
-      "success_rate": 0.13793103448275862,
+      "success_rate": 0.1282051282051282,
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2026-01-04T07:36:49.866944Z",
-          "score": 4.0,
-          "last_used": "2026-01-29T09:24:47.863893Z"
+          "score": 5.0,
+          "last_used": "2026-01-31T07:30:08.712570Z"
         },
         "qwen_image_edit": {
           "added_at": "2026-01-25T09:57:48.129503Z",
@@ -219,7 +250,7 @@
           "last_used": "2026-01-25T09:57:48.129503Z"
         }
       },
-      "last_seen": "2026-01-29T09:24:47.863893Z"
+      "last_seen": "2026-01-31T07:30:08.712570Z"
     },
     "14838": {
       "stats": {
@@ -230,18 +261,18 @@
     },
     "299": {
       "stats": {
-        "success": 9,
-        "failure": 12
+        "success": 10,
+        "failure": 14
       },
-      "success_rate": 0.42857142857142855,
+      "success_rate": 0.4166666666666667,
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2025-12-23T16:01:24.908482Z",
-          "score": 9.0,
-          "last_used": "2026-01-14T18:10:58.861966Z"
+          "score": 10.0,
+          "last_used": "2026-02-01T09:50:30.370470Z"
         }
       },
-      "last_seen": "2026-01-14T18:10:58.861966Z"
+      "last_seen": "2026-02-01T09:50:30.370470Z"
     },
     "14854": {
       "stats": {
@@ -287,10 +318,18 @@
     },
     "276": {
       "stats": {
-        "success": 0,
-        "failure": 2
+        "success": 2,
+        "failure": 8
       },
-      "success_rate": 0.0
+      "success_rate": 0.2,
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2026-02-01T09:43:16.528567Z",
+          "score": 2.0,
+          "last_used": "2026-02-03T19:35:29.449566Z"
+        }
+      },
+      "last_seen": "2026-02-03T19:35:29.449566Z"
     },
     "14871": {
       "stats": {
@@ -306,10 +345,196 @@
         }
       },
       "last_seen": "2026-01-30T04:53:49.566077Z"
+    },
+    "348": {
+      "stats": {
+        "success": 17,
+        "failure": 12
+      },
+      "success_rate": 0.5862068965517241,
+      "cached_images": {
+        "diffusers_outpaint": {
+          "added_at": "2026-01-30T11:35:10.003609Z",
+          "score": 10.0,
+          "last_used": "2026-02-01T09:41:49.026215Z"
+        },
+        "basic_utils": {
+          "added_at": "2026-01-30T14:00:36.937439Z",
+          "score": 5.0,
+          "last_used": "2026-02-01T09:51:50.280370Z"
+        },
+        "realesrgan_face": {
+          "added_at": "2026-01-30T14:56:35.411570Z",
+          "score": 3.0,
+          "last_used": "2026-01-30T14:58:58.012456Z"
+        }
+      },
+      "last_seen": "2026-02-01T09:51:50.280370Z"
+    },
+    "562": {
+      "stats": {
+        "success": 0,
+        "failure": 8
+      },
+      "success_rate": 0.0
+    },
+    "502": {
+      "stats": {
+        "success": 3,
+        "failure": 6
+      },
+      "success_rate": 0.3333333333333333,
+      "cached_images": {
+        "aurasrv2": {
+          "added_at": "2026-02-03T10:49:24.117369Z",
+          "score": 3.0,
+          "last_used": "2026-02-11T09:13:09.941134Z"
+        }
+      },
+      "last_seen": "2026-02-11T09:13:09.941134Z"
+    },
+    "294": {
+      "cached_images": {
+        "realesrgan_face": {
+          "added_at": "2026-01-30T15:00:13.435796Z",
+          "score": 1.0,
+          "last_used": "2026-01-30T15:00:13.435796Z"
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2026-01-30T15:00:13.435796Z",
+      "stats": {
+        "success": 1,
+        "failure": 4
+      },
+      "success_rate": 0.2
+    },
+    "282": {
+      "cached_images": {
+        "realesrgan_face": {
+          "added_at": "2026-01-30T15:01:13.449498Z",
+          "score": 2.0,
+          "last_used": "2026-01-30T15:19:43.385365Z"
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2026-01-30T15:19:43.385365Z",
+      "stats": {
+        "success": 2,
+        "failure": 4
+      },
+      "success_rate": 0.3333333333333333
+    },
+    "353": {
+      "cached_images": {
+        "realesrgan_face": {
+          "added_at": "2026-01-30T15:03:35.641365Z",
+          "score": 1.0,
+          "last_used": "2026-01-30T15:03:35.641365Z"
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2026-01-30T15:03:35.641365Z",
+      "stats": {
+        "success": 0,
+        "failure": 2
+      },
+      "success_rate": 0.0
+    },
+    "350": {
+      "cached_images": {
+        "realesrgan_face": {
+          "added_at": "2026-01-30T15:05:56.560951Z",
+          "score": 1.0,
+          "last_used": "2026-01-30T15:05:56.560951Z"
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2026-01-30T15:05:56.560951Z",
+      "stats": {
+        "success": 1,
+        "failure": 2
+      },
+      "success_rate": 0.3333333333333333
+    },
+    "468": {
+      "stats": {
+        "success": 0,
+        "failure": 2
+      },
+      "success_rate": 0.0
+    },
+    "303": {
+      "cached_images": {
+        "diffusers_outpaint": {
+          "added_at": "2026-01-31T02:09:34.669553Z",
+          "score": 4.0,
+          "last_used": "2026-02-06T13:42:08.419145Z"
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2026-02-06T13:42:08.419145Z",
+      "stats": {
+        "success": 4,
+        "failure": 3
+      },
+      "success_rate": 0.5714285714285714
+    },
+    "302": {
+      "stats": {
+        "success": 0,
+        "failure": 6
+      },
+      "success_rate": 0.0
+    },
+    "272": {
+      "stats": {
+        "success": 0,
+        "failure": 2
+      },
+      "success_rate": 0.0
+    },
+    "14873": {
+      "stats": {
+        "success": 0,
+        "failure": 10
+      },
+      "success_rate": 0.0
+    },
+    "455": {
+      "stats": {
+        "success": 0,
+        "failure": 3
+      },
+      "success_rate": 0.0,
+      "cached_images": {
+        "basic_utils": {
+          "added_at": "2026-02-01T09:47:15.385304Z",
+          "score": 1.0,
+          "last_used": "2026-02-01T09:47:15.385304Z"
+        }
+      },
+      "last_seen": "2026-02-01T09:47:15.385304Z"
+    },
+    "14891": {
+      "cached_images": {
+        "qwen_image_edit_2509": {
+          "added_at": "2026-02-09T08:51:20.994478Z",
+          "score": 21.0,
+          "last_used": "2026-02-10T23:04:15.447120Z"
+        }
+      },
+      "is_priority": false,
+      "last_seen": "2026-02-10T23:04:15.447120Z",
+      "stats": {
+        "success": 20,
+        "failure": 2
+      },
+      "success_rate": 0.9090909090909091
     }
   },
   "meta": {
     "version": 1,
-    "updated_at": "2026-01-30T10:23:34.406786Z"
+    "updated_at": "2026-02-11T09:13:09.941134Z"
   }
 }

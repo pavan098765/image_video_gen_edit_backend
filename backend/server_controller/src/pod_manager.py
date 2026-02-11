@@ -2035,6 +2035,8 @@ class PodManager:
                     f"Global fallback: trying variant={variant} with GPUs={allowed_gpus}"
                 )
                 
+                # First, try with all allowed GPUs together
+                variant_pod_created = False
                 try:
                     # Resolve model alias for requirements lookup
                     base_model = self.resolve_model_alias(model)
@@ -2051,50 +2053,131 @@ class PodManager:
                         blacklisted,  # Pass blacklist to get_best_offer
                     )
                     
-                    if not offer_info:
-                        logger.debug(
-                            f"Global fallback: no offer for variant={variant}, "
-                            f"allowed_gpus={allowed_gpus}"
-                        )
-                        continue
+                    if offer_info and offer_info.machine_id:
+                        # Double-check: Verify the machine is not blacklisted
+                        if not self.is_machine_bad(str(offer_info.machine_id)):
+                            # Get template and disk size for this variant
+                            template_uuid = self.get_template_for_variant(model, variant)
+                            disk_size = self.get_disk_size_for_variant(model, variant)
+                            
+                            if not template_uuid:
+                                template_uuid = self.template_uuids.get(base_model) or self.template_uuids.get("default")
+                            
+                            if template_uuid:
+                                logger.info(
+                                    f"Global fallback: creating pod with variant={variant}, "
+                                    f"machine={offer_info.machine_id}, template={template_uuid}, "
+                                    f"hourly_cost=${offer_info.hourly_cost:.3f}"
+                                )
+                                pod_uuid = await self._try_create_pod_on_machine(
+                                    str(offer_info.machine_id),
+                                    model,
+                                    mode,
+                                    variant,
+                                    offer_info.offer_id,
+                                    template_uuid,
+                                    disk_size,
+                                    hourly_cost=offer_info.hourly_cost,
+                                    gpu_type=offer_info.gpu_type,
+                                )
+                                
+                                if pod_uuid:
+                                    variant_pod_created = True
+                                    # Update machine cache with newly found machine
+                                    await self.machine_cache.mark_image_cached(
+                                        str(offer_info.machine_id), base_model
+                                    )
+                                    logger.info(
+                                        f"Added machine {offer_info.machine_id} to cache for model {base_model}"
+                                    )
+                                    
+                                    # Record fallback event for autoscaler
+                                    await self._record_fallback_event(model, str(offer_info.machine_id))
+                                    return pod_uuid
+                        else:
+                            logger.warning(
+                                f"Global fallback returned blacklisted machine {offer_info.machine_id}, "
+                                f"trying individual GPU types..."
+                            )
                     
-                    # Double-check: Verify the machine is not blacklisted
-                    if offer_info.machine_id and self.is_machine_bad(str(offer_info.machine_id)):
-                        logger.error(
-                            f"Global fallback returned blacklisted machine {offer_info.machine_id}! "
-                            f"This should not happen - blacklist was passed."
-                        )
-                        continue
-                    
-                    # Get template and disk size for this variant
-                    template_uuid = self.get_template_for_variant(model, variant)
-                    disk_size = self.get_disk_size_for_variant(model, variant)
-                    
-                    if not template_uuid:
-                        template_uuid = self.template_uuids.get(base_model) or self.template_uuids.get("default")
-                    
-                    if template_uuid:
+                    # If variant-level search failed, try each GPU type individually
+                    if not variant_pod_created:
                         logger.info(
-                            f"Global fallback: creating pod with variant={variant}, "
-                            f"machine={offer_info.machine_id}, template={template_uuid}, "
-                            f"hourly_cost=${offer_info.hourly_cost:.3f}"
-                        )
-                        pod_uuid = await self._try_create_pod_on_machine(
-                            str(offer_info.machine_id) if offer_info.machine_id else "unknown",
-                            model,
-                            mode,
-                            variant,  # Use the correct variant!
-                            offer_info.offer_id,
-                            template_uuid,
-                            disk_size,
-                            hourly_cost=offer_info.hourly_cost,
-                            gpu_type=offer_info.gpu_type,
+                            f"Global fallback: variant-level search failed for {variant}, "
+                            f"trying individual GPU types: {allowed_gpus}"
                         )
                         
-                        if pod_uuid:
-                            # Record fallback event for autoscaler
-                            await self._record_fallback_event(model, str(offer_info.machine_id))
-                            return pod_uuid
+                        for gpu_type in allowed_gpus:
+                            try:
+                                logger.info(
+                                    f"Global fallback: trying individual GPU type {gpu_type} "
+                                    f"for variant={variant}"
+                                )
+                                
+                                # Try with single GPU type
+                                offer_info = await asyncio.to_thread(
+                                    self.global_qp.get_best_offer_with_details,
+                                    None,  # no preferred machine
+                                    min_tflops,
+                                    [gpu_type],  # Try single GPU type
+                                    1,  # min_gpu_count
+                                    blacklisted,  # Pass blacklist
+                                )
+                                
+                                if offer_info and offer_info.machine_id:
+                                    # Double-check: Verify the machine is not blacklisted
+                                    if self.is_machine_bad(str(offer_info.machine_id)):
+                                        logger.debug(
+                                            f"Skipping blacklisted machine {offer_info.machine_id} "
+                                            f"for GPU type {gpu_type}"
+                                        )
+                                        continue
+                                    
+                                    # Get template and disk size for this variant
+                                    template_uuid = self.get_template_for_variant(model, variant)
+                                    disk_size = self.get_disk_size_for_variant(model, variant)
+                                    
+                                    if not template_uuid:
+                                        template_uuid = self.template_uuids.get(base_model) or self.template_uuids.get("default")
+                                    
+                                    if template_uuid:
+                                        logger.info(
+                                            f"Global fallback: creating pod with variant={variant}, "
+                                            f"GPU={gpu_type}, machine={offer_info.machine_id}, "
+                                            f"template={template_uuid}, hourly_cost=${offer_info.hourly_cost:.3f}"
+                                        )
+                                        pod_uuid = await self._try_create_pod_on_machine(
+                                            str(offer_info.machine_id),
+                                            model,
+                                            mode,
+                                            variant,
+                                            offer_info.offer_id,
+                                            template_uuid,
+                                            disk_size,
+                                            hourly_cost=offer_info.hourly_cost,
+                                            gpu_type=offer_info.gpu_type,
+                                        )
+                                        
+                                        if pod_uuid:
+                                            # Update machine cache with newly found machine
+                                            await self.machine_cache.mark_image_cached(
+                                                str(offer_info.machine_id), base_model
+                                            )
+                                            logger.info(
+                                                f"Added machine {offer_info.machine_id} to cache for model {base_model} "
+                                                f"(found via GPU type {gpu_type})"
+                                            )
+                                            
+                                            # Record fallback event for autoscaler
+                                            await self._record_fallback_event(model, str(offer_info.machine_id))
+                                            return pod_uuid
+                                
+                            except Exception as e:
+                                logger.warning(
+                                    f"Global fallback failed for GPU type {gpu_type} "
+                                    f"in variant {variant}: {e}"
+                                )
+                                continue
                             
                 except Exception as e:
                     logger.warning(f"Global fallback failed for variant={variant}: {e}")
