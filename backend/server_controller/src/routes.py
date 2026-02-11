@@ -566,6 +566,84 @@ async def verify_firebase_token(authorization: Optional[str]) -> Dict[str, Any]:
         )
 
 
+def _save_json_request(
+    data: Dict[str, Any],
+    request_type: str,
+    job_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    additional_labels: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """
+    Save JSON request data to file with proper grouping and labeling.
+    
+    Args:
+        data: The JSON-serializable data to save
+        request_type: Type of request (e.g., "client_submit", "worker_dispatch")
+        job_id: Optional job ID for grouping
+        user_id: Optional user ID for grouping
+        additional_labels: Optional additional labels to include in filename
+    
+    Returns:
+        Path to saved file, or None if save failed
+    """
+    import datetime
+    import os
+    import json
+    
+    try:
+        # Base directory for all JSON dumps
+        base_dir = os.environ.get("JSON_REQUEST_DUMPS_PATH", "./json_request_dumps")
+        
+        # Create subdirectories by request type
+        type_dir = os.path.join(base_dir, request_type)
+        os.makedirs(type_dir, exist_ok=True)
+        
+        # Create subdirectory by date for better organization
+        date_str = datetime.datetime.utcnow().strftime("%Y%m%d")
+        date_dir = os.path.join(type_dir, date_str)
+        os.makedirs(date_dir, exist_ok=True)
+        
+        # Build filename with labels
+        now_str = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        filename_parts = [request_type, now_str]
+        
+        if job_id:
+            filename_parts.append(f"job_{job_id[:8]}")  # First 8 chars of job_id
+        
+        if user_id:
+            filename_parts.append(f"user_{user_id[:8]}")  # First 8 chars of user_id
+        
+        if additional_labels:
+            for key, value in additional_labels.items():
+                if value:
+                    filename_parts.append(f"{key}_{str(value)[:16]}")  # Truncate long values
+        
+        filename = "_".join(filename_parts) + ".json"
+        file_path = os.path.join(date_dir, filename)
+        
+        # Prepare data with metadata
+        save_data = {
+            "request_type": request_type,
+            "timestamp_utc": datetime.datetime.utcnow().isoformat(),
+            "timestamp_filename": now_str,
+            "job_id": job_id,
+            "user_id": user_id,
+            "labels": additional_labels or {},
+            "data": data,
+        }
+        
+        # Save to file
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(save_data, f, indent=2, ensure_ascii=False)
+        
+        logger.debug(f"Saved {request_type} JSON request to: {file_path}")
+        return file_path
+        
+    except Exception as e:
+        logger.warning(f"Failed to save {request_type} JSON request: {e}")
+        return None
+
+
 def get_or_create_user(db: Session, firebase_uid: str, email: Optional[str] = None) -> User:
     """
     Get existing user by firebase_uid or create new user.
@@ -2831,42 +2909,41 @@ async def submit_job(
     Returns job ID and optionally dispatches immediately if a worker is ready.
     For variations > 1 or bulk edit, returns batch_id and all job_ids.
     """
-    import datetime
-    import os
-    import json
-
     ip = get_client_ip(request)
     user_id = auth.get("user_id")
     is_vip = auth.get("is_vip", False)
 
-    # Dump the request payload as JSON file (for debugging/audit)
+    # Save the client request as JSON (as received from client)
     try:
-        dump_dir = os.environ.get("FRONTEND_SUBMIT_DUMPS_PATH", "./frontend_submit_dumps")
-        os.makedirs(dump_dir, exist_ok=True)
-        now_str = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-        filename = f"{user_id or 'anon'}_{now_str}.json"
-        dump_path = os.path.join(dump_dir, filename)
-        # use payload.dict() if it's a Pydantic model
+        # Convert payload to dict (handle Pydantic models)
         try:
             payload_data = payload.dict()
         except Exception:
             payload_data = dict(payload)
-        # include metadata as well if needed
-        request_metadata = {
-            "ip": ip,
-            "user_id": user_id,
-            "is_vip": is_vip,
-            "timestamp_utc": now_str,
-            "auth_info": {k: v for k, v in auth.items() if k != "firebase_token"},
+        
+        # Prepare client request data (exactly as received)
+        client_request_data = {
+            "request_info": {
+                "ip": ip,
+                "user_id": user_id,
+                "is_vip": is_vip,
+                "auth_info": {k: v for k, v in auth.items() if k != "firebase_token"},
+            },
+            "payload": payload_data,  # Original payload from client
         }
-        dump_contents = {
-            "metadata": request_metadata,
-            "payload": payload_data,
-        }
-        with open(dump_path, "w") as f:
-            json.dump(dump_contents, f, indent=2)
+        
+        # Save with proper grouping and labeling
+        _save_json_request(
+            data=client_request_data,
+            request_type="client_submit",
+            user_id=user_id,
+            additional_labels={
+                "model": payload.model if hasattr(payload, "model") else None,
+                "is_vip": "vip" if is_vip else "free",
+            },
+        )
     except Exception as e:
-        logger.warning(f"Failed to dump submit request to file: {e}")
+        logger.warning(f"Failed to save client submit request JSON: {e}")
 
     # Check if user account is active
     if not auth.get("is_active", True):
@@ -3845,6 +3922,38 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             "upload_url": presigned_url,
             "result_key": job.result_r2_key,
         }
+        
+        # Save dispatch payload as JSON (as sent to worker)
+        try:
+            dispatch_data = {
+                "worker_info": {
+                    "worker_id": worker_id,
+                    "worker_endpoint": worker.endpoint,
+                    "pod_uuid": pod_uuid,
+                    "machine_id": worker.machine_id,
+                },
+                "job_info": {
+                    "job_id": job.job_id,
+                    "model": job.model,
+                    "status": job.status,
+                },
+                "dispatch_payload": run_payload,  # Exact payload sent to worker
+            }
+            
+            # Save with proper grouping and labeling
+            _save_json_request(
+                data=dispatch_data,
+                request_type="worker_dispatch",
+                job_id=job.job_id,
+                user_id=job.user_id if hasattr(job, "user_id") else None,
+                additional_labels={
+                    "model": job.model,
+                    "worker_id": worker_id[:8] if worker_id else None,
+                    "mode": dispatch_params.get("mode"),
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save worker dispatch JSON: {e}")
         
         # Log if we're using cached vs DB params
         if cached_params:
