@@ -1,0 +1,37 @@
+# FastWAN 2.1 1.3B Worker Requirements
+
+# Core ML libraries
+torch>=2.0.0
+torchvision
+torchaudio
+
+diffusers
+transformers
+accelerate
+safetensors
+sentencepiece
+peft
+ftfy
+
+# Media processing
+imageio-ffmpeg
+opencv-python
+pillow
+
+# HuggingFace Hub for model downloading
+huggingface-hub
+huggingface-hub[cli]
+
+# NumPy for calculations
+numpy
+
+# Video post-processing dependencies (RIFE and Real-ESRGAN)
+spandrel>=0.4.0
+
+# FastAPI and web server
+fastapi
+uvicorn[standard]
+pydantic
+tenacity
+httpx
+requests

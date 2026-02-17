@@ -29,7 +29,7 @@
   - **Multiple images (array)**: `"init_image": ["base64_img1", "base64_img2", "base64_img3"]`
   - **Qwen Image Edit 2511 supports up to 3 images** in the array
   - **For 2-image LoRAs**: Use array format with at least 2 images
-    - Example: `"init_image": ["base64_img1", "base64_img2"]` for AnyPose or BFS-Best-FaceSwap
+    - Example: `"init_image": ["base64_img1", "base64_img2"]` for AnyPose or BFS-Best-FaceSwap-merge
   - Images are automatically labeled as `image_1`, `image_2`, `image_3` based on array position
 
 ### Optional Parameters
@@ -47,18 +47,14 @@
     - `"Any2Real_2601"` - Convert to realistic photograph
     - `"Hyperrealistic-Portrait"` - Hyper-realistic portrait enhancement
     - `"Ultrarealistic-Portrait"` - Ultra-realistic glamour portrait
-    - `"BFS-Best-FaceSwap"` - **2-image LoRA** - Face swap (requires `init_image_2`)
     - `"BFS-Best-FaceSwap-merge"` - **2-image LoRA** - Face swap merged version (requires `init_image_2`)
     - `"F2P"` - F2P style transfer
     - `"Multiple-Angles"` - Camera angle changes
     - `"Light-Restoration"` - Remove shadows and relight
     - `"Relight"` - Relighting with golden-hour filter
-    - `"Multi-Angle-Lighting"` - Multi-angle lighting effects
     - `"Edit-Skin"` - Skin detail enhancement
     - `"Next-Scene"` - Scene transition effects
     - `"Flat-Log"` - Flat log color grading
-    - `"Upscale-Image"` - Image upscaling
-    - `"Upscale2K"` - Upscale to 2K resolution (target: 2048px)
 
 #### AIO Version
 
@@ -168,7 +164,7 @@
 }
 ```
 
-### 4. Two-Image LoRA: BFS-Best-FaceSwap
+### 4. Two-Image LoRA: BFS-Best-FaceSwap-merge
 
 ```json
 {
@@ -178,7 +174,7 @@
   "mode": null,
   "params": {
     "init_image": ["iVBORw0KGgoAAAANSUhEUgAA...", "iVBORw0KGgoAAAANSUhEUgAA..."],
-    "lora_adapter": "BFS-Best-FaceSwap",
+    "lora_adapter": "BFS-Best-FaceSwap-merge",
     "num_inference_steps": 8,
     "guidance_scale": 1.0,
     "randomize_seed": true
@@ -188,27 +184,7 @@
 }
 ```
 
-### 5. Upscale with LoRA
-
-```json
-{
-  "job_id": "edit-005",
-  "prompt": "Upscale this picture to 4K resolution",
-  "model": "qwen_image_edit_2511_rapid_aio",
-  "mode": null,
-  "params": {
-    "init_image": "iVBORw0KGgoAAAANSUhEUgAA...",
-    "lora_adapter": "Upscale2K",
-    "num_inference_steps": 8,
-    "guidance_scale": 1.0,
-    "randomize_seed": true
-  },
-  "upload_url": "https://r2.example.com/upload",
-  "result_key": "edit-005.png"
-}
-```
-
-### 6. Three Images (Maximum Supported)
+### 5. Three Images (Maximum Supported)
 
 ```json
 {
@@ -228,7 +204,7 @@
 }
 ```
 
-### 7. Custom AIO Version with Advanced Settings
+### 6. Custom AIO Version with Advanced Settings
 
 ```json
 {
@@ -256,7 +232,6 @@
 ### 2-Image LoRAs
 The following LoRAs **REQUIRE** `init_image` to be an **array with at least 2 images**:
 - `"AnyPose"` - Pose reference image (image_1 = base, image_2 = pose reference)
-- `"BFS-Best-FaceSwap"` - Face swap (image_1 = base, image_2 = face/head donor)
 - `"BFS-Best-FaceSwap-merge"` - Face swap merged version (image_1 = base, image_2 = face/head donor)
 
 **Example for 2-image LoRA:**
@@ -274,7 +249,7 @@ If you use these LoRAs with a single image (string instead of array), the reques
 - **Qwen Image Edit 2511 supports up to 3 images** in the array
 - Images are automatically converted to RGB format
 - Images are labeled as `image_1`, `image_2`, `image_3` based on array position
-- Resolution is automatically computed based on the LoRA adapter (most use 1024px, Upscale2K uses 2048px)
+- Resolution is automatically computed based on the LoRA adapter (most use 1024px)
 
 ### LoRA Adapter Names
 - Use **exact** names as listed above (case-sensitive)

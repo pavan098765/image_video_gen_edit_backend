@@ -732,6 +732,7 @@ class PodManager:
 
             "qwen_image_edit_2509": os.getenv("QWEN_IMAGE_EDIT_2509_TEMPLATE_UUID"),
             "qwen_image_edit_2509_int4": os.getenv("QWEN_IMAGE_EDIT_2509_INT4_TEMPLATE_UUID"),
+            "qwen_image_edit_2511_rapid_aio": os.getenv("QWEN_IMAGE_EDIT_25011_RAPID_AIO_TEMPLATE_UUID"),
 
             "qwen_image": os.getenv("QWEN_IMAGE_TEMPLATE_UUID"),
             "qwen_image_int4": os.getenv("QWEN_IMAGE_INT4_TEMPLATE_UUID"),
@@ -744,12 +745,24 @@ class PodManager:
 
             "fastwan_21_1b": os.getenv("FASTWAN_21_1B_TEMPLATE_UUID"),
             "fastwan_22_5b": os.getenv("FASTWAN_22_5B_TEMPLATE_UUID"),
+            "wan_22_14b_rapid": os.getenv("WAN_22_14B_RAPID_TEMPLATE_UUID"),
+            "wan_22_uint4_lightx2v_i2v": os.getenv("WAN_22_14B_I2V_LIGHTX2V"),
+            "wan_22_uint4_lightx2v_t2v": os.getenv("WAN_22_14B_T2V_LIGHTX2V"),
+            "wan_22_fp8_lightx2v_i2v": os.getenv("WAN_22_14B_I2V_LIGHTX2V"),
+            "wan_22_fp8_lightx2v_t2v": os.getenv("WAN_22_14B_T2V_LIGHTX2V"),
+            "video_upscaler": os.getenv("VIDEO_UPSCALER_REALESRGAN_TEMPLATE_UUID"),
 
             "ltx2_video": os.getenv("LTX2_VIDEO_TEMPLATE_UUID"),
+
+            "dreamid": os.getenv("DREAMID_TEMPLATE_UUID"),
+            "hunyan15_480p_t2v_distilled": os.getenv("HUNYUAN_480P_T2V_TEMPLATE_UUID"),
+            "hunyan15_480p_i2v_step_distilled": os.getenv("HUNYUAN_480P_I2V_TEMPLATE_UUID"),
+            "glm_ocr": os.getenv("GLM_OCR_TEMPLATE_UUID"),
 
             "aurasrv2": os.getenv("AURASRV2_TEMPLATE_UUID"),
             "realesrgan": os.getenv("REALESRGAN_TEMPLATE_UUID"),
             "swin2sr": os.getenv("SWIN2SR_TEMPLATE_UUID"),
+            "face_enhancer": os.getenv("REALESRGAN_TEMPLATE_UUID"),  # Uses same template as realesrgan
 
             "basic_utils": os.getenv("BASIC_UTILS_TEMPLATE_UUID"),
             "warm_pod": os.getenv("WARM_POD_TEMPLATE_UUID"),
@@ -766,6 +779,7 @@ class PodManager:
             "qwen_image": 80,
             "qwen_image_edit": 80,
             "qwen_image_edit_2509": 85,
+            "qwen_image_edit_2511_rapid_aio": 85,
             "flux_kontext_dev": 45,
             "z_image_turbo": 80,
             "qwen_image_int4": 80,
@@ -775,10 +789,21 @@ class PodManager:
             "z_image_turbo_int4": 80,
             "fastwan_21_1b": 60,
             "fastwan_22_5b": 60,
+            "wan_22_14b_rapid": 100,  # 75GB model (60GB transformers + other components)
+            "wan_22_uint4_lightx2v_i2v": 70,  # UINT4 quantized model ~40GB + LoRA + post-processing models
+            "wan_22_uint4_lightx2v_t2v": 70,  # UINT4 quantized model ~40GB + LoRA + post-processing models
+            "wan_22_fp8_lightx2v_i2v": 80,  # FP8 quantized model ~20-28GB + post-processing models (no LoRA needed)
+            "wan_22_fp8_lightx2v_t2v": 80,  # FP8 quantized model ~20-28GB + post-processing models (no LoRA needed)
+            "video_upscaler": 40,  # RIFE + Real-ESRGAN models ~10GB + workspace
             "ltx2_video": 85,  # FP4 model ~20GB + Gemma ~2GB + workspace
+            "dreamid": 60,
+            "hunyan15_480p_t2v_distilled": 50,
+            "hunyan15_480p_i2v_step_distilled": 50,
+            "glm_ocr": 40,
             "aurasrv2": 30,
             "realesrgan": 30,
             "swin2sr": 30,
+            "face_enhancer": 30,
             "basic_utils": 30,
         }
     
@@ -1939,30 +1964,38 @@ class PodManager:
                     f"{[c[0] for c in candidates]}"
                 )
             
-            # If no cached candidates, we'll rely on global fallback
-            
             # Try each variant with its specific GPU requirements
+            # For each variant, try ALL available machines of that GPU type (not just cached)
             for variant, allowed_gpus in variant_plan:
                 logger.info(
                     f"Trying variant={variant} for model={model}, "
                     f"allowed_gpus={allowed_gpus}"
                 )
                 
+                # Check requirements (use base model for alias resolution)
+                base_model = self.resolve_model_alias(model)
+                req = self.model_requirements.get(base_model, {})
+                min_tflops = req.get("min_tflops", 0)
+                
+                # Get template and disk size
+                template_uuid = self.get_template_for_variant(model, variant)
+                disk_size = self.get_disk_size_for_variant(model, variant)
+                
+                if not template_uuid:
+                    logger.warning(f"No template found for variant {variant}, skipping")
+                    continue
+                
+                # Track machines we've tried for this variant to avoid duplicates
+                tried_machines = set()
+                
+                # First, try cached machines (prioritize known good machines)
                 for mid, desc in candidates:
+                    if mid in tried_machines:
+                        continue
+                    tried_machines.add(mid)
+                    
                     # Skip blacklisted
                     if self.is_machine_bad(mid):
-                        continue
-                    
-                    # Check requirements (use base model for alias resolution)
-                    base_model = self.resolve_model_alias(model)
-                    req = self.model_requirements.get(base_model, {})
-                    min_tflops = req.get("min_tflops", 0)
-                    
-                    # Get template and disk size
-                    template_uuid = self.get_template_for_variant(model, variant)
-                    disk_size = self.get_disk_size_for_variant(model, variant)
-                    
-                    if not template_uuid:
                         continue
                     
                     try:
@@ -1980,11 +2013,10 @@ class PodManager:
                         )
                         
                         if not offer_info:
-                            logger.debug(f"No offer available for machine {mid}")
+                            logger.debug(f"No offer available for cached machine {mid}")
                             continue
                         
                         # Double-check: Verify the returned machine is not blacklisted
-                        # (Belt and suspenders approach)
                         final_machine_id = str(offer_info.machine_id or mid)
                         if self.is_machine_bad(final_machine_id):
                             logger.warning(
@@ -2010,19 +2042,177 @@ class PodManager:
                             return pod_uuid
                             
                     except Exception as e:
-                        logger.warning(f"Failed on machine {mid}: {e}")
+                        logger.warning(f"Failed on cached machine {mid}: {e}")
                         continue
                 
-                # If we reach here, this variant failed on all cached machines
+                # If cached machines failed, try ALL available machines of this GPU type
+                # This handles new machines that don't have the image cached yet
+                logger.info(
+                    f"Cached machines exhausted for variant {variant} (GPUs: {allowed_gpus}). "
+                    f"Trying all available machines of this GPU type..."
+                )
+                
+                # Get current ACTIVE blacklisted machines
+                blacklisted = self.blacklist.get_active_blacklist()
+                blacklist_set = set(blacklisted)
+                
+                try:
+                    # Get all available offers and filter for this GPU type
+                    all_offers = await asyncio.to_thread(
+                        self.global_qp.get_rentable_machines
+                    )
+                    
+                    if not all_offers:
+                        logger.warning(f"No offers available for variant {variant}")
+                        continue
+                    
+                    # Helper functions to filter offers
+                    def extract_machine_id(o: Dict) -> Optional[int]:
+                        for key in ("machines_id", "machine_id", "machineId"):
+                            if key in o and o[key] is not None:
+                                try:
+                                    return int(o[key])
+                                except (ValueError, TypeError):
+                                    pass
+                        return None
+                    
+                    def extract_offer_id(o: Dict) -> Optional[int]:
+                        return o.get("offer_id") or o.get("id")
+                    
+                    def extract_price(o: Dict) -> float:
+                        try:
+                            return float(o.get("hourly_cost", 1e9))
+                        except (ValueError, TypeError):
+                            return 1e9
+                    
+                    def has_valid_tflops(o: Dict) -> bool:
+                        try:
+                            return float(o.get("tflops", 0)) >= min_tflops
+                        except (ValueError, TypeError):
+                            return False
+                    
+                    def matches_gpu_name(o: Dict) -> bool:
+                        if not allowed_gpus:
+                            return True
+                        offer_name = str(o.get("offer_name", "")).upper()
+                        for gpu in allowed_gpus:
+                            if gpu.upper() in offer_name:
+                                return True
+                        return False
+                    
+                    def is_blacklisted_offer(o: Dict) -> bool:
+                        mid = extract_machine_id(o)
+                        return mid and str(mid) in blacklist_set
+                    
+                    def has_sufficient_memory(o: Dict) -> bool:
+                        try:
+                            return float(o.get("memory", 0)) > 30
+                        except (ValueError, TypeError):
+                            return False
+                    
+                    def is_multi_gpu_offer(o: Dict) -> bool:
+                        name = str(o.get("offer_name", "")).upper()
+                        if name.startswith(("2X", "3X", "4X")):
+                            return True
+                        gpu_indexes = str(o.get("gpu_indexes", "") or "")
+                        tokens = [t for t in gpu_indexes.split("|") if t.strip()]
+                        return len(tokens) > 1
+                    
+                    # Filter offers for this GPU type, excluding blacklisted and already-tried machines
+                    eligible_offers = [
+                        o for o in all_offers
+                        if not is_multi_gpu_offer(o)
+                        and has_valid_tflops(o)
+                        and matches_gpu_name(o)
+                        and has_sufficient_memory(o)
+                        and not is_blacklisted_offer(o)
+                        and extract_machine_id(o) is not None
+                        and str(extract_machine_id(o)) not in tried_machines
+                    ]
+                    
+                    # Sort by price (cheapest first)
+                    eligible_offers.sort(key=extract_price)
+                    
+                    logger.info(
+                        f"Found {len(eligible_offers)} eligible machines for variant {variant} "
+                        f"(GPUs: {allowed_gpus})"
+                    )
+                    
+                    # Try each eligible machine
+                    for offer in eligible_offers:
+                        machine_id = extract_machine_id(offer)
+                        if not machine_id:
+                            continue
+                        
+                        machine_id_str = str(machine_id)
+                        
+                        # Double-check: Verify the machine is not blacklisted (race condition protection)
+                        if self.is_machine_bad(machine_id_str):
+                            logger.debug(
+                                f"Skipping blacklisted machine {machine_id_str} for variant {variant}"
+                            )
+                            continue
+                        
+                        offer_id = extract_offer_id(offer)
+                        if not offer_id:
+                            continue
+                        
+                        # Extract offer details
+                        hourly_cost = extract_price(offer)
+                        gpu_type = offer.get("gpu_type", offer.get("offer_name", "Unknown"))
+                        
+                        logger.info(
+                            f"Trying machine {machine_id_str} for variant {variant} "
+                            f"(GPUs: {allowed_gpus}, price=${hourly_cost:.3f}/hr)"
+                        )
+                        
+                        # Create pod with cost tracking info
+                        pod_uuid = await self._try_create_pod_on_machine(
+                            machine_id_str,
+                            model,
+                            mode,
+                            variant,
+                            offer_id,
+                            template_uuid,
+                            disk_size,
+                            hourly_cost=hourly_cost,
+                            gpu_type=gpu_type,
+                        )
+                        
+                        if pod_uuid:
+                            # Success! Machine will be added to cache in _try_create_pod_on_machine
+                            logger.info(
+                                f"Successfully created pod on machine {machine_id_str} "
+                                f"for variant {variant}. Machine will be cached for future use."
+                            )
+                            return pod_uuid
+                        
+                        # If pod creation failed, machine was blacklisted in _try_create_pod_on_machine
+                        # Continue to next machine
+                        logger.debug(
+                            f"Pod creation failed on machine {machine_id_str} for variant {variant}. "
+                            f"Trying next machine..."
+                        )
+                    
+                    logger.warning(
+                        f"All eligible machines for variant {variant} (GPUs: {allowed_gpus}) "
+                        f"have been tried and failed. Moving to next variant."
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error getting offers for variant {variant}: {e}")
+                    continue
+                
+                # If we reach here, this variant failed on all available machines of this GPU type
                 logger.warning(
-                    f"Variant {variant} (GPUs: {allowed_gpus}) failed on all cached machines. "
+                    f"Variant {variant} (GPUs: {allowed_gpus}) failed on all available machines. "
                     f"Trying next variant..."
                 )
             
-            # Global fallback - try each variant's GPUs without preferred machine
+            # Global fallback - only reached if ALL variants exhausted ALL their GPU tier machines
             logger.warning(
-                "All cached machines exhausted for all variants. "
-                "Trying global fallback (searching all available machines)..."
+                "All variants exhausted all available machines in their GPU tiers. "
+                "Trying global fallback (searching all available machines across all GPU types)..."
             )
             
             # Get current ACTIVE blacklisted machines (excludes expired)

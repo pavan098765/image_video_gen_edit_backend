@@ -21,6 +21,20 @@ import torch
 import imageio
 from PIL import Image
 
+# Video post-processing imports
+try:
+    from video_postprocessing import (
+        load_rife_model,
+        load_sd_upscale,
+        apply_rife_interpolation,
+        apply_realesrgan_upscaling,
+        check_rife_code_available,
+    )
+    POSTPROCESSING_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  Video post-processing not available: {e}")
+    POSTPROCESSING_AVAILABLE = False
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
 # # Disable PyTorch's automatic SDPA optimizations to prevent cutlassF errors
@@ -62,6 +76,7 @@ HUNYAN15_REPO_ID = os.environ.get(
 
 # Local model paths (REQUIRED - models must be pre-downloaded, no HuggingFace downloads)
 MODEL_DIR = os.environ.get("HUNYAN15_T2V_LOCAL_PATH", "/app/models/hunyan15_t2v")
+MODELS_DIR = os.environ.get("MODELS_DIR", "/app/models")
 
 # Inference defaults
 DEFAULT_FPS = 24
@@ -562,13 +577,92 @@ def run_inference_hunyan15_t2v(
                 print(f"   Frames extracted: {num_frames_generated} frames")
                 sys.stdout.flush()
             
+            # Post-processing (RIFE interpolation and/or Real-ESRGAN upscaling)
+            postprocess_time = 0.0
+            final_fps = fps
+            final_output = video_frames
+            final_height = None
+            final_width = None
+            
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            enable_rife = params.get("enable_rife", False)
+            rife_target_fps = params.get("rife_target_fps", 30)
+            enable_upscaling = params.get("enable_upscaling", False)
+            upscale_factor = int(params.get("upscale_factor", 2))
+            postprocess_interpolate_first = params.get("postprocess_interpolate_first", False)
+            
+            if POSTPROCESSING_AVAILABLE and (enable_rife or enable_upscaling):
+                postprocess_start = time.time()
+                
+                # Load post-processing models from local paths
+                rife_model = None
+                upscale_model = None
+                
+                if enable_rife:
+                    if check_rife_code_available():
+                        rife_path = os.path.join(MODELS_DIR, "rife")
+                        if os.path.exists(rife_path) and os.listdir(rife_path):
+                            rife_model = load_rife_model(rife_path)
+                        else:
+                            print(f"⚠️  RIFE model not found, interpolation disabled")
+                    else:
+                        print(f"⚠️  RIFE code not available, interpolation disabled")
+                
+                if enable_upscaling:
+                    realesrgan_model_file = os.path.join(MODELS_DIR, "realesrgan", f"RealESRGAN_x{upscale_factor}.pth")
+                    if os.path.exists(realesrgan_model_file):
+                        try:
+                            upscale_model = load_sd_upscale(realesrgan_model_file, device)
+                        except Exception as e:
+                            print(f"⚠️  Real-ESRGAN load failed: {str(e)[:100]}")
+                            upscale_model = None
+                    else:
+                        print(f"⚠️  Real-ESRGAN {upscale_factor}x model not found")
+                
+                # Apply post-processing based on order
+                if postprocess_interpolate_first:
+                    # Interpolate → Upscale
+                    if enable_rife and rife_model:
+                        try:
+                            final_output, actual_fps = apply_rife_interpolation(
+                                rife_model, final_output, device, original_fps=fps, target_fps=rife_target_fps
+                            )
+                            final_fps = actual_fps
+                        except Exception as e:
+                            print(f"⚠️  RIFE interpolation failed: {str(e)[:100]}")
+                    
+                    if enable_upscaling and upscale_model:
+                        try:
+                            final_output = apply_realesrgan_upscaling(upscale_model, final_output, device)
+                        except Exception as e:
+                            print(f"⚠️  Upscaling failed: {str(e)[:100]}")
+                else:
+                    # Upscale → Interpolate (default)
+                    if enable_upscaling and upscale_model:
+                        try:
+                            final_output = apply_realesrgan_upscaling(upscale_model, final_output, device)
+                        except Exception as e:
+                            print(f"⚠️  Upscaling failed: {str(e)[:100]}")
+                    
+                    if enable_rife and rife_model:
+                        try:
+                            final_output, actual_fps = apply_rife_interpolation(
+                                rife_model, final_output, device, original_fps=fps, target_fps=rife_target_fps
+                            )
+                            final_fps = actual_fps
+                        except Exception as e:
+                            print(f"⚠️  RIFE interpolation failed: {str(e)[:100]}")
+                
+                postprocess_time = time.time() - postprocess_start
+            
             # Export video
             logger.info(f"[{job_id}] 💾 Exporting video to {output_path}...")
             print(f"💾 Exporting video to {output_path}...")
             sys.stdout.flush()
             
             from diffusers.utils import export_to_video
-            export_to_video(video_frames, output_path, fps=fps)
+            export_to_video(final_output, output_path, fps=final_fps)
             
             # Verify file was created
             if os.path.exists(output_path):

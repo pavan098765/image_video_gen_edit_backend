@@ -55,7 +55,7 @@ def cleanup_gpu(verbose: bool = False):
 # -----------------------
 # Import inference functions
 # -----------------------
-from fastwan_1b_inference import run_inference_wan_1b_t2i, run_inference_wan_1b_t2v
+from fastwan_1b_inference import run_inference_wan_1b_t2i, run_inference_wan_1b_t2v, run_inference_wan_1b_i2v
 
 # -----------------------
 # Model Registry
@@ -64,6 +64,7 @@ MODEL_REGISTRY = {
     "fastwan_21_1b": {
         "t2i": run_inference_wan_1b_t2i,
         "t2v": run_inference_wan_1b_t2v,
+        "i2v": run_inference_wan_1b_i2v,
     }
 }
 

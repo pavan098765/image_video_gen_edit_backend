@@ -74,6 +74,11 @@ psutil>=5.9.0
 pyyaml>=6.0.0
 
 # ===========================================
+# Video post-processing
+# ===========================================
+spandrel>=0.4.0  # For Real-ESRGAN upscaling
+
+# ===========================================
 # Optional: FP8 support for Ada/Hopper GPUs
 # Uncomment if using RTX 40xx/50xx or H100
 # ===========================================

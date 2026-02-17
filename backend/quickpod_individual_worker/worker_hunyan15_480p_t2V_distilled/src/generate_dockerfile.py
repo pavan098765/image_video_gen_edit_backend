@@ -77,6 +77,7 @@ def write_rest(f):
 
     # Environment variables
     f.write('ENV HUNYAN15_T2V_LOCAL_PATH="/app/models/hunyan15_t2v"\n')
+    f.write('ENV MODELS_DIR="/app/models"\n')
     f.write('ENV PYTHONPATH="/app/worker/src:${PYTHONPATH}"\n\n')
 
     # Worker setup

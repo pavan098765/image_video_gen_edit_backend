@@ -3040,10 +3040,30 @@ async def submit_job(
     num_images = len(images_to_process)
     
     # ==========================================================================
+    # VIDEO UPSCALER VALIDATION
+    # ==========================================================================
+    # Validate video_duration for video_upscaler (max 10 minutes)
+    if model == "video_upscaler" and "video_duration" in full_params:
+        try:
+            video_duration = float(full_params.get("video_duration", 0))
+            MAX_VIDEO_DURATION = 600  # 10 minutes in seconds
+            if video_duration > MAX_VIDEO_DURATION:
+                logger.warning(
+                    f"[VIDEO_UPSCALER] Video duration {video_duration}s exceeds max {MAX_VIDEO_DURATION}s, "
+                    f"capping to {MAX_VIDEO_DURATION}s"
+                )
+                full_params["video_duration"] = MAX_VIDEO_DURATION
+        except (ValueError, TypeError) as e:
+            logger.warning(f"[VIDEO_UPSCALER] Invalid video_duration: {full_params.get('video_duration')}, error: {e}")
+            # Remove invalid video_duration, will use default cost calculation
+            full_params.pop("video_duration", None)
+    
+    # ==========================================================================
     # CREDIT CALCULATION
     # ==========================================================================
     # VIP benefits: Free upscale
     # Total cost = per_job_cost * variations * num_images
+    # For video_upscaler: dynamic cost based on video_duration (2 credits per 5 seconds)
     credit_cost = get_credit_cost(
         model, 
         full_params, 
@@ -3103,7 +3123,7 @@ async def submit_job(
         
         # Determine output extension based on model type
         # Video models output .mp4, image models output .png
-        VIDEO_MODELS = {"ltx2_video", "fastwan_21_1b", "fastwan_22_5b", "wan21", "wan22"}
+        VIDEO_MODELS = {"ltx2_video", "fastwan_21_1b", "fastwan_22_5b", "wan_22_14b_rapid", "wan_22_uint4_lightx2v_i2v", "wan_22_uint4_lightx2v_t2v", "wan_22_fp8_lightx2v_i2v", "wan_22_fp8_lightx2v_t2v", "wan21", "wan22", "video_upscaler"}
         is_video_model = model.lower() in VIDEO_MODELS or "video" in model.lower()
         output_extension = ".mp4" if is_video_model else ".png"
         
@@ -3130,48 +3150,99 @@ async def submit_job(
                             "is_custom": "is_custom_mode",  # Frontend → Worker key mapping
                         }
                         
-                        # Keys to extract from outpaint_config
-                        extract_keys = [
+                        # Determine if this is custom mode (check both is_custom and is_custom_mode)
+                        is_custom = outpaint_config.get("is_custom", "false")
+                        is_custom_mode_from_config = outpaint_config.get("is_custom_mode", False)
+                        is_actually_custom = (
+                            is_custom == "true" or is_custom is True or 
+                            is_custom_mode_from_config is True
+                        )
+                        
+                        # Base keys that are always extracted (for both custom and non-custom mode)
+                        base_keys = [
                             "alignment", "aspect_ratio", "is_custom", "is_custom_mode",
-                            "custom_scale", "norm_offset_x", "norm_offset_y",
                             "overlap_left", "overlap_right", "overlap_top", "overlap_bottom",
+                        ]
+                        
+                        # Custom positioning keys - ONLY extract when is_custom_mode is True
+                        custom_keys = [
+                            "custom_scale", "norm_offset_x", "norm_offset_y",
                             "canvas_width", "canvas_height",
-                            # Additional keys that might be in the config
                             "image_width", "image_height", "image_left", "image_top",
                             "fitted_width", "fitted_height", "offset_x", "offset_y",
                         ]
                         
-                        # IMPORTANT: First REMOVE any existing outpaint keys from base params
-                        # This ensures per-image config always takes precedence
-                        for key in extract_keys:
+                        # Build extract_keys list based on mode
+                        extract_keys = base_keys.copy()
+                        if is_actually_custom:
+                            extract_keys.extend(custom_keys)
+                            logger.debug(f"[BULK] Custom mode detected for image {image_idx}, including custom positioning params")
+                        else:
+                            logger.debug(f"[BULK] Non-custom mode for image {image_idx}, excluding custom positioning params")
+                        
+                        # IMPORTANT: Only remove keys that are actually in the per-image config
+                        # This ensures defaults from base params are preserved if not overridden
+                        # First, identify which keys from extract_keys are actually in outpaint_config
+                        keys_to_replace = [key for key in extract_keys if key in outpaint_config]
+                        
+                        # Remove only the keys that will be replaced
+                        for key in keys_to_replace:
                             target_key = key_mapping.get(key, key)
                             if target_key in job_full_params:
                                 del job_full_params[target_key]
+                                logger.debug(f"[BULK] Removed base param {target_key} (will be replaced from per-image config)")
+                        
+                        # Also remove custom positioning params if NOT in custom mode
+                        # (to prevent them from being sent when they shouldn't be)
+                        if not is_actually_custom:
+                            for key in custom_keys:
+                                target_key = key_mapping.get(key, key)
+                                if target_key in job_full_params:
+                                    del job_full_params[target_key]
+                                    logger.debug(f"[BULK] Removed custom param {target_key} (not in custom mode)")
                         
                         # Apply outpaint-specific params from per-image config
-                        for key in extract_keys:
-                            if key in outpaint_config:
-                                value = outpaint_config[key]
-                                # Convert string booleans to actual booleans
-                                if value == "true":
-                                    value = True
-                                elif value == "false":
-                                    value = False
-                                # Convert numeric strings to floats where needed
-                                elif key in ["custom_scale", "norm_offset_x", "norm_offset_y", 
-                                            "canvas_width", "canvas_height",
-                                            "image_width", "image_height", "image_left", "image_top",
-                                            "fitted_width", "fitted_height", "offset_x", "offset_y"]:
-                                    try:
-                                        value = float(value)
-                                    except (ValueError, TypeError):
-                                        pass
-                                
-                                # Apply key mapping (e.g., is_custom → is_custom_mode)
-                                target_key = key_mapping.get(key, key)
-                                job_full_params[target_key] = value
+                        # Only apply keys that are actually in the config
+                        for key in keys_to_replace:
+                            value = outpaint_config[key]
+                            # Convert string booleans to actual booleans
+                            if value == "true":
+                                value = True
+                            elif value == "false":
+                                value = False
+                            # Convert numeric strings to floats where needed
+                            elif key in ["custom_scale", "norm_offset_x", "norm_offset_y", 
+                                        "canvas_width", "canvas_height",
+                                        "image_width", "image_height", "image_left", "image_top",
+                                        "fitted_width", "fitted_height", "offset_x", "offset_y"]:
+                                try:
+                                    value = float(value)
+                                except (ValueError, TypeError):
+                                    pass
+                            
+                            # Apply key mapping (e.g., is_custom → is_custom_mode)
+                            target_key = key_mapping.get(key, key)
+                            job_full_params[target_key] = value
+                            logger.debug(f"[BULK] Applied per-image param {target_key}={value}")
                         
-                        logger.info(f"[BULK] Applied outpaint config for image {image_idx}: alignment={outpaint_config.get('alignment')}, aspect={outpaint_config.get('aspect_ratio')}, is_custom={outpaint_config.get('is_custom')}")
+                        # Verify critical params are set after extraction
+                        alignment_set = job_full_params.get("alignment")
+                        aspect_ratio_set = job_full_params.get("aspect_ratio")
+                        is_custom_mode_set = job_full_params.get("is_custom_mode", False)
+                        expansion_factor_set = job_full_params.get("expansion_factor")
+                        
+                        logger.info(f"[BULK] Applied outpaint config for image {image_idx}: alignment={alignment_set}, aspect_ratio={aspect_ratio_set}, is_custom_mode={is_custom_mode_set}, expansion_factor={expansion_factor_set}")
+                        
+                        if not alignment_set or not aspect_ratio_set:
+                            logger.error(f"[BULK] CRITICAL: Missing alignment or aspect_ratio for image {image_idx} after applying outpaint config!")
+                            logger.error(f"[BULK] outpaint_config keys: {list(outpaint_config.keys()) if outpaint_config else 'None'}")
+                            logger.error(f"[BULK] job_full_params keys: {list(job_full_params.keys())}")
+                    else:
+                        logger.warning(f"[BULK] outpaint_config for image {image_idx} is None or empty")
+                elif is_bulk_request and model == "diffusers_outpaint":
+                    # For outpaint bulk requests, outpaint configs are REQUIRED
+                    logger.error(f"[BULK] CRITICAL: Missing outpaint config for image {image_idx} in bulk outpaint request!")
+                    logger.error(f"[BULK] bulk_outpaint_configs exists: {payload.bulk_outpaint_configs is not None}, len: {len(payload.bulk_outpaint_configs) if payload.bulk_outpaint_configs else 0}, image_idx: {image_idx}")
                 
                 # Apply per-image mask (for inpaint/erase bulk edit)
                 if payload.bulk_masks and image_idx < len(payload.bulk_masks):
@@ -3183,6 +3254,16 @@ async def submit_job(
                         job_full_params.pop("mask", None)
                         job_full_params["mask_image"] = mask_data
                         logger.info(f"[BULK] Applied mask for image {image_idx} (mask size: {len(mask_data)} chars)")
+                
+                # Final verification for outpaint bulk requests: ensure critical params are set
+                if is_bulk_request and model == "diffusers_outpaint":
+                    if "alignment" not in job_full_params or "aspect_ratio" not in job_full_params:
+                        logger.error(f"[BULK] CRITICAL ERROR: Missing alignment or aspect_ratio for job {job_id}!")
+                        logger.error(f"[BULK] job_full_params keys: {list(job_full_params.keys())}")
+                        logger.error(f"[BULK] This will cause the image to not expand properly!")
+                    # Ensure expansion_factor is set (should be in base params, but verify)
+                    if "expansion_factor" not in job_full_params:
+                        logger.warning(f"[BULK] expansion_factor not in params for job {job_id}, worker will use default 1.25")
                 
                 # Store for later dispatch (includes full base64 image)
                 job_full_params_map[job_id] = job_full_params
@@ -4472,7 +4553,7 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                     # CRITICAL FIX: Check if RUNNING jobs are actually stuck (exceeded timeout)
                     # This catches jobs that failed silently on the worker
                     
-                    job_timeout_minutes = int(os.getenv("JOB_TIMEOUT_MINUTES", "30"))
+                    job_timeout_minutes = int(os.getenv("JOB_RUNNING_TIMEOUT_MINUTES", "5"))
                     running_job_timeout = timedelta(minutes=job_timeout_minutes)
                     now = utc_naive_now()
                     

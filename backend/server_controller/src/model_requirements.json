@@ -177,6 +177,80 @@
         ],
         "min_gpu_count": 1
     },
+    "wan_22_14b_rapid": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 120,
+        "allowed_gpu_names": [
+            "5090"
+        ],
+        "min_gpu_count": 1,
+        "max_jobs_per_pod": 1,
+        "comment": "WAN 2.2 14B Rapid I2V: FP8 quantized with AoT compilation, 75GB model, requires 5090"
+    },
+    "wan_22_uint4_lightx2v_i2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 120,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "max_jobs_per_pod": 1,
+        "comment": "WAN 2.2 14B I2V: UINT4 quantized with SDNQ, Lightx2v LoRA, requires 5090/4090"
+    },
+    "wan_22_uint4_lightx2v_t2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 120,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "max_jobs_per_pod": 1,
+        "comment": "WAN 2.2 14B T2V: UINT4 quantized with SDNQ, Lightx2v LoRA, requires 5090/4090"
+    },
+    "wan_22_fp8_lightx2v_i2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 120,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "max_jobs_per_pod": 1,
+        "comment": "WAN 2.2 14B I2V: FP8 quantized with SDNQ, FastDM merged Lightning (no LoRA needed), requires 5090/4090"
+    },
+    "wan_22_fp8_lightx2v_t2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 120,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "max_jobs_per_pod": 1,
+        "comment": "WAN 2.2 14B T2V: FP8 quantized with SDNQ, FastDM merged Lightning (no LoRA needed), requires 5090/4090"
+    },
+    "video_upscaler": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 20,
+        "allowed_gpu_names": [
+            "A4000",
+            "5060",
+            "3090",
+            "3060",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "max_jobs_per_pod": 1,
+        "comment": "Video upscaler: RIFE frame interpolation (up to 60fps) and Real-ESRGAN upscaling (2x, 4x)"
+    },
     "ltx2_video": {
         "preferred_variant": null,
         "fallback_variants": [],
@@ -254,6 +328,73 @@
         "min_gpu_count": 1
     },
     "swin2sr": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 20,
+        "allowed_gpu_names": [
+            "A4000",
+            "3060",
+            "5060",
+            "3090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "dreamid": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 95,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "hunyan15_480p_t2v_distilled": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 95,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "hunyan15_480p_i2v_step_distilled": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 95,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "glm_ocr": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 20,
+        "allowed_gpu_names": [
+            "A4000",
+            "3060",
+            "5060",
+            "3090",
+            "4090",
+            "5090"
+        ],
+        "min_gpu_count": 1
+    },
+    "qwen_image_edit_2511_rapid_aio": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 100,
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "face_enhancer": {
         "preferred_variant": null,
         "fallback_variants": [],
         "min_tflops": 20,

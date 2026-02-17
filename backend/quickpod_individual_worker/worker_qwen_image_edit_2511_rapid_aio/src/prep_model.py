@@ -20,8 +20,7 @@ DEFAULT_AIO_VERSION = "v19"
 QWEN_DIR = os.path.join(MODELS_DIR, "qwen_image_edit_2511")
 AIO_DIR = os.path.join(MODELS_DIR, "aio_transformers")
 
-LOCAL_REALESRGAN_SRC = os.path.join(PROJECT_ROOT, "realesrgan_models")
-LOCAL_REALESRGAN_DST = os.path.join(MODELS_DIR, "realesrgan")
+REALESRGAN_DIR = os.path.join(MODELS_DIR, "realesrgan")
 
 os.makedirs(QWEN_DIR, exist_ok=True)
 os.makedirs(AIO_DIR, exist_ok=True)
@@ -36,6 +35,7 @@ if not os.listdir(QWEN_DIR):
             QWEN_REPO,
             local_dir=QWEN_DIR,
             local_dir_use_symlinks=False,
+            token="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",
             resume_download=True,
             ignore_patterns=["transformer/*"],  # skip heavy transformer weights (from AIO repo)
         )
@@ -94,6 +94,7 @@ if not os.listdir(aio_target_dir):
             local_dir=AIO_DIR,  # Download to parent: models/aio_transformers/
             local_dir_use_symlinks=False,
             resume_download=True,
+            token="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",
             allow_patterns=[f"{aio_version}/transformer/*"],
         )
         
@@ -118,62 +119,54 @@ ADAPTER_SPECS = {
     "Consistance": {
         "repo": "Pr0f3ssi0n4ln00b/QIE_2511_Consistency_Lora",
         "weights": "qe2511_consis_alpha_patched.safetensors",
-    },
+    }, # Example prompt: transfer face expression from picture 2 to picture 1. Keep the same structure and color in picture 1. Avoid picture 2 character to be existed in picture 1.
     "Semirealistic-photo-detailer": {
         "repo": "rzgar/Qwen-Image-Edit-semi-realistic-detailer",
         "weights": "Qwen-Image-Edit-Anime-Semi-Realistic-Detailer-v1.safetensors",
-    },
+    }, # input image: transform the background of the image to semi-realistic image
     "AnyPose": {
         "repo": "lilylilith/AnyPose",
         "weights": [
             "2511-AnyPose-base-000006250.safetensors",
             "2511-AnyPose-helper-00006000.safetensors",
         ],
-    },
+    }, # input image: make the person in image 1 do the exact same pose of the person in image 2. Changing the style and background of the image of the person in image 1 is undesirable, so don't do it. The new pose should be pixel accurate to the pose we are trying to copy. The position of the arms and head and legs should be the same as the pose we are trying to copy. Change the field of view and angle to match exactly image 2. Head tilt and eye gaze pose should match the person in image 2.
     "Any2Real_2601": {
         "repo": "lrzjason/Anything2Real_2601",
         "weights": "anything2real_2601_A_final_patched.safetensors",
-    },
+    }, # change the picture 1 to realistic photograph, [description of your image]
     "Hyperrealistic-Portrait": {
         "repo": "prithivMLmods/Qwen-Image-Edit-2511-Hyper-Realistic-Portrait",
         "weights": "HRP_20.safetensors",
-    },
+    }, # "Transform into a hyper-realistic face portrait."
     "Ultrarealistic-Portrait": {
         "repo": "prithivMLmods/Qwen-Image-Edit-2511-Ultra-Realistic-Portrait",
         "weights": "URP_20.safetensors",
-    },
-    "BFS-Best-FaceSwap": {
-        "repo": "Alissonerdx/BFS-Best-Face-Swap",
-        "weights": "bfs_head_v5_2511_original.safetensors",
-    },
+    }, # "ultra-realistic portrait"
     "BFS-Best-FaceSwap-merge": {
         "repo": "Alissonerdx/BFS-Best-Face-Swap",
         "weights": "bfs_head_v5_2511_merged_version_rank_32_fp32.safetensors",
-    },
+    }, # send body first (image 1), then face (image 2).
     "F2P": {
         "repo": "DiffSynth-Studio/Qwen-Image-Edit-F2P",
         "weights": "edit_0928_lora_step40000.safetensors",
-    },
+    }, # Given a cropped facial image as input, it generates full portrait images of the same person.
     "Multiple-Angles": {
         "repo": "dx8152/Qwen-Edit-2509-Multiple-angles",
         "weights": "镜头转换.safetensors",
-    },
+    }, #  You can control the camera to move up, down, left, and right, as well as rotate it to the left and right. You can also look down or up. The camera can be changed to a wide-angle or close-up shot.
     "Light-Restoration": {
         "repo": "dx8152/Qwen-Image-Edit-2509-Light_restoration",
         "weights": "移除光影.safetensors",
-    },
+    }, # remove the shadows and relight the image. PROMPT: "移除光影,使用柔和光线（无明显光斑和阴影）对图片进行重新照明"
     "Relight": {
         "repo": "dx8152/Qwen-Image-Edit-2509-Relight",
         "weights": "Qwen-Edit-Relight.safetensors",
-    },
-    "Multi-Angle-Lighting": {
-        "repo": "dx8152/Qwen-Edit-2509-Multi-Angle-Lighting",
-        "weights": "多角度灯光-251116.safetensors",
-    },
+    }, # There are two ways to use it: 1. Use the prompts in the dataset to change the image directly. 2. Use the trigger word: " 重新照明 "。 （For example:重新照明,使用窗帘透光（柔和漫射）的光线对图片进行重新照明） Meaning: Relighting, using the soft, diffuse light from the curtains to relight the image.
     "Edit-Skin": {
         "repo": "tlennon-ie/qwen-edit-skin",
         "weights": "qwen-edit-skin_1.1_000002750.safetensors",
-    },
+    },  # make the subjects skin details more prominent and natural
     "Next-Scene": {
         "repo": "lovis93/next-scene-qwen-image-lora-2509",
         "weights": "next-scene_lora-v2-3000.safetensors",
@@ -181,14 +174,6 @@ ADAPTER_SPECS = {
     "Flat-Log": {
         "repo": "tlennon-ie/QwenEdit2509-FlatLogColor",
         "weights": "QwenEdit2509-FlatLogColor.safetensors",
-    },
-    "Upscale-Image": {
-        "repo": "vafipas663/Qwen-Edit-2509-Upscale-LoRA",
-        "weights": "qwen-edit-enhance_64-v3_000001000.safetensors",
-    },
-    "Upscale2K": {
-        "repo": "valiantcat/Qwen-Image-Edit-2509-Upscale2K",
-        "weights": "qwen_image_edit_2509_upscale.safetensors",
     },
 }
 
@@ -230,14 +215,66 @@ for adapter_name, spec in ADAPTER_SPECS.items():
 print("✓ LoRA adapters download completed\n")
 
 # ------------------------
-# 4. Copy local Realesrgan models (optional)
+# 4. Download Real-ESRGAN models (2x, 4x)
 # ------------------------
-if os.path.exists(LOCAL_REALESRGAN_SRC):
-    print(f"📦 Copying {LOCAL_REALESRGAN_SRC} -> {LOCAL_REALESRGAN_DST}")
-    shutil.copytree(LOCAL_REALESRGAN_SRC, LOCAL_REALESRGAN_DST, dirs_exist_ok=True)
-    print("✓ Realesrgan models copied.")
-else:
-    print("⚠️ No local realesrgan_models/ found, skipping.")
+os.makedirs(REALESRGAN_DIR, exist_ok=True)
+
+# Download Real-ESRGAN models - try "plus" versions first, fallback to regular versions
+realesrgan_models = [
+    ("RealESRGAN_x2plus.pth", "RealESRGAN_x2.pth", 2),
+    ("RealESRGAN_x4plus.pth", "RealESRGAN_x4.pth", 4),
+]
+
+for preferred_name, fallback_name, scale in realesrgan_models:
+    model_file = os.path.join(REALESRGAN_DIR, preferred_name)
+    
+    if os.path.exists(model_file):
+        print(f"✓ Real-ESRGAN {scale}x model already exists at {model_file}")
+        continue
+    
+    # Try downloading preferred name first
+    downloaded = False
+    try:
+        print(f"⬇️ Downloading Real-ESRGAN {scale}x model ({preferred_name})...")
+        hf_hub_download(
+            repo_id="ai-forever/Real-ESRGAN",
+            filename=preferred_name,
+            local_dir=REALESRGAN_DIR,
+        )
+        # Verify the file was downloaded
+        if os.path.exists(model_file):
+            downloaded = True
+            print(f"✓ Real-ESRGAN {scale}x model downloaded successfully as {preferred_name}")
+        else:
+            raise FileNotFoundError(f"Downloaded file not found at expected path: {model_file}")
+    except Exception as e:
+        # If preferred name doesn't exist, try fallback name
+        try:
+            print(f"  ⚠️  {preferred_name} not found, trying {fallback_name}...")
+            downloaded_path = hf_hub_download(
+                repo_id="ai-forever/Real-ESRGAN",
+                filename=fallback_name,
+                local_dir=REALESRGAN_DIR,
+            )
+            # Copy/rename to expected name
+            if os.path.exists(downloaded_path):
+                shutil.copy2(downloaded_path, model_file)
+                # Remove the fallback file if it's different
+                if downloaded_path != model_file and os.path.exists(downloaded_path):
+                    try:
+                        os.remove(downloaded_path)
+                    except:
+                        pass
+                if os.path.exists(model_file):
+                    downloaded = True
+                    print(f"✓ Real-ESRGAN {scale}x model downloaded and renamed to {preferred_name}")
+                else:
+                    raise FileNotFoundError(f"Failed to create {model_file} from {downloaded_path}")
+            else:
+                raise FileNotFoundError(f"Downloaded file not found: {downloaded_path}")
+        except Exception as e2:
+            print(f"❌ Failed to download Real-ESRGAN {scale}x model: {e2}")
+            traceback.print_exc()
 
 # ------------------------
 # 5. Split large safetensors recursively

@@ -150,16 +150,6 @@ ADAPTER_SPECS = {
         "adapter_name": "URPortrait",
         "strength": 1.0,
     },
-    "BFS-Best-FaceSwap": {
-        "type": "single",
-        "requires_two_images": True,
-        "image2_label": "Upload Head/Face Donor (Image 2)",
-        "repo": "Alissonerdx/BFS-Best-Face-Swap",
-        "weights": "bfs_head_v5_2511_original.safetensors",
-        "adapter_name": "BFS-Best-Faceswap",
-        "strength": 1.0,
-        "needs_alpha_fix": True,
-    },
     "BFS-Best-FaceSwap-merge": {
         "type": "single",
         "requires_two_images": True,
@@ -198,13 +188,6 @@ ADAPTER_SPECS = {
         "adapter_name": "relight",
         "strength": 1.0,
     },
-    "Multi-Angle-Lighting": {
-        "type": "single",
-        "repo": "dx8152/Qwen-Edit-2509-Multi-Angle-Lighting",
-        "weights": "多角度灯光-251116.safetensors",
-        "adapter_name": "multi-angle-lighting",
-        "strength": 1.0,
-    },
     "Edit-Skin": {
         "type": "single",
         "repo": "tlennon-ie/qwen-edit-skin",
@@ -226,25 +209,14 @@ ADAPTER_SPECS = {
         "adapter_name": "flat-log",
         "strength": 1.0,
     },
-    "Upscale-Image": {
-        "type": "single",
-        "repo": "vafipas663/Qwen-Edit-2509-Upscale-LoRA",
-        "weights": "qwen-edit-enhance_64-v3_000001000.safetensors",
-        "adapter_name": "upscale-image",
-        "strength": 1.0,
-    },
-    "Upscale2K": {
-        "type": "single",
-        "repo": "valiantcat/Qwen-Image-Edit-2509-Upscale2K",
-        "weights": "qwen_image_edit_2509_upscale.safetensors",
-        "adapter_name": "upscale-2k",
-        "strength": 1.0,
-        "target_long_edge": 2048,
-    },
 }
 
 # Track what is currently loaded in memory (adapter_name values)
 LOADED_ADAPTERS = set()
+
+# Track the currently ACTIVE adapter configuration to avoid redundant set_adapters() calls
+# Format: (tuple(sorted adapter_names), tuple(sorted adapter_weights)) or None
+_active_adapter_config = None
 
 # -------------------------
 # Lazy pipeline global
@@ -573,14 +545,39 @@ def _round8(x: int) -> int:
 
 
 def compute_dimensions(image: Image.Image, long_edge: int) -> tuple[int, int]:
+    """Compute dimensions preserving aspect ratio, rounded to multiples of 8."""
     w, h = image.size
+    aspect = w / h
+    
+    # Determine which edge is longer
     if w >= h:
-        new_w = long_edge
-        new_h = int(round(long_edge * (h / w)))
+        # Width is longer - round it first
+        new_w = _round8(long_edge)
+        # Compute height from rounded width to maintain exact aspect ratio
+        new_h = int(round(new_w / aspect))
+        # Round height to multiple of 8
+        new_h = _round8(new_h)
+        # Recompute width from rounded height to ensure aspect ratio is maintained
+        new_w = int(round(new_h * aspect))
+        new_w = _round8(new_w)
     else:
-        new_h = long_edge
-        new_w = int(round(long_edge * (w / h)))
-    return _round8(new_w), _round8(new_h)
+        # Height is longer - round it first
+        new_h = _round8(long_edge)
+        # Compute width from rounded height to maintain exact aspect ratio
+        new_w = int(round(new_h * aspect))
+        # Round width to multiple of 8
+        new_w = _round8(new_w)
+        # Recompute height from rounded width to ensure aspect ratio is maintained
+        new_h = int(round(new_w / aspect))
+        new_h = _round8(new_h)
+    
+    return new_w, new_h
+
+
+def _resize_images_to(images: List[Image.Image], size: Tuple[int, int]) -> List[Image.Image]:
+    """Resize images to the specified size while preserving aspect ratio."""
+    w, h = size
+    return [img.resize((w, h), Image.LANCZOS) for img in images]
 
 
 def get_target_long_edge_for_lora(lora_adapter: str) -> int:
@@ -929,35 +926,58 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
             pass
 
     # Handle LoRA adapter
+    # OPTIMIZATION: Track active adapter config and skip set_adapters() if unchanged.
+    # set_adapters() walks every LoRA layer, toggling requires_grad — expensive and also
+    # triggers "requires_grad on inference tensor" errors after torch.inference_mode().
+    # By skipping redundant calls we avoid both the overhead AND the error.
+    global _active_adapter_config
     lora_adapter = params.get("lora_adapter", NONE_LORA)
+
     if lora_adapter == NONE_LORA:
-        try:
-            pipeline.set_adapters([], adapter_weights=[])
-        except Exception:
-            if LOADED_ADAPTERS:
-                pipeline.set_adapters(list(LOADED_ADAPTERS), adapter_weights=[0.0] * len(LOADED_ADAPTERS))
+        desired_config = ((), ())  # no adapters active
     else:
-        # Clear GPU memory before loading LoRA (can be memory-intensive)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
+        # Ensure LoRA weights are loaded (cheap no-op if already in LOADED_ADAPTERS)
         adapter_names, adapter_weights = _ensure_loaded_and_get_active_adapters(pipeline, lora_adapter)
-        pipeline.set_adapters(adapter_names, adapter_weights=adapter_weights)
-        
-        # Clear GPU memory after loading LoRA
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # Log memory after LoRA loading
-        if torch.cuda.is_available():
-            try:
-                allocated = torch.cuda.memory_allocated() / 1024**3
-                reserved = torch.cuda.memory_reserved() / 1024**3
-                print(f"💾 GPU memory after LoRA loading: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
-            except Exception:
-                pass
+        # Build a hashable key from (names, weights) to compare with current state
+        desired_config = (tuple(adapter_names), tuple(adapter_weights))
+
+    if desired_config != _active_adapter_config:
+        # Adapter config changed — must call set_adapters().
+        # Use torch.enable_grad() to temporarily exit inference mode so that
+        # requires_grad can be toggled on inference tensors created by the previous job.
+        with torch.enable_grad():
+            if lora_adapter == NONE_LORA:
+                try:
+                    pipeline.set_adapters([], adapter_weights=[])
+                except Exception:
+                    if LOADED_ADAPTERS:
+                        pipeline.set_adapters(list(LOADED_ADAPTERS), adapter_weights=[0.0] * len(LOADED_ADAPTERS))
+            else:
+                # Clear GPU memory before loading LoRA (can be memory-intensive)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                pipeline.set_adapters(adapter_names, adapter_weights=adapter_weights)
+
+                # Clear GPU memory after loading LoRA
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                # Log memory after LoRA loading
+                if torch.cuda.is_available():
+                    try:
+                        allocated = torch.cuda.memory_allocated() / 1024**3
+                        reserved = torch.cuda.memory_reserved() / 1024**3
+                        print(f"💾 GPU memory after LoRA loading: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+                    except Exception:
+                        pass
+
+        _active_adapter_config = desired_config
+        print(f"🔄 Adapter config changed → set_adapters({lora_adapter})")
+    else:
+        print(f"⚡ Adapter config unchanged ({lora_adapter}) → skipping set_adapters()")
 
     # Handle seed
     seed = params.get("seed")
@@ -1002,6 +1022,14 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
         print(f"⚠️ Warning: {len(image_list)} images provided, but Qwen Image Edit 2511 supports up to 3. Using first 3 images.")
         image_list = image_list[:3]
     
+    # Resolution derived from first image
+    target_long_edge = get_target_long_edge_for_lora(lora_adapter)
+    width, height = compute_dimensions(image_list[0], target_long_edge)
+    
+    # CRITICAL: Resize images to computed dimensions to prevent cropping
+    # This ensures the output matches the full input image aspect ratio
+    image_list = _resize_images_to(image_list, (width, height))
+    
     # Label images as image_1, image_2, image_3...
     labeled = build_labeled_images(image_list)
 
@@ -1009,10 +1037,6 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
     pipe_images = list(labeled.values())
     if len(pipe_images) == 1:
         pipe_images = pipe_images[0]
-
-    # Resolution derived from first image
-    target_long_edge = get_target_long_edge_for_lora(lora_adapter)
-    width, height = compute_dimensions(image_list[0], target_long_edge)
 
     # Prepare pipeline inputs
     num_inference_steps = int(params.get("num_inference_steps", 4))
@@ -1032,8 +1056,6 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
                 image=pipe_images,
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                height=height,
-                width=width,
                 num_inference_steps=num_inference_steps,
                 generator=generator,
                 true_cfg_scale=guidance_scale,
@@ -1098,6 +1120,38 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
     # Save the image (only if inference succeeded)
     if image is None:
         raise RuntimeError("Inference failed: no image was generated")
+    
+    # Handle upscaling if requested
+    scale_image = params.get("scale_image", False)
+    scale_factor = params.get("scale_factor", 2.0)
+    
+    if scale_image and scale_factor:
+        try:
+            # Lazy import to avoid loading RealESRGAN if not needed
+            from upscaler import upscale_image
+            
+            # Determine model based on scale factor
+            if scale_factor <= 2.0:
+                model_name = "RealESRGAN_x2plus"
+            else:
+                model_name = "RealESRGAN_x4plus"
+            
+            print(f"🔍 Upscaling image with {model_name} (scale_factor={scale_factor})...")
+            
+            # Upscale the image
+            image = upscale_image(
+                input_image=image,
+                model_name=model_name,
+                scale_factor=float(scale_factor),
+                remove_metadata=True
+            )
+            
+            print(f"✅ Image upscaled successfully to {image.size[0]}x{image.size[1]}")
+        except ImportError as e:
+            print(f"⚠️ Upscaler not available: {e}. Saving original image without upscaling.")
+        except Exception as e:
+            print(f"⚠️ Upscaling failed: {e}. Saving original image without upscaling.")
+            # Continue with original image if upscaling fails
     
     out_path = os.path.join(output_dir, f"qwen_2511_{job_id}.png")
     image.save(out_path)

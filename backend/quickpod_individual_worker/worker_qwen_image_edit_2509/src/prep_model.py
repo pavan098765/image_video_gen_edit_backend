@@ -16,11 +16,11 @@ NUNCHAKU_REPO = "nunchaku-tech/nunchaku-qwen-image-edit-2509"
 QWEN_DIR = os.path.join(MODELS_DIR, "qwen_image_edit_2509")
 NUNCHAKU_DIR = os.path.join(MODELS_DIR, "nunchaku_qwen_2509")
 
-LOCAL_REALESRGAN_SRC = os.path.join(PROJECT_ROOT, "realesrgan_models")
-LOCAL_REALESRGAN_DST = os.path.join(MODELS_DIR, "realesrgan")
+REALESRGAN_DIR = os.path.join(MODELS_DIR, "realesrgan")
 
 os.makedirs(QWEN_DIR, exist_ok=True)
 os.makedirs(NUNCHAKU_DIR, exist_ok=True)
+os.makedirs(REALESRGAN_DIR, exist_ok=True)
 
 # ------------------------
 # 1. Download Qwen (skip transformer/*)
@@ -46,7 +46,7 @@ except Exception as e:
 rank = 128
 steps = 8
 filename = (
-    f"svdq-int4_r{rank}-qwen-image-edit-2509-lightningv2.0-{steps}steps.safetensors"
+    f"svdq-fp4_r{rank}-qwen-image-edit-2509-lightningv2.0-{steps}steps.safetensors"
 )
 target_path = os.path.join(NUNCHAKU_DIR, filename)
 
@@ -67,16 +67,64 @@ else:
     print(f"✓ Transformer already exists at {target_path}")
 
 # ------------------------
-# 3. Copy local Realesrgan models
+# 3. Download Real-ESRGAN models (2x, 4x)
 # ------------------------
-if os.path.exists(LOCAL_REALESRGAN_SRC):
-    print(f"📦 Copying {LOCAL_REALESRGAN_SRC} -> {LOCAL_REALESRGAN_DST}")
-    shutil.copytree(LOCAL_REALESRGAN_SRC, LOCAL_REALESRGAN_DST, dirs_exist_ok=True)
-    # os.remove(LOCAL_REALESRGAN_SRC)  # remove source to avoid confusion
-    print("✓ Realesrgan models copied.")
-else:
-    print("⚠️ No local realesrgan_models/ found, skipping.")
+# Download Real-ESRGAN models - try "plus" versions first, fallback to regular versions
+realesrgan_models = [
+    ("RealESRGAN_x2plus.pth", "RealESRGAN_x2.pth", 2),
+    ("RealESRGAN_x4plus.pth", "RealESRGAN_x4.pth", 4),
+]
 
+for preferred_name, fallback_name, scale in realesrgan_models:
+    model_file = os.path.join(REALESRGAN_DIR, preferred_name)
+    
+    if os.path.exists(model_file):
+        print(f"✓ Real-ESRGAN {scale}x model already exists at {model_file}")
+        continue
+    
+    # Try downloading preferred name first
+    downloaded = False
+    try:
+        print(f"⬇️ Downloading Real-ESRGAN {scale}x model ({preferred_name})...")
+        hf_hub_download(
+            repo_id="ai-forever/Real-ESRGAN",
+            filename=preferred_name,
+            local_dir=REALESRGAN_DIR,
+        )
+        # Verify the file was downloaded
+        if os.path.exists(model_file):
+            downloaded = True
+            print(f"✓ Real-ESRGAN {scale}x model downloaded successfully as {preferred_name}")
+        else:
+            raise FileNotFoundError(f"Downloaded file not found at expected path: {model_file}")
+    except Exception as e:
+        # If preferred name doesn't exist, try fallback name
+        try:
+            print(f"  ⚠️  {preferred_name} not found, trying {fallback_name}...")
+            downloaded_path = hf_hub_download(
+                repo_id="ai-forever/Real-ESRGAN",
+                filename=fallback_name,
+                local_dir=REALESRGAN_DIR,
+            )
+            # Copy/rename to expected name
+            if os.path.exists(downloaded_path):
+                shutil.copy2(downloaded_path, model_file)
+                # Remove the fallback file if it's different
+                if downloaded_path != model_file and os.path.exists(downloaded_path):
+                    try:
+                        os.remove(downloaded_path)
+                    except:
+                        pass
+                if os.path.exists(model_file):
+                    downloaded = True
+                    print(f"✓ Real-ESRGAN {scale}x model downloaded and renamed to {preferred_name}")
+                else:
+                    raise FileNotFoundError(f"Failed to create {model_file} from {downloaded_path}")
+            else:
+                raise FileNotFoundError(f"Downloaded file not found: {downloaded_path}")
+        except Exception as e2:
+            print(f"❌ Failed to download Real-ESRGAN {scale}x model: {e2}")
+            traceback.print_exc()
 
 # ------------------------
 # 4. Split large safetensors recursively
@@ -107,8 +155,8 @@ split_large_safetensors(MODELS_DIR)
 # 5. Generate runtime Dockerfile with per-part COPY
 # ------------------------
 try:
-    print("⚙️ Generating Dockerfile via generate_dockerfile_int4.py ...")
-    subprocess.run(["python3", "generate_dockerfile_int4.py"], check=True)
+    print("⚙️ Generating Dockerfile via generate_dockerfile.py ...")
+    subprocess.run(["python3", "generate_dockerfile.py"], check=True)
     print("✅ Dockerfile generated successfully.")
 except Exception as e:
     print(f"❌ Failed to generate Dockerfile: {e}")

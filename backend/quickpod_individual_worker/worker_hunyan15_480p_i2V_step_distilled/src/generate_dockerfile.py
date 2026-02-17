@@ -75,7 +75,8 @@ def write_rest(f):
     f.write("    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*\n\n")
 
     # Environment variables
-    f.write('ENV HUNYAN15_LOCAL_PATH="/app/models/hunyan15"\n')
+    f.write('ENV HUNYAN15_MODEL_LOCAL_PATH="/app/models/hunyan15"\n')
+    f.write('ENV MODELS_DIR="/app/models"\n')
     f.write('ENV PYTHONPATH="/app/worker/src:${PYTHONPATH}"\n\n')
 
     # Worker setup

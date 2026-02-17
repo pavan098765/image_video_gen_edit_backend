@@ -1,49 +1,56 @@
-Transformers
-pip install git+https://github.com/huggingface/transformers.git ("transformers>=5.1.0")
+2026-02-14T17:20:37.925336990Z ValueError: Mode required for wan_22_uint4_lightx2v_i2v. Available: ['i2v']
+2026-02-14T17:20:18.865719588Z ✅ Merged into /app/models/lora/Kijai_WanVideo_comfy/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16.safetensors (2788.07 MB)
+2026-02-14T17:20:18.865738074Z 🗑️ Deleted /app/models/lora/Kijai_WanVideo_comfy/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16.safetensors.part-aa
+2026-02-14T17:20:18.865768212Z 🗑️ Deleted /app/models/lora/Kijai_WanVideo_comfy/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16.safetensors.part-ab
+2026-02-14T17:20:18.865782520Z 🗑️ Deleted /app/models/lora/Kijai_WanVideo_comfy/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16.safetensors.part-ac
+2026-02-14T17:20:18.865799092Z 🗑️ Deleted /app/models/lora/Kijai_WanVideo_comfy/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16.safetensors.part-ad
+2026-02-14T17:20:22.979053264Z ✓ RIFE loaded from local directory: /app/worker/src/rife
+2026-02-14T17:20:23.018531729Z INFO:     Started server process [7]
+2026-02-14T17:20:23.018543051Z INFO:     Waiting for application startup.
+2026-02-14T17:20:24.302620711Z INFO:     Application startup complete.
+2026-02-14T17:20:24.302999558Z INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+2026-02-14T17:20:34.541854603Z INFO:     68.233.100.42:49270 - "GET /health HTTP/1.1" 200 OK
+2026-02-14T17:20:35.445565363Z INFO:     68.233.100.42:49272 - "GET /health HTTP/1.1" 200 OK
+2026-02-14T17:20:36.009779149Z INFO:     68.233.100.42:49286 - "GET /health HTTP/1.1" 200 OK
+2026-02-14T17:20:37.924748065Z INFO:     68.233.100.42:49292 - "POST /run HTTP/1.1" 200 OK
+2026-02-14T17:20:37.925293986Z ERROR:worker:[e697fd55-b4da-41c5-a0fa-aad0569d2133] Failed: Mode required for wan_22_uint4_lightx2v_i2v. Available: ['i2v']
+2026-02-14T17:20:37.925304597Z Traceback (most recent call last):
+2026-02-14T17:20:37.925309366Z   File "/app/worker/src/app.py", line 240, in process_job_item
+2026-02-14T17:20:37.925313374Z     out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
+2026-02-14T17:20:37.925316781Z                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-02-14T17:20:37.925320107Z   File "/app/worker/src/app.py", line 207, in run_inference_and_save
+2026-02-14T17:20:37.925323614Z     inference_func = resolve_inference_callable(model, mode)
+2026-02-14T17:20:37.925326880Z                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-02-14T17:20:37.925330096Z   File "/app/worker/src/app.py", line 198, in resolve_inference_callable
+2026-02-14T17:20:37.925333523Z     raise ValueError(f"Mode required for {model}. Available: {list(func.keys())}")
+2026-02-14T17:20:37.925336990Z ValueError: Mode required for wan_22_uint4_lightx2v_i2v. Available: ['i2v']
 
-from transformers import AutoProcessor, AutoModelForImageTextToText
-import torch
 
-MODEL_PATH = "zai-org/GLM-OCR"
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image",
-                "url": "test_image.png"
-            },
-            {
-                "type": "text",
-                "text": "Text Recognition:"
-            }
-        ],
-    }
-]
-processor = AutoProcessor.from_pretrained(MODEL_PATH)
-model = AutoModelForImageTextToText.from_pretrained(
-    pretrained_model_name_or_path=MODEL_PATH,
-    torch_dtype="auto",
-    device_map="auto",
-)
-inputs = processor.apply_chat_template(
-    messages,
-    tokenize=True,
-    add_generation_prompt=True,
-    return_dict=True,
-    return_tensors="pt"
-).to(model.device)
-inputs.pop("token_type_ids", None)
-generated_ids = model.generate(**inputs, max_new_tokens=8192)
-output_text = processor.decode(generated_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=False)
-print(output_text)
 
-Prompt Limited
-GLM-OCR currently supports below prompt scenarios:
-
-Document Parsing – extract raw content from documents. Supported tasks include:
-{
-    "text": "Text Recognition:",
-    "formula": "Formula Recognition:",
-    "table": "Table Recognition:"
-}
+2511 error 1 got processed second failed
+2026-02-14T14:02:01.578459913Z INFO:worker:[9b97ac56-541c-44c0-bb2f-c5ef9bd32a47] Failure notification sent to controller
+2026-02-14T14:02:00.459241071Z ERROR:worker:[9b97ac56-541c-44c0-bb2f-c5ef9bd32a47] Job failed after 0.3s: RuntimeError: Setting requires_grad=True on inference tensor outside InferenceMode is not allowed.
+2026-02-14T14:02:00.459268160Z Traceback (most recent call last):
+2026-02-14T14:02:00.459281630Z   File "/app/worker/src/app.py", line 388, in process_job_item
+2026-02-14T14:02:00.459285460Z     out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
+2026-02-14T14:02:00.459288840Z                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-02-14T14:02:00.459291980Z   File "/app/worker/src/app.py", line 351, in run_inference_and_save
+2026-02-14T14:02:00.459295230Z     out_path = await loop.run_in_executor(INFERENCE_EXECUTOR, inference_func, job_id, prompt, params)
+2026-02-14T14:02:00.459298460Z                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-02-14T14:02:00.459301540Z   File "/usr/local/lib/python3.11/concurrent/futures/thread.py", line 58, in run
+2026-02-14T14:02:00.459304770Z     result = self.fn(*self.args, **self.kwargs)
+2026-02-14T14:02:00.459307770Z              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-02-14T14:02:00.459310730Z   File "/app/worker/src/qwen_image_edit_2511_rapid_aio_inference.py", line 971, in run_inference_qwen_image_edit_2511_rapid_aio
+2026-02-14T14:02:00.459314040Z     pipeline.set_adapters(adapter_names, adapter_weights=adapter_weights)
+2026-02-14T14:02:00.459317120Z   File "/opt/venv/lib/python3.11/site-packages/diffusers/loaders/lora_base.py", line 775, in set_adapters
+2026-02-14T14:02:00.459320340Z     model.set_adapters(adapter_names, _component_adapter_weights[component])
+2026-02-14T14:02:00.459323460Z   File "/opt/venv/lib/python3.11/site-packages/diffusers/loaders/peft.py", line 524, in set_adapters
+2026-02-14T14:02:00.459326750Z     set_weights_and_activate_adapters(self, adapter_names, weights)
+2026-02-14T14:02:00.459329860Z   File "/opt/venv/lib/python3.11/site-packages/diffusers/utils/peft_utils.py", line 269, in set_weights_and_activate_adapters
+2026-02-14T14:02:00.459333060Z     module.set_adapter(adapter_names)
+2026-02-14T14:02:00.459336020Z   File "/opt/venv/lib/python3.11/site-packages/peft/tuners/tuners_utils.py", line 1417, in set_adapter
+2026-02-14T14:02:00.459339150Z     layer.requires_grad_(True)
+2026-02-14T14:02:00.459342100Z   File "/opt/venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 2927, in requires_grad_
+2026-02-14T14:02:00.459345270Z     p.requires_grad_(requires_grad)
+2026-02-14T14:02:00.459348300Z RuntimeError: Setting requires_grad=True on inference tensor outside InferenceMode is not allowed.
+2026-02-14T14:02:01.578459913Z INFO:worker:[9b97ac56-541c-44c0-bb2f-c5ef9bd32a47] Failure notification sent to controller

@@ -164,12 +164,17 @@ def calculate_job_cost(
         per_job_cost = base_cost + upscale_cost - offer_discount
         total = per_job_cost * variations * num_images
     
+    Special handling for video_upscaler:
+        - Dynamic cost based on video_duration: 2 credits per 5 seconds
+        - Max video duration: 10 minutes (600 seconds)
+        - Max cost: 240 credits (2 * 600 / 5)
+    
     VIP Benefits:
         - FREE upscale (upscale_cost = 0 for VIP users)
     
     Args:
         model: The model name (e.g., "qwen_image_edit_2509")
-        params: Job params dict, may contain "scale_factor"
+        params: Job params dict, may contain "scale_factor" or "video_duration"
         variations: Number of variations to generate (multiplies cost)
         is_vip: Whether the user has active VIP subscription (free upscale)
         num_images: Number of images in bulk edit (multiplies cost)
@@ -177,6 +182,40 @@ def calculate_job_cost(
     Returns:
         Total credit cost (integer, minimum 1)
     """
+    # Special handling for video_upscaler: dynamic cost based on video duration
+    if model == "video_upscaler" and params:
+        video_duration = params.get("video_duration")
+        if video_duration is not None:
+            try:
+                # Parse video_duration (can be float or string)
+                duration_seconds = float(video_duration)
+                
+                # Cap at 10 minutes (600 seconds)
+                MAX_VIDEO_DURATION = 600  # 10 minutes
+                duration_seconds = min(duration_seconds, MAX_VIDEO_DURATION)
+                
+                # Calculate cost: 2 credits per 5 seconds
+                # Round up to nearest 5-second increment
+                credits_per_5_sec = 2
+                duration_5sec_blocks = max(1, int((duration_seconds + 4) // 5))  # Round up
+                per_job_cost = credits_per_5_sec * duration_5sec_blocks
+                
+                # Multiply by variations count
+                variations = max(1, min(4, variations))  # Clamp to 1-4
+                total = per_job_cost * variations
+                
+                logger.info(
+                    f"[CREDIT] Video upscaler cost: duration={duration_seconds:.1f}s, "
+                    f"5sec_blocks={duration_5sec_blocks}, per_job={per_job_cost}, "
+                    f"variations={variations}, total={total}"
+                )
+                
+                return max(1, total)  # Ensure minimum cost of 1
+            except (ValueError, TypeError) as e:
+                logger.warning(f"[CREDIT] Invalid video_duration for video_upscaler: {video_duration}, error: {e}")
+                # Fall through to default calculation
+    
+    # Standard cost calculation for other models
     cost_info = get_model_cost_info(model)
     
     base_cost = cost_info.get("cost", 10)

@@ -67,10 +67,14 @@ def write_rest(f):
     f.write("\n# Worker code (last to leverage cache)\n")
     f.write("COPY src /app/worker/src\n\n")
 
-    # Install Python, FlashAttention, other dependencies (like DreamID-V Dockerfile)
+    # Install Python, FlashAttention, other dependencies
     f.write("\n# Install Python dependencies\n")
     f.write("RUN pip install --no-cache-dir torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0\n")
-    f.write("RUN pip install --no-cache-dir https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4/flash_attn-2.7.4+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl\n")
+    f.write(
+        "RUN pip install --no-cache-dir "
+        "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/"
+        "flash_attn-2.7.3+cu12torch2.8cxx11abiFALSE-cp311-cp311-linux_x86_64.whl\n"
+    )
     # Install git (required for git+ dependencies in requirements.txt)
     # Then install requirements, then remove git to keep image size down
     f.write("# Install git for git+ dependencies, then install requirements\n")

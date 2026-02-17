@@ -255,16 +255,6 @@ ADAPTER_SPECS = {
         "adapter_name": "URPortrait",
         "strength": 1.0,
     },
-    "BFS-Best-FaceSwap": {
-        "type": "single",
-        "requires_two_images": True,
-        "image2_label": "Upload Head/Face Donor (Image 2)",
-        "repo": "Alissonerdx/BFS-Best-Face-Swap",
-        "weights": "bfs_head_v5_2511_original.safetensors",
-        "adapter_name": "BFS-Best-Faceswap",
-        "strength": 1.0,
-        "needs_alpha_fix": True,  # <-- fixes KeyError 'img_in.alpha'
-    },
     "BFS-Best-FaceSwap-merge": {
         "type": "single",
         "requires_two_images": True,
@@ -303,13 +293,6 @@ ADAPTER_SPECS = {
         "adapter_name": "relight",
         "strength": 1.0,
     },
-    "Multi-Angle-Lighting": {
-        "type": "single",
-        "repo": "dx8152/Qwen-Edit-2509-Multi-Angle-Lighting",
-        "weights": "多角度灯光-251116.safetensors",
-        "adapter_name": "multi-angle-lighting",
-        "strength": 1.0,
-    },
     "Edit-Skin": {
         "type": "single",
         "repo": "tlennon-ie/qwen-edit-skin",
@@ -331,21 +314,6 @@ ADAPTER_SPECS = {
         "adapter_name": "flat-log",
         "strength": 1.0,
     },
-    "Upscale-Image": {
-        "type": "single",
-        "repo": "vafipas663/Qwen-Edit-2509-Upscale-LoRA",
-        "weights": "qwen-edit-enhance_64-v3_000001000.safetensors",
-        "adapter_name": "upscale-image",
-        "strength": 1.0,
-    },
-    "Upscale2K": {
-        "type": "single",
-        "repo": "valiantcat/Qwen-Image-Edit-2509-Upscale2K",
-        "weights": "qwen_image_edit_2509_upscale.safetensors",
-        "adapter_name": "upscale-2k",
-        "strength": 1.0,
-        "target_long_edge": 2048,
-    },
 }
 
 LORA_PRESET_PROMPTS = {
@@ -354,8 +322,6 @@ LORA_PRESET_PROMPTS = {
     "AnyPose": "Make the person in image 1 do the exact same pose of the person in image 2. Changing the style and background of the image of the person in image 1 is undesirable, so don't do it. The new pose should be pixel accurate to the pose we are trying to copy. The position of the arms and head and legs should be the same as the pose we are trying to copy. Change the field of view and angle to match exactly image 2. Head tilt and eye gaze pose should match the person in image 2.",
     "Hyperrealistic-Portrait": "Transform the image into an ultra-realistic photorealistic portrait with strict identity preservation, facing straight to the camera. Enhance pore-level skin textures, realistic moisture effects, and natural wet hair clumping against the skin. Apply cool-toned soft-box lighting with subtle highlights and shadows, maintain realistic green-hazel eye catchlights without synthetic gloss, and preserve soft natural lip texture. Use shallow depth of field with a clean bokeh background, an 85mm macro photographic look, and raw photo grading without retouching to maintain realism and original details.",
     "Ultrarealistic-Portrait": "Transform the image into an ultra-realistic glamour portrait while strictly preserving the subject’s identity. Apply a close-up composition with a slight head tilt and a hand near the face, enhance cinematic directional lighting with dramatic fashion-style highlights, and refine makeup details including glowing skin, glossy lips, luminous highlighter, and defined eyes. Increase skin realism with detailed epidermal textures such as micropores, microhairs, subtle oil sheen, natural highlights, soft wrinkles, and subsurface scattering. Maintain a luxury fashion-magazine look in a 9:16 aspect ratio, preserving realism, facial structure, and original details without over-smoothing or retouching.",
-    "Upscale2K": "Upscale this picture to 4K resolution.",
-    "BFS-Best-FaceSwap": "head_swap: start with Picture 1 as the base image, keeping its lighting, environment, and background. remove the head from Picture 1 completely and replace it with the head from Picture 2, strictly preserving the hair, eye color, and nose structure of Picture 2. copy the eye direction, head rotation, and micro-expressions from Picture 1. high quality, sharp details, 4k",
     "BFS-Best-FaceSwap-merge": "head_swap: start with Picture 1 as the base image, keeping its lighting, environment, and background. remove the head from Picture 1 completely and replace it with the head from Picture 2, strictly preserving the hair, eye color, and nose structure of Picture 2. copy the eye direction, head rotation, and micro-expressions from Picture 1. high quality, sharp details, 4k",
 }
 
@@ -912,9 +878,6 @@ with gr.Blocks() as demo:
                     "flatcolor Desaturate the image and lower the contrast to create a flat, ungraded look similar to a camera log profile. Preserve details in the highlights and shadows.",
                     "Flat-Log",
                 ],
-                ["examples/7.jpg", "Light source from the Right Rear", "Multi-Angle-Lighting"],
-                ["examples/10.jpeg", "Upscale the image.", "Upscale-Image"],
-                ["examples/7.jpg", "Light source from the Below", "Multi-Angle-Lighting"],
                 ["examples/2.jpeg", "Switch the camera to a top-down right corner view.", "Multiple-Angles"],
                 [
                     "examples/9.jpg",
@@ -927,7 +890,6 @@ with gr.Blocks() as demo:
                 ["examples/4.jpg", "Rotate the camera 45 degrees to the right.", "Multiple-Angles"],
                 ["examples/4.jpg", "Switch the camera to a top-down view.", "Multiple-Angles"],
                 ["examples/4.jpg", "Switch the camera to a wide-angle lens.", "Multiple-Angles"],
-                ["examples/11.jpg", "Upscale this picture to 4K resolution.", "Upscale2K"],
             ],
             inputs=[input_image_1, prompt, lora_adapter],
             outputs=[output_image, seed],
