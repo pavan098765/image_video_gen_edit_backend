@@ -105,21 +105,27 @@ ALLOWED_PATHS: List[str] = [
     "/submit",
     "/job_complete",
     "/job_status",
+    "/job_started",
     "/register_worker",
     "/heartbeat",
     "/download",
     "/auth",  # Firebase auth endpoints
     "/ads",   # Ad network SSV callbacks (AdMob, etc.)
+    "/get_video_upload_url",   # R2 presigned video upload
+    "/get_media_upload_urls",  # R2 presigned media upload (images/videos)
+    "/batch_status",           # Batch/variation status polling
 ]
 
 # Worker paths (exempt from some checks)
-WORKER_PATHS: List[str] = ["/register_worker", "/heartbeat"]
+WORKER_PATHS: List[str] = ["/register_worker", "/heartbeat", "/job_started", "/job_complete"]
 
 # Trusted API paths (require auth - Bearer token or fingerprint)
 TRUSTED_API_PATHS: List[str] = [
     "/submit",
-    "/job_complete",
     "/job_status",
+    "/batch_status",
+    "/get_video_upload_url",
+    "/get_media_upload_urls",
     "/auth",  # Firebase auth endpoints require Bearer token
 ]
 

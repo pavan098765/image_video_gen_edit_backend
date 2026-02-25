@@ -7,7 +7,7 @@ import os
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-BASE_IMAGE = "pavanalur3/deps-base-extended:py311-cu129"
+BASE_IMAGE = "pavanalur3/deps-base-new:py311-cu128"
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 WORKER_DIR = os.path.join(PROJECT_ROOT, "src")
 OUT_DOCKERFILE = os.path.join(PROJECT_ROOT, "Dockerfile")
@@ -16,7 +16,7 @@ OUT_DOCKERFILE = os.path.join(PROJECT_ROOT, "Dockerfile")
 def write_header(f):
     f.write(f"FROM {BASE_IMAGE}\n\n")
     f.write("WORKDIR /app\n\n")
-    f.write("# --- SDXL Realism Illustrious build ---\n\n")
+    f.write("# --- SDXL Lighting 8-steps build ---\n\n")
 
 
 def copy_non_chunk_files(f):
@@ -67,15 +67,16 @@ def write_rest(f):
     f.write("COPY src /app/worker/src\n\n")
 
     # Install minimal dependencies and cleanup
-    # f.write("RUN apt-get update && apt-get install -y --no-install-recommends git \\\n")
-    # f.write("    && pip install --no-cache-dir git+https://github.com/huggingface/diffusers.git \\\n")
-    # f.write("    && apt-get purge -y git \\\n")
-    # f.write("    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*\n\n")
+    f.write("RUN pip install --no-cache-dir torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0\n")
+    f.write(
+        "RUN pip install --no-cache-dir "
+        "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/"
+        "flash_attn-2.7.3+cu12torch2.8cxx11abiFALSE-cp311-cp311-linux_x86_64.whl\n"
+    )
     f.write("RUN rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*\n\n")
 
     # Environment variables
-    f.write('ENV SDXL_LOCAL_PATH="/app/models/sdxl_realism_illustrious"\n')
-    f.write('ENV SDXL_EMBEDDINGS_PATH="/app/models/sdxl_realism_illustrious/embeddings"\n')
+    f.write('ENV SDXL_LOCAL_PATH="/app/models/sdxl_lighting_8_steps"\n')
     f.write('ENV REALESRGAN_LOCAL_PATH="/app/models/realesrgan"\n')
     f.write('ENV PYTHONPATH="/app/worker/src:${PYTHONPATH}"\n\n')
 
@@ -94,7 +95,7 @@ def main():
         copy_chunks_one_per_line(f)
         write_rest(f)
 
-    print(f"✅ Wrote {OUT_DOCKERFILE} for SDXL Realism Illustrious + Realesrgan setup.")
+    print(f"✅ Wrote {OUT_DOCKERFILE} for SDXL Lighting 8-steps + Realesrgan setup.")
 
 
 if __name__ == "__main__":

@@ -217,7 +217,95 @@ def run_inference_video_upscaler(
         postprocess_time = time.time() - postprocess_start
     
     # Convert numpy frames to PIL Images for export
-    pil_frames = [Image.fromarray(frame) for frame in final_output]
+    # Post-processing functions return float32 [0, 1] arrays, need to convert to uint8 [0, 255]
+    print(f"[{job_id}] Converting {len(final_output) if isinstance(final_output, (list, np.ndarray)) else 'unknown'} frames to PIL Images...")
+    
+    if isinstance(final_output, np.ndarray):
+        print(f"[{job_id}] final_output shape: {final_output.shape}, dtype: {final_output.dtype}")
+        
+        # Ensure correct dtype and range
+        if final_output.dtype == np.float32 or final_output.dtype == np.float64:
+            # Clamp to [0, 1] and convert to uint8
+            final_output = np.clip(final_output, 0, 1)
+            final_output = (final_output * 255).astype(np.uint8)
+        elif final_output.dtype != np.uint8:
+            # Convert other dtypes to uint8
+            final_output = final_output.astype(np.uint8)
+        
+        # Ensure correct shape: [f, h, w, c]
+        if len(final_output.shape) == 3:
+            # Single frame [h, w, c] - add frame dimension
+            final_output = final_output[np.newaxis, ...]
+        elif len(final_output.shape) == 2:
+            # Single grayscale frame [h, w] - add frame and channel dimensions
+            final_output = final_output[np.newaxis, ..., np.newaxis]  # [1, h, w, 1]
+            # Convert to RGB
+            final_output = np.repeat(final_output, 3, axis=-1)  # [1, h, w, 3]
+        elif len(final_output.shape) == 4 and final_output.shape[0] == 0:
+            # Empty array - this shouldn't happen but handle gracefully
+            raise ValueError(f"Empty frame array with shape {final_output.shape}")
+        elif len(final_output.shape) not in [3, 4]:
+            raise ValueError(f"Unexpected final_output shape: {final_output.shape}, expected [f, h, w, c] or [h, w, c]")
+        
+        # Convert each frame to PIL Image
+        pil_frames = []
+        for i in range(final_output.shape[0]):
+            frame = final_output[i]  # [h, w, c] or [h, w]
+            
+            # Handle edge case: if frame is too small (like 1x1x3), skip it with warning
+            if frame.size == 0:
+                print(f"[{job_id}] ⚠️  Skipping empty frame {i}")
+                continue
+            
+            # Ensure frame is 2D or 3D with correct shape
+            if len(frame.shape) == 3:
+                if frame.shape[2] == 3:
+                    # RGB frame [h, w, 3]
+                    if frame.shape[0] < 1 or frame.shape[1] < 1:
+                        print(f"[{job_id}] ⚠️  Skipping invalid frame {i} with shape {frame.shape}")
+                        continue
+                    pil_frames.append(Image.fromarray(frame, mode='RGB'))
+                elif frame.shape[2] == 1:
+                    # Single channel [h, w, 1] - convert to RGB
+                    frame = frame.squeeze(2)  # [h, w]
+                    frame_rgb = np.stack([frame] * 3, axis=-1)  # [h, w, 3]
+                    pil_frames.append(Image.fromarray(frame_rgb, mode='RGB'))
+                else:
+                    raise ValueError(f"Unexpected frame shape: {frame.shape}, expected [h, w, 3] or [h, w, 1]")
+            elif len(frame.shape) == 2:
+                # Grayscale frame [h, w] - convert to RGB
+                if frame.shape[0] < 1 or frame.shape[1] < 1:
+                    print(f"[{job_id}] ⚠️  Skipping invalid frame {i} with shape {frame.shape}")
+                    continue
+                frame_rgb = np.stack([frame] * 3, axis=-1)  # [h, w, 3]
+                pil_frames.append(Image.fromarray(frame_rgb, mode='RGB'))
+            else:
+                raise ValueError(f"Unexpected frame shape: {frame.shape}, expected [h, w, 3] or [h, w]")
+        
+        print(f"[{job_id}] Converted {len(pil_frames)} frames to PIL Images")
+    else:
+        # Fallback: assume it's already a list or handle other types
+        pil_frames = []
+        for i, frame in enumerate(final_output):
+            if isinstance(frame, np.ndarray):
+                # Convert numpy array to PIL
+                if frame.dtype == np.float32 or frame.dtype == np.float64:
+                    frame = np.clip(frame, 0, 1)
+                    frame = (frame * 255).astype(np.uint8)
+                elif frame.dtype != np.uint8:
+                    frame = frame.astype(np.uint8)
+                
+                # Handle shape
+                if len(frame.shape) == 3 and frame.shape[2] == 3:
+                    pil_frames.append(Image.fromarray(frame, mode='RGB'))
+                elif len(frame.shape) == 2:
+                    frame_rgb = np.stack([frame] * 3, axis=-1)
+                    pil_frames.append(Image.fromarray(frame_rgb, mode='RGB'))
+                else:
+                    print(f"[{job_id}] ⚠️  Skipping frame {i} with unexpected shape: {frame.shape}")
+            else:
+                # Assume it's already a PIL Image
+                pil_frames.append(frame)
     
     # Export video
     out_path = os.path.join(output_dir, f"upscaled_{job_id}.mp4")

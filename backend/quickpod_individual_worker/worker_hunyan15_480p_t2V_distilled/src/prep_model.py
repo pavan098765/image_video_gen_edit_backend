@@ -11,13 +11,15 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)  # go one level up from src/
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 
 HUNYAN15_REPO = "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v_distilled"
+TRANSFORMER_REPO = "lightx2v/Hy1.5-Distill-Models"
+TRANSFORMER_FILE = "hy1.5_t2v_480p_lightx2v_4step.safetensors"
 
 HUNYAN15_DIR = os.path.join(MODELS_DIR, "hunyan15_t2v")
 
 os.makedirs(HUNYAN15_DIR, exist_ok=True)
 
 # ------------------------
-# 1. Download Hunyan15 model
+# 1. Download Hunyan15 model (all files except transformer)
 # ------------------------
 try:
     print(f"⬇️ Downloading {HUNYAN15_REPO} into {HUNYAN15_DIR}")
@@ -30,6 +32,64 @@ try:
     print(f"✓ Hunyan15 repo ready at {HUNYAN15_DIR}")
 except Exception as e:
     print(f"❌ Failed to download {HUNYAN15_REPO}: {e}")
+    traceback.print_exc()
+
+# ------------------------
+# 1b. Download transformer from lightx2v repo and replace the original
+# ------------------------
+try:
+    transformer_dir = os.path.join(HUNYAN15_DIR, "transformer")
+    os.makedirs(transformer_dir, exist_ok=True)
+    
+    # Remove original transformer files if they exist
+    if os.path.exists(transformer_dir):
+        for f in os.listdir(transformer_dir):
+            if f.endswith(".safetensors"):
+                old_file = os.path.join(transformer_dir, f)
+                print(f"🗑️  Removing original transformer file: {f}")
+                os.remove(old_file)
+    
+    # Download transformer file from lightx2v repo
+    transformer_file_path = os.path.join(transformer_dir, "diffusion_pytorch_model.safetensors")
+    print(f"⬇️ Downloading transformer from {TRANSFORMER_REPO}")
+    print(f"   File: {TRANSFORMER_FILE}")
+    print(f"   Destination: {transformer_file_path}")
+    
+    # Download to a temp location first
+    temp_download_dir = os.path.join(transformer_dir, "temp_download")
+    os.makedirs(temp_download_dir, exist_ok=True)
+    
+    hf_hub_download(
+        repo_id=TRANSFORMER_REPO,
+        filename=TRANSFORMER_FILE,
+        local_dir=temp_download_dir,
+        local_dir_use_symlinks=False,
+        resume_download=True,
+    )
+    
+    # Find the downloaded file (it will be in the nested directory structure)
+    downloaded_file = os.path.join(temp_download_dir, TRANSFORMER_FILE)
+    if not os.path.exists(downloaded_file):
+        # Search for the file in the temp directory (hf_hub_download may create nested structure)
+        for root, _, files in os.walk(temp_download_dir):
+            if TRANSFORMER_FILE in files:
+                downloaded_file = os.path.join(root, TRANSFORMER_FILE)
+                break
+    
+    if os.path.exists(downloaded_file):
+        # Move/copy the file to the transformer directory with the expected name
+        print(f"📦 Moving transformer file to {transformer_file_path}")
+        shutil.move(downloaded_file, transformer_file_path)
+        print(f"✅ Transformer file downloaded and placed successfully")
+        
+        # Clean up temp directory
+        if os.path.exists(temp_download_dir):
+            shutil.rmtree(temp_download_dir)
+    else:
+        raise FileNotFoundError(f"Downloaded transformer file not found: {downloaded_file}")
+        
+except Exception as e:
+    print(f"❌ Failed to download transformer from {TRANSFORMER_REPO}: {e}")
     traceback.print_exc()
 
 

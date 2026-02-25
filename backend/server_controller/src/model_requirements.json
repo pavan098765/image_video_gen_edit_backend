@@ -71,6 +71,17 @@
             "int4": ["4090", "4080", "4070"]
         }
     },
+    "flux_klein": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 100,
+        "allowed_gpu_names": [
+            "4090",
+            "5090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "Flux Klein 9B: Lightning model"
+    },
     "qwen_image": {
         "preferred_variant": "fp4",
         "fallback_variants": [
@@ -106,7 +117,6 @@
             "4090"
         ],
         "min_gpu_count": 1,
-        "max_jobs_per_pod": 1,
         "variant_template_key": {
             "fp4": "qwen_image_edit_2509",
             "int4": "qwen_image_edit_2509_int4"
@@ -120,7 +130,31 @@
             "int4": ["4090", "4080", "4070"]
         }
     },
-    "sdxl": {
+    "sdxl_t2i": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 20,
+        "allowed_gpu_names": [
+            "3090",
+            "5060",
+            "4090",
+            "5090"
+        ],
+        "min_gpu_count": 1
+    },
+    "sdxl_i2i": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": 20,
+        "allowed_gpu_names": [
+            "3090",
+            "5060",
+            "4090",
+            "5090"
+        ],
+        "min_gpu_count": 1
+    },
+    "sdxl_inpaint": {
         "preferred_variant": null,
         "fallback_variants": [],
         "min_tflops": 20,
@@ -185,31 +219,28 @@
             "5090"
         ],
         "min_gpu_count": 1,
-        "max_jobs_per_pod": 1,
         "comment": "WAN 2.2 14B Rapid I2V: FP8 quantized with AoT compilation, 75GB model, requires 5090"
     },
     "wan_22_uint4_lightx2v_i2v": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 120,
+        "min_tflops": 100,
         "allowed_gpu_names": [
             "5090",
             "4090"
         ],
         "min_gpu_count": 1,
-        "max_jobs_per_pod": 1,
         "comment": "WAN 2.2 14B I2V: UINT4 quantized with SDNQ, Lightx2v LoRA, requires 5090/4090"
     },
     "wan_22_uint4_lightx2v_t2v": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 120,
+        "min_tflops": 100,
         "allowed_gpu_names": [
             "5090",
             "4090"
         ],
         "min_gpu_count": 1,
-        "max_jobs_per_pod": 1,
         "comment": "WAN 2.2 14B T2V: UINT4 quantized with SDNQ, Lightx2v LoRA, requires 5090/4090"
     },
     "wan_22_fp8_lightx2v_i2v": {
@@ -221,7 +252,6 @@
             "4090"
         ],
         "min_gpu_count": 1,
-        "max_jobs_per_pod": 1,
         "comment": "WAN 2.2 14B I2V: FP8 quantized with SDNQ, FastDM merged Lightning (no LoRA needed), requires 5090/4090"
     },
     "wan_22_fp8_lightx2v_t2v": {
@@ -233,7 +263,6 @@
             "4090"
         ],
         "min_gpu_count": 1,
-        "max_jobs_per_pod": 1,
         "comment": "WAN 2.2 14B T2V: FP8 quantized with SDNQ, FastDM merged Lightning (no LoRA needed), requires 5090/4090"
     },
     "video_upscaler": {
@@ -248,7 +277,6 @@
             "4090"
         ],
         "min_gpu_count": 1,
-        "max_jobs_per_pod": 1,
         "comment": "Video upscaler: RIFE frame interpolation (up to 60fps) and Real-ESRGAN upscaling (2x, 4x)"
     },
     "ltx2_video": {
@@ -259,7 +287,6 @@
             "5090"
         ],
         "min_gpu_count": 1,
-        "max_jobs_per_pod": 1,
         "comment": "LTX-2 Video: FP4 model (20GB), works on 5090 without OOM"
     },
     "aurasrv2": {

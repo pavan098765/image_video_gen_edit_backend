@@ -173,6 +173,33 @@ class SubmitRequest(BaseModel):
                     "custom_scale, norm_offset_x, norm_offset_y. Must align with bulk_images array."
     )
     
+    # -------------------------------------------------------------------------
+    # R2 Presigned Media Upload (preferred over base64 for large payloads)
+    # Frontend uploads media to R2 via /get_media_upload_urls, then sends only
+    # the R2 keys here. Server converts keys to presigned GET URLs at dispatch.
+    # -------------------------------------------------------------------------
+    input_image_r2_keys: Optional[List[str]] = Field(
+        default=None,
+        max_length=10,
+        description="R2 keys for pre-uploaded input images (replaces base64 init_image / bulk_images). "
+                    "For single image, provide a list with one key. For bulk, one key per image."
+    )
+    mask_image_r2_key: Optional[str] = Field(
+        default=None,
+        max_length=512,
+        description="R2 key for pre-uploaded mask image (replaces base64 mask_image)."
+    )
+    bulk_mask_r2_keys: Optional[List[Optional[str]]] = Field(
+        default=None,
+        description="R2 keys for pre-uploaded bulk masks. Must align with input_image_r2_keys. "
+                    "Use null for images without masks."
+    )
+    input_video_r2_key: Optional[str] = Field(
+        default=None,
+        max_length=512,
+        description="R2 key for pre-uploaded input video (replaces base64 input_video / ref_video)."
+    )
+    
     @field_validator("model")
     @classmethod
     def validate_model_name(cls, v: str) -> str:
@@ -320,6 +347,25 @@ class HeartbeatRequest(BaseModel):
     )
 
 
+class JobStartedRequest(BaseModel):
+    """
+    Job started notification from worker.
+    
+    Worker calls this when it actually begins processing a job (not just when queued).
+    This allows the server to update started_at timestamp accurately.
+    """
+    job_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Job ID that started processing"
+    )
+    worker_id: Optional[str] = Field(
+        None,
+        description="Worker ID (optional, for validation)"
+    )
+
+
 class JobCompleteRequest(BaseModel):
     """
     Job completion notification from worker.
@@ -347,6 +393,11 @@ class JobCompleteRequest(BaseModel):
     metrics: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Job execution metrics (duration, memory usage, etc.)"
+    )
+    next_job_id: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description="ID of the next job the worker will process (peeked from worker queue)"
     )
 
 

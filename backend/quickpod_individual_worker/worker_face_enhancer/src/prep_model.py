@@ -23,6 +23,14 @@ MODELS_TO_DOWNLOAD = {
         "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
         "repo": None,  # Direct download
     },
+    "RealESRGAN_x2plus.pth": {
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+        "repo": None,  # Direct download
+    },
+    "RealESRGAN_x4plus_anime_6B.pth": {
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
+        "repo": None,  # Direct download
+    },
     "GFPGANv1.2.pth": {
         "url": "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.2.pth",
         "repo": None,

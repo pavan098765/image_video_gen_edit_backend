@@ -1121,41 +1121,32 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
     if image is None:
         raise RuntimeError("Inference failed: no image was generated")
     
-    # Handle upscaling if requested
-    scale_image = params.get("scale_image", False)
-    scale_factor = params.get("scale_factor", 2.0)
-    
-    if scale_image and scale_factor:
-        try:
-            # Lazy import to avoid loading RealESRGAN if not needed
-            from upscaler import upscale_image
-            
-            # Determine model based on scale factor
-            if scale_factor <= 2.0:
-                model_name = "RealESRGAN_x2plus"
-            else:
-                model_name = "RealESRGAN_x4plus"
-            
-            print(f"🔍 Upscaling image with {model_name} (scale_factor={scale_factor})...")
-            
-            # Upscale the image
-            image = upscale_image(
-                input_image=image,
-                model_name=model_name,
-                scale_factor=float(scale_factor),
-                remove_metadata=True
-            )
-            
-            print(f"✅ Image upscaled successfully to {image.size[0]}x{image.size[1]}")
-        except ImportError as e:
-            print(f"⚠️ Upscaler not available: {e}. Saving original image without upscaling.")
-        except Exception as e:
-            print(f"⚠️ Upscaling failed: {e}. Saving original image without upscaling.")
-            # Continue with original image if upscaling fails
-    
     out_path = os.path.join(output_dir, f"qwen_2511_{job_id}.png")
     image.save(out_path)
-    print(f"✅ Saved output image: {out_path}")
+    print(f"✅ Saved base image: {out_path}")
+
+    # Optional upscaling
+    if params.get("scale_image", False):
+        scale_factor = int(params.get("scale_factor", 2))
+        # Determine model based on scale factor
+        if scale_factor <= 2:
+            model_name = "RealESRGAN_x2plus"
+        else:
+            model_name = "RealESRGAN_x4plus"
+        try:
+            from upscaler import upscale_image
+            upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
+            up_path = os.path.join(output_dir, f"qwen_2511_{job_id}_upscaled.png")
+            upscaled.save(up_path)
+            print(f"✅ Saved upscaled image: {up_path}")
+            return os.path.abspath(up_path)
+        except Exception as e:
+            print(f"⚠️ Upscaling failed: {e}")
+            print("Model name: ", model_name)
+            print("Scale factor: ", scale_factor)
+            print("Out path: ", out_path)
+            print(traceback.format_exc())
+            return os.path.abspath(out_path)
 
     return os.path.abspath(out_path)
 
@@ -1178,6 +1169,8 @@ if __name__ == "__main__":
         "guidance_scale": 1.0,
         "num_inference_steps": 4,
         "lora_adapter": NONE_LORA,
+        "scale_image": True,
+        "scale_factor": 2,
         "output_dir": "/app/worker/outputs",
     }
 

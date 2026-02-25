@@ -1,5 +1,6 @@
 from io import BytesIO
 import os
+import re
 import time
 import json
 import logging
@@ -118,12 +119,22 @@ os.makedirs(WORKSPACE_DIR, exist_ok=True)
 # -----------------------
 # Job queue and state
 # -----------------------
-job_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+job_queue: asyncio.Queue = asyncio.Queue(maxsize=30)
 job_status: Dict[str, Dict[str, Any]] = {}
 job_status_lock = asyncio.Lock()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 last_model_key: Optional[str] = None
 startup_completed = False
+
+
+def _peek_next_job_id() -> Optional[str]:
+    """Peek at the next job in the queue without removing it."""
+    try:
+        if not job_queue.empty():
+            return job_queue._queue[0].get("job_id")
+    except (IndexError, AttributeError):
+        pass
+    return None
 
 # -----------------------
 # Request Model
@@ -137,6 +148,69 @@ class RunRequest(BaseModel):
     upload_url: str
     result_key: str
 
+
+# -----------------------
+# Media URL Resolution
+# -----------------------
+# Fields that may contain URLs (presigned R2 GET URLs) instead of base64 data.
+# At dispatch time the server converts R2 keys to presigned GET URLs.
+# This helper downloads the binary and converts to base64 so inference code
+# (which expects base64 strings) works without modification.
+MEDIA_FIELDS = frozenset([
+    "init_image", "mask_image", "image", "source_image", "face_image",
+    "reference_image", "style_image", "control_image", "input_image",
+    "ref_image", "ref_video", "input_video",
+])
+
+
+def _is_url(value: str) -> bool:
+    return isinstance(value, str) and (value.startswith("http://") or value.startswith("https://"))
+
+
+def _download_to_base64(url: str, timeout: int = 120) -> str:
+    """Download binary from URL and return base64-encoded string."""
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    return base64.b64encode(resp.content).decode("utf-8")
+
+
+def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, Any]:
+    """
+    Resolve any URL-valued media fields in params to base64 strings.
+    
+    If a known media field contains a URL (e.g. presigned R2 download URL),
+    download the binary and replace with base64 so downstream inference
+    functions work unchanged.
+    
+    Handles both single string values and lists of strings.
+    """
+    resolved = dict(params)
+    for field in MEDIA_FIELDS:
+        value = resolved.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str) and _is_url(value):
+            try:
+                logger.info(f"[{job_id}] Downloading {field} from URL ({len(value)} chars)...")
+                resolved[field] = _download_to_base64(value)
+                logger.info(f"[{job_id}] Downloaded {field}: {len(resolved[field])} base64 chars")
+            except Exception as e:
+                logger.error(f"[{job_id}] Failed to download {field} from URL: {e}")
+                raise
+        elif isinstance(value, list):
+            new_list = []
+            for i, item in enumerate(value):
+                if isinstance(item, str) and _is_url(item):
+                    try:
+                        logger.info(f"[{job_id}] Downloading {field}[{i}] from URL...")
+                        new_list.append(_download_to_base64(item))
+                    except Exception as e:
+                        logger.error(f"[{job_id}] Failed to download {field}[{i}]: {e}")
+                        raise
+                else:
+                    new_list.append(item)
+            resolved[field] = new_list
+    return resolved
 # -----------------------
 # HMAC utils
 # -----------------------
@@ -191,11 +265,128 @@ def register_with_controller():
 def send_heartbeat():
     if not CONTROLLER_URL:
         return {"skipped": True}
-    payload = {"worker_id": WORKER_ID, "pod_uuid": POD_UUID, "timestamp": int(time.time()), "status": "ready" if startup_completed else "starting"}
+    
+    # Determine actual worker status based on job state
+    # CRITICAL FIX: Report "busy" when jobs are running or queued, not just "ready"
+    if not startup_completed:
+        status = "starting"
+    else:
+        # Check if any jobs are running or queued
+        # Note: This is called from async context via run_in_executor, so we can safely
+        # read job_status dict (dict reads are thread-safe for concurrent access)
+        try:
+            # Quick check: any running jobs?
+            has_running = any(j.get("status") == "running" for j in job_status.values())
+            # Check queue size (qsize() is thread-safe)
+            queue_size = job_queue.qsize()
+            
+            if has_running or queue_size > 0:
+                status = "busy"
+            else:
+                status = "ready"
+        except Exception:
+            # Fallback: if check fails, assume ready (conservative - better than blocking)
+            status = "ready"
+    
+    payload = {"worker_id": WORKER_ID, "pod_uuid": POD_UUID, "timestamp": int(time.time()), "status": status}
     try:
         return post_signed_json(f"{CONTROLLER_URL.rstrip('/')}/heartbeat", payload, timeout=8, max_retries=3).json()
     except Exception:
         return {}
+
+# -----------------------
+# Together AI Prompt Enhancement
+# -----------------------
+TOGETHER_API_KEY = os.environ.get(
+    "TOGETHER_API_KEY",
+    "no_api_key",
+)
+TOGETHER_MODEL = "ServiceNow-AI/Apriel-1.6-15b-Thinker"
+TOGETHER_API_URL = "https://api.together.xyz/v1/chat/completions"
+
+_ENHANCE_SYSTEM_PROMPT_VIDEO_I2V = (
+    "You are an expert cinematic prompt engineer specialized in enhancing prompts for AI image-to-video generation models.\n\n"
+    "Your task is NOT to change the user's intent, but to expand and refine it into a highly detailed, visually descriptive, and generation-optimized prompt.\n\n"
+    "Follow these principles:\n\n"
+    "1. Preserve Core Intent\n- Never alter the main subject or meaning.\n- Only enhance clarity, detail, and visual richness.\n"
+    "- The input image is the primary visual reference; the prompt should describe desired motion and changes.\n\n"
+    "2. Add Missing Visual Information\nEnhance prompts with:\n- Subject description (appearance, clothing, age, materials, textures)\n"
+    "- Environment and background\n- Lighting (cinematic lighting, volumetric light, rim light, neon glow, etc.)\n"
+    "- Camera details (lens, depth of field, perspective, framing)\n- Mood and atmosphere\n- Color palette\n- Composition\n"
+    "- Motion (for video prompts)\n- Time of day / weather\n- Style references if appropriate\n\n"
+    "3. Cinematic & Photorealistic Quality Boost\nWhen suitable, include:\n- ultra detailed\n- cinematic\n- photorealistic\n"
+    "- high dynamic range\n- global illumination\n- 8k / high resolution\n- shallow depth of field\n"
+    "- film grain\n- realistic shadows\n\n"
+    "4. Video Prompt Enhancement\nAdd:\n- camera movement (slow pan, dolly, handheld, drone, tracking shot)\n"
+    "- subject motion\n- environmental motion\n- temporal continuity\n- physics realism\n- cinematic pacing\n\n"
+    "5. Editing Requests\nClearly describe:\n- what remains unchanged from the input image\n- what is modified or animated\n"
+    "- integration realism\n- lighting consistency\n- perspective matching\n\n"
+    "6. Avoid Negative Behavior\nDo NOT:\n- add unrelated objects\n- change gender, ethnicity, or identity unless asked\n"
+    "- introduce unwanted elements\n- overcomplicate simple prompts\n\n"
+    "7. Output Format Rules\nAlways output:\n\nENHANCED PROMPT:\n<final enhanced prompt>\n\n"
+    "Optional sections when useful:\n\nNEGATIVE PROMPT:\n<artifacts to avoid>\n\n"
+    "VIDEO PARAMETERS:\n<only if video related>\n\n"
+    "Do NOT explain reasoning.\nDo NOT include commentary.\nOnly output the final structured result.\n\n"
+    "8. Style Intelligence\nAutomatically infer best style based on user intent.\n\n"
+    "9. Model Awareness\nOptimize prompts to work well with video generation models such as:\nWAN, Hunyuan, LTX, Sora-style pipelines.\n\n"
+    "10. Precision Over Length\nBe descriptive but meaningful. Avoid useless adjectives.\n\n"
+    "Your goal: produce prompts that generate visually stunning, coherent, and realistic videos from images with minimal artifacts."
+)
+
+
+def _enhance_prompt(prompt: str, job_id: str) -> str:
+    """
+    Enhance a prompt using Together AI LLM for video I2V generation.
+
+    Returns enhanced prompt, or original prompt on failure.
+    """
+    if TOGETHER_API_KEY == "no_api_key":
+        logger.warning("PROMPT ENHANCE REQUESTED, SKIPPING.. NO API KEY SET IN ENV VAR")
+        return prompt
+
+    logger.info("[%s] ENHANCE: calling Together AI (%s) to enhance prompt (type=video_i2v)", job_id, TOGETHER_MODEL)
+    logger.info("[%s] ENHANCE: original prompt = '%s'", job_id, prompt[:200] + ("..." if len(prompt) > 200 else ""))
+
+    try:
+        resp = requests.post(
+            TOGETHER_API_URL,
+            headers={
+                "Authorization": f"Bearer {TOGETHER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": TOGETHER_MODEL,
+                "messages": [
+                    {"role": "system", "content": _ENHANCE_SYSTEM_PROMPT_VIDEO_I2V},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.7,
+                "max_tokens": 1024,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        logger.info("[%s] ENHANCE: raw response (%d chars): %s", job_id, len(content), content[:300])
+
+        match = re.search(r"ENHANCED PROMPT:\s*\n?(.*?)(?:\n\s*\n(?:NEGATIVE PROMPT:|VIDEO PARAMETERS:|EDIT INSTRUCTIONS:)|$)", content, re.DOTALL)
+        if match:
+            enhanced = match.group(1).strip()
+        else:
+            cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            enhanced = cleaned if cleaned else content
+
+        if enhanced:
+            logger.info("[%s] ENHANCE: enhanced prompt = '%s'", job_id, enhanced[:200] + ("..." if len(enhanced) > 200 else ""))
+            return enhanced
+
+    except Exception as e:
+        logger.warning("[%s] ENHANCE: prompt enhancement failed: %s", job_id, e, exc_info=True)
+
+    logger.info("[%s] ENHANCE: falling back to original prompt", job_id)
+    return prompt
+
 
 # -----------------------
 # Inference dispatcher
@@ -221,6 +412,10 @@ async def run_inference_and_save(job_id: str, prompt: str, model: str, mode: Opt
     if last_model_key and last_model_key != model_key:
         cleanup_gpu()
 
+    # Prompt enhancement for video I2V
+    if params.get("enhance_prompt", False):
+        prompt = await loop.run_in_executor(IO_EXECUTOR, _enhance_prompt, prompt, job_id)
+
     try:
         if model == "wan_22_fp8_lightx2v_i2v" and mode == "i2v":
             init_image_b64 = params.pop("init_image", None)
@@ -243,11 +438,31 @@ async def process_job_item(item: Dict[str, Any]):
     job_id, model, mode, prompt = item["job_id"], item["model"], item.get("mode"), item["prompt"]
     params, upload_url, result_key = item.get("params", {}), item["upload_url"], item["result_key"]
 
+    # Resolve any URL-valued media fields to base64 before inference
+    try:
+        params = resolve_media_urls(params, job_id)
+    except Exception as e:
+        logger.error(f"[{job_id}] Failed to resolve media URLs: {e}")
+
     async with job_status_lock:
         job_status[job_id] = {"status": "running", "started_at": datetime.utcnow().isoformat()}
 
     try:
         async with semaphore:
+            # Notify server that inference is ACTUALLY starting now (not just queued)
+            # This resets started_at to the real processing start time
+            is_autotest = job_id.startswith("autotest-")
+            if CONTROLLER_URL and not is_autotest:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        IO_EXECUTOR, post_signed_json,
+                        f"{CONTROLLER_URL.rstrip('/')}/job_started",
+                        {"job_id": job_id, "worker_id": WORKER_ID},
+                        8, 3
+                    )
+                except Exception as e:
+                    logger.warning(f"[{job_id}] Failed to notify job_started: {e}")
+
             out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
             if not upload_url.startswith("http://dummy-upload"):
                 if not await _upload_with_retry(out_local, upload_url, job_id):
@@ -257,7 +472,7 @@ async def process_job_item(item: Dict[str, Any]):
             if CONTROLLER_URL and not is_autotest:
                 try:
                     await asyncio.get_running_loop().run_in_executor(IO_EXECUTOR, post_signed_json,
-                        f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": result_key}, 10, 5)
+                        f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": result_key, "next_job_id": _peek_next_job_id()}, 10, 5)
                 except Exception:
                     pass
 
@@ -275,7 +490,7 @@ async def process_job_item(item: Dict[str, Any]):
         if CONTROLLER_URL and not is_autotest:
             try:
                 await asyncio.get_running_loop().run_in_executor(IO_EXECUTOR, post_signed_json,
-                    f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": None, "failed": True}, 10, 5)
+                    f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": None, "failed": True, "next_job_id": _peek_next_job_id()}, 10, 5)
             except Exception:
                 pass
         asyncio.create_task(_cleanup_job_status(job_id, 60))

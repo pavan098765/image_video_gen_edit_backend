@@ -70,14 +70,30 @@ GFPGAN_MODELS = {
     "RealESR-General-x4v3": os.path.join(MODEL_DIR, "realesr-general-x4v3.pth"),
 }
 
-# RealESRGAN background upsampler model
-REALESRGAN_BG_MODEL = {
-    "model_name": "realesr-general-x4v3",
-    "model_path": os.path.join(MODEL_DIR, "realesr-general-x4v3.pth"),
+# RealESRGAN background upsampler models
+REALESRGAN_BG_MODELS = {
+    "realesr-general-x4v3": {
+        "model_path": os.path.join(MODEL_DIR, "realesr-general-x4v3.pth"),
+        "scale": 4,
+        "arch": "srvgg",
+    },
+    "RealESRGAN_x2plus": {
+        "model_path": os.path.join(MODEL_DIR, "RealESRGAN_x2plus.pth"),
+        "scale": 2,
+        "arch": "rrdb",
+    },
+    "RealESRGAN_x4plus_anime_6B": {
+        "model_path": os.path.join(MODEL_DIR, "RealESRGAN_x4plus_anime_6B.pth"),
+        "scale": 4,
+        "arch": "rrdb_anime",
+    },
 }
 
-# Cache for loaded models
-LOADED_BG_UPSAMPLER: Optional[RealESRGANer] = None
+# Default background upsampler
+DEFAULT_BG_MODEL = "realesr-general-x4v3"
+
+# Cache for loaded models (keyed by model name)
+LOADED_BG_UPSAMPLERS: Dict[str, RealESRGANer] = {}
 
 # -------------------------
 # Helpers
@@ -105,29 +121,60 @@ def _strip_metadata(img: Image.Image) -> Image.Image:
         buf.seek(0)
         return Image.open(buf).convert("RGB")
 
-def _get_background_upsampler() -> RealESRGANer:
-    """Load and cache RealESRGAN background upsampler (realesr-general-x4v3)."""
-    global LOADED_BG_UPSAMPLER
+def _get_background_upsampler(model_name: str = DEFAULT_BG_MODEL) -> RealESRGANer:
+    """Load and cache RealESRGAN background upsampler.
     
-    if LOADED_BG_UPSAMPLER is not None:
-        print(f"  ℹ️ Using cached background upsampler")
-        return LOADED_BG_UPSAMPLER
+    Args:
+        model_name: One of "realesr-general-x4v3", "RealESRGAN_x2plus", "RealESRGAN_x4plus_anime_6B"
     
-    print(f"  📦 Loading RealESRGAN background upsampler from disk...")
-    model_path = REALESRGAN_BG_MODEL["model_path"]
+    Returns:
+        RealESRGANer instance
+    """
+    global LOADED_BG_UPSAMPLERS
+    
+    if model_name in LOADED_BG_UPSAMPLERS:
+        print(f"  ℹ️ Using cached background upsampler: {model_name}")
+        return LOADED_BG_UPSAMPLERS[model_name]
+    
+    if model_name not in REALESRGAN_BG_MODELS:
+        raise ValueError(
+            f"Unsupported background upsampler '{model_name}'. "
+            f"Available: {list(REALESRGAN_BG_MODELS.keys())}"
+        )
+    
+    model_info = REALESRGAN_BG_MODELS[model_name]
+    model_path = model_info["model_path"]
+    scale = model_info["scale"]
+    arch = model_info["arch"]
+    
+    print(f"  📦 Loading RealESRGAN background upsampler ({model_name}) from disk...")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"❌ Missing background upsampler weights at {model_path}")
     
-    print(f"  📦 Creating SRVGGNetCompact model architecture...")
-    model = SRVGGNetCompact(
-        num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32,
-        upscale=4, act_type="prelu"
-    )
+    # Create appropriate model architecture
+    print(f"  📦 Creating model architecture ({arch})...")
+    if arch == "srvgg":
+        model = SRVGGNetCompact(
+            num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32,
+            upscale=scale, act_type="prelu"
+        )
+    elif arch == "rrdb":
+        if model_name == "RealESRGAN_x2plus":
+            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                           num_block=23, num_grow_ch=32, scale=2)
+        else:
+            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                           num_block=23, num_grow_ch=32, scale=4)
+    elif arch == "rrdb_anime":
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                       num_block=6, num_grow_ch=32, scale=4)
+    else:
+        raise ValueError(f"Unknown architecture: {arch}")
     
     print(f"  📦 Initializing RealESRGANer (this may take a moment)...")
     half = True if torch.cuda.is_available() else False
     upsampler = RealESRGANer(
-        scale=4,
+        scale=scale,
         model_path=model_path,
         model=model,
         tile=0,
@@ -137,8 +184,8 @@ def _get_background_upsampler() -> RealESRGANer:
         gpu_id=0 if torch.cuda.is_available() else None
     )
     
-    LOADED_BG_UPSAMPLER = upsampler
-    print(f"✅ Background upsampler (realesr-general-x4v3) loaded and cached.")
+    LOADED_BG_UPSAMPLERS[model_name] = upsampler
+    print(f"✅ Background upsampler ({model_name}) loaded and cached.")
     return upsampler
 
 # -------------------------
@@ -154,6 +201,7 @@ def run_inference_face_enhancer(job_id: str, params: Dict[str, Any]) -> str:
             - init_image (base64 string): input image
             - version (str): GFPGAN version - "v1.2", "v1.3", "v1.4", "RestoreFormer", "CodeFormer", "RealESR-General-x4v3"
             - scale (float, default: 2.0): rescaling factor (final output scale)
+            - bg_model (str, default: "realesr-general-x4v3"): background upsampler model - "realesr-general-x4v3", "RealESRGAN_x2plus", "RealESRGAN_x4plus_anime_6B"
             - output_dir (str): output directory
     
     Returns:
@@ -202,9 +250,10 @@ def run_inference_face_enhancer(job_id: str, params: Dict[str, Any]) -> str:
     # Get scale (rescaling factor, default: 2.0)
     scale = float(params.get("scale", 2.0))
     
-    # Get background upsampler
-    print(f"  [4/7] Loading background upsampler (RealESRGAN)...")
-    bg_upsampler = _get_background_upsampler()
+    # Get background upsampler model name (default: realesr-general-x4v3)
+    bg_model_name = params.get("bg_model", DEFAULT_BG_MODEL)
+    print(f"  [4/7] Loading background upsampler (RealESRGAN: {bg_model_name})...")
+    bg_upsampler = _get_background_upsampler(bg_model_name)
     print(f"  ✅ Background upsampler loaded")
     
     # Determine GFPGAN architecture based on version

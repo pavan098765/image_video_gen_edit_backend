@@ -28,6 +28,9 @@ COPY --from=builder /app/models /app/models
 # Copy code *after* models so model layer is cached when only code changes
 COPY . /app/worker
 
+# Install Python dependencies from requirements.txt
+RUN pip install --no-cache-dir -r /app/worker/src/requirements.txt
+
 # Set env vars so inference loads baked model paths
 ENV BIREFNET_LOCAL_PATH="/app/models/basic_utils/birefnet" \
     LAMA_LOCAL_PATH="/app/models/basic_utils/lama/lama.pt" \

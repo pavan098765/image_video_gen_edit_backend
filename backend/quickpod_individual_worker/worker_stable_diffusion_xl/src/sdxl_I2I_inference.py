@@ -1,11 +1,15 @@
-# realism_illustrious_img2img.py
-# ✅ Lazy-loading implementation
-# ✅ GPU memory cleanup before/after inference (OOM prevention)
-# SDXL Img2Img with dynamic resolution + embedding auto-prepend (GPU-only, baked local models)
+# ------------------------------------------------------------------
+# SDXL Img2Img Inference with SDXL-Lightning LoRA
+# - Lazy pipeline loading (prevents OOM during FastAPI startup)
+# - SDXL-Lightning LoRA fused for fast 8-step inference
+# - Dynamic resolution + optional upscaling
+# - GPU memory cleanup before/after inference (OOM prevention)
+# ------------------------------------------------------------------
 
 import base64
 import os
 import gc
+import time
 import random
 from io import BytesIO
 from typing import Dict, Any, Optional, Union
@@ -13,8 +17,7 @@ from PIL import Image
 import torch
 from diffusers import (
     StableDiffusionXLImg2ImgPipeline,
-    DPMSolverMultistepScheduler,
-    EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
 )
 from upscaler import upscale_image
 
@@ -25,77 +28,114 @@ MODEL_ID = os.environ.get("SDXL_LOCAL_PATH")
 if not MODEL_ID or not os.path.exists(MODEL_ID):
     raise RuntimeError("❌ SDXL_LOCAL_PATH is not set or invalid. Ensure local model path is correct.")
 
-EMBEDDINGS_DIR = os.environ.get(
-    "SDXL_EMBEDDINGS_PATH", os.path.join(MODEL_ID, "embeddings")
-)
-POS_EMBED_PATH = os.path.join(EMBEDDINGS_DIR, "Stable_Yogis_Illustrious_Positives.safetensors")
-NEG_EMBED_PATH = os.path.join(EMBEDDINGS_DIR, "Stable_Yogis_Illustrious_Negatives-neg.safetensors")
+LIGHTNING_LORA_DIR = os.environ.get("SDXL_LIGHTNING_LORA_PATH", "/app/models/sdxl_lightning")
+LIGHTNING_LORA_FILE = "sdxl_lightning_8step_lora.safetensors"
+LIGHTNING_LORA_PATH = os.path.join(LIGHTNING_LORA_DIR, LIGHTNING_LORA_FILE)
 
-POS_TOKEN = "illustrious_pos"
-NEG_TOKEN = "illustrious_neg"
+# SDXL-Lightning defaults: 8 steps, EulerDiscrete trailing, guidance_scale ~1
+DEFAULT_STEPS = 8
+DEFAULT_CFG = 1.0
 
 DEFAULT_OUTPUT_DIR = "./outputs"
 os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
 # -------------------------
-# Lazy Pipeline Global
+# Lazy Pipeline Global (will load on first use)
 # -------------------------
 _pipeline = None
-_scheduler_config = None
 
 
-def get_sdxl_pipe():
-    """Lazy-load the SDXL Img2Img pipeline and cache it."""
-    global _pipeline, _scheduler_config
+def get_pipeline():
+    """Lazy-initialize the SDXL Img2Img pipeline with Lightning LoRA fused."""
+    global _pipeline
     if _pipeline is not None:
-        return _pipeline, _scheduler_config
+        return _pipeline
 
-    import time
     total_start = time.time()
 
+    # MEMORY-OPTIMIZED: Check if T2I pipeline is already loaded and share components
+    # This prevents duplicate model loading on low-VRAM GPUs (<24GB)
+    try:
+        from sdxl_T2I_inference import _pipeline as t2i_pipeline
+        if t2i_pipeline is not None:
+            print(f"🧠 T2I pipeline already loaded → creating I2I from shared components (saves ~7-8GB VRAM)")
+            pipeline_start = time.time()
+            pipe = StableDiffusionXLImg2ImgPipeline(**t2i_pipeline.components)
+            pipeline_time = time.time() - pipeline_start
+            print(f"✅ I2I pipeline created from shared components in {pipeline_time:.1f}s")
+            
+            # Set EulerDiscreteScheduler with trailing timesteps (required by SDXL-Lightning)
+            pipe.scheduler = EulerDiscreteScheduler.from_config(
+                pipe.scheduler.config, timestep_spacing="trailing"
+            )
+            
+            # Load and fuse SDXL-Lightning LoRA if not already fused in T2I
+            # Note: If T2I already has LoRA fused, we need to check/apply LoRA here too
+            # For now, we'll load LoRA if it exists (T2I doesn't use Lightning LoRA)
+            if os.path.exists(LIGHTNING_LORA_PATH):
+                try:
+                    lora_start = time.time()
+                    print(f"⚡ Loading SDXL-Lightning LoRA from {LIGHTNING_LORA_PATH}")
+                    pipe.load_lora_weights(LIGHTNING_LORA_DIR, weight_name=LIGHTNING_LORA_FILE)
+                    pipe.fuse_lora()
+                    lora_time = time.time() - lora_start
+                    print(f"✅ Lightning LoRA loaded and fused in {lora_time:.1f}s")
+                except Exception as e:
+                    print(f"⚠️ Failed to load Lightning LoRA: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"⚠️ Lightning LoRA not found at {LIGHTNING_LORA_PATH}, running without LoRA")
+            
+            _pipeline = pipe
+            total_time = time.time() - total_start
+            print(f"✅ SDXL Img2Img pipeline initialized in {total_time:.1f}s (shared components: {pipeline_time:.1f}s)")
+            return _pipeline
+    except (ImportError, AttributeError):
+        # T2I not loaded yet, fall through to full load
+        pass
+
+    # Fallback: Full pipeline load (if T2I not available or sharing failed)
     # CRITICAL: Clear GPU cache before loading to maximize free memory
     gc.collect()
     torch.cuda.empty_cache()
 
-    print("🧠 Loading SDXL Img2Img pipeline...")
+    print(f"🧠 Loading SDXL Img2Img pipeline from {MODEL_ID}")
+    pipeline_start = time.time()
     pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16,
         use_safetensors=True,
     ).to("cuda")
+    pipeline_time = time.time() - pipeline_start
+    print(f"✅ Base pipeline loaded in {pipeline_time:.1f}s")
 
-    default_scheduler_config = pipe.scheduler.config
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(default_scheduler_config)
+    # Load and fuse SDXL-Lightning LoRA for fast inference
+    if os.path.exists(LIGHTNING_LORA_PATH):
+        try:
+            lora_start = time.time()
+            print(f"⚡ Loading SDXL-Lightning LoRA from {LIGHTNING_LORA_PATH}")
+            pipe.load_lora_weights(LIGHTNING_LORA_DIR, weight_name=LIGHTNING_LORA_FILE)
+            pipe.fuse_lora()
+            lora_time = time.time() - lora_start
+            print(f"✅ Lightning LoRA loaded and fused in {lora_time:.1f}s")
+        except Exception as e:
+            print(f"⚠️ Failed to load Lightning LoRA: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"⚠️ Lightning LoRA not found at {LIGHTNING_LORA_PATH}, running without LoRA")
 
-    # Load embeddings (optional)
-    if os.path.exists(POS_EMBED_PATH):
-        try:
-            pipe.load_textual_inversion(POS_EMBED_PATH, token=POS_TOKEN)
-            print(f"✅ Loaded positive embedding: {POS_EMBED_PATH}")
-        except Exception as e:
-            print(f"⚠️ Failed to load POS embedding: {e}")
-    if os.path.exists(NEG_EMBED_PATH):
-        try:
-            pipe.load_textual_inversion(NEG_EMBED_PATH, token=NEG_TOKEN)
-            print(f"✅ Loaded negative embedding: {NEG_EMBED_PATH}")
-        except Exception as e:
-            print(f"⚠️ Failed to load NEG embedding: {e}")
+    # Set EulerDiscreteScheduler with trailing timesteps (required by SDXL-Lightning)
+    pipe.scheduler = EulerDiscreteScheduler.from_config(
+        pipe.scheduler.config, timestep_spacing="trailing"
+    )
+    print("✅ Scheduler set to EulerDiscreteScheduler (trailing timesteps)")
 
     _pipeline = pipe
-    _scheduler_config = default_scheduler_config
     total_time = time.time() - total_start
-    print(f"✅ SDXL Img2Img pipeline loaded in {total_time:.1f}s")
-    return pipe, default_scheduler_config
-
-
-def unload_sdxl_pipe():
-    """Optional cleanup: unload SDXL pipeline and free GPU/CPU memory."""
-    global _pipeline, _scheduler_config
-    _pipeline = None
-    _scheduler_config = None
-    gc.collect()
-    torch.cuda.empty_cache()
-    print("🧹 SDXL pipeline cache cleared and GPU memory freed.")
+    print(f"✅ SDXL Img2Img pipeline initialized in {total_time:.1f}s (base: {pipeline_time:.1f}s)")
+    return _pipeline
 
 
 # -------------------------
@@ -119,7 +159,7 @@ def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image
         raise ValueError(f"Unable to decode image: {e}")
 
 
-def _get_dynamic_size(img: Image.Image, max_dim: int = 1152) -> tuple[int, int]:
+def _get_dynamic_size(img: Image.Image, max_dim: int = 1024) -> tuple[int, int]:
     """Compute output resolution keeping aspect ratio, multiple-of-64, within max_dim."""
     w, h = img.size
     aspect = w / h
@@ -139,41 +179,43 @@ def _get_dynamic_size(img: Image.Image, max_dim: int = 1152) -> tuple[int, int]:
 # -------------------------
 def run_inference_sdxl_i2i(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
     """
-    Runs SDXL Img2Img inference with dynamic resolution and embedding auto-prepend.
-    Saves and optionally upscales the result.
+    Run SDXL Img2Img inference with Lightning LoRA.
+
+    Args:
+        job_id: unique job identifier (for output filenames)
+        prompt: text prompt for image editing
+        params:
+        - output_dir (str)
+        - init_image (base64/path/PIL)
+        - negative_prompt (str)
+        - sample_steps (int) - default 8 for Lightning
+        - cfg_scale (float) - default 1.0 for Lightning
+        - strength (float) - default 0.7
+        - seed (int)
+        - scale_image (bool)
+        - scale_factor (int)
+
+    Returns: absolute path to final image (upscaled if requested)
     """
-    print(f"🧩 Starting SDXL Img2Img job: {job_id}")
-    pipe, default_scheduler_config = get_sdxl_pipe()
+    # Consistent global output path
+    default_out = "/app/worker/outputs"
+    output_dir = os.path.abspath(params.get("output_dir", default_out))
+    os.makedirs(output_dir, exist_ok=True)
+
+    pipe = get_pipeline()
 
     init_image = _load_image(params.get("init_image"))
     if init_image is None:
         raise ValueError("init_image is required for img2img")
 
-    width, height = _get_dynamic_size(init_image, max_dim=1152)
+    width, height = _get_dynamic_size(init_image, max_dim=1024)
     negative_prompt = params.get("negative_prompt", "")
 
-    # Auto-prepend embedding tokens
-    if POS_TOKEN and POS_TOKEN not in prompt:
-        prompt = f"{POS_TOKEN}, {prompt}"
-    if NEG_TOKEN and NEG_TOKEN not in str(negative_prompt):
-        negative_prompt = f"{NEG_TOKEN}, {negative_prompt}"
-
-    # Scheduler selection
-    sampler_name = params.get("sampler", "DPMSolverMultistep")
-    if sampler_name == "DPMSolverMultistep":
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(default_scheduler_config)
-    elif sampler_name == "EulerA":
-        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(default_scheduler_config)
-    else:
-        print(f"⚠️ Unknown sampler '{sampler_name}', defaulting to DPMSolverMultistep")
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(default_scheduler_config)
-
-    steps = int(params.get("sample_steps", 30))
-    cfg = float(params.get("cfg_scale", 5))
+    # Parameters (SDXL-Lightning defaults: 8 steps, cfg=1)
+    steps = int(params.get("sample_steps", DEFAULT_STEPS))
+    cfg = float(params.get("cfg_scale", DEFAULT_CFG))
     strength = float(params.get("strength", 0.7))
     seed = int(params.get("seed", random.randint(0, 2**32 - 1)))
-    output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
-    os.makedirs(output_dir, exist_ok=True)
 
     # CRITICAL: Clear GPU memory before inference to maximize available VRAM
     gc.collect()
@@ -187,9 +229,10 @@ def run_inference_sdxl_i2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     except Exception:
         pass
 
-    print(f"⚙️ Running Img2Img | Steps={steps}, CFG={cfg}, Strength={strength}, Sampler={sampler_name}, Seed={seed}")
+    print(f"⚙️ Running Img2Img | Steps={steps}, CFG={cfg}, Strength={strength}, Seed={seed}, Size={width}x{height}")
     generator = torch.manual_seed(seed) if seed >= 0 else None
 
+    # Run inference with automatic mixed precision for memory efficiency
     try:
         with torch.inference_mode():
             result = pipe(
@@ -211,22 +254,25 @@ def run_inference_sdxl_i2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
 
     out_path = os.path.join(output_dir, f"sdxl_i2i_{job_id}.png")
     image.save(out_path)
-    print(f"🖼️ Base image saved at {out_path}")
+    print(f"✅ Saved base image: {out_path}")
 
     # -------------------------
-    # Optional Upscaling and compulsory metadata removal
+    # Optional Upscaling
     # -------------------------
-    scale_image = params.get("scale_image", True)
-    scale_factor = params.get("scale_factor", 2) if scale_image else 0
-    model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
+    if params.get("scale_image", False):
+        scale_factor = int(params.get("scale_factor", 2))
+        model_name = params.get("scale_model_name", f"RealESRGAN_x{scale_factor}plus")
+        try:
+            upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
+            up_path = os.path.join(output_dir, f"sdxl_i2i_{job_id}_upscaled.png")
+            upscaled.save(up_path)
+            print(f"✅ Saved upscaled image: {up_path}")
+            return os.path.abspath(up_path)
+        except Exception as e:
+            print(f"⚠️ Upscaling failed: {e}")
+            return os.path.abspath(out_path)
 
-    upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
-
-    upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
-    upscaled.save(upscaled_path)
-    print(f"🚀 Upscaled image saved to {upscaled_path}")
-
-    return os.path.abspath(upscaled_path)
+    return os.path.abspath(out_path)
 
 
 # -------------------------
@@ -244,13 +290,13 @@ if __name__ == "__main__":
         img_b64 = base64.b64encode(f.read()).decode("utf-8")
 
     params = {
-        "sample_steps": 30,
-        "cfg_scale": 5,
+        "sample_steps": 8,
+        "cfg_scale": 1.0,
         "strength": 0.65,
         "output_dir": "./outputs",
         "negative_prompt": "lowres, blurry, bad anatomy, extra limbs",
         "init_image": img_b64,
-        "sampler": "DPMSolverMultistep",
+        "scale_image": False,
     }
 
     out = run_inference_sdxl_i2i(job_id, prompt, params)

@@ -92,7 +92,7 @@ class PodStatus(str, Enum):
 # which is dynamically updated based on successful pod creations and model caching.
 # This prevents conflicts with the machine blacklist system.
 
-MAX_JOBS_PER_POD = int(os.getenv("MAX_JOBS_PER_POD", "5"))
+MAX_JOBS_PER_POD = int(os.getenv("MAX_JOBS_PER_POD", "30"))
 MAX_SAME_JOB_PER_POD = int(os.getenv("MAX_SAME_JOB_PER_POD", "5"))
 
 
@@ -723,7 +723,9 @@ class PodManager:
             
             "sd15": os.getenv("SD15_TEMPLATE_UUID"),
             "sd35": os.getenv("SD35_TEMPLATE_UUID"),
-            "sdxl": os.getenv("SDXL_TEMPLATE_UUID"),
+            "sdxl_t2i": os.getenv("SDXL_TEMPLATE_UUID"),
+            "sdxl_inpaint": os.getenv("SDXL_TEMPLATE_UUID"),
+            "sdxl_i2i": os.getenv("SDXL_TEMPLATE_UUID"),
             
             "diffusers_outpaint": os.getenv("DIFFUSERS_OUTPAINT_TEMPLATE_UUID"),
             
@@ -739,6 +741,7 @@ class PodManager:
 
             "flux_kontext_dev": os.getenv("FLUX_KONTEXT_DEV_TEMPLATE_UUID"),
             "flux_kontext_dev_int4": os.getenv("FLUX_KONTEXT_DEV_INT4_TEMPLATE_UUID"),
+            "flux_klein": os.getenv("FLUX_KLEIN_TEMPLATE_UUID"),
 
             "z_image_turbo": os.getenv("Z_IMAGE_TURBO_TEMPLATE_UUID"),
             "z_image_turbo_int4": os.getenv("Z_IMAGE_TURBO_INT4_TEMPLATE_UUID"),
@@ -774,7 +777,10 @@ class PodManager:
         return {
             "sd15": 30,
             "sd35": 40,
-            "sdxl": 30,
+            "sdxl_t2i": 40,
+            "sdxl_inpaint": 40,
+            "sdxl_i2i": 40,
+            "flux_klein": 40,
             "diffusers_outpaint": 50,
             "qwen_image": 80,
             "qwen_image_edit": 80,
@@ -1272,39 +1278,69 @@ class PodManager:
         # Track pods that exist for this model but have no available slots
         busy_pods_for_model = []
         
-        # === PHASE 1: Try to find a READY pod to reuse immediately ===
+        # === PHASE 1: Try to find a READY pod to reuse immediately (least-loaded first) ===
+        # Collect all eligible READY pods for this model
+        eligible_ready_pods = []
         for pod_uuid, info in candidates:
-            # Skip blacklisted machines
             if info.machine_id and self.is_machine_bad(info.machine_id):
                 continue
-            
-            # CRITICAL: Skip pods that were recently destroyed (shouldn't be in candidates, but double-check)
             if self.lifecycle.is_recently_destroyed(pod_uuid):
-                logger.debug(f"Skipping recently destroyed pod {pod_uuid}")
+                continue
+            if info.model == model and info.status == PodStatus.READY:
+                eligible_ready_pods.append((pod_uuid, info))
+        
+        # Sort by queue_size ascending (least-loaded first)
+        eligible_ready_pods.sort(key=lambda x: x[1].queue_size)
+        
+        for pod_uuid, info in eligible_ready_pods:
+            # Try to reserve slot
+            reserved = await self.reserve_slot_on_pod(pod_uuid, job_id)
+            if not reserved:
+                # Pod exists for this model but has no available slots (busy)
+                busy_pods_for_model.append(pod_uuid)
                 continue
             
-            if info.model == model and info.status == PodStatus.READY:
-                # Try to reserve slot
-                reserved = await self.reserve_slot_on_pod(pod_uuid, job_id)
-                if not reserved:
-                    # Pod exists for this model but has no available slots (busy)
-                    busy_pods_for_model.append(pod_uuid)
-                    continue
+            # Update DB
+            with SessionLocal() as db:
+                worker = (
+                    db.query(Worker)
+                    .filter(Worker.container_id == pod_uuid, Worker.model == model)
+                    .first()
+                )
                 
-                # Update DB
-                with SessionLocal() as db:
-                    worker = (
-                        db.query(Worker)
-                        .filter(Worker.container_id == pod_uuid, Worker.model == model)
-                        .first()
-                    )
-                    
-                    if worker:
-                        # CRITICAL: Never dispatch to workers that aren't truly ready.
-                        # Some pods register as "starting" and only become ready after model load.
-                        # If we flip them to "dispatching" here, routes._dispatch_to_worker won't detect
-                        # the starting state and server will timeout hitting /run.
-                        if worker.status != "ready":
+                if worker:
+                    # CRITICAL: Never dispatch to workers that aren't truly ready.
+                    # Some pods register as "starting" and only become ready after model load.
+                    # If we flip them to "dispatching" here, routes._dispatch_to_worker won't detect
+                    # the starting state and server will timeout hitting /run.
+                    if worker.status != "ready":
+                        # BUG FIX: Before rejecting, check if the heartbeat cache shows
+                        # the worker as "ready". The DB may lag behind the in-memory
+                        # cache (heartbeat sync runs every 30s). If the worker is
+                        # actually ready per heartbeat, update the DB and proceed.
+                        worker_actually_ready = False
+                        try:
+                            from routes import _heartbeat_cache
+                            cached = _heartbeat_cache.get(worker.worker_id)
+                            if cached:
+                                hb_status = cached.get("status")
+                                last_hb = cached.get("last_heartbeat")
+                                from db import utc_naive_now as _utc_now
+                                _now = _utc_now()
+                                hb_age = ((_now - last_hb).total_seconds() if last_hb else 9999)
+                                if hb_status == "ready" and hb_age < 60:
+                                    # Heartbeat confirms worker is ready; trust it over stale DB
+                                    worker.status = "ready"
+                                    db.commit()
+                                    worker_actually_ready = True
+                                    logger.info(
+                                        f"Pod {pod_uuid}: DB worker was '{worker.status}' but heartbeat "
+                                        f"shows 'ready' ({hb_age:.0f}s ago). Updated DB, proceeding with reuse."
+                                    )
+                        except Exception as e:
+                            logger.debug(f"Heartbeat cache check failed for {worker.worker_id}: {e}")
+
+                        if not worker_actually_ready:
                             logger.info(
                                 f"Pod {pod_uuid} tracked as READY but DB worker {worker.worker_id} "
                                 f"is '{worker.status}'. Skipping reuse for job {job_id}."
@@ -1324,14 +1360,14 @@ class PodManager:
                             await self.release_slot_on_pod(pod_uuid, job_id)
                             continue
 
-                        worker.status = "dispatching"
-                        worker.last_active = datetime.utcnow()
-                        db.commit()
-                        logger.info(f"Reusing READY pod {pod_uuid} for job {job_id}")
-                        return worker.worker_id
-                    else:
-                        # Rollback reservation
-                        await self.release_slot_on_pod(pod_uuid, job_id)
+                    worker.status = "dispatching"
+                    worker.last_active = datetime.utcnow()
+                    db.commit()
+                    logger.info(f"Reusing READY pod {pod_uuid} for job {job_id} (least-loaded, queue_size={info.queue_size})")
+                    return worker.worker_id
+                else:
+                    # Rollback reservation
+                    await self.release_slot_on_pod(pod_uuid, job_id)
         
         # === PHASE 2: Check for STARTING pods for the same model ===
         # If another job already triggered pod creation, wait for it instead of creating duplicate
@@ -1405,43 +1441,39 @@ class PodManager:
                                     f"(avoiding unnecessary pod creation)"
                                 )
                                 return worker.worker_id
+                            elif worker and worker.status != "ready":
+                                # Check heartbeat cache - DB may be stale
+                                try:
+                                    from routes import _heartbeat_cache
+                                    cached = _heartbeat_cache.get(worker.worker_id)
+                                    if cached and cached.get("status") == "ready":
+                                        last_hb = cached.get("last_heartbeat")
+                                        from db import utc_naive_now as _utc_now
+                                        hb_age = ((_utc_now() - last_hb).total_seconds() if last_hb else 9999)
+                                        if hb_age < 60:
+                                            worker.status = "dispatching"
+                                            worker.last_active = datetime.utcnow()
+                                            db.commit()
+                                            logger.info(
+                                                f"After timeout, pod {pod_uuid} DB was '{worker.status}' "
+                                                f"but heartbeat says ready. Reusing for job {job_id}."
+                                            )
+                                            return worker.worker_id
+                                except Exception:
+                                    pass
+                                await self.release_slot_on_pod(pod_uuid, job_id)
                             else:
                                 await self.release_slot_on_pod(pod_uuid, job_id)
                 
                 # No READY pods found after timeout, fall through to create new pod
         
-        # === PHASE 2.5: Wait for BUSY pod to become available ===
-        # If there are existing pods for this model but all are busy (max_jobs reached),
-        # wait for one to become available instead of creating a new pod
+        # === PHASE 2.5: All pods full -- skip wait, fall through to create new pod ===
         if busy_pods_for_model:
-            busy_pod_uuid = busy_pods_for_model[0]
             logger.info(
-                f"Found BUSY pod {busy_pod_uuid} for model {model} (max jobs reached), "
-                f"waiting for slot to become available for job {job_id}"
+                f"All {len(busy_pods_for_model)} pod(s) for model {model} are at capacity, "
+                f"creating new pod for job {job_id} (overflow)"
             )
-            try:
-                worker_id = await self._wait_for_busy_pod_slot(
-                    busy_pod_uuid, model, job_id
-                )
-                if worker_id:
-                    logger.info(
-                        f"Job {job_id} successfully assigned to pod {busy_pod_uuid} "
-                        f"(waited for BUSY pod slot)"
-                    )
-                    return worker_id
-            except JobAlreadyProcessedError:
-                # Job was processed by another dispatch task - this is OK
-                logger.info(
-                    f"Job {job_id} was already processed by another dispatch task "
-                    f"while waiting for BUSY pod {busy_pod_uuid}"
-                )
-                raise
-            except Exception as e:
-                logger.warning(
-                    f"Failed to wait for BUSY pod {busy_pod_uuid}: {e}. "
-                    f"Will create new pod for job {job_id}"
-                )
-                # Fall through to create a new pod
+            # Fall through to Phase 3 -- don't wait 120s
         
         # === PHASE 3: No existing pods - create a new one ===
         logger.info(f"No existing pods for model {model}, creating new pod for job {job_id}")
@@ -1605,6 +1637,19 @@ class PodManager:
                 )
                 
                 if worker:
+                    # CRITICAL FIX: Reserve slot on pod before assigning job
+                    # This enforces max_jobs_per_pod limit even for STARTING-pod wait path
+                    slot_reserved = await self.reserve_slot_on_pod(pod_uuid, job_id)
+                    if not slot_reserved:
+                        # Pod is at capacity (max_jobs_per_pod reached)
+                        logger.debug(
+                            f"Pod {pod_uuid} is at capacity (max_jobs_per_pod reached), "
+                            f"continuing wait for slot availability for job {job_id}"
+                        )
+                        # Continue wait loop - don't assign yet
+                        await asyncio.sleep(1)
+                        continue
+                    
                     # Double-check job state right before assignment
                     job = db.query(Job).filter(Job.job_id == job_id).first()
                     if job:
@@ -1614,6 +1659,8 @@ class PodManager:
                                 f"Job {job_id} changed to {current_state.value} before assignment, "
                                 f"aborting wait for worker registration"
                             )
+                            # Release slot since we're not assigning
+                            await self.release_slot_on_pod(pod_uuid, job_id)
                             raise JobAlreadyProcessedError(
                                 f"Job {job_id} is already in {current_state.value} state"
                             )
@@ -1622,7 +1669,7 @@ class PodManager:
                     worker.last_active = datetime.utcnow()
                     db.commit()
                     logger.info(
-                        f"Worker {worker.worker_id} is READY, assigning job {job_id}"
+                        f"Worker {worker.worker_id} is READY, assigning job {job_id} (slot reserved)"
                     )
                     return worker.worker_id
                 
@@ -1678,18 +1725,31 @@ class PodManager:
                     )
                 elif final_worker.status == "ready":
                     # Race condition - worker became ready just now
+                    # CRITICAL FIX: Reserve slot before assigning
+                    slot_reserved = await self.reserve_slot_on_pod(pod_uuid, job_id)
+                    if not slot_reserved:
+                        # Pod is at capacity - this shouldn't happen at timeout, but handle gracefully
+                        logger.warning(
+                            f"Pod {pod_uuid} is at capacity during timeout check for job {job_id}. "
+                            f"Will raise timeout error."
+                        )
+                        # Release any partial state and raise timeout
+                        raise WorkerTimeoutError(pod_uuid, timeout)
+                    
                     # But first check job state
                     job = db.query(Job).filter(Job.job_id == job_id).first()
                     if job:
                         current_state = JobState(job.status)
                         if current_state in [JobState.RUNNING, JobState.COMPLETED, JobState.FAILED]:
+                            # Release slot since we're not assigning
+                            await self.release_slot_on_pod(pod_uuid, job_id)
                             raise JobAlreadyProcessedError(
                                 f"Job {job_id} is already in {current_state.value} state"
                             )
                     
                     logger.info(
                         f"Worker {final_worker.worker_id} became ready during timeout check, "
-                        f"assigning job {job_id}"
+                        f"assigning job {job_id} (slot reserved)"
                     )
                     final_worker.status = "dispatching"
                     final_worker.last_active = datetime.utcnow()
@@ -1790,14 +1850,36 @@ class PodManager:
                             f"after waiting {elapsed:.1f}s"
                         )
                         return worker.worker_id
-                    else:
+                    elif worker and worker.status != "ready":
+                        # BUG FIX: Check heartbeat cache before giving up
+                        try:
+                            from routes import _heartbeat_cache
+                            cached = _heartbeat_cache.get(worker.worker_id)
+                            if cached and cached.get("status") == "ready":
+                                last_hb = cached.get("last_heartbeat")
+                                from db import utc_naive_now as _utc_now
+                                hb_age = ((_utc_now() - last_hb).total_seconds() if last_hb else 9999)
+                                if hb_age < 60:
+                                    worker.status = "dispatching"
+                                    worker.last_active = datetime.utcnow()
+                                    db.commit()
+                                    elapsed = time.time() - start
+                                    logger.info(
+                                        f"Job {job_id} got slot on BUSY pod {pod_uuid} after {elapsed:.1f}s "
+                                        f"(DB was '{worker.status}', heartbeat says ready)"
+                                    )
+                                    return worker.worker_id
+                        except Exception:
+                            pass
                         # Worker not ready yet, release slot and keep waiting
                         await self.release_slot_on_pod(pod_uuid, job_id)
-                        if worker:
-                            logger.debug(
-                                f"Pod {pod_uuid} has slot but worker status is '{worker.status}', "
-                                f"waiting for ready state"
-                            )
+                        logger.debug(
+                            f"Pod {pod_uuid} has slot but worker status is '{worker.status}', "
+                            f"waiting for ready state"
+                        )
+                    else:
+                        # No worker found, release slot and keep waiting
+                        await self.release_slot_on_pod(pod_uuid, job_id)
             
             # Log progress every 10 seconds
             elapsed = time.time() - start
@@ -1988,8 +2070,53 @@ class PodManager:
                 # Track machines we've tried for this variant to avoid duplicates
                 tried_machines = set()
                 
-                # First, try cached machines (prioritize known good machines)
-                for mid, desc in candidates:
+                # ---------------------------------------------------------------
+                # GPU PRIORITY FIX: Fetch all offers ONCE per variant iteration.
+                # Used for: (1) sorting cached candidates by GPU priority
+                #           (2) the "all available machines" fallback (avoids re-fetch)
+                # ---------------------------------------------------------------
+                _all_variant_offers: list = []
+                try:
+                    _all_variant_offers = await asyncio.to_thread(
+                        self.global_qp.get_rentable_machines
+                    )
+                except Exception as _fetch_err:
+                    logger.debug(f"Pre-fetch offers for GPU priority sorting failed: {_fetch_err}")
+                
+                # Build machine_id -> GPU priority index (lower = higher priority
+                # per the order specified in allowed_gpus from model_requirements).
+                _machine_gpu_prio: Dict[str, int] = {}
+                for _o in _all_variant_offers:
+                    _mid_val = None
+                    for _k in ("machines_id", "machine_id", "machineId"):
+                        if _k in _o and _o[_k] is not None:
+                            try:
+                                _mid_val = str(int(_o[_k]))
+                                break
+                            except (ValueError, TypeError):
+                                pass
+                    if _mid_val:
+                        _oname = str(_o.get("offer_name", "")).upper()
+                        for _gi, _gn in enumerate(allowed_gpus or []):
+                            if _gn.upper() in _oname:
+                                if _mid_val not in _machine_gpu_prio or _gi < _machine_gpu_prio[_mid_val]:
+                                    _machine_gpu_prio[_mid_val] = _gi
+                                break
+                
+                # Sort cached candidates by GPU priority (e.g. 5090 before 4090).
+                # Stable sort: within same GPU priority, original cache-score order is preserved.
+                candidates_by_gpu_priority = sorted(
+                    candidates, key=lambda c: _machine_gpu_prio.get(c[0], 999)
+                )
+                
+                if candidates_by_gpu_priority:
+                    logger.info(
+                        f"Cached candidates sorted by GPU priority for variant {variant}: "
+                        f"{[(c[0], _machine_gpu_prio.get(c[0], '?')) for c in candidates_by_gpu_priority[:5]]}"
+                    )
+                
+                # First, try cached machines (in GPU priority order)
+                for mid, desc in candidates_by_gpu_priority:
                     if mid in tried_machines:
                         continue
                     tried_machines.add(mid)
@@ -2057,10 +2184,13 @@ class PodManager:
                 blacklist_set = set(blacklisted)
                 
                 try:
-                    # Get all available offers and filter for this GPU type
-                    all_offers = await asyncio.to_thread(
-                        self.global_qp.get_rentable_machines
-                    )
+                    # Use pre-fetched offers from variant start (avoids redundant API call)
+                    all_offers = _all_variant_offers
+                    if not all_offers:
+                        # Fallback: try fetching again if the earlier pre-fetch failed
+                        all_offers = await asyncio.to_thread(
+                            self.global_qp.get_rentable_machines
+                        )
                     
                     if not all_offers:
                         logger.warning(f"No offers available for variant {variant}")
@@ -2130,8 +2260,17 @@ class PodManager:
                         and str(extract_machine_id(o)) not in tried_machines
                     ]
                     
-                    # Sort by price (cheapest first)
-                    eligible_offers.sort(key=extract_price)
+                    # GPU PRIORITY FIX: Sort by allowed_gpus order first, then by
+                    # price within each GPU tier.  This ensures e.g. 5090 machines
+                    # are tried before 4090 machines when allowed_gpus=["5090","4090"].
+                    def gpu_priority_then_price(o):
+                        offer_name = str(o.get("offer_name", "")).upper()
+                        for idx, gpu in enumerate(allowed_gpus or []):
+                            if gpu.upper() in offer_name:
+                                return (idx, extract_price(o))
+                        return (len(allowed_gpus or []), extract_price(o))
+                    
+                    eligible_offers.sort(key=gpu_priority_then_price)
                     
                     logger.info(
                         f"Found {len(eligible_offers)} eligible machines for variant {variant} "
@@ -2727,13 +2866,30 @@ class PodManager:
         except Exception as e:
             logger.error(f"Error recovering jobs before destroying pod {pod_uuid}: {e}")
         
-        # CRITICAL: Remove pod from local tracking FIRST, before re-dispatching recovered jobs.
-        # This ensures any in-flight dispatches or new dispatches won't try to use this dying pod.
+        # BUG FIX: Mark pod as STOPPING first so dispatchers skip it, then call the
+        # API destroy BEFORE removing from tracking.  Previously the pod was removed
+        # from tracking first, and the API call happened later -- if the API call
+        # failed the pod became a zombie (still running, but invisible to our system).
+        async with self._lock:
+            pi = self.individual_pods.get(pod_uuid)
+            if pi:
+                pi.status = PodStatus.STOPPING
+        
+        # Destroy via lifecycle manager (API call) BEFORE removing from tracking
+        success = await self.lifecycle.destroy_pod(pod_uuid, reason=reason)
+        
+        if not success:
+            logger.error(
+                f"API destroy call failed for pod {pod_uuid}. "
+                f"Pod may still be running (zombie). Will still remove from tracking."
+            )
+        
+        # NOW remove from tracking (after API destroy has been attempted)
         async with self._lock:
             self.individual_pods.pop(pod_uuid, None)
             self.individual_pod_managers.pop(pod_uuid, None)
         
-        logger.info(f"Pod {pod_uuid} removed from tracking (recovered jobs will be re-dispatched)")
+        logger.info(f"Pod {pod_uuid} removed from tracking (destroy success={success})")
         
         # CRITICAL: Recovered jobs must be re-enqueued into the in-memory pending queue,
         # otherwise autoscaler/dispatcher won't see them and clients will be stuck in QUEUED forever.
@@ -2763,9 +2919,6 @@ class PodManager:
                             asyncio.create_task(delayed_dispatch(r["job_id"], r["model"], r.get("mode")))
             except Exception as e:
                 logger.warning(f"Failed to trigger dispatch for recovered jobs from pod {pod_uuid}: {e}")
-        
-        # Destroy via lifecycle manager
-        success = await self.lifecycle.destroy_pod(pod_uuid, reason=reason)
         
         # Finalize pod costs and distribute overhead across all jobs that ran on this pod
         if success and pod_created_at and pod_hourly_cost > 0:
@@ -2877,17 +3030,21 @@ class PodManager:
                             logger.error(f"Error verifying pending count from DB: {e}")
                             continue
                         
-                        # Check if any pods exist for this model (READY or STARTING)
-                        # Don't create new pod if one is already being created
-                        has_pod = any(
-                            p.model == model and p.status in [PodStatus.READY, PodStatus.STARTING]
+                        # Check if any pods exist with available capacity for this model
+                        model_limit = self.model_requirements.get(model, {}).get(
+                            "max_jobs_per_pod", MAX_JOBS_PER_POD
+                        )
+                        has_available_pod = any(
+                            p.model == model
+                            and p.status in [PodStatus.READY, PodStatus.STARTING]
+                            and p.queue_size < model_limit
                             for p in self.individual_pods.values()
                         )
                         
-                        if not has_pod:
+                        if not has_available_pod:
                             logger.info(
                                 f"Load autoscaler: model={model}, pending={pending_count}, "
-                                f"no existing pods - creating new pod"
+                                f"no pods with available capacity - creating new pod"
                             )
                             self.last_autoscale_ts = now
                             await self._scale_up_for_model(model)
@@ -2895,7 +3052,7 @@ class PodManager:
                         else:
                             logger.debug(
                                 f"Load autoscaler: model={model}, pending={pending_count}, "
-                                f"but pod already exists - skipping"
+                                f"pod with capacity exists - skipping"
                             )
                 
                 # Fallback frequency scaling

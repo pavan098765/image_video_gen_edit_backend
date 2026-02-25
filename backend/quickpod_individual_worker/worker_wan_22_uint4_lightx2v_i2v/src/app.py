@@ -137,6 +137,69 @@ class RunRequest(BaseModel):
     upload_url: str
     result_key: str
 
+
+# -----------------------
+# Media URL Resolution
+# -----------------------
+# Fields that may contain URLs (presigned R2 GET URLs) instead of base64 data.
+# At dispatch time the server converts R2 keys to presigned GET URLs.
+# This helper downloads the binary and converts to base64 so inference code
+# (which expects base64 strings) works without modification.
+MEDIA_FIELDS = frozenset([
+    "init_image", "mask_image", "image", "source_image", "face_image",
+    "reference_image", "style_image", "control_image", "input_image",
+    "ref_image", "ref_video", "input_video",
+])
+
+
+def _is_url(value: str) -> bool:
+    return isinstance(value, str) and (value.startswith("http://") or value.startswith("https://"))
+
+
+def _download_to_base64(url: str, timeout: int = 120) -> str:
+    """Download binary from URL and return base64-encoded string."""
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    return base64.b64encode(resp.content).decode("utf-8")
+
+
+def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, Any]:
+    """
+    Resolve any URL-valued media fields in params to base64 strings.
+    
+    If a known media field contains a URL (e.g. presigned R2 download URL),
+    download the binary and replace with base64 so downstream inference
+    functions work unchanged.
+    
+    Handles both single string values and lists of strings.
+    """
+    resolved = dict(params)
+    for field in MEDIA_FIELDS:
+        value = resolved.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str) and _is_url(value):
+            try:
+                logger.info(f"[{job_id}] Downloading {field} from URL ({len(value)} chars)...")
+                resolved[field] = _download_to_base64(value)
+                logger.info(f"[{job_id}] Downloaded {field}: {len(resolved[field])} base64 chars")
+            except Exception as e:
+                logger.error(f"[{job_id}] Failed to download {field} from URL: {e}")
+                raise
+        elif isinstance(value, list):
+            new_list = []
+            for i, item in enumerate(value):
+                if isinstance(item, str) and _is_url(item):
+                    try:
+                        logger.info(f"[{job_id}] Downloading {field}[{i}] from URL...")
+                        new_list.append(_download_to_base64(item))
+                    except Exception as e:
+                        logger.error(f"[{job_id}] Failed to download {field}[{i}]: {e}")
+                        raise
+                else:
+                    new_list.append(item)
+            resolved[field] = new_list
+    return resolved
 # -----------------------
 # HMAC utils
 # -----------------------
@@ -242,6 +305,12 @@ async def run_inference_and_save(job_id: str, prompt: str, model: str, mode: Opt
 async def process_job_item(item: Dict[str, Any]):
     job_id, model, mode, prompt = item["job_id"], item["model"], item.get("mode"), item["prompt"]
     params, upload_url, result_key = item.get("params", {}), item["upload_url"], item["result_key"]
+
+    # Resolve any URL-valued media fields to base64 before inference
+    try:
+        params = resolve_media_urls(params, job_id)
+    except Exception as e:
+        logger.error(f"[{job_id}] Failed to resolve media URLs: {e}")
 
     async with job_status_lock:
         job_status[job_id] = {"status": "running", "started_at": datetime.utcnow().isoformat()}

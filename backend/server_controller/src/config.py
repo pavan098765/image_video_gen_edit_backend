@@ -106,7 +106,7 @@ class WorkerConfig:
     heartbeat_grace_multiplier: int = 2
     idle_timeout: int = 10
     registration_timeout: int = 180
-    max_jobs_per_pod: int = 5
+    max_jobs_per_pod: int = 30
     max_same_job_per_pod: int = 5
     heartbeat_stale_seconds: int = 90
 
@@ -307,7 +307,7 @@ class ConfigManager:
         worker_config.heartbeat_grace_multiplier = int(os.getenv("HEARTBEAT_GRACE_MULTIPLIER", "2"))
         worker_config.idle_timeout = int(os.getenv("WORKER_IDLE_TIMEOUT", "15"))
         worker_config.registration_timeout = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "180"))
-        worker_config.max_jobs_per_pod = int(os.getenv("MAX_JOBS_PER_POD", "5"))
+        worker_config.max_jobs_per_pod = int(os.getenv("MAX_JOBS_PER_POD", "30"))
         worker_config.heartbeat_stale_seconds = int(os.getenv("HEARTBEAT_STALE_SECS", "90"))
     
     def _load_job_config(self):

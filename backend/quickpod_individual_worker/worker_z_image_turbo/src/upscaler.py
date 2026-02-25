@@ -92,16 +92,57 @@ def _get_model(model_name: str, gpu_id: int = 0) -> RealESRGANer:
     else:
         raise ValueError(f"Model not supported: {model_name}")
 
-    upsampler = RealESRGANer(
-        scale=scale,
-        model_path=model_path,
-        model=model,
-        tile=0,
-        tile_pad=10,
-        pre_pad=0,
-        half=torch.cuda.is_available(),
-        gpu_id=gpu_id if torch.cuda.is_available() else None
-    )
+    # Preemptively check model file structure to avoid KeyError
+    # RealESRGANer expects 'params' or 'params_ema' keys, but some model files
+    # have the weights directly without these wrapper keys
+    print(f"🔍 Checking model file structure: {model_path}")
+    loadnet = torch.load(model_path, map_location='cpu')
+    
+    # Check if model file has the expected structure
+    needs_reformat = 'params' not in loadnet and 'params_ema' not in loadnet
+    
+    if needs_reformat:
+        print(f"⚠️ Model file missing 'params'/'params_ema' keys, reformatting preemptively...")
+        
+        # Model file has weights directly without wrapper keys - use it as-is
+        state_dict = loadnet
+        
+        # Create a temporary model file with the correct structure for RealESRGANer
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pth') as tmp_file:
+            tmp_path = tmp_file.name
+            torch.save({'params': state_dict}, tmp_path)
+        
+        # Use the reformatted temp file
+        final_model_path = tmp_path
+        cleanup_temp = True
+    else:
+        # Model file is already properly formatted
+        final_model_path = model_path
+        cleanup_temp = False
+    
+    try:
+        # Load with RealESRGANer (will work since we've ensured proper structure)
+        upsampler = RealESRGANer(
+            scale=scale,
+            model_path=final_model_path,
+            model=model,
+            tile=0,
+            tile_pad=10,
+            pre_pad=0,
+            half=torch.cuda.is_available(),
+            gpu_id=gpu_id if torch.cuda.is_available() else None
+        )
+    except Exception as e:
+        # For any error, re-raise it with more context
+        raise RuntimeError(f"Failed to load RealESRGAN model '{model_name}' from {model_path}: {e}")
+    finally:
+        # Clean up temporary file if we created one
+        if cleanup_temp:
+            try:
+                os.unlink(final_model_path)
+            except Exception:
+                pass
 
     MODEL_CACHE[model_name] = upsampler
     return upsampler

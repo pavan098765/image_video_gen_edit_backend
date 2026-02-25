@@ -299,7 +299,7 @@ def run_inference_glm_ocr(
         job_id: Unique job identifier
         prompt: Text prompt (can be "Text Recognition:", "Formula Recognition:", or "Table Recognition:")
         params:
-            - input_image: Base64 encoded image or image URL (required)
+            - input_image: Base64 encoded image or image URL (required, or init_image)
             - prompt_type: One of "text", "formula", "table" (default: "text")
             - max_new_tokens: Maximum tokens to generate (default: 8192)
             - output_dir: Output directory (default: /app/worker/outputs)
@@ -318,9 +318,11 @@ def run_inference_glm_ocr(
     cleanup_gpu_memory()
     
     # Parameters
-    input_image = params.get("input_image")
+    # Accept both model-specific name (input_image) and canonical name (init_image)
+    # so R2 presigned-URL flow works without base64 fallback.
+    input_image = params.get("input_image") or params.get("init_image")
     if not input_image:
-        raise ValueError("input_image is required in params (base64 or URL)")
+        raise ValueError("input_image (or init_image) is required in params (base64 or URL)")
     
     prompt_type = params.get("prompt_type", "text")
     if prompt_type not in PROMPT_TYPES:

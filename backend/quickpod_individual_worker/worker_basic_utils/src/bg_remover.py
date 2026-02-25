@@ -164,14 +164,18 @@ def run_inference_rmbg(job_id: str, prompt: Optional[str], params: Dict[str, Any
     # -------------------------
     
     scale_image = params.get("scale_image", True)
-    scale_factor = params.get("scale_factor", 2) if scale_image else 0
-    model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
+    
+    if scale_image:
+        scale_factor = params.get("scale_factor", 2)
+        model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
+        upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
+        final_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
+        upscaled.save(final_path)
+    else:
+        # No upscaling — just strip metadata from the saved result
+        final_path = out_path
 
-    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
-
-    upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
-    upscaled.save(upscaled_path)
-    return os.path.abspath(upscaled_path)
+    return os.path.abspath(final_path)
 
 # -------------------------
 # Example usage

@@ -1,21 +1,33 @@
-# inference_sdxl_t2i.py
-# ✅ Lazy-loading implementation
-# ✅ GPU memory cleanup before/after inference (OOM prevention)
-# SDXL Txt2Img with scheduler switch, embedding auto-prepend, and upscaling
-# GPU-only, assumes baked local models
+# ------------------------------------------------------------------
+# SDXL Txt2Img Inference with SDXL-Lighting-8-steps
+# - Lazy pipeline loading (prevents OOM during FastAPI startup)
+# - Fast 8-step inference with guidance_scale=0
+# - Optional upscaling
+# - GPU memory cleanup before/after inference (OOM prevention)
+# ------------------------------------------------------------------
 
 import os
 import gc
+import time
 import random
 from typing import Dict, Any
 from PIL import Image
 import torch
-from diffusers import (
-    StableDiffusionXLPipeline,
-    DPMSolverMultistepScheduler,
-    EulerAncestralDiscreteScheduler,
-)
+from diffusers import StableDiffusionXLPipeline
 from upscaler import upscale_image
+
+# --- Auto-merge split safetensors if merge.py exists ---
+# NOTE: Models are always in parts for Docker image size management
+# Merge happens every time on startup before model loading
+try:
+    from merge import main as merge_main
+    print("🔍 Scanning for .safetensors.part-* files...")
+    merge_start = time.time()
+    merge_main()
+    merge_time = time.time() - merge_start
+    print(f"✅ Merge completed in {merge_time:.1f}s")
+except Exception as e:
+    print(f"⚠️ merge.py auto-merge skipped or failed: {e}")
 
 # -------------------------
 # Paths / Config
@@ -24,112 +36,85 @@ MODEL_ID = os.environ.get("SDXL_LOCAL_PATH")
 if not MODEL_ID or not os.path.exists(MODEL_ID):
     raise RuntimeError("❌ SDXL_LOCAL_PATH is not set or invalid. Ensure the model is baked and available.")
 
-EMBEDDINGS_DIR = os.environ.get("SDXL_EMBEDDINGS_PATH", os.path.join(MODEL_ID, "embeddings"))
-POS_EMBED_PATH = os.path.join(EMBEDDINGS_DIR, "Stable_Yogis_Illustrious_Positives.safetensors")
-NEG_EMBED_PATH = os.path.join(EMBEDDINGS_DIR, "Stable_Yogis_Illustrious_Negatives-neg.safetensors")
-
-POS_TOKEN = "illustrious_pos"
-NEG_TOKEN = "illustrious_neg"
+# SDXL-Lighting-8-steps defaults: 8 steps, guidance_scale=0
+DEFAULT_STEPS = 8
+DEFAULT_CFG = 0.0
 
 DEFAULT_OUTPUT_DIR = "./outputs"
 os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
 # -------------------------
-# Lazy Pipeline Global
+# Lazy Pipeline Global (will load on first use)
 # -------------------------
 _pipeline = None
-_scheduler_config = None
 
 
-def get_sdxl_t2i_pipe():
-    """Lazy-load the SDXL Txt2Img pipeline and cache it."""
-    global _pipeline, _scheduler_config
+def get_pipeline():
+    """Lazy-initialize the SDXL Txt2Img pipeline with SDXL-Lighting-8-steps."""
+    global _pipeline
     if _pipeline is not None:
-        return _pipeline, _scheduler_config
+        return _pipeline
 
-    import time
     total_start = time.time()
 
     # CRITICAL: Clear GPU cache before loading to maximize free memory
     gc.collect()
     torch.cuda.empty_cache()
 
-    print("🧠 Loading SDXL Txt2Img pipeline...")
+    print(f"🧠 Loading SDXL Txt2Img pipeline from {MODEL_ID}")
+    pipeline_start = time.time()
     pipe = StableDiffusionXLPipeline.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16,
         use_safetensors=True,
     ).to("cuda")
-
-    scheduler_config = pipe.scheduler.config
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(scheduler_config)
-
-    # Load textual inversion embeddings (optional)
-    if os.path.exists(POS_EMBED_PATH):
-        try:
-            pipe.load_textual_inversion(POS_EMBED_PATH, token=POS_TOKEN)
-            print(f"✅ Loaded positive embedding: {POS_EMBED_PATH}")
-        except Exception as e:
-            print(f"⚠️ Failed to load POS embedding: {e}")
-
-    if os.path.exists(NEG_EMBED_PATH):
-        try:
-            pipe.load_textual_inversion(NEG_EMBED_PATH, token=NEG_TOKEN)
-            print(f"✅ Loaded negative embedding: {NEG_EMBED_PATH}")
-        except Exception as e:
-            print(f"⚠️ Failed to load NEG embedding: {e}")
+    pipeline_time = time.time() - pipeline_start
+    print(f"✅ Pipeline loaded in {pipeline_time:.1f}s")
 
     _pipeline = pipe
-    _scheduler_config = scheduler_config
     total_time = time.time() - total_start
-    print(f"✅ SDXL Txt2Img pipeline loaded in {total_time:.1f}s")
-    return pipe, scheduler_config
-
-
-def unload_sdxl_t2i_pipe():
-    """Optional cleanup: unload SDXL Txt2Img pipeline and free GPU memory."""
-    global _pipeline, _scheduler_config
-    _pipeline = None
-    _scheduler_config = None
-    gc.collect()
-    torch.cuda.empty_cache()
-    print("🧹 SDXL Txt2Img pipeline cache cleared and GPU memory freed.")
+    print(f"✅ SDXL Txt2Img pipeline initialized in {total_time:.1f}s")
+    return _pipeline
 
 
 # -------------------------
 # Main Inference
 # -------------------------
 def run_inference_sdxl_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
-    """Run SDXL Txt2Img inference with lazy loading and embedding auto-prepend."""
-    print(f"🧩 Starting SDXL Txt2Img job: {job_id}")
-    pipe, scheduler_config = get_sdxl_t2i_pipe()
+    """
+    Run SDXL Txt2Img inference with SDXL-Lighting-8-steps.
+
+    Args:
+        job_id: unique job identifier (for output filenames)
+        prompt: text prompt for image generation
+        params:
+        - output_dir (str)
+        - negative_prompt (str)
+        - num_inference_steps (int) - default 8
+        - guidance_scale (float) - default 0.0
+        - width (int) - default 768
+        - height (int) - default 768
+        - seed (int)
+        - scale_image (bool)
+        - scale_factor (int)
+
+    Returns: absolute path to final image (upscaled if requested)
+    """
+    # Consistent global output path
+    default_out = "/app/worker/outputs"
+    output_dir = os.path.abspath(params.get("output_dir", default_out))
+    os.makedirs(output_dir, exist_ok=True)
+
+    pipe = get_pipeline()
 
     negative_prompt = params.get("negative_prompt", "")
 
-    # Auto-prepend embeddings if not already in prompt
-    if POS_TOKEN not in prompt:
-        prompt = f"{POS_TOKEN}, {prompt}"
-    if NEG_TOKEN not in str(negative_prompt):
-        negative_prompt = f"{NEG_TOKEN}, {negative_prompt}"
-
-    # Scheduler selection
-    sampler_name = params.get("sampler", "DPMSolverMultistep")
-    if sampler_name == "DPMSolverMultistep":
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(scheduler_config)
-    elif sampler_name == "EulerA":
-        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(scheduler_config)
-    else:
-        print(f"⚠️ Unknown sampler '{sampler_name}', defaulting to DPMSolverMultistep.")
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(scheduler_config)
-
-    # Parameters
-    steps = int(params.get("sample_steps", 30))
+    # Parameters (SDXL-Lighting-8-steps defaults: 8 steps, guidance_scale=0)
+    steps = int(params.get("num_inference_steps", params.get("sample_steps", DEFAULT_STEPS)))
     width = int(params.get("width", 768))
     height = int(params.get("height", 768))
-    cfg = float(params.get("cfg_scale", 5))
+    cfg = float(params.get("guidance_scale", params.get("cfg_scale", DEFAULT_CFG)))
     seed = int(params.get("seed", random.randint(0, 2**32 - 1)))
-    output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
-    os.makedirs(output_dir, exist_ok=True)
 
     # CRITICAL: Clear GPU memory before inference to maximize available VRAM
     gc.collect()
@@ -143,20 +128,26 @@ def run_inference_sdxl_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
     except Exception:
         pass
 
-    print(f"⚙️ Running Txt2Img | Steps={steps}, CFG={cfg}, Sampler={sampler_name}, Seed={seed}")
-    generator = torch.manual_seed(seed) if seed >= 0 else None
+    print(f"⚙️ Running Txt2Img | Steps={steps}, Guidance={cfg}, Seed={seed}, Size={width}x{height}")
+    generator = torch.Generator(device="cuda").manual_seed(seed) if seed >= 0 else None
 
+    # Run inference with automatic mixed precision for memory efficiency
     try:
         with torch.inference_mode():
-            result = pipe(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                width=width,
-                height=height,
-                num_inference_steps=steps,
-                guidance_scale=cfg,
-                generator=generator,
-            )
+            pipe_kwargs = {
+                "prompt": prompt,
+                "num_inference_steps": steps,
+                "guidance_scale": cfg,
+                "generator": generator,
+            }
+            if negative_prompt:
+                pipe_kwargs["negative_prompt"] = negative_prompt
+            # Width/height are optional - if not provided, pipeline uses defaults
+            if width and height:
+                pipe_kwargs["width"] = width
+                pipe_kwargs["height"] = height
+            
+            result = pipe(**pipe_kwargs)
             image = result.images[0]
     finally:
         # CRITICAL: Clean up GPU memory after inference
@@ -165,22 +156,25 @@ def run_inference_sdxl_t2i(job_id: str, prompt: str, params: Dict[str, Any]) -> 
 
     out_path = os.path.join(output_dir, f"sdxl_t2i_{job_id}.png")
     image.save(out_path)
-    print(f"🖼️ Base image saved at {out_path}")
+    print(f"✅ Saved base image: {out_path}")
 
     # -------------------------
-    # Optional Upscaling and metadata removal
+    # Optional Upscaling
     # -------------------------
-    scale_image = params.get("scale_image", True)
-    scale_factor = params.get("scale_factor", 2) if scale_image else 0
-    model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
+    if params.get("scale_image", False):
+        scale_factor = int(params.get("scale_factor", 2))
+        model_name = params.get("scale_model_name", f"RealESRGAN_x{scale_factor}plus")
+        try:
+            upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
+            up_path = os.path.join(output_dir, f"sdxl_t2i_{job_id}_upscaled.png")
+            upscaled.save(up_path)
+            print(f"✅ Saved upscaled image: {up_path}")
+            return os.path.abspath(up_path)
+        except Exception as e:
+            print(f"⚠️ Upscaling failed: {e}")
+            return os.path.abspath(out_path)
 
-    upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
-
-    upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
-    upscaled.save(upscaled_path)
-    print(f"🚀 Upscaled image saved at {upscaled_path}")
-
-    return os.path.abspath(upscaled_path)
+    return os.path.abspath(out_path)
 
 
 # -------------------------
@@ -191,13 +185,13 @@ if __name__ == "__main__":
     prompt = "a beautiful indian girl, highly detailed, cinematic lighting, ultra realistic"
 
     params = {
-        "sample_steps": 30,
-        "cfg_scale": 5,
+        "num_inference_steps": 8,
+        "guidance_scale": 0.0,
         "output_dir": "./outputs",
-        "negative_prompt": "lowres, bad anatomy, blurry, extra limbs, deformed, unrealistic skin",
-        "sampler": "DPMSolverMultistep",
+        "negative_prompt": "",
         "width": 768,
         "height": 512,
+        "scale_image": False,
     }
 
     out = run_inference_sdxl_t2i(job_id, prompt, params)

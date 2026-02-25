@@ -66,6 +66,11 @@ def write_rest(f):
     f.write("\n# Worker code (last to leverage cache)\n")
     f.write("COPY src /app/worker/src\n\n")
 
+    # Install system dependencies and Python packages
+    f.write("# Install system dependencies and Python packages\n")
+    f.write("RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client build-essential \\\n")
+    f.write("    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*\n\n")
+
     # Install transformers from git (>=5.1.0 required for GLM-OCR)
     f.write("# Install transformers>=5.1.0 from git (required for GLM-OCR)\n")
     f.write("RUN pip install --no-cache-dir 'git+https://github.com/huggingface/transformers.git'\n\n")
