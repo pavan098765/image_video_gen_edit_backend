@@ -6,7 +6,7 @@ import asyncio
 import hmac
 import hashlib
 import gc
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 import uuid
 import base64
@@ -17,6 +17,14 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from tenacity import retry, wait_exponential, stop_after_attempt
+
+
+# -----------------------
+# Pod startup time tracking
+# -----------------------
+POD_START_TIME = time.time()
+FIRST_INFERENCE_START_TIME = None
+_first_inference_lock = asyncio.Lock()
 
 
 # -----------------------
@@ -167,20 +175,20 @@ def _is_url(value: str) -> bool:
     return isinstance(value, str) and (value.startswith("http://") or value.startswith("https://"))
 
 
-def _download_to_base64(url: str, timeout: int = 120) -> str:
-    """Download binary from URL and return base64-encoded string."""
+def _download_url_bytes(url: str, timeout: int = 120) -> bytes:
+    """Download binary from URL and return raw bytes."""
     resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()
-    return base64.b64encode(resp.content).decode("utf-8")
+    return resp.content
 
 
 def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, Any]:
     """
-    Resolve any URL-valued media fields in params to base64 strings.
+    Resolve any URL-valued media fields in params to raw bytes.
     
     If a known media field contains a URL (e.g. presigned R2 download URL),
-    download the binary and replace with base64 so downstream inference
-    functions work unchanged.
+    download the binary and store as raw bytes so downstream _load_image()
+    functions can open them directly without a base64 round-trip.
     
     Handles both single string values and lists of strings.
     """
@@ -191,9 +199,9 @@ def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, An
             continue
         if isinstance(value, str) and _is_url(value):
             try:
-                logger.info(f"[{job_id}] Downloading {field} from URL ({len(value)} chars)...")
-                resolved[field] = _download_to_base64(value)
-                logger.info(f"[{job_id}] Downloaded {field}: {len(resolved[field])} base64 chars")
+                logger.info(f"[{job_id}] Downloading {field} from URL...")
+                resolved[field] = _download_url_bytes(value)
+                logger.info(f"[{job_id}] Downloaded {field}: {len(resolved[field])} bytes")
             except Exception as e:
                 logger.error(f"[{job_id}] Failed to download {field} from URL: {e}")
                 raise
@@ -203,7 +211,7 @@ def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, An
                 if isinstance(item, str) and _is_url(item):
                     try:
                         logger.info(f"[{job_id}] Downloading {field}[{i}] from URL...")
-                        new_list.append(_download_to_base64(item))
+                        new_list.append(_download_url_bytes(item))
                     except Exception as e:
                         logger.error(f"[{job_id}] Failed to download {field}[{i}]: {e}")
                         raise
@@ -301,26 +309,37 @@ async def run_inference_and_save(
     model: str,
     mode: Optional[str],
     params: Dict[str, Any],
-) -> str:
-    global last_model_key
+) -> Tuple[str, Dict[str, float]]:
+    global last_model_key, FIRST_INFERENCE_START_TIME
     loop = asyncio.get_event_loop()
     params = params.copy()
     params.setdefault("output_dir", WORKSPACE_DIR)
 
+    async with _first_inference_lock:
+        if FIRST_INFERENCE_START_TIME is None:
+            FIRST_INFERENCE_START_TIME = time.time()
+            startup_time = FIRST_INFERENCE_START_TIME - POD_START_TIME
+        else:
+            startup_time = None
+
     inference_func = resolve_inference_callable(model, mode)
     model_key = f"{model}:{mode or ''}"
-
     if last_model_key and last_model_key != model_key:
         logger.info(
             f"Switching model {last_model_key} -> {model_key}, cleaning up GPU first"
         )
         cleanup_gpu()
 
+    inference_start_time = time.time()
     try:
         out_path = await loop.run_in_executor(
             None, inference_func, job_id, prompt, params
         )
-        return out_path
+        processing_time = time.time() - inference_start_time
+        metrics = {"processing_time_seconds": round(processing_time, 2)}
+        if startup_time is not None:
+            metrics["startup_time_seconds"] = round(startup_time, 2)
+        return out_path, metrics
     finally:
         last_model_key = model_key
 
@@ -351,7 +370,7 @@ async def process_job_item(item: Dict[str, Any]):
 
     try:
         async with semaphore:
-            out_local = await run_inference_and_save(
+            out_local, metrics = await run_inference_and_save(
                 job_id, prompt, model, mode, params
             )
             if upload_url.startswith("http://dummy-upload"):

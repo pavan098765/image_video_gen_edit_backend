@@ -137,6 +137,7 @@ from exceptions import (
     WorkerTimeoutError,
 )
 from job_manager import JobManager, JobState
+from pod_manager import MAX_JOBS_PER_POD
 from logging_config import get_audit_logger
 
 logger = logging.getLogger("routes")
@@ -2807,6 +2808,11 @@ def _log_timing_metrics(
             f"   🚀 Dispatch Time: {timing_metrics['dispatch_time']:.2f}s (dispatched → started)"
         )
     
+    if timing_metrics.get("startup_time") is not None:
+        logger.info(
+            f"   🌱 Startup Time: {timing_metrics['startup_time']:.2f}s (pod start → first inference)"
+        )
+    
     logger.info("=" * 80)
 
 
@@ -3112,6 +3118,11 @@ async def submit_job(
         full_params["mask_image"] = full_params.pop("mask")
         logger.debug("[PARAMS] Mapped 'mask' → 'mask_image'")
     
+    # Upscale capability uses input id "image"; face_enhancer and other upscalers expect "init_image"
+    if "image" in full_params and "init_image" not in full_params:
+        full_params["init_image"] = full_params.pop("image")
+        logger.debug("[PARAMS] Mapped 'image' → 'init_image' for upscale")
+    
     # Frontend may send "is_custom" (string) but workers expect "is_custom_mode" (boolean)
     if "is_custom" in full_params and "is_custom_mode" not in full_params:
         is_custom_val = full_params.pop("is_custom")
@@ -3213,8 +3224,8 @@ async def submit_job(
     # ==========================================================================
     # VIDEO UPSCALER VALIDATION
     # ==========================================================================
-    # Validate video_duration for video_upscaler (max 10 minutes)
-    if model == "video_upscaler" and "video_duration" in full_params:
+    # Validate video_duration for video upscalers (max 10 minutes)
+    if model in ("video_upscaler", "flashvsr_video_upscaler") and "video_duration" in full_params:
         try:
             video_duration = float(full_params.get("video_duration", 0))
             MAX_VIDEO_DURATION = 600  # 10 minutes in seconds
@@ -3294,7 +3305,14 @@ async def submit_job(
         
         # Determine output extension based on model type
         # Video models output .mp4, image models output .png
-        VIDEO_MODELS = {"ltx2_video", "fastwan_21_1b", "fastwan_22_5b", "wan_22_14b_rapid", "wan_22_uint4_lightx2v_i2v", "wan_22_uint4_lightx2v_t2v", "wan_22_fp8_lightx2v_i2v", "wan_22_fp8_lightx2v_t2v", "wan21", "wan22", "video_upscaler"}
+        VIDEO_MODELS = {
+            "ltx2_video", "fastwan_21_1b", "fastwan_22_5b", "wan_22_14b_rapid",
+            "wan_22_uint4_lightx2v_i2v", "wan_22_uint4_lightx2v_t2v",
+            "wan_22_fp8_lightx2v_i2v", "wan_22_fp8_lightx2v_t2v",
+            "wan21", "wan22",
+            "video_upscaler", "flashvsr_video_upscaler",
+            "hunyan15_480p_i2v_step_distilled", "hunyan15_480p_t2v_distilled",
+        }
         is_video_model = model.lower() in VIDEO_MODELS or "video" in model.lower()
         output_extension = ".mp4" if is_video_model else ".png"
         
@@ -3906,88 +3924,132 @@ async def _dispatch_job_background(
             db.close()
 
 
+async def _release_bulk_chunk_and_dispatch_individually(
+    chunk: List[str],
+    pod_uuid: Optional[str],
+    model: str,
+    mode: Optional[str],
+):
+    """
+    Release all slots for a chunk on the pod, set chunk jobs to QUEUED and worker_id=None,
+    then schedule individual dispatch for each job. Used when a chunk fails (reserve or bulk send).
+    """
+    if _pod_manager and pod_uuid:
+        for jid in chunk:
+            try:
+                await _pod_manager.release_slot_on_pod(pod_uuid, jid)
+            except Exception as e:
+                logger.warning(f"[BULK_DISPATCH] Release slot for {jid} failed: {e}")
+    db = SessionLocal()
+    try:
+        for jid in chunk:
+            job = db.query(Job).filter(Job.job_id == jid).first()
+            if job and job.status not in [
+                JobState.RUNNING.value, JobState.COMPLETED.value, JobState.FAILED.value,
+            ]:
+                job.status = JobState.QUEUED.value
+                job.worker_id = None
+                job.updated_at = utc_naive_now()
+        db.commit()
+    finally:
+        db.close()
+    for jid in chunk:
+        asyncio.create_task(_dispatch_job_background(jid, model, mode, retry_count=0))
+
+
 async def _dispatch_bulk_jobs_background(
     job_ids: List[str], model: str, mode: Optional[str]
 ):
     """
-    Background task to dispatch multiple jobs to ONE worker via /run_bulk endpoint.
-    
-    Used for bulk edit requests and multi-variation requests.
-    Assigns all jobs to a single worker and sends them in one HTTP request.
-    
-    Fallback: if bulk dispatch fails, falls back to individual dispatch per job.
+    Background task to dispatch multiple jobs in chunks by pod capacity.
+    Chunks by available_slots (MAX_JOBS_PER_POD - queue_size) so we never send more
+    than the worker can accept. Reserves one slot per job before sending each chunk.
+    Fallback: on reserve or bulk send failure, release chunk slots, revert to QUEUED,
+    and dispatch that chunk individually.
     """
     if not job_ids:
         return
-    
+    if not _job_manager or not _pod_manager:
+        logger.warning(
+            "[BULK_DISPATCH] job_manager or pod_manager not available, skipping bulk dispatch"
+        )
+        for jid in job_ids:
+            asyncio.create_task(_dispatch_job_background(jid, model, mode, retry_count=0))
+        return
+
     logger.info(
         f"[BULK_DISPATCH] Starting bulk dispatch of {len(job_ids)} jobs for model={model}"
     )
-    
+    remaining = list(job_ids)
+
     try:
-        # Step 1: Assign the FIRST job via normal path to get a worker_id
-        # This provisions/finds a pod through pod_manager
-        primary_job_id = job_ids[0]
-        worker_id = await _job_manager.assign_job(primary_job_id, model, mode)
-        logger.info(
-            f"[BULK_DISPATCH] Primary job {primary_job_id} assigned to worker {worker_id}, "
-            f"assigning remaining {len(job_ids) - 1} jobs to same worker..."
-        )
-        
-        # Step 2: Assign remaining jobs to the SAME worker in DB
-        db = SessionLocal()
-        try:
-            for jid in job_ids[1:]:
-                job = db.query(Job).filter(Job.job_id == jid).first()
-                if job:
-                    job.worker_id = worker_id
-                    job.updated_at = utc_naive_now()
-            db.commit()
-        finally:
-            db.close()
-        
-        # Step 3: Dispatch all jobs at once to the worker
-        success = await _dispatch_bulk_to_worker(job_ids, worker_id)
-        
-        if success:
-            logger.info(
-                f"[BULK_DISPATCH] Successfully dispatched {len(job_ids)} jobs to worker {worker_id}"
-            )
-        else:
-            logger.warning(
-                f"[BULK_DISPATCH] Bulk dispatch failed for {len(job_ids)} jobs. "
-                f"Falling back to individual dispatch..."
-            )
-            # Fallback: revert all jobs to QUEUED and dispatch individually
+        while remaining:
+            # Reserve one slot via assign_job for the first remaining job
+            worker_id = await _job_manager.assign_job(remaining[0], model, mode)
+            pod_uuid = None
             db = SessionLocal()
             try:
-                for jid in job_ids:
+                worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+                if worker:
+                    pod_uuid = worker.container_id
+            finally:
+                db.close()
+
+            # Get pod's current queue_size and compute available_slots (under lock)
+            async with _pod_manager._lock:
+                pi = _pod_manager.individual_pods.get(pod_uuid) if pod_uuid else None
+                if pi is not None:
+                    limit = MAX_JOBS_PER_POD
+                    available_slots = limit - pi.queue_size
+                else:
+                    # Pod not in tracking (e.g. race); use conservative default
+                    available_slots = max(1, MAX_JOBS_PER_POD - 1)
+            chunk_size = min(len(remaining), available_slots)
+            chunk = remaining[0:chunk_size]
+
+            # Reserve slots for chunk[1:] (chunk[0] already reserved by assign_job)
+            reserve_failed = False
+            for jid in chunk[1:]:
+                reserved = await _pod_manager.reserve_slot_on_pod(pod_uuid, jid)
+                if not reserved:
+                    reserve_failed = True
+                    break
+            if reserve_failed:
+                await _release_bulk_chunk_and_dispatch_individually(chunk, pod_uuid, model, mode)
+                remaining = remaining[len(chunk):]
+                continue
+
+            # Assign chunk[1:] to worker_id in DB
+            db = SessionLocal()
+            try:
+                for jid in chunk[1:]:
                     job = db.query(Job).filter(Job.job_id == jid).first()
-                    if job and job.status not in [
-                        JobState.RUNNING.value, JobState.COMPLETED.value, JobState.FAILED.value
-                    ]:
-                        job.status = JobState.QUEUED.value
-                        job.worker_id = None
+                    if job:
+                        job.worker_id = worker_id
                         job.updated_at = utc_naive_now()
                 db.commit()
             finally:
                 db.close()
-            
-            # Dispatch each job individually (existing retry logic handles failures)
-            for jid in job_ids:
-                asyncio.create_task(
-                    _dispatch_job_background(jid, model, mode, retry_count=0)
+
+            # Send chunk to worker
+            success = await _dispatch_bulk_to_worker(chunk, worker_id)
+            if not success:
+                await _release_bulk_chunk_and_dispatch_individually(chunk, pod_uuid, model, mode)
+            else:
+                logger.info(
+                    f"[BULK_DISPATCH] Dispatched chunk of {len(chunk)} jobs to worker {worker_id}"
                 )
-    
+            remaining = remaining[len(chunk):]
+
     except Exception as e:
         logger.error(f"[BULK_DISPATCH] Error during bulk dispatch: {e}")
-        # Fallback: revert all jobs and dispatch individually
+        # Revert all job_ids (this bulk's full list) to QUEUED and dispatch individually
         db = SessionLocal()
         try:
             for jid in job_ids:
                 job = db.query(Job).filter(Job.job_id == jid).first()
                 if job and job.status not in [
-                    JobState.RUNNING.value, JobState.COMPLETED.value, JobState.FAILED.value
+                    JobState.RUNNING.value, JobState.COMPLETED.value, JobState.FAILED.value,
                 ]:
                     job.status = JobState.QUEUED.value
                     job.worker_id = None
@@ -3995,11 +4057,8 @@ async def _dispatch_bulk_jobs_background(
             db.commit()
         finally:
             db.close()
-        
         for jid in job_ids:
-            asyncio.create_task(
-                _dispatch_job_background(jid, model, mode, retry_count=0)
-            )
+            asyncio.create_task(_dispatch_job_background(jid, model, mode, retry_count=0))
 
 
 async def _check_worker_health(endpoint: str, timeout: int = 5) -> bool:
@@ -5070,8 +5129,8 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                         # Track retry count to prevent infinite retries
                         
                         running_retry_count = affected_job.retry_count or 0
-                        max_running_retries = 2  # Allow 2 retries for RUNNING jobs
-                        
+                        max_running_retries = 3  # Allow 3 retries for RUNNING jobs (consistent with other paths)
+
                         if running_retry_count < max_running_retries:
                             # Requeue for retry on different machine
                             logger.warning(
@@ -5615,16 +5674,15 @@ async def _dispatch_bulk_to_worker(job_ids: List[str], worker_id: str) -> bool:
         for i, jid in enumerate(valid_job_ids):
             try:
                 if _job_manager:
-                    if i == 0:
-                        _job_manager.mark_running(jid, worker_id)  # sets started_at = now()
-                    else:
-                        _job_manager.mark_running(jid, worker_id, started_at=None)  # NULL started_at -- will be chained via job_complete
+                    # Do NOT set started_at for any bulk job. Stuck detection uses started_at;
+                    # only the job actually being processed should have started_at set, which
+                    # happens when the worker reports job_complete with next_job_id (or fallback below).
+                    _job_manager.mark_running(jid, worker_id, started_at=None)
                 else:
                     job = db.query(Job).filter(Job.job_id == jid).first()
                     if job:
                         job.status = JobState.RUNNING.value
-                        if i == 0:
-                            job.started_at = utc_naive_now()
+                        # Leave started_at NULL for all; chained via job_complete (next_job_id or fallback)
                 
                 # Store pod_uuid in job
                 job = db.query(Job).filter(Job.job_id == jid).first()
@@ -6876,7 +6934,7 @@ async def job_complete(
                 if hasattr(job, "retry_count") and job.retry_count
                 else 0
             )
-            max_retries = 3  # Allow up to 3 retries for infrastructure failures
+            max_retries = 3  # Allow up to 3 retries for any worker error (consistent pattern)
             
             # Get variant and machine info
             variant = None
@@ -6977,10 +7035,10 @@ async def job_complete(
             elif is_other_cuda_error:
                 logger.warning(f"CUDA error detected for job {job_id}: {payload.error}")
             
-            # CRITICAL: Retry infrastructure failures instead of marking as permanently failed
-            if is_infrastructure_failure and retry_count < max_retries:
+            # CRITICAL: Retry any worker error up to max_retries (consistent with other paths)
+            if retry_count < max_retries:
                 logger.warning(
-                    f"Job {job_id} failed due to infrastructure issue (retry {retry_count + 1}/{max_retries}). "
+                    f"Job {job_id} failed (retry {retry_count + 1}/{max_retries}). "
                     f"Requeuing for retry on different machine/variant. Error: {payload.error}"
                 )
                 
@@ -7021,12 +7079,11 @@ async def job_complete(
                 return {"status": "requeued", "retry_count": job.retry_count}
             
             else:
-                # Either not a retryable error or retries exhausted
-                if is_infrastructure_failure:
-                    logger.error(
-                        f"Job {job_id} failed after {retry_count} retries. "
-                        f"Marking as permanently failed. Error: {payload.error}"
-                    )
+                # Retries exhausted - mark as permanently failed
+                logger.error(
+                    f"Job {job_id} failed after {retry_count} retries. "
+                    f"Marking as permanently failed. Error: {payload.error}"
+                )
                 
                 # Mark job as permanently failed
                 if _job_manager:
@@ -7076,15 +7133,31 @@ async def job_complete(
             
             # Mark job completed - use signed URL endpoint
             if _job_manager:
-                _job_manager.mark_completed(
-                    job_id,
-                    result_r2_key=payload.result_r2_key,
-                    output_url=(
-                        f"{_controller_url}/download_url/{job_id}"
-                        if _controller_url
-                        else None
-                    ),
-                )
+                try:
+                    _job_manager.mark_completed(
+                        job_id,
+                        result_r2_key=payload.result_r2_key,
+                        output_url=(
+                            f"{_controller_url}/download_url/{job_id}"
+                            if _controller_url
+                            else None
+                        ),
+                        metrics=payload.metrics,
+                    )
+                except TypeError as te:
+                    if "metrics" in str(te):
+                        # Backward compat: older server_controller without metrics param
+                        _job_manager.mark_completed(
+                            job_id,
+                            result_r2_key=payload.result_r2_key,
+                            output_url=(
+                                f"{_controller_url}/download_url/{job_id}"
+                                if _controller_url
+                                else None
+                            ),
+                        )
+                    else:
+                        raise
             else:
                 completion_time = utc_naive_now()
                 job.status = JobState.COMPLETED.value
@@ -7092,19 +7165,32 @@ async def job_complete(
                 job.completed_at = completion_time
                 job.updated_at = completion_time
                 
-                # Calculate timing metrics
+                # Use worker-provided metrics if available, otherwise calculate
+                if payload.metrics:
+                    # Worker provides accurate processing_time_seconds (actual inference time including upscaler)
+                    if "processing_time_seconds" in payload.metrics:
+                        job.processing_time_seconds = payload.metrics["processing_time_seconds"]
+                    # Worker provides startup_time_seconds (pod start to first inference start)
+                    if "startup_time_seconds" in payload.metrics:
+                        job.startup_time_seconds = payload.metrics["startup_time_seconds"]
+                
+                # Calculate other timing metrics (total_time, queue_time, dispatch_time)
                 timing_metrics = _calculate_timing_metrics(job, completion_time)
                 job.total_time_seconds = timing_metrics["total_time"]
-                job.processing_time_seconds = timing_metrics["processing_time"]
+                # Only set processing_time_seconds if not provided by worker
+                if job.processing_time_seconds is None:
+                    job.processing_time_seconds = timing_metrics["processing_time"]
                 job.queue_time_seconds = timing_metrics["queue_time"]
                 job.dispatch_time_seconds = timing_metrics["dispatch_time"]
                 
                 db.commit()
                 
-                # Log timing metrics
+                # Log timing metrics (include worker-provided startup_time if set)
+                if job.startup_time_seconds is not None:
+                    timing_metrics = dict(timing_metrics, startup_time=job.startup_time_seconds)
                 _log_timing_metrics(job_id, job.model, timing_metrics)
             
-            # Chain started_at to the next job the worker will process
+            # Chain started_at to the next job the worker will process (so stuck detection only times actual execution)
             if payload.next_job_id:
                 next_job = db.query(Job).filter(Job.job_id == payload.next_job_id).first()
                 if next_job and next_job.status == JobState.RUNNING.value:
@@ -7112,6 +7198,28 @@ async def job_complete(
                     next_job.updated_at = utc_naive_now()
                     db.commit()
                     logger.info(f"Chained started_at to next job {payload.next_job_id}")
+            elif worker_id:
+                # Fallback: worker did not send next_job_id; set started_at for oldest RUNNING job on this worker with started_at NULL
+                from sqlalchemy import and_
+                next_job = (
+                    db.query(Job)
+                    .filter(
+                        and_(
+                            Job.worker_id == worker_id,
+                            Job.status == JobState.RUNNING.value,
+                            Job.job_id != job_id,
+                            Job.started_at.is_(None),
+                        )
+                    )
+                    .order_by(Job.updated_at.asc())
+                    .limit(1)
+                    .first()
+                )
+                if next_job:
+                    next_job.started_at = utc_naive_now()
+                    next_job.updated_at = utc_naive_now()
+                    db.commit()
+                    logger.info(f"Chained started_at to next job {next_job.job_id} (fallback, no next_job_id in payload)")
 
             # Update worker's last_job_finished_at timestamp
             gpu_hourly_rate = 0.0

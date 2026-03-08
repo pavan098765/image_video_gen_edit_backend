@@ -270,14 +270,12 @@ class AppState:
         from job_manager import JobState
         
         heartbeat_stale_secs = self.config.worker.heartbeat_stale_seconds
-        idle_timeout_secs = self.config.worker.idle_timeout
-        # Sweep interval controls how frequently we check for idle workers.
-        # 30s is fine now that minimum adaptive timeout is 90s.
+        idle_cfg = self.config.worker
         sweep_interval = 30
         
         logger.info(
             f"Idle worker reaper: stale>{heartbeat_stale_secs}s, "
-            f"idle>{idle_timeout_secs}s"
+            f"idle_timeout={idle_cfg.idle_timeout_seconds}s, min_age={idle_cfg.idle_min_age_seconds}s"
         )
         
         while not self.shutdown_event.is_set():
@@ -405,121 +403,37 @@ class AppState:
                                             )
                                             continue
                                 
-                                # Check for pending jobs for this model (but not assigned yet)
-                                pending = db.query(Job).filter(
-                                    Job.model == w.model,
-                                    Job.worker_id.is_(None),  # Not assigned yet
-                                    Job.status.in_([JobState.QUEUED.value, JobState.DISPATCHING.value])
-                                ).count()
-                                
-                                if pending > 0:
-                                    # CRITICAL FIX: Don't blindly keep all workers alive.
-                                    # If there are multiple workers for this model and another worker
-                                    # is actively processing jobs, this worker might be excess.
-                                    
-                                    # Count ready/busy workers for this model
-                                    workers_for_model = db.query(Worker).filter(
-                                        Worker.model == w.model,
-                                        Worker.status.in_(["ready", "busy", "dispatching"])
+                                # Do not destroy if there are PENDING jobs for this model (e.g. next bulk batch)
+                                if w.model:
+                                    pending_for_model = db.query(Job).filter(
+                                        Job.model == w.model,
+                                        Job.status == JobState.PENDING.value,
                                     ).count()
-                                    
-                                    # If we have more workers than pending jobs AND this worker
-                                    # has been idle for a while, it's excess
-                                    last_job_time = w.last_job_finished_at or w.created_at or w.last_active
-                                    idle_seconds = (now - last_job_time).total_seconds() if last_job_time else 0
-                                    
-                                    if workers_for_model > 1 and idle_seconds > 60:
-                                        # Check if OTHER workers are processing jobs (not idle)
-                                        active_other_workers = db.query(Worker).filter(
-                                            Worker.model == w.model,
-                                            Worker.worker_id != w.worker_id,
-                                            Worker.status.in_(["busy", "dispatching"])
-                                        ).count()
-                                        
-                                        if active_other_workers > 0:
-                                            logger.info(
-                                                f"Worker {w.worker_id} idle for {idle_seconds:.0f}s while "
-                                                f"{active_other_workers} other worker(s) are active. "
-                                                f"Marking as excess (pending={pending}, workers={workers_for_model})"
-                                            )
-                                            # Don't skip - continue to idle timeout check below
-                                        else:
-                                            logger.debug(
-                                                f"Model {w.model} has {pending} pending job(s) and "
-                                                f"{workers_for_model} workers, keeping worker {w.worker_id} alive"
-                                            )
-                                            continue
-                                    else:
+                                    if pending_for_model > 0:
                                         logger.debug(
-                                            f"Model {w.model} has {pending} pending job(s), "
-                                            f"keeping worker {w.worker_id} alive"
+                                            f"Worker {w.worker_id} model {w.model} has {pending_for_model} "
+                                            f"PENDING job(s), skipping idle destroy"
                                         )
                                         continue
                                 
-                                # Check idle time
+                                # Idle timeout: pod completed all assigned jobs, no new jobs came to it.
+                                # Destroy only if idle for configured timeout (errors handled separately).
                                 last_job = w.last_job_finished_at or w.created_at or w.last_active
-                                idle_for = (now - last_job).total_seconds()
-                                
-                                # Add cooldown period after worker creation to avoid premature destruction
+                                idle_for = (now - last_job).total_seconds() if last_job else 0
                                 worker_age = (now - w.created_at).total_seconds() if w.created_at else 0
-                                min_worker_age = 120  # 2 minutes minimum lifetime (increased from 60s)
                                 
-                                if worker_age < min_worker_age:
+                                if worker_age < idle_cfg.idle_min_age_seconds:
                                     logger.debug(
                                         f"Worker {w.worker_id} is only {worker_age:.1f}s old, "
-                                        f"minimum age is {min_worker_age}s, skipping idle check"
+                                        f"min_age={idle_cfg.idle_min_age_seconds}s, skipping idle check"
                                     )
                                     continue
                                 
-                                # CRITICAL: Truly adaptive idle timeout balancing cost vs. readiness
-                                # Goal: Aggressive destruction when no work, patient when work exists
-                                
-                                total_pending_jobs = db.query(Job).filter(
-                                    Job.status.in_([JobState.QUEUED.value, JobState.PENDING.value])
-                                ).count()
-                                
-                                # Check recent job submission rate (jobs created in last 2 minutes)
-                                recent_cutoff = now - timedelta(minutes=2)
-                                recent_jobs = db.query(Job).filter(
-                                    Job.model == w.model,
-                                    Job.created_at >= recent_cutoff
-                                ).count()
-                                
-                                # SMART ADAPTIVE TIMEOUT:
-                                # Balanced to avoid premature destruction (which causes expensive
-                                # pod-create/destroy churn) while still reclaiming truly idle pods.
-                                # Minimum 90s ensures a user submitting jobs in quick succession
-                                # won't lose a pod between submissions.
-                                
-                                if total_pending_jobs > 5:
-                                    # High load: 10 minute idle timeout (worth keeping worker ready)
-                                    adaptive_idle_timeout = 600
-                                    timeout_reason = f"high load ({total_pending_jobs} pending)"
-                                elif total_pending_jobs > 0:
-                                    # Medium load: 5 minute idle timeout
-                                    adaptive_idle_timeout = 300
-                                    timeout_reason = f"pending jobs ({total_pending_jobs})"
-                                elif recent_jobs > 0:
-                                    # Recent activity but no queue: 2 minute timeout
-                                    # Keep worker alive in case more jobs come
-                                    adaptive_idle_timeout = 120
-                                    timeout_reason = f"recent activity ({recent_jobs} jobs in last 2min)"
-                                else:
-                                    # NO LOAD: conservative minimum timeout to avoid churn
-                                    # 90s is enough for users to submit the next job in a session
-                                    adaptive_idle_timeout = 90
-                                    timeout_reason = "no load (no pending, no recent)"
-                                
-                                logger.debug(
-                                    f"Worker {w.worker_id} adaptive timeout: {adaptive_idle_timeout}s "
-                                    f"({timeout_reason})"
-                                )
-                                
-                                if idle_for > adaptive_idle_timeout:
+                                timeout_secs = idle_cfg.idle_timeout_seconds
+                                if idle_for > timeout_secs:
                                     logger.info(
                                         f"Worker {w.worker_id} idle for {idle_for:.1f}s "
-                                        f"(timeout: {adaptive_idle_timeout}s, pending_jobs: {total_pending_jobs}), "
-                                        f"destroying pod {w.container_id}"
+                                        f"(timeout: {timeout_secs}s), destroying pod {w.container_id}"
                                     )
                                     if w.container_id and self.pod_manager:
                                         await self.pod_manager.destroy_individual_pod(
@@ -565,7 +479,7 @@ class AppState:
                                     
                                     logger.debug(
                                         f"Worker {w.worker_id} idle for {idle_for:.1f}s, "
-                                        f"but within timeout ({adaptive_idle_timeout}s)"
+                                        f"within timeout ({timeout_secs}s)"
                                     )
                                     
                         except Exception as e:

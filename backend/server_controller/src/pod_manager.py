@@ -754,6 +754,7 @@ class PodManager:
             "wan_22_fp8_lightx2v_i2v": os.getenv("WAN_22_14B_I2V_LIGHTX2V"),
             "wan_22_fp8_lightx2v_t2v": os.getenv("WAN_22_14B_T2V_LIGHTX2V"),
             "video_upscaler": os.getenv("VIDEO_UPSCALER_REALESRGAN_TEMPLATE_UUID"),
+            "flashvsr_video_upscaler": os.getenv("FLASHVSR_VIDEO_UPSCALER_TEMPLATE_UUID"),
 
             "ltx2_video": os.getenv("LTX2_VIDEO_TEMPLATE_UUID"),
 
@@ -801,6 +802,7 @@ class PodManager:
             "wan_22_fp8_lightx2v_i2v": 80,  # FP8 quantized model ~20-28GB + post-processing models (no LoRA needed)
             "wan_22_fp8_lightx2v_t2v": 80,  # FP8 quantized model ~20-28GB + post-processing models (no LoRA needed)
             "video_upscaler": 40,  # RIFE + Real-ESRGAN models ~10GB + workspace
+            "flashvsr_video_upscaler": 50,  # FlashVSR-Pro models ~7GB + workspace
             "ltx2_video": 85,  # FP4 model ~20GB + Gemma ~2GB + workspace
             "dreamid": 60,
             "hunyan15_480p_t2v_distilled": 50,
@@ -2806,6 +2808,7 @@ class PodManager:
         # CRITICAL: Recover any running jobs BEFORE destroying the pod
         # This prevents jobs from being lost when a pod dies
         recovered_jobs: List[Dict[str, Any]] = []
+        failed_jobs_to_remove: List[Tuple[str, str]] = []
         try:
             with SessionLocal() as db:
                 # Find the worker associated with this pod (try both formats)
@@ -2825,39 +2828,76 @@ class PodManager:
                         Job.status.in_([JobState.RUNNING.value, JobState.DISPATCHING.value]),
                     ).all()
                     
+                    max_retries_default = int(os.getenv("JOB_MAX_RETRIES", "3"))
                     recovered_count = 0
+                    failed_count = 0
                     for job in jobs_to_recover:
                         old_status = job.status
-                        job.status = JobState.QUEUED.value
-                        job.worker_id = None
-                        job.updated_at = datetime.utcnow()
-                        recovered_jobs.append(
-                            {
-                                "job_id": job.job_id,
-                                "model": getattr(job, "model", None),
-                                "mode": getattr(job, "mode", None),
-                            }
-                        )
-                        
-                        if job.error_log is None:
-                            job.error_log = []
-                        job.error_log.append({
-                            "timestamp": datetime.utcnow().isoformat(),
-                            "state": "pod_destruction_recovery",
-                            "error": f"Job recovered (was {old_status}) after pod {pod_uuid} destroyed: {reason}",
-                            "previous_status": old_status,
-                        })
-                        
-                        recovered_count += 1
-                        logger.warning(
-                            f"Recovered job {job.job_id} (was {old_status}) from destroyed pod {pod_uuid}"
-                        )
+                        retry_count = job.retry_count or 0
+                        max_retries = getattr(job, "max_retries", None) or max_retries_default
+
+                        if retry_count >= max_retries:
+                            # Exceeded retry limit - mark FAILED to stop infinite create/destroy loop
+                            job.status = JobState.FAILED.value
+                            job.worker_id = None
+                            job.updated_at = datetime.utcnow()
+                            job.error = (
+                                f"Pod destroyed: {reason}. Max retries ({max_retries}) exceeded."
+                            )
+                            if job.error_log is None:
+                                job.error_log = []
+                            job.error_log.append({
+                                "timestamp": datetime.utcnow().isoformat(),
+                                "state": "pod_destruction_max_retries",
+                                "error": f"Job marked FAILED (was {old_status}) - retry {retry_count} >= max {max_retries}",
+                                "previous_status": old_status,
+                            })
+                            failed_count += 1
+                            failed_jobs_to_remove.append(
+                                (job.job_id, getattr(job, "model", "") or "")
+                            )
+                            logger.error(
+                                f"Job {job.job_id} exceeded max retries ({retry_count}/{max_retries}) "
+                                f"after pod {pod_uuid} destroyed. Marking FAILED to stop retry loop."
+                            )
+                        else:
+                            # Under limit - recover and requeue
+                            job.status = JobState.QUEUED.value
+                            job.worker_id = None
+                            job.updated_at = datetime.utcnow()
+                            job.retry_count = retry_count + 1
+                            recovered_jobs.append(
+                                {
+                                    "job_id": job.job_id,
+                                    "model": getattr(job, "model", None),
+                                    "mode": getattr(job, "mode", None),
+                                }
+                            )
+                            if job.error_log is None:
+                                job.error_log = []
+                            job.error_log.append({
+                                "timestamp": datetime.utcnow().isoformat(),
+                                "state": "pod_destruction_recovery",
+                                "error": f"Job recovered (was {old_status}) after pod {pod_uuid} destroyed: {reason}",
+                                "previous_status": old_status,
+                                "retry_count": job.retry_count,
+                            })
+                            recovered_count += 1
+                            logger.warning(
+                                f"Recovered job {job.job_id} (was {old_status}, retry {job.retry_count}/{max_retries}) "
+                                f"from destroyed pod {pod_uuid}"
+                            )
                     
-                    if recovered_count > 0:
+                    if recovered_count > 0 or failed_count > 0:
                         db.commit()
-                        logger.info(
-                            f"Recovered {recovered_count} job(s) from pod {pod_uuid} before destruction"
-                        )
+                        if recovered_count > 0:
+                            logger.info(
+                                f"Recovered {recovered_count} job(s) from pod {pod_uuid} before destruction"
+                            )
+                        if failed_count > 0:
+                            logger.info(
+                                f"Marked {failed_count} job(s) as FAILED (max retries exceeded)"
+                            )
                     
                     # Mark worker as offline
                     worker.status = "offline"
@@ -2865,6 +2905,14 @@ class PodManager:
                     
         except Exception as e:
             logger.error(f"Error recovering jobs before destroying pod {pod_uuid}: {e}")
+        finally:
+            # Remove failed jobs from pending queue (best-effort)
+            for job_id, model in failed_jobs_to_remove:
+                if job_id and model:
+                    try:
+                        await self.remove_pending_job(job_id, model)
+                    except Exception as e:
+                        logger.debug(f"Could not remove failed job {job_id} from pending: {e}")
         
         # BUG FIX: Mark pod as STOPPING first so dispatchers skip it, then call the
         # API destroy BEFORE removing from tracking.  Previously the pod was removed
@@ -2949,6 +2997,7 @@ class PodManager:
 
         # If pod died due to infrastructure/network issues, blacklist the machine to avoid immediate reuse.
         # (Do NOT blacklist for normal idle scale-down.)
+        # Do NOT blacklist for "stuck running" / "running for" so recovered jobs can be re-dispatched to a new pod.
         if machine_id and reason:
             reason_l = reason.lower()
             if (
@@ -2956,8 +3005,6 @@ class PodManager:
                 or "startup timeout" in reason_l
                 or "dispatch failure" in reason_l
                 or "stuck in starting" in reason_l
-                or "stuck running" in reason_l  # Worker stuck during job execution
-                or "running for" in reason_l    # Job exceeded running timeout
             ):
                 try:
                     await self.mark_machine_bad(str(machine_id), duration=600)

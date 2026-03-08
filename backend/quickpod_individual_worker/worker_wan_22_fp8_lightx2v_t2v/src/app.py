@@ -8,7 +8,7 @@ import asyncio
 import hmac
 import hashlib
 import gc
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime
 import uuid
 import httpx
@@ -23,6 +23,13 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 from contextlib import asynccontextmanager
 
 import torch
+
+# -----------------------
+# Pod startup time tracking
+# -----------------------
+POD_START_TIME = time.time()
+FIRST_INFERENCE_START_TIME = None
+_first_inference_lock = asyncio.Lock()
 
 # -----------------------
 # Dedicated Thread Pool for Inference
@@ -149,68 +156,14 @@ class RunRequest(BaseModel):
     result_key: str
 
 
+class BulkRunRequest(BaseModel):
+    jobs: List[RunRequest]
+
+
 # -----------------------
-# Media URL Resolution
+# T2V: prompt only, no init_image or other media. No URL resolution.
 # -----------------------
-# Fields that may contain URLs (presigned R2 GET URLs) instead of base64 data.
-# At dispatch time the server converts R2 keys to presigned GET URLs.
-# This helper downloads the binary and converts to base64 so inference code
-# (which expects base64 strings) works without modification.
-MEDIA_FIELDS = frozenset([
-    "init_image", "mask_image", "image", "source_image", "face_image",
-    "reference_image", "style_image", "control_image", "input_image",
-    "ref_image", "ref_video", "input_video",
-])
 
-
-def _is_url(value: str) -> bool:
-    return isinstance(value, str) and (value.startswith("http://") or value.startswith("https://"))
-
-
-def _download_to_base64(url: str, timeout: int = 120) -> str:
-    """Download binary from URL and return base64-encoded string."""
-    resp = requests.get(url, timeout=timeout)
-    resp.raise_for_status()
-    return base64.b64encode(resp.content).decode("utf-8")
-
-
-def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, Any]:
-    """
-    Resolve any URL-valued media fields in params to base64 strings.
-    
-    If a known media field contains a URL (e.g. presigned R2 download URL),
-    download the binary and replace with base64 so downstream inference
-    functions work unchanged.
-    
-    Handles both single string values and lists of strings.
-    """
-    resolved = dict(params)
-    for field in MEDIA_FIELDS:
-        value = resolved.get(field)
-        if value is None:
-            continue
-        if isinstance(value, str) and _is_url(value):
-            try:
-                logger.info(f"[{job_id}] Downloading {field} from URL ({len(value)} chars)...")
-                resolved[field] = _download_to_base64(value)
-                logger.info(f"[{job_id}] Downloaded {field}: {len(resolved[field])} base64 chars")
-            except Exception as e:
-                logger.error(f"[{job_id}] Failed to download {field} from URL: {e}")
-                raise
-        elif isinstance(value, list):
-            new_list = []
-            for i, item in enumerate(value):
-                if isinstance(item, str) and _is_url(item):
-                    try:
-                        logger.info(f"[{job_id}] Downloading {field}[{i}] from URL...")
-                        new_list.append(_download_to_base64(item))
-                    except Exception as e:
-                        logger.error(f"[{job_id}] Failed to download {field}[{i}]: {e}")
-                        raise
-                else:
-                    new_list.append(item)
-            resolved[field] = new_list
-    return resolved
 # -----------------------
 # HMAC utils
 # -----------------------
@@ -385,23 +338,34 @@ def resolve_inference_callable(model: str, mode: Optional[str]):
         func = func[mode]
     return func
 
-async def run_inference_and_save(job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]) -> str:
-    global last_model_key
+async def run_inference_and_save(job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]) -> Tuple[str, Dict[str, float]]:
+    global last_model_key, FIRST_INFERENCE_START_TIME
     loop = asyncio.get_event_loop()
     params = params.copy()
     params.setdefault("output_dir", WORKSPACE_DIR)
+
+    async with _first_inference_lock:
+        if FIRST_INFERENCE_START_TIME is None:
+            FIRST_INFERENCE_START_TIME = time.time()
+            startup_time = FIRST_INFERENCE_START_TIME - POD_START_TIME
+        else:
+            startup_time = None
+
     inference_func = resolve_inference_callable(model, mode)
     model_key = f"{model}:{mode or ''}"
-
     if last_model_key and last_model_key != model_key:
         cleanup_gpu()
-
-    # Prompt enhancement for video T2V
     if params.get("enhance_prompt", False):
         prompt = await loop.run_in_executor(IO_EXECUTOR, _enhance_prompt, prompt, job_id)
 
+    inference_start_time = time.time()
     try:
-        return await loop.run_in_executor(INFERENCE_EXECUTOR, inference_func, job_id, prompt, params)
+        out_path = await loop.run_in_executor(INFERENCE_EXECUTOR, inference_func, job_id, prompt, params)
+        processing_time = time.time() - inference_start_time
+        metrics = {"processing_time_seconds": round(processing_time, 2)}
+        if startup_time is not None:
+            metrics["startup_time_seconds"] = round(startup_time, 2)
+        return out_path, metrics
     finally:
         last_model_key = model_key
 
@@ -409,21 +373,16 @@ async def run_inference_and_save(job_id: str, prompt: str, model: str, mode: Opt
 # Job Processing
 # -----------------------
 async def process_job_item(item: Dict[str, Any]):
+    global FIRST_INFERENCE_START_TIME
     job_id, model, mode, prompt = item["job_id"], item["model"], item.get("mode"), item["prompt"]
     params, upload_url, result_key = item.get("params", {}), item["upload_url"], item["result_key"]
-
-    # Resolve any URL-valued media fields to base64 before inference
-    try:
-        params = resolve_media_urls(params, job_id)
-    except Exception as e:
-        logger.error(f"[{job_id}] Failed to resolve media URLs: {e}")
 
     async with job_status_lock:
         job_status[job_id] = {"status": "running", "started_at": datetime.utcnow().isoformat()}
 
     try:
         async with semaphore:
-            out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
+            out_local, metrics = await run_inference_and_save(job_id, prompt, model, mode, params)
             if not upload_url.startswith("http://dummy-upload"):
                 if not await _upload_with_retry(out_local, upload_url, job_id):
                     raise Exception("Upload failed")
@@ -432,7 +391,7 @@ async def process_job_item(item: Dict[str, Any]):
             if CONTROLLER_URL and not is_autotest:
                 try:
                     await asyncio.get_running_loop().run_in_executor(IO_EXECUTOR, post_signed_json,
-                        f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": result_key, "next_job_id": _peek_next_job_id()}, 10, 5)
+                        f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": result_key, "next_job_id": _peek_next_job_id(), "metrics": metrics}, 10, 5)
                 except Exception:
                     pass
 
@@ -448,9 +407,14 @@ async def process_job_item(item: Dict[str, Any]):
             job_status[job_id] = {"status": "failed", "error": str(e)}
         is_autotest = job_id.startswith("autotest-")
         if CONTROLLER_URL and not is_autotest:
+            fail_metrics = {}
+            async with _first_inference_lock:
+                if FIRST_INFERENCE_START_TIME is None:
+                    FIRST_INFERENCE_START_TIME = time.time()
+                    fail_metrics["startup_time_seconds"] = round(FIRST_INFERENCE_START_TIME - POD_START_TIME, 2)
             try:
                 await asyncio.get_running_loop().run_in_executor(IO_EXECUTOR, post_signed_json,
-                    f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": None, "failed": True, "next_job_id": _peek_next_job_id()}, 10, 5)
+                    f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": None, "failed": True, "next_job_id": _peek_next_job_id(), "metrics": fail_metrics if fail_metrics else None}, 10, 5)
             except Exception:
                 pass
         asyncio.create_task(_cleanup_job_status(job_id, 60))
@@ -586,6 +550,51 @@ async def run_endpoint(req: RunRequest):
     await job_queue.put(req.dict())
     asyncio.create_task(_record_job_status_later(req.job_id, req.model))
     return {"status": "accepted", "job_id": req.job_id, "queue_position": job_queue.qsize(), "worker_id": WORKER_ID}
+
+
+@app.post("/run_bulk")
+async def run_bulk_endpoint(req: BulkRunRequest):
+    """Accept multiple jobs in one request. Used for bulk edit and multi-variation."""
+    if not req.jobs:
+        raise HTTPException(status_code=400, detail="No jobs provided")
+    if not startup_completed:
+        raise HTTPException(status_code=503, detail="Worker not ready")
+    available_slots = job_queue.maxsize - job_queue.qsize()
+    if available_slots < len(req.jobs):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Not enough queue capacity. Available: {available_slots}, Requested: {len(req.jobs)}"
+        )
+    accepted_ids = []
+    for job in req.jobs:
+        if job.model not in MODEL_REGISTRY:
+            logger.warning(f"[BULK] Unknown model {job.model} for job {job.job_id}, skipping")
+            continue
+        try:
+            await asyncio.wait_for(job_status_lock.acquire(), timeout=2.0)
+            try:
+                if job.job_id in job_status and job_status[job.job_id].get("status") in ("queued", "running"):
+                    logger.warning(f"[BULK] Job {job.job_id} already queued/running, skipping")
+                    continue
+                if job.job_id in job_status:
+                    del job_status[job.job_id]
+            finally:
+                job_status_lock.release()
+        except asyncio.TimeoutError:
+            pass
+        await job_queue.put(job.dict())
+        asyncio.create_task(_record_job_status_later(job.job_id, job.model))
+        accepted_ids.append(job.job_id)
+    logger.info(f"[BULK] Enqueued {len(accepted_ids)} of {len(req.jobs)} jobs")
+    return {
+        "status": "accepted",
+        "job_ids": accepted_ids,
+        "total_accepted": len(accepted_ids),
+        "total_requested": len(req.jobs),
+        "worker_id": WORKER_ID,
+        "queue_size": job_queue.qsize(),
+    }
+
 
 @app.get("/health")
 async def health():

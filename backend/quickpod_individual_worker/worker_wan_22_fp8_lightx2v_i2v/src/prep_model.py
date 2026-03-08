@@ -9,10 +9,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 
-# WAN 2.2 I2V 14B SDNQ model repo (FastDM merged Lightning - Lightning already fused into base model, then quantized)
-# This model has Lightning distillation baked into the weights, so no LoRA is needed
-MODEL_REPO = "rockapaper/wan22-14b-i2v-lightning-sdnq-fp8-svd-r32"
-MODEL_LOCAL_DIR = os.path.join(MODELS_DIR, "fastdm_wan22_i2v_lightning_sdnq_fp8_svd_r32")
+MODEL_REPO = "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_Multiscene_SVI_sdnq_fp8_svd_r64"
+MODEL_LOCAL_DIR = os.path.join(MODELS_DIR, "wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_Multiscene_SVI_sdnq_fp8_svd_r64")
 
 os.makedirs(MODEL_LOCAL_DIR, exist_ok=True)
 

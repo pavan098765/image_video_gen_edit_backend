@@ -406,8 +406,11 @@ class JobManager:
         job_id: str,
         result_r2_key: Optional[str] = None,
         output_url: Optional[str] = None,
+        metrics: Optional[Dict[str, Any]] = None,
     ) -> Job:
-        """Mark job as completed with result and calculate timing metrics"""
+        """Mark job as completed with result and calculate timing metrics.
+        If metrics is provided by worker: use processing_time_seconds and startup_time_seconds from it.
+        """
         with self.session_factory() as db:
             job = db.query(Job).filter(Job.job_id == job_id).first()
             if not job:
@@ -426,10 +429,18 @@ class JobManager:
             if output_url:
                 job.output_url = output_url
             
-            # Calculate timing metrics
+            # Worker-provided metrics (accurate inference time and pod startup time)
+            if metrics:
+                if "processing_time_seconds" in metrics:
+                    job.processing_time_seconds = metrics["processing_time_seconds"]
+                if "startup_time_seconds" in metrics:
+                    job.startup_time_seconds = metrics["startup_time_seconds"]
+            
+            # Calculate other timing metrics
             timing_metrics = self._calculate_timing_metrics(job, completion_time)
             job.total_time_seconds = timing_metrics["total_time"]
-            job.processing_time_seconds = timing_metrics["processing_time"]
+            if job.processing_time_seconds is None:
+                job.processing_time_seconds = timing_metrics["processing_time"]
             job.queue_time_seconds = timing_metrics["queue_time"]
             job.dispatch_time_seconds = timing_metrics["dispatch_time"]
             

@@ -95,12 +95,14 @@ def ssim_interpolation_rife(model, samples, exp=1, upscale_amount=1, output_devi
     
     # [f, c, h, w]
     for b in range(samples.shape[0]):
-        frame = samples[b : b + 1]
-        _, _, h, w = frame.shape
         I0 = samples[b : b + 1]
         I1 = samples[b + 1 : b + 2] if b + 2 <= samples.shape[0] else samples[-1:]
+
+        # Pad both frames so spatial dims match for torch.cat inside RIFE
+        I0 = pad_image(I0, upscale_amount)
         I1 = pad_image(I1, upscale_amount)
-        
+        frame = I0
+
         # [c, h, w]
         I0_small = F.interpolate(I0, (32, 32), mode="bilinear", align_corners=False)
         I1_small = F.interpolate(I1, (32, 32), mode="bilinear", align_corners=False)
@@ -108,9 +110,7 @@ def ssim_interpolation_rife(model, samples, exp=1, upscale_amount=1, output_devi
         ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
         
         if ssim > 0.996:
-            I1 = I0
-            I1 = pad_image(I1, upscale_amount)
-            I1 = make_inference(model, I0, I1, upscale_amount, 1)
+            I1 = make_inference(model, I0, I0, upscale_amount, 1)
             
             I1_small = F.interpolate(I1[0], (32, 32), mode="bilinear", align_corners=False)
             ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
@@ -124,7 +124,6 @@ def ssim_interpolation_rife(model, samples, exp=1, upscale_amount=1, output_devi
         else:
             tmp_output = make_inference(model, I0, I1, upscale_amount, 2**exp - 1) if exp else []
         
-        frame = pad_image(frame, upscale_amount)
         tmp_output = [frame] + tmp_output
         for i, frame in enumerate(tmp_output):
             output.append(frame.to(output_device))
@@ -505,13 +504,18 @@ def apply_rife_interpolation(model, frames, device="cuda", original_fps=16, targ
         return frames, original_fps
 
 
-def apply_realesrgan_upscaling(model, frames, device="cuda"):
+def apply_realesrgan_upscaling(model, frames, device="cuda", batch_size=8):
     """Apply Real-ESRGAN upscaling to frames (numpy array).
+    
+    Processes frames in batches to avoid CUDA OOM when upscaling long videos.
+    Loading all frames to GPU at once (e.g. 3773 frames at 704x1280) can require
+    38+ GiB; batch processing keeps memory within GPU limits.
     
     Args:
         model: Real-ESRGAN model (already loaded with specific upscale factor)
         frames: Input frames (numpy array [f, h, w, c] or list of PIL Images)
         device: Device to run on
+        batch_size: Number of frames to process at a time (default 8 for 4x upscale)
     
     Returns:
         Upscaled frames (numpy array [f, h, w, c])
@@ -520,11 +524,9 @@ def apply_realesrgan_upscaling(model, frames, device="cuda"):
         return frames
     
     try:
-        # Convert frames to tensor [f, c, h, w] in [0, 1] range
+        # Convert frames to tensor [f, c, h, w] in [0, 1] range (keep on CPU)
         if isinstance(frames, np.ndarray):
-            # Already numpy array - ensure correct format
-            if len(frames.shape) == 4 and frames.shape[-1] == 3:  # [f, h, w, c]
-                # Convert to [f, c, h, w] and normalize
+            if len(frames.shape) == 4 and frames.shape[-1] == 3:
                 if frames.dtype == np.uint8:
                     frames_norm = frames.astype(np.float32) / 255.0
                 else:
@@ -535,18 +537,32 @@ def apply_realesrgan_upscaling(model, frames, device="cuda"):
         else:
             tensor = frames_to_tensor(frames)
         
-        tensor = tensor.to(device)
+        num_frames = tensor.shape[0]
+        upscale_factor = getattr(model, "scale", 4)
         
-        # Upscale using tiled upscaling
-        upscaled_tensor = upscale(model, tensor, device, "cpu")
+        # For 4x upscale on long videos, process in batches to avoid OOM
+        # 2x with few frames can use smaller batches; 4x needs more conservative batch_size
+        if upscale_factor >= 4:
+            batch_size = min(batch_size, 4)
+        elif num_frames > 500:
+            batch_size = min(batch_size, 16)
         
-        # Convert back to numpy using VaeImageProcessor for proper color space handling
-        # This ensures colors are preserved correctly
-        upscaled_tensor = upscaled_tensor.clamp(0, 1)  # Ensure [0, 1] range
+        upscaled_chunks = []
+        for start_idx in range(0, num_frames, batch_size):
+            end_idx = min(start_idx + batch_size, num_frames)
+            batch = tensor[start_idx:end_idx]
+            batch = batch.to(device)
+            upscaled_batch = upscale(model, batch, device, "cpu")
+            upscaled_batch = upscaled_batch.clamp(0, 1)
+            upscaled_chunks.append(upscaled_batch)
+            del batch
+            if device == "cuda":
+                torch.cuda.empty_cache()
         
-        # Use VaeImageProcessor for proper conversion (same as CogVideoX)
-        image_np = VaeImageProcessor.pt_to_numpy(upscaled_tensor)  # [f, h, w, c]
+        upscaled_tensor = torch.cat(upscaled_chunks, dim=0)
+        del upscaled_chunks
         
+        image_np = VaeImageProcessor.pt_to_numpy(upscaled_tensor)
         return image_np
     except Exception as e:
         print(f"⚠️  Real-ESRGAN upscaling failed: {e}")

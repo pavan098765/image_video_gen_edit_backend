@@ -60,7 +60,8 @@ DEFAULT_OUTPUT_DIR = "/app/worker/outputs"
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 
-# GFPGAN model paths
+# GFPGAN face model paths (must match prep_model.py filenames)
+# Frontend sends model="face_enhancer" and mode=<one of FACE_ENHANCER_MODES>
 GFPGAN_MODELS = {
     "v1.2": os.path.join(MODEL_DIR, "GFPGANv1.2.pth"),
     "v1.3": os.path.join(MODEL_DIR, "GFPGANv1.3.pth"),
@@ -69,8 +70,9 @@ GFPGAN_MODELS = {
     "CodeFormer": os.path.join(MODEL_DIR, "CodeFormer.pth"),
     "RealESR-General-x4v3": os.path.join(MODEL_DIR, "realesr-general-x4v3.pth"),
 }
+FACE_ENHANCER_MODES = list(GFPGAN_MODELS.keys())
 
-# RealESRGAN background upsampler models
+# RealESRGAN background upsampler models (used for upscaling after face enhancement)
 REALESRGAN_BG_MODELS = {
     "realesr-general-x4v3": {
         "model_path": os.path.join(MODEL_DIR, "realesr-general-x4v3.pth"),
@@ -91,6 +93,7 @@ REALESRGAN_BG_MODELS = {
 
 # Default background upsampler
 DEFAULT_BG_MODEL = "realesr-general-x4v3"
+REALESRGAN_BG_MODES = list(REALESRGAN_BG_MODELS.keys())
 
 # Cache for loaded models (keyed by model name)
 LOADED_BG_UPSAMPLERS: Dict[str, RealESRGANer] = {}
@@ -99,17 +102,32 @@ LOADED_BG_UPSAMPLERS: Dict[str, RealESRGANer] = {}
 # Helpers
 # -------------------------
 def _load_image(img: Optional[Union[str, Image.Image, bytes]]) -> Optional[Image.Image]:
-    """Load image from PIL, bytes, path, or base64 string."""
+    """Load image from PIL, bytes, path, URL, or base64 string."""
     if img is None:
         return None
     if isinstance(img, Image.Image):
         return img.convert("RGB")
     if isinstance(img, bytes):
         return Image.open(BytesIO(img)).convert("RGB")
-    if os.path.exists(str(img)):
-        return Image.open(str(img)).convert("RGB")
+    s = str(img).strip()
+    if os.path.exists(s):
+        return Image.open(s).convert("RGB")
+    # URL: download then open (server often sends presigned R2 URL instead of base64)
+    if s.startswith("http://") or s.startswith("https://"):
+        try:
+            import requests
+            resp = requests.get(s, timeout=120)
+            resp.raise_for_status()
+            return Image.open(BytesIO(resp.content)).convert("RGB")
+        except Exception as e:
+            raise ValueError(f"Unable to download image from URL: {e}")
+    # Base64: fix padding then decode (avoids "Incorrect padding" when padding was stripped)
     try:
-        decoded = base64.b64decode(img)
+        raw = s.encode("utf-8")
+        pad = 4 - (len(raw) % 4)
+        if pad and pad != 4:
+            raw += b"=" * pad
+        decoded = base64.b64decode(raw)
         return Image.open(BytesIO(decoded)).convert("RGB")
     except Exception as e:
         raise ValueError(f"Unable to decode image from input: {e}")
@@ -193,15 +211,18 @@ def _get_background_upsampler(model_name: str = DEFAULT_BG_MODEL) -> RealESRGANe
 # -------------------------
 def run_inference_face_enhancer(job_id: str, params: Dict[str, Any]) -> str:
     """
-    Run GFPGAN face enhancement with RealESRGAN background upsampling.
+    Run GFPGAN face enhancement with RealESRGAN background upsampling,
+    or general upscale only (RealESRGAN without GFPGAN) when face_enhance=False.
     
     Args:
         job_id: unique job identifier (for output filenames)
         params:
-            - init_image (base64 string): input image
-            - version (str): GFPGAN version - "v1.2", "v1.3", "v1.4", "RestoreFormer", "CodeFormer", "RealESR-General-x4v3"
+            - init_image (required): input image (base64, URL, or path)
+            - face_enhance (bool, default: True): if False, run only bg_model (general upscale, no GFPGAN)
+            - mode (str): GFPGAN model mode - overrides version if set. One of FACE_ENHANCER_MODES.
+            - version (str): legacy; used if mode not set. GFPGAN version - same values as mode.
             - scale (float, default: 2.0): rescaling factor (final output scale)
-            - bg_model (str, default: "realesr-general-x4v3"): background upsampler model - "realesr-general-x4v3", "RealESRGAN_x2plus", "RealESRGAN_x4plus_anime_6B"
+            - bg_model (str): background upsampler - one of REALESRGAN_BG_MODES
             - output_dir (str): output directory
     
     Returns:
@@ -215,27 +236,59 @@ def run_inference_face_enhancer(job_id: str, params: Dict[str, Any]) -> str:
     try:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            # ipc_collect() may fail if PyTorch version doesn't support certain allocator options
             try:
                 torch.cuda.ipc_collect()
             except (RuntimeError, AttributeError) as e:
                 if "expandable_segments" in str(e) or "CachingAllocator" in str(e):
-                    # PyTorch version doesn't support this option - skip it
                     pass
                 else:
                     raise
     except Exception:
-        pass  # CUDA may not be available
+        pass
     
     print(f"  [2/7] Loading input image...")
-    input_image = _load_image(params.get("init_image"))
+    # Support both init_image and image (upscale capability uses input id "image")
+    input_image = _load_image(params.get("init_image") or params.get("image"))
     if input_image is None:
-        raise ValueError("❌ 'init_image' parameter required")
+        raise ValueError("❌ 'init_image' or 'image' parameter required")
     print(f"  ✅ Input image loaded: {input_image.size}")
     
-    # Get GFPGAN version (default: v1.4)
-    version = params.get("version", "v1.4")
-    print(f"  [3/7] Validating GFPGAN version: {version}")
+    # face_enhance=False → general upscale only (RealESRGAN), no GFPGAN
+    face_enhance = params.get("face_enhance", True)
+    if isinstance(face_enhance, str):
+        face_enhance = face_enhance.lower() in ("true", "1", "yes")
+    
+    # Get scale (rescaling factor, default: 2.0)
+    scale = float(params.get("scale", 2.0))
+    
+    # Get background upsampler model name (default: realesr-general-x4v3)
+    bg_model_name = params.get("bg_model", DEFAULT_BG_MODEL)
+    print(f"  [3/7] Loading background upsampler (RealESRGAN: {bg_model_name})...")
+    bg_upsampler = _get_background_upsampler(bg_model_name)
+    print(f"  ✅ Background upsampler loaded")
+    
+    if not face_enhance:
+        # General upscale only: run RealESRGAN directly on full image (no GFPGAN)
+        print(f"  [4/7] General upscale mode (no face enhancement)...")
+        img_array = np.array(input_image)
+        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        h, w = img_bgr.shape[0:2]
+        with torch.inference_mode():
+            output, _ = bg_upsampler.enhance(img_bgr, outscale=scale)
+        output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
+        output_rgb = np.clip(output_rgb, 0, 255).astype(np.uint8)
+        pil_img = Image.fromarray(output_rgb)
+        clean_img = _strip_metadata(pil_img)
+        output_dir = params.get("output_dir", DEFAULT_OUTPUT_DIR)
+        os.makedirs(output_dir, exist_ok=True)
+        out_path = os.path.join(output_dir, f"face_enhanced_{job_id}.png")
+        clean_img.save(out_path, format="PNG")
+        print(f"✅ General upscale saved to {out_path}")
+        return os.path.abspath(out_path)
+    
+    # Face enhancement path: GFPGAN + bg_upsampler
+    version = params.get("mode") or params.get("version", "v1.4")
+    print(f"  [4/7] Validating GFPGAN mode/version: {version}")
     if version not in GFPGAN_MODELS:
         raise ValueError(
             f"Unsupported GFPGAN version '{version}'. "
@@ -246,15 +299,6 @@ def run_inference_face_enhancer(job_id: str, params: Dict[str, Any]) -> str:
     if not os.path.exists(gfpgan_model_path):
         raise FileNotFoundError(f"❌ Missing GFPGAN model weights at {gfpgan_model_path}")
     print(f"  ✅ Model path verified: {gfpgan_model_path}")
-    
-    # Get scale (rescaling factor, default: 2.0)
-    scale = float(params.get("scale", 2.0))
-    
-    # Get background upsampler model name (default: realesr-general-x4v3)
-    bg_model_name = params.get("bg_model", DEFAULT_BG_MODEL)
-    print(f"  [4/7] Loading background upsampler (RealESRGAN: {bg_model_name})...")
-    bg_upsampler = _get_background_upsampler(bg_model_name)
-    print(f"  ✅ Background upsampler loaded")
     
     # Determine GFPGAN architecture based on version
     print(f"  [5/7] Determining architecture for version: {version}")
@@ -335,6 +379,8 @@ def run_inference_face_enhancer(job_id: str, params: Dict[str, Any]) -> str:
         
     except Exception as e:
         raise RuntimeError(f"❌ Face enhancement failed: {e}")
+    finally:
+        del face_enhancer
     
     # Post-inference GPU cleanup
     gc.collect()

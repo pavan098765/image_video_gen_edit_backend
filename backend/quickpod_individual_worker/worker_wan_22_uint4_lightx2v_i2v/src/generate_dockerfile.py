@@ -73,7 +73,7 @@ def copy_chunks_one_per_line(f):
 
 def write_rest(f):
     f.write("\n# Copy requirements.txt first for dependency installation\n")
-        f.write("COPY requirements.txt /app/requirements.txt\n\n")
+    f.write("COPY requirements.txt /app/requirements.txt\n\n")
     
     # Install system dependencies and Python packages
     f.write("# Install system dependencies and Python packages\n")

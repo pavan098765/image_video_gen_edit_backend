@@ -102,6 +102,7 @@ ADAPTER_SPECS = {
         "weights": "qe2511_consis_alpha_patched.safetensors",
         "adapter_name": "Consistency",
         "strength": 0.6,
+        "target_long_edge": 1024,
     },
     "Semirealistic-photo-detailer": {
         "type": "single",
@@ -109,6 +110,7 @@ ADAPTER_SPECS = {
         "weights": "Qwen-Image-Edit-Anime-Semi-Realistic-Detailer-v1.safetensors",
         "adapter_name": "semirealistic",
         "strength": 1.0,
+        "target_long_edge": 1024,
     },
     "AnyPose": {
         "type": "package",
@@ -236,7 +238,6 @@ def get_aio_version() -> str:
     _aio_version = _AIO_ENV_NORM or DEFAULT_AIO_VERSION
     return _aio_version
 
-
 def get_pipeline(version: Optional[str] = None) -> QwenImageEditPlusPipeline:
     """Lazy-initialize the pipeline only once to prevent duplicate GPU memory usage."""
     global _pipeline
@@ -247,55 +248,33 @@ def get_pipeline(version: Optional[str] = None) -> QwenImageEditPlusPipeline:
     import time
     total_start = time.time()
     
-    # Clear GPU cache before loading
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
     
-    # -------------------------
-    # OOM Protection: Detect VRAM FIRST to determine loading strategy
-    # -------------------------
     try:
         vram_gb = get_gpu_memory()
     except Exception:
-        vram_gb = 8.0  # Default to low VRAM if detection fails
+        vram_gb = 8.0
     
     print(f"🔍 Detected GPU VRAM: {vram_gb:.1f} GB")
-    
-    # Determine loading strategy based on VRAM
-    # For 32GB and below, load to CPU first, then enable offloading
-    # For 48GB+, can load directly to GPU
-    use_cpu_first = vram_gb < 48
-    
-    # Use provided version or get from env/default
+
     aio_version = version or get_aio_version()
     
-    # Check for local transformer path first (from prep_model.py)
     AIO_TRANSFORMER_LOCAL_PATH = os.environ.get("AIO_TRANSFORMER_LOCAL_PATH", "/app/models/aio_transformers")
     qwen_local_path = os.environ.get("QWEN_2511_LOCAL_PATH", "/app/models/qwen_image_edit_2511")
-    
     transformer_local_path = os.path.join(AIO_TRANSFORMER_LOCAL_PATH, aio_version, "transformer")
     
     print(f"🔧 Loading AIO transformer (version={aio_version})")
-    if use_cpu_first:
-        print("  📦 Loading to CPU first (will offload to GPU after)")
-    
     transformer_start = time.time()
     
-    # Load transformer with memory-efficient settings
     load_kwargs = {
         "torch_dtype": dtype,
         "low_cpu_mem_usage": True,
+        "device_map": "cpu",
     }
     
-    # For 32GB and below, load to CPU first to avoid OOM during loading
-    if use_cpu_first:
-        load_kwargs["device_map"] = "cpu"
-    else:
-        load_kwargs["device_map"] = "auto" if torch.cuda.is_available() else "cpu"
-    
-    # Try local path first, fallback to HuggingFace Hub
     if os.path.exists(transformer_local_path) and os.listdir(transformer_local_path):
         print(f"  Using local path: {transformer_local_path}")
         transformer = QwenImageTransformer2DModel.from_pretrained(
@@ -312,19 +291,17 @@ def get_pipeline(version: Optional[str] = None) -> QwenImageEditPlusPipeline:
         )
     
     transformer_time = time.time() - transformer_start
-    print(f"✅ Transformer loaded in {transformer_time:.1f}s")
+    print(f"✅ Transformer loaded to CPU in {transformer_time:.1f}s")
 
     print(f"🔧 Building QwenImageEditPlusPipeline")
     pipeline_start = time.time()
     
-    # Load pipeline - for CPU-first strategy, load to CPU then move components
     pipeline_load_kwargs = {
         "transformer": transformer,
         "torch_dtype": dtype,
         "low_cpu_mem_usage": True,
     }
     
-    # Try local Qwen path first, fallback to HuggingFace Hub
     if os.path.exists(qwen_local_path) and os.listdir(qwen_local_path):
         print(f"  Using local Qwen path: {qwen_local_path}")
         pipeline = QwenImageEditPlusPipeline.from_pretrained(
@@ -337,180 +314,132 @@ def get_pipeline(version: Optional[str] = None) -> QwenImageEditPlusPipeline:
             QWEN_REPO,
             **pipeline_load_kwargs
         )
-    
-    # For CPU-first strategy, don't move to GPU yet - offloading will handle it
-    if not use_cpu_first and torch.cuda.is_available():
-        pipeline = pipeline.to(device)
-    
-    pipeline_time = time.time() - pipeline_start
-    print(f"✅ Pipeline built in {pipeline_time:.1f}s")
 
-    # Apply Flash Attention 2 (FA2) - Compatible with RTX 5090
-    # Priority: FA2 > Processor2_0 (PyTorch native)
-    # FA2 is preferred because it's faster and more memory-efficient than PyTorch native attention
+    pipeline_time = time.time() - pipeline_start
+    print(f"✅ Pipeline built on CPU in {pipeline_time:.1f}s")
+
+    # Set attention processor BEFORE offload hooks
     attention_processor_set = False
-    
-    # Try Flash Attention 2 first (compatible with RTX 5090)
     if FA2_AVAILABLE:
         try:
             pipeline.transformer.set_attn_processor(QwenDoubleStreamAttnProcessorFA2())
-            print("✅ Flash Attention 2 Processor set successfully (compatible with RTX 5090).")
+            print("✅ Flash Attention 2 processor set.")
             attention_processor_set = True
-        except (RuntimeError, ImportError, Exception) as e:
-            error_msg = str(e)
-            if "no kernel image" in error_msg or "CUDA error" in error_msg or "cuda" in error_msg.lower():
-                print(f"⚠️ Flash Attention 2 not compatible with this GPU architecture")
-                print(f"   Error: {error_msg[:200]}...")
-            else:
-                print(f"⚠️ Warning: Could not set FA2 processor: {e}")
+        except Exception as e:
+            print(f"⚠️ FA2 failed: {e}")
     
-    # Fall back to Processor2_0 (PyTorch native attention) if FA2 failed
     if not attention_processor_set:
         try:
             pipeline.transformer.set_attn_processor(QwenDoubleStreamAttnProcessor2_0())
-            print("✅ Using QwenDoubleStreamAttnProcessor2_0 (PyTorch native scaled_dot_product_attention)")
+            print("✅ Using QwenDoubleStreamAttnProcessor2_0.")
             attention_processor_set = True
-        except Exception as fallback_error:
-            print(f"⚠️ Could not set Processor2_0 fallback: {fallback_error}")
-            print("   Pipeline will use default attention processor")
+        except Exception as e:
+            print(f"⚠️ Could not set Processor2_0: {e}.")
 
     # -------------------------
-    # OOM Protection: Enable CPU Offloading Based on VRAM
+    # Verify all components are on CPU before applying offload.
+    # When a pre-instantiated transformer is passed to from_pretrained,
+    # diffusers may not register it in self.components properly, causing
+    # enable_model_cpu_offload to miss it and leave it on GPU.
+    # We explicitly move everything to CPU first to guarantee a clean state.
     # -------------------------
-    # VRAM thresholds for adaptive offloading:
-    # - 48GB+ (A100, H100): Simple CPU offload (plenty of VRAM)
-    # - 32GB (RTX 5090): Aggressive sequential offload with memory-efficient attention
-    # - 24GB (RTX 4090): Maximum aggressive offload (1 block, no pin memory)
-    # - <24GB: Most aggressive sequential offload
+    print("🔧 Ensuring all components are on CPU before applying offload hooks...")
+    for name, component in pipeline.components.items():
+        if isinstance(component, torch.nn.Module):
+            try:
+                component.to("cpu")
+                print(f"  ✅ {name} → CPU")
+            except Exception as e:
+                print(f"  ⚠️ Could not move {name} to CPU: {e}")
     
+    # Also explicitly move transformer since it may not be in pipeline.components
+    # if it was passed as a pre-instantiated object
+    try:
+        pipeline.transformer.to("cpu")
+        print(f"  ✅ transformer (explicit) → CPU")
+    except Exception as e:
+        print(f"  ⚠️ Could not move transformer to CPU: {e}")
+    
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Verify GPU memory is now near-zero before applying offload
+    if torch.cuda.is_available():
+        try:
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free = free_bytes / 1024**3
+            print(f"💾 GPU state before offload setup: {allocated:.2f}GB allocated, {free:.2f}GB free of {total_bytes/1024**3:.1f}GB")
+            if allocated > 2.0:
+                print(f"⚠️ WARNING: {allocated:.2f}GB still on GPU before offload hooks — offload may not fully work")
+        except Exception:
+            pass
+
     if vram_gb >= 48:
-        print("🧠 Very High VRAM (>=48GB) → enabling simple CPU offload")
+        print("🧠 >=48GB → enable_model_cpu_offload")
         pipeline.enable_model_cpu_offload()
-    elif vram_gb >= 32:
-        # RTX 5090 (32GB): Use aggressive sequential offload with memory-efficient attention
-        print("🧠 High VRAM (32GB RTX 5090) → enabling aggressive sequential offload with memory-efficient attention")
-        
-        # CRITICAL: Enable sequential CPU offload BEFORE any GPU operations
-        # This moves models from CPU to GPU in a memory-efficient way
+    elif vram_gb >= 31:
+        # RTX 5090: ~31.7GB reported
+        # Transformer (20GB) + activations (~4-6GB) = ~24-26GB peak, fits fine
+        # with component-level offload keeping text_encoder and VAE on CPU
+        print("🧠 RTX 5090 → enable_model_cpu_offload (component-level)")
+        # pipeline.enable_model_cpu_offload()
         pipeline.enable_sequential_cpu_offload()
         
-        # Try to enable transformer offloading if available
-        try:
-            if hasattr(transformer, 'set_offload'):
-                transformer.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=2)
-                if hasattr(pipeline, '_exclude_from_cpu_offload'):
-                    pipeline._exclude_from_cpu_offload.append("transformer")
-                print("✅ Transformer offloading enabled (2 blocks on GPU)")
-        except Exception as e:
-            print(f"ℹ️ Transformer offloading not available: {e}")
+        # -------------------------
+        # Verify offload hooks were actually attached to the transformer.
+        # The transformer is the critical component — if hooks are missing here
+        # it will sit on GPU consuming 20GB permanently.
+        # -------------------------
+        # from accelerate.hooks import AlignDevicesHook
+        # transformer_has_hook = hasattr(pipeline.transformer, '_hf_hook') or \
+        #                        any(hasattr(m, '_hf_hook') for m in pipeline.transformer.modules())
         
-        # Enable memory-efficient attention
-        # NOTE: XFormers may use incompatible Flash Attention kernels on RTX 5090
-        # Use attention slicing instead for better compatibility
-        try:
-            pipeline.enable_attention_slicing()
-            print("✅ Attention slicing enabled (compatible with RTX 5090)")
-        except Exception as e:
-            print(f"ℹ️ Attention slicing not available: {e}")
-            # Try xformers as last resort, but catch CUDA errors
-            try:
-                pipeline.enable_xformers_memory_efficient_attention()
-                print("✅ XFormers memory efficient attention enabled")
-            except (RuntimeError, Exception) as xformers_err:
-                error_msg = str(xformers_err)
-                if "CUDA error" in error_msg or "invalid argument" in error_msg:
-                    print(f"⚠️ XFormers not compatible with this GPU: {error_msg[:200]}")
-                    print("   Continuing without memory-efficient attention optimizations")
-                else:
-                    print(f"ℹ️ XFormers not available: {xformers_err}")
-                
-    elif vram_gb >= 24:
-        # RTX 4090 (24GB): Maximum aggressive offload
-        print("🧠 24GB VRAM (RTX 4090) → enabling MAXIMUM aggressive sequential offload (1 block, no pin memory)")
-        
-        # CRITICAL: Enable sequential CPU offload FIRST
+        # if not transformer_has_hook:
+        #     print("⚠️ WARNING: enable_model_cpu_offload did not attach hooks to transformer!")
+        #     print("   Falling back to enable_sequential_cpu_offload for reliable offloading.")
+        #     # Reset pipeline state and try sequential offload instead
+        #     # First ensure transformer is back on CPU
+        #     pipeline.transformer.to("cpu")
+        #     gc.collect()
+        #     torch.cuda.empty_cache()
+        #     pipeline.enable_sequential_cpu_offload()
+        #     print("✅ Fallback: enable_sequential_cpu_offload applied")
+        # else:
+        #     print("✅ Verified: offload hooks attached to transformer")
+
+    elif vram_gb >= 23:
+        print("🧠 RTX 4090 → enable_sequential_cpu_offload")
         pipeline.enable_sequential_cpu_offload()
-        
-        try:
-            if hasattr(transformer, 'set_offload'):
-                transformer.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=1)
-                if hasattr(pipeline, '_exclude_from_cpu_offload'):
-                    pipeline._exclude_from_cpu_offload.append("transformer")
-                print("✅ Transformer offloading enabled (1 block on GPU)")
-        except Exception as e:
-            print(f"ℹ️ Transformer offloading not available: {e}")
-        
-        # Enable memory-efficient attention
-        # NOTE: XFormers may use incompatible Flash Attention kernels on RTX 5090
-        # Use attention slicing instead for better compatibility
-        try:
-            pipeline.enable_attention_slicing()
-            print("✅ Attention slicing enabled (compatible with RTX 5090)")
-        except Exception as e:
-            print(f"ℹ️ Attention slicing not available: {e}")
-            # Try xformers as last resort, but catch CUDA errors
-            try:
-                pipeline.enable_xformers_memory_efficient_attention()
-                print("✅ XFormers memory efficient attention enabled")
-            except (RuntimeError, Exception) as xformers_err:
-                error_msg = str(xformers_err)
-                if "CUDA error" in error_msg or "invalid argument" in error_msg:
-                    print(f"⚠️ XFormers not compatible with this GPU: {error_msg[:200]}")
-                    print("   Continuing without memory-efficient attention optimizations")
-                else:
-                    print(f"ℹ️ XFormers not available: {xformers_err}")
-                
-    elif vram_gb >= 20:
-        # 20-24GB: Aggressive sequential offload
-        print("🧠 Medium VRAM (20-24GB) → enabling aggressive sequential offload")
-        
-        # CRITICAL: Enable sequential CPU offload FIRST
-        pipeline.enable_sequential_cpu_offload()
-        
-        try:
-            if hasattr(transformer, 'set_offload'):
-                transformer.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=1)
-                if hasattr(pipeline, '_exclude_from_cpu_offload'):
-                    pipeline._exclude_from_cpu_offload.append("transformer")
-        except Exception:
-            pass
-        
-        try:
-            pipeline.enable_attention_slicing()
-            print("✅ Attention slicing enabled")
-        except Exception:
-            pass
     else:
-        # <20GB: Most aggressive sequential offload
-        print("🧠 Low VRAM (<20GB) → enabling most aggressive sequential offload")
-        
-        # CRITICAL: Enable sequential CPU offload FIRST
+        print(f"🧠 {vram_gb:.1f}GB → enable_sequential_cpu_offload")
         pipeline.enable_sequential_cpu_offload()
-        
-        try:
-            if hasattr(transformer, 'set_offload'):
-                transformer.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=1)
-                if hasattr(pipeline, '_exclude_from_cpu_offload'):
-                    pipeline._exclude_from_cpu_offload.append("transformer")
-        except Exception:
-            pass
-        
-        try:
-            pipeline.enable_attention_slicing()
-            print("✅ Attention slicing enabled")
-        except Exception:
-            pass
 
     _pipeline = pipeline
     total_time = time.time() - total_start
-    print(f"✅ Pipeline initialized successfully in {total_time:.1f}s (transformer: {transformer_time:.1f}s, pipeline: {pipeline_time:.1f}s)")
+    print(
+        f"✅ Pipeline ready in {total_time:.1f}s "
+        f"(transformer: {transformer_time:.1f}s, pipeline: {pipeline_time:.1f}s)"
+    )
     
-    # Log memory state after loading
     if torch.cuda.is_available():
         try:
             allocated = torch.cuda.memory_allocated() / 1024**3
             reserved = torch.cuda.memory_reserved() / 1024**3
-            print(f"💾 GPU memory after loading: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free = free_bytes / 1024**3
+            print(
+                f"💾 GPU after pipeline init: {allocated:.2f}GB allocated, "
+                f"{reserved:.2f}GB reserved, {free:.2f}GB truly free"
+            )
+            # After offload setup, GPU should be near-empty (model on CPU)
+            # If more than 2GB is allocated here, offload hooks are not working
+            if allocated > 2.0:
+                print(
+                    f"🚨 CRITICAL: {allocated:.2f}GB allocated after offload setup. "
+                    f"Model is NOT properly offloaded. Inference will OOM."
+                )
         except Exception:
             pass
     
@@ -540,37 +469,39 @@ def _ensure_image_list(maybe_one_or_many) -> List[Image.Image]:
     raise ValueError("Unsupported image input type")
 
 
-def _round8(x: int) -> int:
-    return max(8, (int(x) // 8) * 8)
-
-
-def compute_dimensions(image: Image.Image, long_edge: int) -> tuple[int, int]:
-    """Compute dimensions preserving aspect ratio, rounded to multiples of 8."""
-    w, h = image.size
+def _get_dynamic_size_for_images(images: List[Image.Image], max_dim: int = 1152) -> Tuple[int, int]:
+    """Keep aspect ratio, clamp to max_dim (scale down only), round to multiples of 64.
+    Same logic as worker_qwen_image_edit_2509: avoids upscaling small images and uses 64 alignment."""
+    if not images:
+        raise ValueError("No images provided")
+    w, h = images[0].size
     aspect = w / h
-    
-    # Determine which edge is longer
-    if w >= h:
-        # Width is longer - round it first
-        new_w = _round8(long_edge)
-        # Compute height from rounded width to maintain exact aspect ratio
-        new_h = int(round(new_w / aspect))
-        # Round height to multiple of 8
-        new_h = _round8(new_h)
-        # Recompute width from rounded height to ensure aspect ratio is maintained
-        new_w = int(round(new_h * aspect))
-        new_w = _round8(new_w)
+
+    # First, scale down if needed (never scale up)
+    if max(w, h) > max_dim:
+        if w > h:
+            new_w = max_dim
+            new_h = int(round(max_dim / aspect))
+        else:
+            new_h = max_dim
+            new_w = int(round(max_dim * aspect))
     else:
-        # Height is longer - round it first
-        new_h = _round8(long_edge)
-        # Compute width from rounded height to maintain exact aspect ratio
-        new_w = int(round(new_h * aspect))
-        # Round width to multiple of 8
-        new_w = _round8(new_w)
-        # Recompute height from rounded width to ensure aspect ratio is maintained
+        new_w, new_h = w, h
+
+    # Round to multiples of 64 while preserving aspect ratio
+    if new_w >= new_h:
+        new_w = (new_w // 64) * 64
         new_h = int(round(new_w / aspect))
-        new_h = _round8(new_h)
-    
+        new_h = (new_h // 64) * 64
+        new_w = int(round(new_h * aspect))
+        new_w = (new_w // 64) * 64
+    else:
+        new_h = (new_h // 64) * 64
+        new_w = int(round(new_h * aspect))
+        new_w = (new_w // 64) * 64
+        new_h = int(round(new_w / aspect))
+        new_h = (new_h // 64) * 64
+
     return new_w, new_h
 
 
@@ -869,82 +800,56 @@ def _ensure_loaded_and_get_active_adapters(
 # Main inference function
 # -------------------------
 def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
-    """
-    Run inference for Qwen Image Edit 2511 Rapid AIO.
-    
-    Args:
-        job_id: unique job identifier (for output filenames)
-        prompt: text prompt for image editing
-        params:
-            - output_dir (str): output directory
-            - init_image (base64 string OR array of base64 strings): input image(s)
-                - Single string: one image
-                - Array: multiple images (up to 3 supported by Qwen Image Edit 2511)
-                - For 2-image LoRAs: ensure init_image is array with at least 2 images
-            - lora_adapter (str): LoRA adapter name (from ADAPTER_SPECS keys or "None")
-            - aio_version (str, optional): AIO version (default: v19)
-            - num_inference_steps (int, default: 4)
-            - guidance_scale (float, default: 1.0)
-            - seed (int, optional): random seed (if not provided, uses random)
-            - randomize_seed (bool, default: True): whether to randomize seed
-            - negative_prompt (str, optional): negative prompt
-    
-    Returns:
-        absolute path to final image
-    """
-    # Consistent global output path
     default_out = "/app/worker/outputs"
     output_dir = os.path.abspath(params.get("output_dir", default_out))
     os.makedirs(output_dir, exist_ok=True)
 
-    # Get pipeline (with optional version override)
     aio_version = params.get("aio_version")
     if aio_version:
         aio_version = _normalize_version(aio_version) or DEFAULT_AIO_VERSION
     pipeline = get_pipeline(version=aio_version)
 
-    # CRITICAL: Aggressive GPU memory cleanup before inference
-    # This maximizes available VRAM, especially important for 32GB cards
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
         torch.cuda.synchronize()
     
-    # Log memory state before inference
     if torch.cuda.is_available():
         try:
             allocated = torch.cuda.memory_allocated() / 1024**3
             reserved = torch.cuda.memory_reserved() / 1024**3
-            free = get_gpu_memory() - reserved
-            print(f"💾 GPU memory before inference: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved, {free:.2f} GB free")
-            
-            # Warn if memory is getting tight
-            if free < 4.0:
-                print(f"⚠️ WARNING: Only {free:.2f} GB free GPU memory. Inference may be at risk of OOM.")
+            # CORRECT free memory: actual CUDA free, not total-reserved
+            # mem_get_info() returns (free, total) from CUDA driver perspective,
+            # accounting for ALL processes and the CUDA context itself —
+            # not just what PyTorch knows about.
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free = free_bytes / 1024**3
+            print(
+                f"💾 GPU memory before inference: {allocated:.2f}GB allocated, "
+                f"{reserved:.2f}GB reserved, {free:.2f}GB truly free "
+                f"(of {total_bytes/1024**3:.1f}GB total)"
+            )
+            if free < 2.0:
+                raise RuntimeError(
+                    f"Insufficient GPU memory before inference: only {free:.2f}GB free. "
+                    f"Another process may be holding GPU memory. Run nvidia-smi to check."
+                )
+        except RuntimeError:
+            raise
         except Exception:
             pass
 
-    # Handle LoRA adapter
-    # OPTIMIZATION: Track active adapter config and skip set_adapters() if unchanged.
-    # set_adapters() walks every LoRA layer, toggling requires_grad — expensive and also
-    # triggers "requires_grad on inference tensor" errors after torch.inference_mode().
-    # By skipping redundant calls we avoid both the overhead AND the error.
     global _active_adapter_config
     lora_adapter = params.get("lora_adapter", NONE_LORA)
 
     if lora_adapter == NONE_LORA:
-        desired_config = ((), ())  # no adapters active
+        desired_config = ((), ())
     else:
-        # Ensure LoRA weights are loaded (cheap no-op if already in LOADED_ADAPTERS)
         adapter_names, adapter_weights = _ensure_loaded_and_get_active_adapters(pipeline, lora_adapter)
-        # Build a hashable key from (names, weights) to compare with current state
         desired_config = (tuple(adapter_names), tuple(adapter_weights))
 
     if desired_config != _active_adapter_config:
-        # Adapter config changed — must call set_adapters().
-        # Use torch.enable_grad() to temporarily exit inference mode so that
-        # requires_grad can be toggled on inference tensors created by the previous job.
         with torch.enable_grad():
             if lora_adapter == NONE_LORA:
                 try:
@@ -953,24 +858,18 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
                     if LOADED_ADAPTERS:
                         pipeline.set_adapters(list(LOADED_ADAPTERS), adapter_weights=[0.0] * len(LOADED_ADAPTERS))
             else:
-                # Clear GPU memory before loading LoRA (can be memory-intensive)
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-
                 pipeline.set_adapters(adapter_names, adapter_weights=adapter_weights)
-
-                # Clear GPU memory after loading LoRA
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-
-                # Log memory after LoRA loading
                 if torch.cuda.is_available():
                     try:
                         allocated = torch.cuda.memory_allocated() / 1024**3
                         reserved = torch.cuda.memory_reserved() / 1024**3
-                        print(f"💾 GPU memory after LoRA loading: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+                        print(f"💾 GPU memory after LoRA loading: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
                     except Exception:
                         pass
 
@@ -979,7 +878,6 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
     else:
         print(f"⚡ Adapter config unchanged ({lora_adapter}) → skipping set_adapters()")
 
-    # Handle seed
     seed = params.get("seed")
     randomize_seed = params.get("randomize_seed", True)
     if randomize_seed or seed is None:
@@ -989,27 +887,22 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
     
     generator = torch.Generator(device=device).manual_seed(seed)
 
-    # Handle negative prompt
     negative_prompt = params.get(
         "negative_prompt",
         "worst quality, low quality, bad anatomy, bad hands, text, error, missing fingers, "
         "extra digit, fewer digits, cropped, jpeg artifacts, signature, watermark, username, blurry"
     )
 
-    # Normalize images - init_image can be single base64 string or array of base64 strings
     init_image_input = params.get("init_image") or params.get("images")
     if not init_image_input:
         raise ValueError("No input images provided (init_image required)")
     
-    # Convert to list of PIL Images
     image_list = _ensure_image_list(init_image_input)
     if not image_list:
         raise ValueError("No valid images found in init_image")
     
-    # Convert all to RGB
     image_list = [img.convert("RGB") for img in image_list]
     
-    # Enforce 2-image LoRA behavior - check if init_image is array with at least 2 images
     if lora_requires_two_images(lora_adapter):
         if len(image_list) < 2:
             raise ValueError(
@@ -1017,28 +910,19 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
                 f"Please provide init_image as an array with at least 2 images."
             )
     
-    # Limit to 3 images (Qwen Image Edit 2511 supports up to 3)
     if len(image_list) > 3:
-        print(f"⚠️ Warning: {len(image_list)} images provided, but Qwen Image Edit 2511 supports up to 3. Using first 3 images.")
+        print(f"⚠️ {len(image_list)} images provided, using first 3.")
         image_list = image_list[:3]
     
-    # Resolution derived from first image
-    target_long_edge = get_target_long_edge_for_lora(lora_adapter)
-    width, height = compute_dimensions(image_list[0], target_long_edge)
-    
-    # CRITICAL: Resize images to computed dimensions to prevent cropping
-    # This ensures the output matches the full input image aspect ratio
+    max_dim = get_target_long_edge_for_lora(lora_adapter)
+    width, height = _get_dynamic_size_for_images(image_list, max_dim=max_dim)
     image_list = _resize_images_to(image_list, (width, height))
     
-    # Label images as image_1, image_2, image_3...
     labeled = build_labeled_images(image_list)
-
-    # Pass to pipeline in labeled order
     pipe_images = list(labeled.values())
     if len(pipe_images) == 1:
         pipe_images = pipe_images[0]
 
-    # Prepare pipeline inputs
     num_inference_steps = int(params.get("num_inference_steps", 4))
     guidance_scale = float(params.get("guidance_scale", 1.0))
 
@@ -1051,6 +935,19 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
     result = None
     image = None
     try:
+        # Final cache flush immediately before pipeline call
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+        # CRITICAL: inference_mode must wrap the pipeline call.
+        # Without it, PyTorch builds a full autograd graph for every operation,
+        # keeping ALL intermediate activation tensors alive for potential
+        # gradient computation. For this transformer this 2-3x the memory
+        # footprint during the forward pass and will cause OOM.
+        # torch.enable_grad() around set_adapters() above is a separate concern
+        # and does not affect this — inference_mode here is not redundant.
         with torch.inference_mode():
             result = pipeline(
                 image=pipe_images,
@@ -1061,12 +958,10 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
                 true_cfg_scale=guidance_scale,
             )
             image = result.images[0]
+
     except torch.cuda.OutOfMemoryError as e:
-        # CRITICAL: Handle OOM errors gracefully
-        print(f"❌ GPU OOM detected during inference: {e}")
+        print(f"❌ GPU OOM during inference: {e}")
         print("🧹 Performing aggressive GPU cleanup...")
-        
-        # Aggressive cleanup
         if result is not None:
             del result
         if image is not None:
@@ -1076,15 +971,12 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             torch.cuda.synchronize()
-        
-        # Re-raise with helpful message
         raise RuntimeError(
             f"GPU Out of Memory during inference. "
             f"Try reducing image size, num_inference_steps, or using a smaller LoRA adapter. "
             f"Original error: {e}"
         )
     except Exception as e:
-        # Handle any other exceptions during inference
         print(f"❌ Error during inference: {e}")
         if result is not None:
             del result
@@ -1097,27 +989,26 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
             torch.cuda.synchronize()
         raise
     finally:
-        # CRITICAL: Aggressive GPU memory cleanup after inference
-        # This prevents OOM on back-to-back jobs, especially on 32GB cards
         if result is not None:
             del result
-        # Note: Don't delete image here - we need it for saving
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             torch.cuda.synchronize()
-        
-        # Log memory state after inference
         if torch.cuda.is_available():
             try:
                 allocated = torch.cuda.memory_allocated() / 1024**3
                 reserved = torch.cuda.memory_reserved() / 1024**3
-                print(f"💾 GPU memory after inference: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+                free_bytes, _ = torch.cuda.mem_get_info()
+                free = free_bytes / 1024**3
+                print(
+                    f"💾 GPU memory after inference: {allocated:.2f}GB allocated, "
+                    f"{reserved:.2f}GB reserved, {free:.2f}GB truly free"
+                )
             except Exception:
                 pass
 
-    # Save the image (only if inference succeeded)
     if image is None:
         raise RuntimeError("Inference failed: no image was generated")
     
@@ -1125,14 +1016,9 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
     image.save(out_path)
     print(f"✅ Saved base image: {out_path}")
 
-    # Optional upscaling
     if params.get("scale_image", False):
         scale_factor = int(params.get("scale_factor", 2))
-        # Determine model based on scale factor
-        if scale_factor <= 2:
-            model_name = "RealESRGAN_x2plus"
-        else:
-            model_name = "RealESRGAN_x4plus"
+        model_name = "RealESRGAN_x2plus" if scale_factor <= 2 else "RealESRGAN_x4plus"
         try:
             from upscaler import upscale_image
             upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
@@ -1142,14 +1028,10 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
             return os.path.abspath(up_path)
         except Exception as e:
             print(f"⚠️ Upscaling failed: {e}")
-            print("Model name: ", model_name)
-            print("Scale factor: ", scale_factor)
-            print("Out path: ", out_path)
             print(traceback.format_exc())
             return os.path.abspath(out_path)
 
     return os.path.abspath(out_path)
-
 
 # -------------------------
 # CLI test mode

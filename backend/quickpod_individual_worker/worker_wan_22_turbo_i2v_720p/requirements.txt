@@ -1,0 +1,26 @@
+# WAN 2.2 TurboDiffusion I2V 720p worker
+# TurboDiffusion is installed from git clone in the Dockerfile (with submodules).
+# SageSLA installed in Dockerfile via SpargeAttn.
+
+torch>=2.7.0
+torchvision
+einops
+tqdm
+Pillow
+numpy
+requests
+fastapi
+uvicorn[standard]
+pydantic
+tenacity
+httpx
+ftfy
+regex
+transformers
+safetensors
+imageio-ffmpeg
+huggingface_hub
+
+# Optional video postprocessing (RIFE / Real-ESRGAN)
+spandrel>=0.4.0
+diffusers

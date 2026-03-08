@@ -287,7 +287,13 @@ async def run_inference_and_save(job_id: str, prompt: Optional[str], model: str,
 # -----------------------
 async def process_job_item(item: Dict[str, Any]):
     job_id, model, prompt = item["job_id"], item["model"], item.get("prompt")
-    params, upload_url, result_key = item.get("params", {}), item["upload_url"], item["result_key"]
+    params = item.get("params", {})
+    upload_url = item.get("upload_url")
+    result_key = item.get("result_key")
+
+    if not upload_url or not result_key:
+        logger.error(f"[{job_id}] Missing upload_url or result_key in job item; cannot upload or notify")
+        raise ValueError("Missing upload_url or result_key in job item")
 
     # Resolve any URL-valued media fields to base64 before inference
     try:
@@ -301,17 +307,30 @@ async def process_job_item(item: Dict[str, Any]):
     try:
         async with semaphore:
             out_local = await run_inference_and_save(job_id, prompt, model, None, params)
-            if not upload_url.startswith("http://dummy-upload"):
+            logger.info(f"[{job_id}] Inference finished, result at {out_local}")
+            if str(upload_url).startswith("http://dummy-upload"):
+                logger.info(f"[{job_id}] Skipping R2 upload (dummy upload_url)")
+            else:
+                logger.info(f"[{job_id}] Uploading result to R2...")
                 if not await _upload_with_retry(out_local, upload_url, job_id):
                     raise Exception("Upload failed")
+                logger.info(f"[{job_id}] R2 upload succeeded")
 
             is_autotest = job_id.startswith("autotest-")
             if CONTROLLER_URL and not is_autotest:
-                try:
-                    await asyncio.get_running_loop().run_in_executor(IO_EXECUTOR, post_signed_json,
-                        f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": result_key, "next_job_id": _peek_next_job_id()}, 10, 5)
-                except Exception:
-                    pass
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(IO_EXECUTOR, post_signed_json,
+                            f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": result_key, "next_job_id": _peek_next_job_id()}, 10, 5)
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        if attempt < 2:
+                            await asyncio.sleep(2 ** attempt)
+                if last_err is not None:
+                    logger.error(f"[{job_id}] job_complete (success) failed after retries: {last_err}")
 
             async with job_status_lock:
                 job_status[job_id] = {"status": "completed", "result_r2_key": result_key}
@@ -328,8 +347,8 @@ async def process_job_item(item: Dict[str, Any]):
             try:
                 await asyncio.get_running_loop().run_in_executor(IO_EXECUTOR, post_signed_json,
                     f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": None, "failed": True, "next_job_id": _peek_next_job_id()}, 10, 5)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"[{job_id}] job_complete (failed) failed: {e}")
         asyncio.create_task(_cleanup_job_status(job_id, 60))
 
 async def _upload_with_retry(file_path: str, upload_url: str, job_id: str, max_retries: int = 3) -> bool:
@@ -340,7 +359,8 @@ async def _upload_with_retry(file_path: str, upload_url: str, job_id: str, max_r
         try:
             await asyncio.get_running_loop().run_in_executor(IO_EXECUTOR, _upload)
             return True
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[{job_id}] R2 upload attempt {attempt + 1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(2 ** attempt)
     return False
@@ -359,8 +379,9 @@ async def worker_loop():
             try:
                 await process_job_item(item)
                 consecutive_errors = 0
-            except Exception:
+            except Exception as e:
                 consecutive_errors += 1
+                logger.exception(f"process_job_item raised (job may be lost): {e}")
                 if consecutive_errors >= 5:
                     cleanup_gpu(verbose=True)
                     consecutive_errors = 0
@@ -391,7 +412,7 @@ async def run_autotest():
     async with httpx.AsyncClient(timeout=300.0) as client:
         resp = await client.post("http://127.0.0.1:8000/run", json={
             "job_id": test_job_id, "prompt": "", "model": "swin2sr",
-            "params": {"init_image": img_b64, "output_dir": "./outputs", "scale": "swin2sr_x2"},
+            "params": {"init_image": img_b64, "output_dir": "./outputs", "scale": "swin2sr_x4"},
             "upload_url": "http://dummy-upload/skip", "result_key": f"{test_job_id}.png"})
         logger.info(f"🔥 Auto-test response: {resp.status_code}")
 

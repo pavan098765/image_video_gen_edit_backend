@@ -112,11 +112,12 @@ echo "  Found $MODEL_COUNT model file(s)"
 # ---------------------------------------------------------------------------
 # Verify workflow exists
 # ---------------------------------------------------------------------------
-if [ ! -f "$WORKFLOW_DIR/wan_22_i2v_svi.json" ]; then
-    echo "ERROR: Workflow not found at $WORKFLOW_DIR/wan_22_i2v_svi.json"
+NEW_WORKFLOW="WAN2.2 T2V-I2V-T2I-S2V K3NK v2.5.4 SVI.json"
+if [ ! -f "$WORKFLOW_DIR/$NEW_WORKFLOW" ]; then
+    echo "ERROR: Workflow not found at $WORKFLOW_DIR/$NEW_WORKFLOW"
     exit 1
 fi
-echo "  Workflow found"
+echo "  Workflow found: $NEW_WORKFLOW"
 
 # ---------------------------------------------------------------------------
 # Create workspace directory

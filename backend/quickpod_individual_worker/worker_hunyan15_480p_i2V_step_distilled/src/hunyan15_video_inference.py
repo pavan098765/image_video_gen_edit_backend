@@ -77,12 +77,14 @@ HUNYAN15_REPO_ID = os.environ.get(
 MODEL_DIR = os.environ.get("HUNYAN15_MODEL_LOCAL_PATH", "/app/models/hunyan15")
 MODELS_DIR = os.environ.get("MODELS_DIR", "/app/models")
 
-# Inference defaults
+# Inference defaults (480p model)
 DEFAULT_FPS = 24
 MAX_SEED = np.iinfo(np.int32).max
-MAX_HEIGHT = 1024
-MAX_WIDTH = 1024
-MAX_FRAMES = 240  # approximately 10 seconds at 24fps
+MAX_HEIGHT = 480   # 480p vertical resolution
+MAX_WIDTH = 864   # 480p 16:9 width (mod 16)
+MAX_FRAMES = 240  # max 8 seconds at 24fps
+MIN_DURATION = 4  # seconds
+MAX_DURATION = 10  # seconds
 
 # Step distilled model uses only 12 steps
 NUM_INFERENCE_STEPS = 12
@@ -454,7 +456,8 @@ def run_inference_hunyan15_i2v(
         prompt: Text prompt describing the animation
         image_input: Base64 encoded image or image URL
         params:
-            - num_frames (int): Number of frames (default: 121)
+            - duration (float): Video duration in seconds (4-8). If set, frames = duration * fps.
+            - num_frames (int): Number of frames (default: 121, used when duration not set)
             - num_inference_steps (int): Denoising steps (default: 12)
             - seed (int): Random seed
             - fps (int): Frames per second (default: 24)
@@ -474,15 +477,21 @@ def run_inference_hunyan15_i2v(
     cleanup_gpu_memory()
     
     # Parameters
-    num_frames = int(params.get("num_frames", 121))
+    fps = int(params.get("fps", DEFAULT_FPS))
+    duration = params.get("duration")
+    if duration is not None:
+        # Duration-based: clamp to [4, 8] sec, compute frames at fps (max 240 at 24fps)
+        duration_sec = max(MIN_DURATION, min(MAX_DURATION, float(duration)))
+        num_frames = max(1, min(MAX_FRAMES, int(duration_sec * fps)))
+    else:
+        num_frames = int(params.get("num_frames", 121))
     num_inference_steps = int(params.get("num_inference_steps", NUM_INFERENCE_STEPS))
     # Note: guidance_scale is not supported by HunyuanVideo15ImageToVideoPipeline
     seed = int(params.get("seed", random.randint(0, MAX_SEED)))
-    fps = int(params.get("fps", DEFAULT_FPS))
     output_dir = params.get("output_dir", "/app/worker/outputs")
     
     # Validate parameters
-    num_frames = min(num_frames, MAX_FRAMES)
+    num_frames = max(1, min(num_frames, MAX_FRAMES))
     num_inference_steps = max(1, num_inference_steps)
     
     logger.info(f"[{job_id}] 📐 Configuration: frames={num_frames}, steps={num_inference_steps}, fps={fps}, seed={seed}")
@@ -584,13 +593,23 @@ def run_inference_hunyan15_i2v(
             final_width = None
             
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            
-            enable_rife = params.get("enable_rife", False)
-            rife_target_fps = params.get("rife_target_fps", 30)
-            enable_upscaling = params.get("enable_upscaling", False)
+
+            # Coerce bools so "true"/"false" from JSON work; support enable_upscale alias
+            def _bool_param(p, key, default=False):
+                v = p.get(key, default)
+                if isinstance(v, bool):
+                    return v
+                if isinstance(v, str):
+                    return v.strip().lower() in ("true", "1", "yes")
+                return bool(v)
+
+            enable_rife = _bool_param(params, "enable_rife", False)
+            rife_target_fps = int(params.get("rife_target_fps", 30))
+            force_target_fps = _bool_param(params, "force_target_fps", True)
+            enable_upscaling = _bool_param(params, "enable_upscaling", False) or _bool_param(params, "enable_upscale", False)
             upscale_factor = int(params.get("upscale_factor", 2))
-            postprocess_interpolate_first = params.get("postprocess_interpolate_first", False)
-            
+            postprocess_interpolate_first = _bool_param(params, "postprocess_interpolate_first", False)
+
             if POSTPROCESSING_AVAILABLE and (enable_rife or enable_upscaling):
                 postprocess_start = time.time()
                 
@@ -625,7 +644,7 @@ def run_inference_hunyan15_i2v(
                     if enable_rife and rife_model:
                         try:
                             final_output, actual_fps = apply_rife_interpolation(
-                                rife_model, final_output, device, original_fps=fps, target_fps=rife_target_fps
+                                rife_model, final_output, device, original_fps=fps, target_fps=rife_target_fps, force_target_fps=force_target_fps
                             )
                             final_fps = actual_fps
                         except Exception as e:
@@ -647,7 +666,7 @@ def run_inference_hunyan15_i2v(
                     if enable_rife and rife_model:
                         try:
                             final_output, actual_fps = apply_rife_interpolation(
-                                rife_model, final_output, device, original_fps=fps, target_fps=rife_target_fps
+                                rife_model, final_output, device, original_fps=fps, target_fps=rife_target_fps, force_target_fps=force_target_fps
                             )
                             final_fps = actual_fps
                         except Exception as e:

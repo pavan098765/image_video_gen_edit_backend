@@ -7,7 +7,7 @@ import asyncio
 import hmac
 import hashlib
 import gc
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 import uuid
 import httpx
@@ -46,6 +46,13 @@ IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=4,
     thread_name_prefix="io"
 )
+
+# -----------------------
+# Pod startup time tracking
+# -----------------------
+POD_START_TIME = time.time()
+FIRST_INFERENCE_START_TIME = None
+_first_inference_lock = asyncio.Lock()
 
 # -----------------------
 # GPU cleanup
@@ -495,34 +502,37 @@ def resolve_inference_callable(model: str, mode: Optional[str]):
 
 async def run_inference_and_save(
     job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]
-) -> str:
-    """
-    Run inference in a dedicated thread pool to avoid blocking FastAPI endpoints.
-    
-    CRITICAL: This uses INFERENCE_EXECUTOR (dedicated pool) instead of the default executor.
-    This ensures /health and /run endpoints remain responsive during heavy GPU work.
-    """
-    global last_model_key
+) -> Tuple[str, Dict[str, float]]:
+    """Run inference in a dedicated thread pool. Returns (output_path, metrics_dict)."""
+    global last_model_key, FIRST_INFERENCE_START_TIME
     loop = asyncio.get_event_loop()
     params = params.copy()
     params.setdefault("output_dir", WORKSPACE_DIR)
 
-    # Prompt enhancement for image editing
+    async with _first_inference_lock:
+        if FIRST_INFERENCE_START_TIME is None:
+            FIRST_INFERENCE_START_TIME = time.time()
+            startup_time = FIRST_INFERENCE_START_TIME - POD_START_TIME
+        else:
+            startup_time = None
+
     if params.get("enhance_prompt", False):
         prompt = await loop.run_in_executor(IO_EXECUTOR, _enhance_prompt, prompt, job_id)
 
     inference_func = resolve_inference_callable(model, mode)
     model_key = model
-
     if last_model_key and last_model_key != model_key:
         logger.info(f"Switching model {last_model_key} -> {model_key}, cleaning up GPU first")
         cleanup_gpu()
 
+    inference_start_time = time.time()
     try:
-        # CRITICAL: Use dedicated INFERENCE_EXECUTOR to avoid blocking FastAPI event loop
-        # This prevents /health timeouts during inference
         out_path = await loop.run_in_executor(INFERENCE_EXECUTOR, inference_func, job_id, prompt, params)
-        return out_path
+        processing_time = time.time() - inference_start_time
+        metrics = {"processing_time_seconds": round(processing_time, 2)}
+        if startup_time is not None:
+            metrics["startup_time_seconds"] = round(startup_time, 2)
+        return out_path, metrics
     finally:
         last_model_key = model_key
 
@@ -564,7 +574,7 @@ async def process_job_item(item: Dict[str, Any]):
         async with semaphore:
             # Run inference
             logger.info(f"[{job_id}] Starting inference...")
-            out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
+            out_local, metrics = await run_inference_and_save(job_id, prompt, model, mode, params)
             logger.info(f"[{job_id}] Inference completed, output: {out_local}")
 
             # Upload result with retry
@@ -581,7 +591,7 @@ async def process_job_item(item: Dict[str, Any]):
             is_autotest = job_id.startswith("autotest-")
             if CONTROLLER_URL and not is_autotest:
                 logger.info(f"[{job_id}] Notifying controller of completion...")
-                payload = {"job_id": job_id, "result_r2_key": result_key, "next_job_id": _peek_next_job_id()}
+                payload = {"job_id": job_id, "result_r2_key": result_key, "next_job_id": _peek_next_job_id(), "metrics": metrics}
                 url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
                 try:
                     # post_signed_json(url, payload, timeout=10, max_retries=5)
@@ -655,12 +665,18 @@ async def process_job_item(item: Dict[str, Any]):
         # Notify controller with retry (skip for autotest jobs - they're not on the server)
         is_autotest = job_id.startswith("autotest-")
         if CONTROLLER_URL and not is_autotest:
+            fail_metrics = {}
+            async with _first_inference_lock:
+                if FIRST_INFERENCE_START_TIME is None:
+                    FIRST_INFERENCE_START_TIME = time.time()
+                    fail_metrics["startup_time_seconds"] = round(FIRST_INFERENCE_START_TIME - POD_START_TIME, 2)
             payload = {
                 "job_id": job_id, 
                 "result_r2_key": None, 
                 "failed": True, 
                 "error": error_str,
                 "next_job_id": _peek_next_job_id(),
+                "metrics": fail_metrics if fail_metrics else None,
             }
             try:
                 url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"

@@ -28,7 +28,7 @@ import time
 import traceback
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download
 
 # ---------------------------------------------------------------------------
 # Resolve project root
@@ -116,13 +116,17 @@ MODEL_FILES = [
     },
 ]
 
-# RIFE model weights (for frame interpolation post-processing)
+# RIFE model weights (optional: for post-workflow frame interpolation in inference code).
+# The v2.5.4 workflow uses built-in FL_RIFE; Python RIFE is only needed if you add
+# a post-processing step (e.g. run RIFE on workflow output). Use --with-rife to download.
 RIFE_MODEL_DIR = os.path.join(MODELS_DIR, "..", "rife_weights")  # Store outside ComfyUI models dir
 
 # ---------------------------------------------------------------------------
 # Custom node definitions
 # ---------------------------------------------------------------------------
-
+# All entries below are required by workflow "WAN2.2 T2V-I2V-T2I-S2V K3NK v2.5.4 SVI.json".
+# Generated from workflow_node_types.txt; add or strip nodes in comfyui_inference if workflow changes.
+#
 CUSTOM_NODES = [
     {
         "name": "ComfyUI-WanVideoWrapper",
@@ -132,19 +136,291 @@ CUSTOM_NODES = [
     {
         "name": "ComfyUI-KJNodes",
         "url": "https://github.com/kijai/ComfyUI-KJNodes.git",
-        "description": "SetNode, GetNode, INTConstant, SimpleMath, ImageResizeKJv2",
+        "description": "SetNode, GetNode, INTConstant, SimpleMath+, ImageResizeKJv2, PrimitiveFloat, PrimitiveInt",
     },
     {
         "name": "ComfyUI-VideoHelperSuite",
         "url": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git",
-        "description": "VHS_VideoCombine (video output), VRAM_Debug",
+        "description": "VHS_VideoCombine, VHS_LoadVideo, VHS_SelectEveryNthImage, etc.",
     },
     {
         "name": "ComfyUI_essentials",
         "url": "https://github.com/cubiq/ComfyUI_essentials.git",
-        "description": "GetImageSizeAndCount, GetImageRangeFromBatch",
+        "description": "GetImageSizeAndCount, GetImageRangeFromBatch, ImageFromBatch+",
+    },
+    {
+        "name": "ComfyUI-Easy-Use",
+        "url": "https://github.com/yolain/ComfyUI-Easy-Use.git",
+        "description": "easy cleanGpuUsed, easy mathFloat/Int, easy promptReplace, easy textIndexSwitch",
+    },
+    # --- Workflow custom nodes (from workflow_node_types.txt) ---
+    {
+        "name": "comfyui-various",
+        "url": "https://github.com/jamesWalker55/comfyui-various.git",
+        "description": "JWFloatToInteger",
+    },
+    {
+        "name": "rgthree-comfy",
+        "url": "https://github.com/rgthree/rgthree-comfy.git",
+        "description": "Any Switch, Seed, Bookmark, Display Int, Fast Groups, Label, Mute/Bypass, Power Lora Loader",
+    },
+    {
+        "name": "ComfyUI_Fill-Nodes",
+        "url": "https://github.com/filliptm/ComfyUI_Fill-Nodes.git",
+        "description": "FL_RIFE (frame interpolation)",
+    },
+    {
+        "name": "ComfyUI-Impact-Pack",
+        "url": "https://github.com/ltdrdata/ComfyUI-Impact-Pack.git",
+        "description": "ImpactWildcardProcessor and other Impact nodes",
+    },
+    {
+        "name": "ComfyUI-Inspire-Pack",
+        "url": "https://github.com/ltdrdata/ComfyUI-Inspire-Pack.git",
+        "description": "LoadImagesFromDir //Inspire",
+    },
+    {
+        "name": "ComfyUI-Custom-Scripts",
+        "url": "https://github.com/pythongosssss/ComfyUI-Custom-Scripts.git",
+        "description": "MathExpression|pysssss, PlaySound|pysssss",
+    },
+    {
+        "name": "ComfyUI-K3NKImageGrab",
+        "url": "https://github.com/K3NK3/ComfyUI-K3NKImageGrab.git",
+        "description": "K3NKImageGrab",
+    },
+    {
+        "name": "ComfyUI-K3NK-ComfyUI-Nodes",
+        "url": "https://github.com/K3NK3/ComfyUI-K3NK-ComfyUI-Nodes.git",
+        "description": "K3NKImageLoaderWithBlending, K3NKSaveLatentPassThrought",
+    },
+    {
+        "name": "wlsh_nodes",
+        "url": "https://github.com/wallish77/wlsh_nodes.git",
+        "description": "Resolutions by Ratio (WLSH)",
+    },
+    {
+        "name": "ComfyUI-post-processing-nodes",
+        "url": "https://github.com/EllangoK/ComfyUI-post-processing-nodes.git",
+        "description": "ColorCorrect",
+    },
+    {
+        "name": "ComfyUI_Comfyroll_CustomNodes",
+        "url": "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes.git",
+        "description": "CR String To Combo, CR Text",
+    },
+    {
+        "name": "ComfyMath",
+        "url": "https://github.com/evanspearman/ComfyMath.git",
+        "description": "CM_FloatToInt, CM_IntToFloat",
+    },
+    {
+        "name": "ComfyUI_tinyterraNodes",
+        "url": "https://github.com/TinyTerra/ComfyUI_tinyterraNodes.git",
+        "description": "ttN concat, ttN int, ttN text",
+    },
+    {
+        "name": "Derfuu_ComfyUI_ModdedNodes",
+        "url": "https://github.com/Derfuu/Derfuu_ComfyUI_ModdedNodes.git",
+        "description": "DF_Int_to_Float",
+    },
+    {
+        "name": "ComfyUI-QHNodes",
+        "url": "https://github.com/liuqianhonga/ComfyUI-QHNodes.git",
+        "description": "QHNodes utilities",
+    },
+    {
+        "name": "Comfyui-ergouzi-Nodes",
+        "url": "https://github.com/11dogzi/Comfyui-ergouzi-Nodes.git",
+        "description": "EG_WXZ_QH (Unrestricted switching)",
+    },
+    {
+        "name": "ComfyUI-FramePackWrapper_PlusOne",
+        "url": "https://github.com/tori29umai0123/ComfyUI-FramePackWrapper_PlusOne.git",
+        "description": "FramePackFindNearestBucket",
+    },
+    # --- Additional nodes from validate_workflow_nodes missing list ---
+    {
+        "name": "ComfyUI-Addoor",
+        "url": "https://github.com/Eagle-CN/ComfyUI-Addoor.git",
+        "description": "Incrementer 🪴",
+    },
+    {
+        "name": "ComfyUI-pause",
+        "url": "https://github.com/wywywywy/ComfyUI-pause.git",
+        "description": "PauseWorkflowNode",
+    },
+    {
+        "name": "ComfyUI-mxToolkit",
+        "url": "https://github.com/Smirnov75/ComfyUI-mxToolkit.git",
+        "description": "mxSlider2D, mxStop",
+    },
+    {
+        "name": "ComfyUI-MelBandRoFormer",
+        "url": "https://github.com/kijai/ComfyUI-MelBandRoFormer.git",
+        "description": "MelBandRoFormerModelLoader, MelBandRoFormerSampler, NormalizeAudioLoudness, PreviewAudio",
+    },
+    {
+        "name": "ComfyUI-MMAudio",
+        "url": "https://github.com/kijai/ComfyUI-MMAudio.git",
+        "description": "MMAudioFeatureUtilsLoader, MMAudioModelLoader, MMAudioSampler",
+    },
+    {
+        "name": "ComfyUI-NovaSR",
+        "url": "https://github.com/Saganaki22/ComfyUI-NovaSR.git",
+        "description": "NovaSR (audio super resolution)",
+    },
+    {
+        "name": "ComfyUI-Florence2",
+        "url": "https://github.com/kijai/ComfyUI-Florence2.git",
+        "description": "DownloadAndLoadFlorence2Model, Florence2Run",
+    },
+    {
+        "name": "RES4LYF",
+        "url": "https://github.com/ClownsharkBatwing/RES4LYF.git",
+        "description": "Sigmas Split Value",
+    },
+    {
+        "name": "comfyui-vrgamedevgirl",
+        "url": "https://github.com/vrgamegirl19/comfyui-vrgamedevgirl.git",
+        "description": "ColorMatchToReference",
+    },
+    {
+        "name": "efficiency-nodes-comfyui",
+        "url": "https://github.com/jags111/efficiency-nodes-comfyui.git",
+        "description": "Image Overlay",
     },
 ]
+
+
+# ---------------------------------------------------------------------------
+# Workflow node type -> source (for coverage check vs workflow_node_types.txt)
+# ---------------------------------------------------------------------------
+# "builtin" = ComfyUI core; otherwise = CUSTOM_NODES entry "name".
+# Used by check_workflow_node_coverage() to ensure every type is either builtin or installed.
+WORKFLOW_NODE_SOURCE: dict[str, str] = {
+    # Built-in ComfyUI
+    "BasicScheduler": "builtin",
+    "CLIPTextEncode": "builtin",
+    "CLIPVisionLoader": "builtin",
+    "CreateCFGScheduleFloatList": "builtin",
+    "LoadImage": "builtin",
+    "Note": "builtin",
+    "PreviewImage": "builtin",
+    "Reroute": "builtin",
+    "SaveImage": "builtin",
+    "UpscaleModelLoader": "builtin",
+    "ImageUpscaleWithModelBatched": "builtin",
+    "ImageScaleBy": "builtin",
+    "SaveLatent": "builtin",
+    # WanVideoWrapper
+    "DummyComfyWanModelObject": "ComfyUI-WanVideoWrapper",
+    "WanVideoApplyNAG": "ComfyUI-WanVideoWrapper",
+    "WanVideoBlockList": "ComfyUI-WanVideoWrapper",
+    "WanVideoBlockSwap": "ComfyUI-WanVideoWrapper",
+    "WanVideoClipVisionEncode": "ComfyUI-WanVideoWrapper",
+    "WanVideoContextOptions": "ComfyUI-WanVideoWrapper",
+    "WanVideoDecode": "ComfyUI-WanVideoWrapper",
+    "WanVideoEmptyEmbeds": "ComfyUI-WanVideoWrapper",
+    "WanVideoEncode": "ComfyUI-WanVideoWrapper",
+    "WanVideoEncodeLatentBatch": "ComfyUI-WanVideoWrapper",
+    "WanVideoEnhanceAVideo": "ComfyUI-WanVideoWrapper",
+    "WanVideoExperimentalArgs": "ComfyUI-WanVideoWrapper",
+    "WanVideoImageToVideoEncode": "ComfyUI-WanVideoWrapper",
+    "WanVideoLoraSelect": "ComfyUI-WanVideoWrapper",
+    "WanVideoLoraSelectMulti": "ComfyUI-WanVideoWrapper",
+    "WanVideoModelLoader": "ComfyUI-WanVideoWrapper",
+    "WanVideoSVIProEmbeds": "ComfyUI-WanVideoWrapper",
+    "WanVideoSampler": "ComfyUI-WanVideoWrapper",
+    "WanVideoScheduler": "ComfyUI-WanVideoWrapper",
+    "WanVideoSetBlockSwap": "ComfyUI-WanVideoWrapper",
+    "WanVideoSetLoRAs": "ComfyUI-WanVideoWrapper",
+    "WanVideoSetRadialAttention": "ComfyUI-WanVideoWrapper",
+    "WanVideoSigmaToStep": "ComfyUI-WanVideoWrapper",
+    "WanVideoTextEncodeCached": "ComfyUI-WanVideoWrapper",
+    "WanVideoTorchCompileSettings": "ComfyUI-WanVideoWrapper",
+    "WanVideoVAELoader": "ComfyUI-WanVideoWrapper",
+    # ComfyUI-KJNodes
+    "INTConstant": "ComfyUI-KJNodes",
+    "ImageResizeKJv2": "ComfyUI-KJNodes",
+    "SimpleMath+": "ComfyUI-KJNodes",
+    "PrimitiveFloat": "ComfyUI-KJNodes",
+    "PrimitiveInt": "ComfyUI-KJNodes",
+    "PrimitiveNode": "ComfyUI-KJNodes",
+    "FloatConstant": "ComfyUI-KJNodes",
+    # ComfyUI-VideoHelperSuite
+    "VHS_LoadAudio": "ComfyUI-VideoHelperSuite",
+    "VHS_LoadVideo": "ComfyUI-VideoHelperSuite",
+    "VHS_LoadVideoFFmpeg": "ComfyUI-VideoHelperSuite",
+    "VHS_SelectEveryNthImage": "ComfyUI-VideoHelperSuite",
+    "VHS_VideoCombine": "ComfyUI-VideoHelperSuite",
+    # ComfyUI_essentials
+    "GetImageSizeAndCount": "ComfyUI_essentials",
+    "ImageFromBatch+": "ComfyUI_essentials",
+    # ComfyUI-Easy-Use
+    "easy cleanGpuUsed": "ComfyUI-Easy-Use",
+    "easy mathFloat": "ComfyUI-Easy-Use",
+    "easy mathInt": "ComfyUI-Easy-Use",
+    "easy promptReplace": "ComfyUI-Easy-Use",
+    "easy showAnything": "ComfyUI-Easy-Use",
+    "easy textIndexSwitch": "ComfyUI-Easy-Use",
+    # Other custom nodes (same order as CUSTOM_NODES)
+    "JWFloatToInteger": "comfyui-various",
+    "Any Switch (rgthree)": "rgthree-comfy",
+    "Bookmark (rgthree)": "rgthree-comfy",
+    "Display Int (rgthree)": "rgthree-comfy",
+    "Fast Groups Bypasser (rgthree)": "rgthree-comfy",
+    "Fast Groups Muter (rgthree)": "rgthree-comfy",
+    "Label (rgthree)": "rgthree-comfy",
+    "Mute / Bypass Relay (rgthree)": "rgthree-comfy",
+    "Mute / Bypass Repeater (rgthree)": "rgthree-comfy",
+    "Power Lora Loader (rgthree)": "rgthree-comfy",
+    "Seed (rgthree)": "rgthree-comfy",
+    "FL_RIFE": "ComfyUI_Fill-Nodes",
+    "ImpactWildcardProcessor": "ComfyUI-Impact-Pack",
+    "LoadImagesFromDir //Inspire": "ComfyUI-Inspire-Pack",
+    "MathExpression|pysssss": "ComfyUI-Custom-Scripts",
+    "PlaySound|pysssss": "ComfyUI-Custom-Scripts",
+    "K3NKImageGrab": "ComfyUI-K3NKImageGrab",
+    "K3NKImageLoaderWithBlending": "ComfyUI-K3NK-ComfyUI-Nodes",
+    "K3NKSaveLatentPassThrought": "ComfyUI-K3NK-ComfyUI-Nodes",
+    "Resolutions by Ratio (WLSH)": "wlsh_nodes",
+    "ColorCorrect": "ComfyUI-post-processing-nodes",
+    "CR String To Combo": "ComfyUI_Comfyroll_CustomNodes",
+    "CR Text": "ComfyUI_Comfyroll_CustomNodes",
+    "CM_FloatToInt": "ComfyMath",
+    "CM_IntToFloat": "ComfyMath",
+    "ttN concat": "ComfyUI_tinyterraNodes",
+    "ttN int": "ComfyUI_tinyterraNodes",
+    "ttN text": "ComfyUI_tinyterraNodes",
+    "DF_Int_to_Float": "Derfuu_ComfyUI_ModdedNodes",
+    "EG_WXZ_QH": "Comfyui-ergouzi-Nodes",
+    # Additional from workflow_node_types.txt
+    "FramePackFindNearestBucket": "ComfyUI-FramePackWrapper_PlusOne",
+    "PreviewAny": "builtin",
+    "PreviewBridge": "ComfyUI-Impact-Pack",
+    "Image Overlay": "efficiency-nodes-comfyui",
+    "FastFilmGrain": "ComfyUI-post-processing-nodes",
+    "ImageSharpen": "ComfyUI-post-processing-nodes",
+    # Nodes that were reported missing by validate_workflow_nodes
+    "ColorMatchToReference": "comfyui-vrgamedevgirl",
+    "DownloadAndLoadFlorence2Model": "ComfyUI-Florence2",
+    "Florence2Run": "ComfyUI-Florence2",
+    "Incrementer 🪴": "ComfyUI-Addoor",
+    "MarkdownNote": "ComfyUI-Impact-Pack",
+    "MMAudioFeatureUtilsLoader": "ComfyUI-MMAudio",
+    "MMAudioModelLoader": "ComfyUI-MMAudio",
+    "MMAudioSampler": "ComfyUI-MMAudio",
+    "MelBandRoFormerModelLoader": "ComfyUI-MelBandRoFormer",
+    "MelBandRoFormerSampler": "ComfyUI-MelBandRoFormer",
+    "NormalizeAudioLoudness": "ComfyUI-MelBandRoFormer",
+    "PreviewAudio": "ComfyUI-MelBandRoFormer",
+    "NovaSR": "ComfyUI-NovaSR",
+    "PauseWorkflowNode": "ComfyUI-pause",
+    "Sigmas Split Value": "RES4LYF",
+    "mxSlider2D": "ComfyUI-mxToolkit",
+    "mxStop": "ComfyUI-mxToolkit",
+}
 
 
 # ============================================================================
@@ -183,6 +459,47 @@ def clone_comfyui():
 # ============================================================================
 # 2. Install custom nodes
 # ============================================================================
+
+def check_workflow_node_coverage() -> bool:
+    """
+    Read workflow_node_types.txt and verify every type is either builtin or
+    provided by a CUSTOM_NODES repo we install. Prints report; returns False
+    if any type is unmapped (so caller can warn or fail).
+    """
+    types_file = os.path.join(WORKFLOW_DIR, "workflow_node_types.txt")
+    if not os.path.isfile(types_file):
+        print(f"  (No {types_file} — run: python src/scan_workflow_nodes.py)")
+        return True
+
+    custom_node_names = {n["name"] for n in CUSTOM_NODES}
+    with open(types_file, encoding="utf-8") as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+
+    unmapped = []
+    for raw in lines:
+        # Skip UUID-like ids (from workflow node ids, not type names)
+        if len(raw) == 36 and raw.count("-") >= 4:
+            continue
+        if raw not in WORKFLOW_NODE_SOURCE:
+            unmapped.append(raw)
+            continue
+        src = WORKFLOW_NODE_SOURCE[raw]
+        if src != "builtin" and src not in custom_node_names:
+            unmapped.append(f"{raw} (repo '{src}' not in CUSTOM_NODES)")
+            continue
+
+    if unmapped:
+        print(f"  Workflow node types not in prep mapping ({len(unmapped)}):")
+        for u in sorted(set(unmapped))[:30]:
+            print(f"    - {u}")
+        if len(unmapped) > 30:
+            print(f"    ... and {len(unmapped) - 30} more")
+        print("  After starting ComfyUI, run: python src/validate_workflow_nodes.py")
+        print("  to see which nodes are actually missing at runtime.")
+        return False
+    print(f"  All {len(lines)} workflow node types mapped (builtin or CUSTOM_NODES).")
+    return True
+
 
 def install_custom_nodes():
     """Clone required custom node repositories."""
@@ -276,11 +593,13 @@ def download_models():
 
 
 # ============================================================================
-# 3b. Download RIFE model weights
+# 3b. Download RIFE model weights (optional, use --with-rife)
 # ============================================================================
 
 def download_rife_weights():
-    """Download RIFE model weights from HuggingFace (AlexWortega/RIFE)."""
+    """Download RIFE model weights from HuggingFace (AlexWortega/RIFE).
+    Used only for optional post-workflow Python RIFE in inference (workflow uses FL_RIFE).
+    """
     rife_dir = os.path.normpath(RIFE_MODEL_DIR)
     flownet_path = os.path.join(rife_dir, "flownet.pkl")
 
@@ -301,7 +620,46 @@ def download_rife_weights():
         print(f"  RIFE model weights downloaded successfully")
     except Exception as e:
         print(f"  WARNING: Failed to download RIFE model weights: {e}")
-        print(f"  RIFE frame interpolation will not be available")
+        print(f"  Post-workflow RIFE frame interpolation will not be available")
+
+
+# ============================================================================
+# 3c. Download default upscale model (workflow FL_RIFE chain uses it)
+# ============================================================================
+
+UPSCALE_MODEL_DEFAULT = "2x_NMKD-UpgifLiteV2_210k.pth"
+UPSCALE_HF_REPO = "utnah/esrgan"
+UPSCALE_HF_FILENAME = "2x_NMKD-UpgifLiteV2_210k.pth"
+
+
+def download_upscale_model():
+    """Download default 2x upscale model for workflow post-processing chain."""
+    upscale_dir = os.path.join(MODELS_DIR, "upscale_models")
+    dest_path = os.path.join(upscale_dir, UPSCALE_MODEL_DEFAULT)
+
+    if os.path.exists(dest_path):
+        size_mb = os.path.getsize(dest_path) / (1024 * 1024)
+        print(f"Upscale model already exists: {dest_path} ({size_mb:.1f} MB)")
+        return
+
+    os.makedirs(upscale_dir, exist_ok=True)
+    print(f"Downloading upscale model to {dest_path}...")
+    try:
+        downloaded_path = hf_hub_download(
+            repo_id=UPSCALE_HF_REPO,
+            filename=UPSCALE_HF_FILENAME,
+            local_dir=upscale_dir,
+            local_dir_use_symlinks=False,
+            resume_download=True,
+            token=HF_TOKEN,
+        )
+        if os.path.abspath(downloaded_path) != os.path.abspath(dest_path):
+            shutil.move(downloaded_path, dest_path)
+        size_mb = os.path.getsize(dest_path) / (1024 * 1024)
+        print(f"  Downloaded: {size_mb:.1f} MB")
+    except Exception as e:
+        print(f"  WARNING: Failed to download upscale model: {e}")
+        print(f"  Workflow upscale step may fail; use enable_upscale=false or provide model manually.")
 
 
 # ============================================================================
@@ -441,13 +799,13 @@ def create_requirements():
         "uvicorn[standard]==0.30.6",
         "httpx==0.27.0",
         "requests==2.32.3",
-        "tenacity==8.5.0",
-        "pydantic==2.9.1",
-        "Pillow>=10.0.0",
-        # Video post-processing (RIFE frame interpolation)
+        # Optional: video_postprocessing (RIFE/Real-ESRGAN when you add post-workflow step)
         "opencv-python>=4.8.0",
         "spandrel>=0.4.0",
         "imageio-ffmpeg>=0.5.1",
+        "tenacity==8.5.0",
+        "pydantic==2.9.1",
+        "Pillow>=10.0.0",
         "safetensors>=0.4.0",
     ]
 
@@ -477,6 +835,10 @@ def main():
         "--install-deps", action="store_true",
         help="Install pip dependencies for ComfyUI, custom nodes, and worker (for local testing)",
     )
+    parser.add_argument(
+        "--with-rife", action="store_true",
+        help="Download RIFE model weights for optional post-workflow frame interpolation (workflow uses built-in FL_RIFE; use when adding RIFE/upscale in inference later)",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -497,13 +859,24 @@ def main():
     print("\n--- Step 2: Install Custom Nodes ---")
     install_custom_nodes()
 
+    # Step 2b: Check workflow node coverage (vs workflow_node_types.txt)
+    print("\n--- Step 2b: Workflow Node Coverage ---")
+    check_workflow_node_coverage()
+
     # Step 3: Download models
     print("\n--- Step 3: Download Model Files ---")
     download_models()
 
-    # Step 3b: Download RIFE weights
-    print("\n--- Step 3b: Download RIFE Model Weights ---")
-    download_rife_weights()
+    # Step 3c: Download default upscale model (for workflow post-processing)
+    print("\n--- Step 3c: Download Upscale Model ---")
+    download_upscale_model()
+
+    # Step 3b: Download RIFE weights (optional; for post-workflow use when you add it in inference)
+    if getattr(args, "with_rife", False):
+        print("\n--- Step 3b: Download RIFE Model Weights ---")
+        download_rife_weights()
+    else:
+        print("\n--- Step 3b: Skipping RIFE weights (workflow uses FL_RIFE; use --with-rife to add for post-workflow RIFE/upscale) ---")
 
     # Step 4: Create requirements.txt
     print("\n--- Step 4: Create Requirements ---")
@@ -559,6 +932,7 @@ def main():
     if args.no_split:
         print("Local testing mode - next steps:")
         print("  1. Run: bash src/test_local.sh")
+        print("  (To enable post-workflow RIFE/upscale later: run prep with --with-rife)")
         print("     OR manually:")
         print(f"     export COMFYUI_DIR={COMFYUI_DIR}")
         print(f"     export WORKFLOW_DIR={WORKFLOW_DIR}")

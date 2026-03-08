@@ -82,6 +82,12 @@ try:
         shutil.move(downloaded_file, transformer_file_path)
         print(f"✅ Transformer file downloaded and placed successfully")
         
+        # Remove shard index so Diffusers loads single-file transformer (not 7-shard format)
+        index_path = os.path.join(transformer_dir, "diffusion_pytorch_model.safetensors.index.json")
+        if os.path.exists(index_path):
+            os.remove(index_path)
+            print("🗑️  Removed shard index (using single-file transformer)")
+        
         # Clean up temp directory
         if os.path.exists(temp_download_dir):
             shutil.rmtree(temp_download_dir)

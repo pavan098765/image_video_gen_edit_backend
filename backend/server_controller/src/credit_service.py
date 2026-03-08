@@ -69,25 +69,53 @@ def _fetch_tool_config() -> Optional[Dict[str, Any]]:
         return None
 
 
-def _build_model_cost_map(config: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
+def _build_model_cost_map(config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """
     Build a model -> cost info mapping from tool_config.json.
+    
+    Reads from:
+    1. config.capabilities[].models[] (model id, cost, costUpscale, offer, baseCost5Sec, maxDuration)
+    2. config.categories[].tools[] (model, cost, cost_upscale, offer) - fallback
     
     Returns dict like:
     {
         "qwen_image_edit_2509": {"cost": 10, "cost_upscale": 5, "offer": 0},
+        "wan_22_fp8_lightx2v_t2v": {"cost": 15, "cost_upscale": 3, "offer": 0, "baseCost5Sec": 15, "maxDuration": 5},
         ...
     }
     """
     model_costs = {}
     
     try:
+        # 1. capabilities[].models[] (primary source - has id, cost, costUpscale, baseCost5Sec, maxDuration)
+        capabilities = config.get("capabilities", [])
+        for capability in capabilities:
+            models = capability.get("models", [])
+            for m in models:
+                model_id = m.get("id")
+                if not model_id:
+                    continue
+                entry = {
+                    "cost": m.get("cost", 10),
+                    "cost_upscale": m.get("costUpscale", m.get("cost_upscale", 5)),
+                    "offer": m.get("offer", 0),
+                }
+                # Duration-based video cost (create_video, animate_image)
+                base_cost_5 = m.get("baseCost5Sec", m.get("base_cost_5_sec"))
+                if base_cost_5 is not None:
+                    entry["baseCost5Sec"] = int(base_cost_5)
+                max_dur = m.get("maxDuration", m.get("max_duration"))
+                if max_dur is not None:
+                    entry["maxDuration"] = int(max_dur)
+                model_costs[model_id] = entry
+        
+        # 2. categories[].tools[] (fallback for configs with older structure)
         categories = config.get("categories", [])
         for category in categories:
             tools = category.get("tools", [])
             for tool in tools:
                 model = tool.get("model")
-                if model:
+                if model and model not in model_costs:
                     model_costs[model] = {
                         "cost": tool.get("cost", 10),
                         "cost_upscale": tool.get("cost_upscale", 5),
@@ -164,10 +192,16 @@ def calculate_job_cost(
         per_job_cost = base_cost + upscale_cost - offer_discount
         total = per_job_cost * variations * num_images
     
-    Special handling for video_upscaler:
+    Special handling for video_upscaler and flashvsr_video_upscaler:
         - Dynamic cost based on video_duration: 2 credits per 5 seconds
         - Max video duration: 10 minutes (600 seconds)
         - Max cost: 240 credits (2 * 600 / 5)
+    
+    Duration-based cost for create_video / animate_image models (with baseCost5Sec in tool_config):
+        - params.duration required (seconds from front end)
+        - Formula: cost = baseCost5Sec * min(duration, maxDuration) / 5  (3 credits/sec when baseCost5Sec=15)
+        - E.g. 5s→15, 8s→24, 10s→30
+        - Capped by maxDuration from tool_config
     
     VIP Benefits:
         - FREE upscale (upscale_cost = 0 for VIP users)
@@ -182,8 +216,8 @@ def calculate_job_cost(
     Returns:
         Total credit cost (integer, minimum 1)
     """
-    # Special handling for video_upscaler: dynamic cost based on video duration
-    if model == "video_upscaler" and params:
+    # Special handling for video upscalers: dynamic cost based on video duration
+    if model in ("video_upscaler", "flashvsr_video_upscaler") and params:
         video_duration = params.get("video_duration")
         if video_duration is not None:
             try:
@@ -212,11 +246,41 @@ def calculate_job_cost(
                 
                 return max(1, total)  # Ensure minimum cost of 1
             except (ValueError, TypeError) as e:
-                logger.warning(f"[CREDIT] Invalid video_duration for video_upscaler: {video_duration}, error: {e}")
+                logger.warning(f"[CREDIT] Invalid video_duration for {model}: {video_duration}, error: {e}")
                 # Fall through to default calculation
     
-    # Standard cost calculation for other models
+    # Duration-based cost for create_video / animate_image models (with baseCost5Sec in tool_config)
     cost_info = get_model_cost_info(model)
+    base_cost_5_sec = cost_info.get("baseCost5Sec")
+    duration_val = (params or {}).get("duration") or (params or {}).get("duration_seconds")
+    if base_cost_5_sec is not None and duration_val is not None:
+        try:
+            duration_seconds = float(duration_val)
+            if duration_seconds > 0:
+                max_duration = cost_info.get("maxDuration", 10)
+                effective_duration = min(duration_seconds, max_duration)
+                # Formula: cost = baseCost5Sec * effective_duration / 5 (matches frontend: 5s→15, 8s→24, 10s→30)
+                per_job_cost = int(base_cost_5_sec * effective_duration / 5)
+                per_job_cost = max(1, per_job_cost)
+                # Apply offer discount
+                offer_percent = cost_info.get("offer", 0)
+                if offer_percent > 0:
+                    per_job_cost -= int(per_job_cost * offer_percent / 100)
+                    per_job_cost = max(1, per_job_cost)
+                variations_count = max(1, min(4, variations))
+                num_images_count = max(1, num_images)
+                total = per_job_cost * variations_count * num_images_count
+                logger.info(
+                    f"[CREDIT] Duration-based cost for {model}: duration={duration_seconds:.1f}s, "
+                    f"effective={effective_duration:.1f}s, baseCost5Sec={base_cost_5_sec}, "
+                    f"per_job={per_job_cost}, variations={variations_count}, total={total}"
+                )
+                return max(1, total)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"[CREDIT] Invalid duration for {model}: {duration_val}, error: {e}")
+            # Fall through to standard calculation
+    
+    # Standard cost calculation for other models
     
     base_cost = cost_info.get("cost", 10)
     upscale_cost = cost_info.get("cost_upscale", 5)

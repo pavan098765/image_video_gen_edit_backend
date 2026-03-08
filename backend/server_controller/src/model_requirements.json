@@ -416,8 +416,9 @@
         "fallback_variants": [],
         "min_tflops": 100,
         "allowed_gpu_names": [
-            "5090",
-            "4090"
+            "4090",
+            "3090",
+            "5090"
         ],
         "min_gpu_count": 1
     },

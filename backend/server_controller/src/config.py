@@ -104,11 +104,16 @@ class WorkerConfig:
     """Worker management configuration"""
     heartbeat_interval: int = 20
     heartbeat_grace_multiplier: int = 2
-    idle_timeout: int = 10
     registration_timeout: int = 180
     max_jobs_per_pod: int = 30
     max_same_job_per_pod: int = 5
     heartbeat_stale_seconds: int = 90
+    # Pod idle timeout: destroy pod after N seconds with no work.
+    # Only applies when: pod has completed all assigned jobs AND no new jobs assigned to it.
+    # Pods with active jobs (RUNNING/QUEUED/DISPATCHING) are never destroyed by idle reaper.
+    idle_timeout_seconds: int = 90
+    # Safety: Don't destroy pods younger than this (avoids thrashing on fresh startups)
+    idle_min_age_seconds: int = 60
 
 
 @dataclass
@@ -116,7 +121,7 @@ class JobConfig:
     """Job management configuration"""
     max_retries: int = 3
     timeout_minutes: int = 30  # General timeout for PENDING/QUEUED/DISPATCHING jobs
-    running_timeout_minutes: int = 5  # Hard timeout for RUNNING jobs (shorter - detect stuck workers)
+    running_timeout_minutes: int = 10  # Hard timeout for RUNNING jobs (shorter - detect stuck workers)
     auto_recover: bool = True
     queue_size_threshold: int = 5
 
@@ -305,10 +310,12 @@ class ConfigManager:
         worker_config = self._config.worker
         worker_config.heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL", "20"))
         worker_config.heartbeat_grace_multiplier = int(os.getenv("HEARTBEAT_GRACE_MULTIPLIER", "2"))
-        worker_config.idle_timeout = int(os.getenv("WORKER_IDLE_TIMEOUT", "15"))
         worker_config.registration_timeout = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "180"))
         worker_config.max_jobs_per_pod = int(os.getenv("MAX_JOBS_PER_POD", "30"))
         worker_config.heartbeat_stale_seconds = int(os.getenv("HEARTBEAT_STALE_SECS", "90"))
+        # Pod idle timeout: destroy after N seconds with no work assigned
+        worker_config.idle_timeout_seconds = int(os.getenv("WORKER_IDLE_TIMEOUT", "90"))
+        worker_config.idle_min_age_seconds = int(os.getenv("WORKER_IDLE_MIN_AGE", "60"))
     
     def _load_job_config(self):
         """Load job configuration"""
@@ -362,6 +369,7 @@ class ConfigManager:
             "wan_22_fp8_lightx2v_i2v": os.getenv("WAN_22_14B_I2V_LIGHTX2V"),
             "wan_22_fp8_lightx2v_t2v": os.getenv("WAN_22_14B_T2V_LIGHTX2V"),
             "video_upscaler": os.getenv("VIDEO_UPSCALER_REALESRGAN_TEMPLATE_UUID"),
+            "flashvsr_video_upscaler": os.getenv("FLASHVSR_VIDEO_UPSCALER_TEMPLATE_UUID"),
             "dreamid": os.getenv("DREAMID_TEMPLATE_UUID"),
             "hunyan15_480p_t2v_distilled": os.getenv("HUNYUAN_480P_T2V_TEMPLATE_UUID"),
             "hunyan15_480p_i2v_step_distilled": os.getenv("HUNYUAN_480P_I2V_TEMPLATE_UUID"),
@@ -398,6 +406,7 @@ class ConfigManager:
             "wan_22_fp8_lightx2v_i2v": 80,
             "wan_22_fp8_lightx2v_t2v": 80,
             "video_upscaler": 40,  # RIFE + Real-ESRGAN models ~10GB + workspace
+            "flashvsr_video_upscaler": 50,  # FlashVSR-Pro models ~7GB + workspace
             "dreamid": 70,
             "hunyan15_480p_t2v_distilled": 100,
             "hunyan15_480p_i2v_step_distilled": 100,
@@ -468,6 +477,10 @@ class ConfigManager:
         logger.info(f"Pod Strategy: {self._config.pod.strategy.value}")
         logger.info(f"Max Individual Pods: {self._config.pod.max_individual_pods}")
         logger.info(f"Worker Registration Timeout: {self._config.worker.registration_timeout}s")
+        logger.info(
+            f"Pod Idle Timeout: {self._config.worker.idle_timeout_seconds}s "
+            f"(destroy when idle with no jobs assigned)"
+        )
         logger.info(f"Job Timeout: {self._config.job.timeout_minutes} minutes")
         logger.info(f"Job Max Retries: {self._config.job.max_retries}")
         logger.info(f"R2 Configured: {bool(self._config.r2.endpoint)}")

@@ -1,218 +1,164 @@
-# Face Enhancer (GFPGAN) - API Request Format
+# Face Enhancer — Client Request Format
 
-## Endpoint
-`POST /run`
+Submit jobs to the **controller** `POST /submit` (not directly to the worker). The controller forwards the run to the face_enhancer worker with the params you send.
 
-## Request Structure
+---
+
+## Request: `POST /submit`
+
+### Top-level payload
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `model` | string | Yes | `"face_enhancer"` |
+| `prompt` | string | No | Can be `""` for face_enhancer |
+| `params` | object | Yes | See **params** below |
+| `fcm_token` | string | No | FCM token for push notifications |
+| `enhance_prompt` | boolean | No | Default `false` |
+| `variations` | number | No | 1–4, default `1` |
+| `input_image_r2_keys` | string[] | No* | R2 keys for uploaded images (preferred over base64) |
+| `is_bulk` | boolean | No | Default `false` |
+
+\* For image input you must send **either** `input_image_r2_keys` (one key) **or** put the image in `params.init_image` / `params.image` (base64).
+
+---
+
+## `params` (face_enhancer)
+
+All of these go inside the `params` object.
+
+### Image (required — one of)
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `init_image` | string | Base64 image **or** URL (if controller gave a presigned URL). Prefer R2 flow and omit this when using `input_image_r2_keys`. |
+| `image` | string | Same as `init_image` (worker accepts either). |
+
+When using R2: upload image first, then send `input_image_r2_keys: ["your-r2-key"]` and **do not** put image data in `params`. The controller will turn the key into a URL and the worker gets it as `init_image`.
+
+### Scale and output
+
+| Key | Type | Default | Description |
+|-----|------|--------|-------------|
+| `scale` | number | `2` | Output scale factor (e.g. 2, 2.5, 4). |
+| `output_dir` | string | worker default | Output directory (optional). |
+
+### Face vs general upscale
+
+| Key | Type | Default | Description |
+|-----|------|--------|-------------|
+| `face_enhance` | boolean or string | `true` | `true` = GFPGAN + RealESRGAN (face enhancement). `false` = general upscale only (RealESRGAN, no GFPGAN). Strings `"true"`/`"false"` accepted. |
+
+### GFPGAN model (used only when `face_enhance` is true)
+
+| Key | Type | Default | Description |
+|-----|------|--------|-------------|
+| `mode` | string | — | GFPGAN variant. Overrides `version` if set. |
+| `version` | string | `"v1.4"` | Same as `mode`; used when `mode` is not set. |
+
+**Allowed values (mode / version):**
+
+- `"v1.2"`
+- `"v1.3"`
+- `"v1.4"`
+- `"RestoreFormer"`
+- `"CodeFormer"`
+- `"RealESR-General-x4v3"`
+
+### Background upsampler (RealESRGAN)
+
+| Key | Type | Default | Description |
+|-----|------|--------|-------------|
+| `bg_model` | string | `"realesr-general-x4v3"` | RealESRGAN model for upscaling (and for non-face regions when face_enhance is true). |
+
+**Allowed values:**
+
+- `"realesr-general-x4v3"`
+- `"RealESRGAN_x2plus"`
+- `"RealESRGAN_x4plus_anime_6B"`
+
+---
+
+## Example payloads
+
+### 1) Face enhancement (GFPGAN + RealESRGAN), R2 image
 
 ```json
 {
-  "job_id": "unique-job-id-string",
-  "prompt": null,
   "model": "face_enhancer",
-  "mode": null,
+  "prompt": "",
   "params": {
-    // See params section below
-  },
-  "upload_url": "https://r2-bucket-url/upload-endpoint",
-  "result_key": "output-filename.png"
-}
-```
-
-## Parameters (`params` object)
-
-### Required Parameters
-
-- **`init_image`** (string, base64): 
-  - Input image as base64-encoded string
-  - Example: `"init_image": "iVBORw0KGgoAAAANSUhEUgAA..."`
-
-### Optional Parameters
-
-#### GFPGAN Version Selection
-
-- **`version`** (string, optional, default: `"v1.4"`):
-  - GFPGAN version/model to use for face enhancement
-  - **Available versions:**
-    - `"v1.2"` - GFPGAN v1.2
-    - `"v1.3"` - GFPGAN v1.3
-    - `"v1.4"` - GFPGAN v1.4 (default, recommended)
-    - `"RestoreFormer"` - RestoreFormer architecture
-    - `"CodeFormer"` - CodeFormer architecture
-    - `"RealESR-General-x4v3"` - RealESRGAN General x4v3 architecture
-  - Example: `"version": "v1.4"`
-
-#### Output Configuration
-
-- **`scale`** (float, optional, default: `2.0`):
-  - Final rescaling factor for the output image
-  - GFPGAN internally upscales by 2x, then this scale is applied
-  - Example: `scale: 2.0` = 2x final output (4x total from original)
-  - Example: `scale: 4.0` = 4x final output (8x total from original)
-  - Range: Any positive float
-  - Example: `"scale": 2.0`
-
-- **`output_dir`** (string, optional, default: `"/app/worker/outputs"`):
-  - Output directory for saved images
-  - Usually not needed (uses default)
-  - Example: `"output_dir": "/app/worker/outputs"`
-
-## Example Requests
-
-### 1. Basic Face Enhancement (Default v1.4)
-
-```json
-{
-  "job_id": "face-001",
-  "prompt": null,
-  "model": "face_enhancer",
-  "mode": null,
-  "params": {
-    "init_image": "iVBORw0KGgoAAAANSUhEUgAA...",
     "version": "v1.4",
-    "scale": 2.0
+    "scale": 2,
+    "face_enhance": true,
+    "bg_model": "realesr-general-x4v3",
+    "output_dir": "./outputs"
   },
-  "upload_url": "https://r2.example.com/upload",
-  "result_key": "face-001.png"
+  "input_image_r2_keys": ["image-vide-generator-api/input-media/your-file-id.bin"],
+  "fcm_token": "your-fcm-token",
+  "enhance_prompt": false,
+  "variations": 1
 }
 ```
 
-### 2. Face Enhancement with v1.3
+### 2) General upscale only (no face enhancement)
 
 ```json
 {
-  "job_id": "face-002",
-  "prompt": null,
   "model": "face_enhancer",
-  "mode": null,
+  "prompt": "",
   "params": {
-    "init_image": "iVBORw0KGgoAAAANSUhEUgAA...",
-    "version": "v1.3",
-    "scale": 2.0
+    "scale": 4,
+    "face_enhance": false,
+    "bg_model": "realesr-general-x4v3",
+    "output_dir": "./outputs"
   },
-  "upload_url": "https://r2.example.com/upload",
-  "result_key": "face-002.png"
+  "input_image_r2_keys": ["image-vide-generator-api/input-media/your-file-id.bin"],
+  "variations": 1
 }
 ```
 
-### 3. RestoreFormer Architecture
+### 3) Face enhancement with base64 image (fallback)
 
 ```json
 {
-  "job_id": "face-003",
-  "prompt": null,
   "model": "face_enhancer",
-  "mode": null,
+  "prompt": "",
   "params": {
-    "init_image": "iVBORw0KGgoAAAANSUhEUgAA...",
-    "version": "RestoreFormer",
-    "scale": 2.0
-  },
-  "upload_url": "https://r2.example.com/upload",
-  "result_key": "face-003.png"
-}
-```
-
-### 4. CodeFormer Architecture
-
-```json
-{
-  "job_id": "face-004",
-  "prompt": null,
-  "model": "face_enhancer",
-  "mode": null,
-  "params": {
-    "init_image": "iVBORw0KGgoAAAANSUhEUgAA...",
-    "version": "CodeFormer",
-    "scale": 2.0
-  },
-  "upload_url": "https://r2.example.com/upload",
-  "result_key": "face-004.png"
-}
-```
-
-### 5. RealESR-General-x4v3 Architecture
-
-```json
-{
-  "job_id": "face-005",
-  "prompt": null,
-  "model": "face_enhancer",
-  "mode": null,
-  "params": {
-    "init_image": "iVBORw0KGgoAAAANSUhEUgAA...",
-    "version": "RealESR-General-x4v3",
-    "scale": 2.0
-  },
-  "upload_url": "https://r2.example.com/upload",
-  "result_key": "face-005.png"
-}
-```
-
-### 6. Custom Scale (4x Final Output)
-
-```json
-{
-  "job_id": "face-006",
-  "prompt": null,
-  "model": "face_enhancer",
-  "mode": null,
-  "params": {
-    "init_image": "iVBORw0KGgoAAAANSUhEUgAA...",
+    "init_image": "data:image/png;base64,iVBORw0KGgo...",
     "version": "v1.4",
-    "scale": 4.0
+    "scale": 2,
+    "face_enhance": true,
+    "bg_model": "realesr-general-x4v3"
   },
-  "upload_url": "https://r2.example.com/upload",
-  "result_key": "face-006.png"
+  "variations": 1
 }
 ```
 
-## Important Notes
-
-### Image Format
-- All images must be base64-encoded strings
-- Images are automatically converted to RGB format
-- **Automatic preprocessing:**
-  - Images with height < 300px are automatically resized to 2x (using LANCZOS4 interpolation)
-  - RGBA images are handled (alpha channel preserved)
-  - Grayscale images are converted to RGB
-
-### GFPGAN Versions
-- **v1.4** (default) - Recommended for most use cases
-- **v1.2, v1.3** - Older versions, may have different quality characteristics
-- **RestoreFormer** - Uses RestoreFormer architecture
-- **CodeFormer** - Uses CodeFormer architecture
-- **RealESR-General-x4v3** - Uses RealESRGAN General architecture
-
-### Scale Parameter
-- GFPGAN internally upscales by **2x** first
-- Then the `scale` parameter is applied as a final rescaling
-- **Total upscale = 2 × scale**
-  - `scale: 2.0` → 4x total upscale
-  - `scale: 4.0` → 8x total upscale
-  - `scale: 1.0` → 2x total upscale
-- Uses `INTER_AREA` interpolation if scale < 2, `INTER_LANCZOS4` if scale >= 2
-
-### Background Upsampling
-- All versions use **RealESRGAN realesr-general-x4v3** as the background upsampler
-- This ensures high-quality upscaling of the entire image, not just faces
-
-### Output Format
-- Output images are saved as PNG format
-- All metadata (EXIF/ICC) is stripped for clean output
-- Images are converted from BGR (OpenCV) to RGB (PIL) for correct color display
-
-## Response Format
-
-The endpoint returns:
+### 4) Different GFPGAN mode via `mode`
 
 ```json
 {
-  "status": "accepted",
-  "job_id": "face-001",
-  "queue_position": 0,
-  "worker_id": "worker-uuid"
+  "model": "face_enhancer",
+  "prompt": "",
+  "params": {
+    "mode": "CodeFormer",
+    "scale": 2,
+    "face_enhance": true,
+    "bg_model": "RealESRGAN_x2plus"
+  },
+  "input_image_r2_keys": ["image-vide-generator-api/input-media/your-file-id.bin"],
+  "variations": 1
 }
 ```
 
-The actual result will be uploaded to the provided `upload_url` and the controller will be notified with `result_key`.
+---
+
+## Summary
+
+- **Endpoint:** controller `POST /submit`.
+- **Image:** either `input_image_r2_keys` (one key) or `params.init_image` / `params.image` (base64/URL).
+- **Always in params:** `scale` (and `face_enhance` if you want general upscale).
+- **Face enhancement:** `face_enhance: true` (default), and optionally `mode` or `version` for GFPGAN variant.
+- **General upscale only:** `face_enhance: false`; only `bg_model` and `scale` are used.
+- **Optional:** `bg_model`, `mode`/`version`, `output_dir`.

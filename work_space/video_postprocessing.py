@@ -289,7 +289,7 @@ def upscale(upscale_model, tensor: torch.Tensor, inf_device, output_device="cpu"
 
 
 def frames_to_tensor(frames):
-    """Convert frames (numpy array or PIL images) to tensor format [f, c, h, w]."""
+    """Convert frames (numpy array, list of PIL, or list of numpy) to tensor format [f, c, h, w]."""
     if isinstance(frames, np.ndarray):
         # Assume shape is [f, h, w, c] or [h, w, c]
         if len(frames.shape) == 3:
@@ -300,19 +300,20 @@ def frames_to_tensor(frames):
         if frames.dtype == np.uint8:
             frames = frames.astype(np.float32) / 255.0
         tensor = torch.from_numpy(frames).float()
-    elif isinstance(frames, list) and isinstance(frames[0], Image.Image):
-        # Convert PIL images to tensor
-        tensor_frames = []
-        for img in frames:
-            img_array = np.array(img)
-            if len(img_array.shape) == 2:  # Grayscale
-                img_array = np.stack([img_array] * 3, axis=-1)
-            if img_array.shape[2] == 4:  # RGBA
-                img_array = img_array[:, :, :3]
-            img_array = img_array.astype(np.float32) / 255.0
-            img_tensor = torch.from_numpy(np.transpose(img_array, (2, 0, 1)))  # [c, h, w]
-            tensor_frames.append(img_tensor)
-        tensor = torch.stack(tensor_frames)  # [f, c, h, w]
+    elif isinstance(frames, list) and len(frames) > 0:
+        # List of PIL Images and/or numpy arrays (e.g. from stitch_clips with blend_at_join)
+        arrs = []
+        for f in frames:
+            a = np.asarray(f, dtype=np.float32)
+            if a.max() > 1.0:
+                a = a / 255.0
+            if len(a.shape) == 2:
+                a = np.stack([a] * 3, axis=-1)
+            elif a.shape[-1] == 4:
+                a = a[:, :, :3]
+            arrs.append(np.clip(a, 0, 1))
+        frames_np = np.stack(arrs, axis=0)  # [f, h, w, c]
+        tensor = torch.from_numpy(np.transpose(frames_np, (0, 3, 1, 2))).float()  # [f, c, h, w]
     else:
         raise ValueError(f"Unsupported frame format: {type(frames)}")
     

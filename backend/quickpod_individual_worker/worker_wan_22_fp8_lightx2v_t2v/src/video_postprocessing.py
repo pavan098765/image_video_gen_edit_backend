@@ -289,7 +289,16 @@ def upscale(upscale_model, tensor: torch.Tensor, inf_device, output_device="cpu"
 
 
 def frames_to_tensor(frames):
-    """Convert frames (numpy array or PIL images) to tensor format [f, c, h, w]."""
+    """Convert frames (numpy array, torch tensor, or PIL images) to tensor format [f, c, h, w] in [0, 1]."""
+    if isinstance(frames, torch.Tensor):
+        t = frames.float()
+        if t.dim() == 3:
+            t = t.unsqueeze(0)
+        if t.shape[1] != 3:
+            t = t.permute(0, 3, 1, 2)
+        if t.max() > 1.0:
+            t = t / 255.0
+        return t
     if isinstance(frames, np.ndarray):
         # Assume shape is [f, h, w, c] or [h, w, c]
         if len(frames.shape) == 3:
@@ -300,7 +309,7 @@ def frames_to_tensor(frames):
         if frames.dtype == np.uint8:
             frames = frames.astype(np.float32) / 255.0
         tensor = torch.from_numpy(frames).float()
-    elif isinstance(frames, list) and isinstance(frames[0], Image.Image):
+    elif isinstance(frames, list) and len(frames) > 0 and isinstance(frames[0], Image.Image):
         # Convert PIL images to tensor
         tensor_frames = []
         for img in frames:
@@ -508,7 +517,7 @@ def calculate_rife_exp(original_fps, target_fps):
     return exp, actual_fps
 
 
-def apply_rife_interpolation(model, frames, device="cuda", original_fps=16, target_fps=None):
+def apply_rife_interpolation(model, frames, device="cuda", original_fps=16, target_fps=None, force_target_fps=True):
     """Apply RIFE frame interpolation to frames (numpy array).
     
     Args:
@@ -517,6 +526,8 @@ def apply_rife_interpolation(model, frames, device="cuda", original_fps=16, targ
         device: Device to run on
         original_fps: Original frame rate
         target_fps: Target frame rate (if None, doubles the FPS)
+        force_target_fps: If True, resample to exact target_fps when RIFE overshoots (e.g. 96->60).
+                         If False, keep RIFE output FPS (e.g. 96 when target was 60).
     
     Returns:
         Interpolated frames (numpy array [f, h, w, c]), actual_fps
@@ -564,6 +575,22 @@ def apply_rife_interpolation(model, frames, device="cuda", original_fps=16, targ
         pt_image = pt_image.clamp(0, 1)  # Ensure [0, 1] range
         image_np = VaeImageProcessor.pt_to_numpy(pt_image)  # [f, h, w, c]
         
+        # RIFE only does 2x/4x/8x; if we overshot target_fps and force_target_fps, resample to exact target
+        # Use temporal blending (not nearest-frame) to avoid judder and preserve smoothness
+        if force_target_fps and target_fps is not None and actual_fps > target_fps:
+            num_f = image_np.shape[0]
+            duration_sec = num_f / actual_fps
+            target_num_f = max(1, int(round(duration_sec * target_fps)))
+            out = np.empty((target_num_f,) + image_np.shape[1:], dtype=image_np.dtype)
+            for i in range(target_num_f):
+                src_idx = (i + 0.5) * actual_fps / target_fps
+                src_idx = min(src_idx, num_f - 1.001)
+                low = int(np.floor(src_idx))
+                high = min(low + 1, num_f - 1)
+                w = src_idx - low
+                out[i] = (1.0 - w) * image_np[low] + w * image_np[high]
+            image_np = out
+            actual_fps = target_fps
         return image_np, actual_fps
     except Exception as e:
         print(f"⚠️  RIFE interpolation failed: {e}")

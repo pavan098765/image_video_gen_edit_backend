@@ -237,11 +237,11 @@ def main():
         # Non-chunk model files
         non_chunk_count = copy_non_chunk_model_files(f)
 
-        # Chunk model files (one per layer)
-        chunk_count = copy_chunks_one_per_line(f)
-
         # RIFE weights
         rife_count = copy_rife_weights(f)
+
+        # Chunk model files (one per layer)
+        chunk_count = copy_chunks_one_per_line(f)
 
         # Install dependencies
         write_install_deps(f)

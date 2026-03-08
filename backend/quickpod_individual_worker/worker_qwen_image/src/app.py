@@ -7,7 +7,7 @@ import asyncio
 import hmac
 import hashlib
 import gc
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 import uuid
 import httpx
@@ -20,6 +20,13 @@ from contextlib import asynccontextmanager
 import concurrent.futures
 
 import torch
+
+# -----------------------
+# Pod startup time tracking (from first line of Python code execution)
+# -----------------------
+POD_START_TIME = time.time()
+FIRST_INFERENCE_START_TIME = None
+_first_inference_lock = asyncio.Lock()
 
 # -----------------------
 # Dedicated Thread Pool for Inference
@@ -463,14 +470,24 @@ def resolve_inference_callable(model: str, mode: Optional[str]):
 
 async def run_inference_and_save(
     job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]
-) -> str:
+) -> Tuple[str, Dict[str, float]]:
     """
     Run inference in a dedicated thread pool to avoid blocking FastAPI endpoints.
+    Returns (output_path, metrics_dict).
+    metrics_dict contains: processing_time_seconds, startup_time_seconds (only for first job)
     """
-    global last_model_key
+    global last_model_key, FIRST_INFERENCE_START_TIME
     loop = asyncio.get_event_loop()
     params = params.copy()
     params.setdefault("output_dir", WORKSPACE_DIR)
+
+    # Track first inference start time for startup_time calculation
+    async with _first_inference_lock:
+        if FIRST_INFERENCE_START_TIME is None:
+            FIRST_INFERENCE_START_TIME = time.time()
+            startup_time = FIRST_INFERENCE_START_TIME - POD_START_TIME
+        else:
+            startup_time = None
 
     # Prompt enhancement for image generation
     if params.get("enhance_prompt", False):
@@ -483,9 +500,18 @@ async def run_inference_and_save(
         logger.info(f"Switching model {last_model_key} -> {model_key}, cleaning up GPU first")
         cleanup_gpu()
 
+    # Measure actual inference time (including upscaler if used)
+    inference_start_time = time.time()
     try:
         out_path = await loop.run_in_executor(INFERENCE_EXECUTOR, inference_func, job_id, prompt, params)
-        return out_path
+        inference_end_time = time.time()
+        processing_time = inference_end_time - inference_start_time
+        
+        metrics = {"processing_time_seconds": round(processing_time, 2)}
+        if startup_time is not None:
+            metrics["startup_time_seconds"] = round(startup_time, 2)
+        
+        return out_path, metrics
     finally:
         last_model_key = model_key
 
@@ -523,7 +549,7 @@ async def process_job_item(item: Dict[str, Any]):
     try:
         async with semaphore:
             logger.info(f"[{job_id}] Starting inference...")
-            out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
+            out_local, metrics = await run_inference_and_save(job_id, prompt, model, mode, params)
             logger.info(f"[{job_id}] Inference completed, output: {out_local}")
 
             if upload_url.startswith("http://dummy-upload"):
@@ -538,7 +564,12 @@ async def process_job_item(item: Dict[str, Any]):
             is_autotest = job_id.startswith("autotest-")
             if CONTROLLER_URL and not is_autotest:
                 logger.info(f"[{job_id}] Notifying controller of completion...")
-                payload = {"job_id": job_id, "result_r2_key": result_key, "next_job_id": _peek_next_job_id()}
+                payload = {
+                    "job_id": job_id,
+                    "result_r2_key": result_key,
+                    "next_job_id": _peek_next_job_id(),
+                    "metrics": metrics
+                }
                 url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
                 try:
                     loop = asyncio.get_running_loop()
@@ -589,7 +620,22 @@ async def process_job_item(item: Dict[str, Any]):
         
         is_autotest = job_id.startswith("autotest-")
         if CONTROLLER_URL and not is_autotest:
-            payload = {"job_id": job_id, "result_r2_key": None, "failed": True, "error": error_str, "next_job_id": _peek_next_job_id()}
+            # For failed jobs, we still want to track startup_time if this was the first job
+            metrics = {}
+            async with _first_inference_lock:
+                if FIRST_INFERENCE_START_TIME is None:
+                    FIRST_INFERENCE_START_TIME = time.time()
+                    startup_time = FIRST_INFERENCE_START_TIME - POD_START_TIME
+                    metrics["startup_time_seconds"] = round(startup_time, 2)
+            
+            payload = {
+                "job_id": job_id,
+                "result_r2_key": None,
+                "failed": True,
+                "error": error_str,
+                "next_job_id": _peek_next_job_id(),
+                "metrics": metrics if metrics else None
+            }
             try:
                 url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
                 loop = asyncio.get_running_loop()

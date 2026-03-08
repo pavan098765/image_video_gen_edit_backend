@@ -61,12 +61,17 @@ def cleanup_gpu(verbose: bool = False):
         print(f"[GPU] Cleanup warning: {e}")
 
 # -----------------------
-# Import inference function
+# Import inference function and mode lists
 # -----------------------
-from inference_face_enhancer import run_inference_face_enhancer
+from inference_face_enhancer import (
+    run_inference_face_enhancer,
+    FACE_ENHANCER_MODES,
+    REALESRGAN_BG_MODES,
+    GFPGAN_MODELS,
+)
 
 # -----------------------
-# Model Registry
+# Model Registry (model key -> inference callable; mode selects GFPGAN variant)
 # -----------------------
 MODEL_REGISTRY = {
     "face_enhancer": run_inference_face_enhancer,
@@ -154,20 +159,20 @@ def _is_url(value: str) -> bool:
     return isinstance(value, str) and (value.startswith("http://") or value.startswith("https://"))
 
 
-def _download_to_base64(url: str, timeout: int = 120) -> str:
-    """Download binary from URL and return base64-encoded string."""
+def _download_url_bytes(url: str, timeout: int = 120) -> bytes:
+    """Download binary from URL and return raw bytes."""
     resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()
-    return base64.b64encode(resp.content).decode("utf-8")
+    return resp.content
 
 
 def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, Any]:
     """
-    Resolve any URL-valued media fields in params to base64 strings.
+    Resolve any URL-valued media fields in params to raw bytes.
     
     If a known media field contains a URL (e.g. presigned R2 download URL),
-    download the binary and replace with base64 so downstream inference
-    functions work unchanged.
+    download the binary and store as raw bytes so downstream _load_image()
+    functions can open them directly without a base64 round-trip.
     
     Handles both single string values and lists of strings.
     """
@@ -178,9 +183,9 @@ def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, An
             continue
         if isinstance(value, str) and _is_url(value):
             try:
-                logger.info(f"[{job_id}] Downloading {field} from URL ({len(value)} chars)...")
-                resolved[field] = _download_to_base64(value)
-                logger.info(f"[{job_id}] Downloaded {field}: {len(resolved[field])} base64 chars")
+                logger.info(f"[{job_id}] Downloading {field} from URL...")
+                resolved[field] = _download_url_bytes(value)
+                logger.info(f"[{job_id}] Downloaded {field}: {len(resolved[field])} bytes")
             except Exception as e:
                 logger.error(f"[{job_id}] Failed to download {field} from URL: {e}")
                 raise
@@ -190,7 +195,7 @@ def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, An
                 if isinstance(item, str) and _is_url(item):
                     try:
                         logger.info(f"[{job_id}] Downloading {field}[{i}] from URL...")
-                        new_list.append(_download_to_base64(item))
+                        new_list.append(_download_url_bytes(item))
                     except Exception as e:
                         logger.error(f"[{job_id}] Failed to download {field}[{i}]: {e}")
                         raise
@@ -282,6 +287,8 @@ async def run_inference_and_save(job_id: str, prompt: Optional[str], model: str,
     loop = asyncio.get_event_loop()
     params = params.copy()
     params.setdefault("output_dir", WORKSPACE_DIR)
+    if mode is not None:
+        params["mode"] = mode
     inference_func = resolve_inference_callable(model, mode)
 
     if last_model_key and last_model_key != model:
@@ -297,20 +304,22 @@ async def run_inference_and_save(job_id: str, prompt: Optional[str], model: str,
 # -----------------------
 async def process_job_item(item: Dict[str, Any]):
     job_id, model, prompt = item["job_id"], item["model"], item.get("prompt")
+    mode = item.get("mode")
     params, upload_url, result_key = item.get("params", {}), item["upload_url"], item["result_key"]
 
-    # Resolve any URL-valued media fields to base64 before inference
+    # Resolve any URL-valued media fields (download presigned URLs to bytes) before inference
     try:
         params = resolve_media_urls(params, job_id)
     except Exception as e:
         logger.error(f"[{job_id}] Failed to resolve media URLs: {e}")
+        raise  # Fail the job so controller is notified; do not run inference with unresolved URLs
 
     async with job_status_lock:
         job_status[job_id] = {"status": "running", "started_at": datetime.utcnow().isoformat()}
 
     try:
         async with semaphore:
-            out_local = await run_inference_and_save(job_id, prompt, model, None, params)
+            out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
             if not upload_url.startswith("http://dummy-upload"):
                 if not await _upload_with_retry(out_local, upload_url, job_id):
                     raise Exception("Upload failed")
@@ -382,9 +391,106 @@ async def worker_loop():
 # -----------------------
 # Auto-test
 # -----------------------
+def _build_autotest_cases(img_b64: str, autotest_output_dir: str) -> List[tuple]:
+    """Build (label, params) for all models and modes: GFPGAN modes, bg_models, face_enhance on/off."""
+    cases: List[tuple] = []
+    # 1) Face enhancement: each GFPGAN mode with default bg_model
+    for version in FACE_ENHANCER_MODES:
+        cases.append((
+            f"face_enhance|{version}|default_bg",
+            {
+                "init_image": img_b64,
+                "version": version,
+                "scale": 2.0,
+                "face_enhance": True,
+                "output_dir": autotest_output_dir,
+            },
+        ))
+    # 2) General upscale only (no GFPGAN): each RealESRGAN bg_model
+    for bg_model in REALESRGAN_BG_MODES:
+        cases.append((
+            f"general_upscale|bg_{bg_model}",
+            {
+                "init_image": img_b64,
+                "scale": 2.0,
+                "face_enhance": False,
+                "bg_model": bg_model,
+                "output_dir": autotest_output_dir,
+            },
+        ))
+    # 3) Face enhancement with each bg_model (fix version to v1.4 to cover pipeline)
+    for bg_model in REALESRGAN_BG_MODES:
+        cases.append((
+            f"face_enhance|v1.4|bg_{bg_model}",
+            {
+                "init_image": img_b64,
+                "version": "v1.4",
+                "scale": 2.0,
+                "face_enhance": True,
+                "bg_model": bg_model,
+                "output_dir": autotest_output_dir,
+            },
+        ))
+    return cases
+
+
+async def _run_one_autotest(client: httpx.AsyncClient, label: str, params: Dict[str, Any], results: Dict[str, Dict]) -> None:
+    """Submit one job, wait for completion, record in results keyed by label."""
+    safe_label = label.replace(" ", "-").replace(".", "-")
+    test_job_id = f"autotest-{safe_label}-{uuid.uuid4()}"
+    status_url = "http://127.0.0.1:8000/status"
+    max_wait = 300
+    autotest_output_dir = params.get("output_dir", "")
+
+    try:
+        resp = await client.post(
+            "http://127.0.0.1:8000/run",
+            json={
+                "job_id": test_job_id,
+                "prompt": "",
+                "model": "face_enhancer",
+                "params": params,
+                "upload_url": "http://dummy-upload/skip",
+                "result_key": f"{test_job_id}.png",
+            },
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"❌ Auto-test [{label}] submit failed: {e}")
+        results[label] = {"status": "failed", "error": str(e)}
+        return
+
+    job_completed = False
+    wait_start = time.time()
+    while not job_completed and (time.time() - wait_start < max_wait):
+        await asyncio.sleep(2)
+        try:
+            status_resp = await client.get(status_url)
+            status_resp_data = status_resp.json()
+        except Exception:
+            continue
+        job_info = status_resp_data.get("jobs", {}).get(test_job_id)
+        if job_info and job_info.get("status") in ["completed", "failed"]:
+            job_completed = True
+            results[label] = {
+                "status": job_info["status"],
+                "processing_time": job_info.get("processing_time"),
+                "error": job_info.get("error"),
+                "output_path": os.path.join(autotest_output_dir, f"face_enhanced_{test_job_id}.png"),
+            }
+            break
+        elif job_info and job_info.get("status") == "running":
+            if int(time.time() - wait_start) % 60 < 2:
+                logger.info(f"[{test_job_id}] Still running... ({int(time.time() - wait_start)}s)")
+
+    if not job_completed:
+        results[label] = {"status": "pending", "error": "Job timed out"}
+        logger.warning(f"[{label}] Job timed out after {max_wait}s.")
+
+
 async def run_autotest():
     await asyncio.sleep(5)
-    logger.info("🚀 Starting Face Enhancer auto-test")
+    logger.info("🚀 Starting Face Enhancer auto-test (all models and modes)")
 
     # Check GPU VRAM - disable autotest on low-memory cards to avoid OOM
     try:
@@ -394,7 +500,6 @@ async def run_autotest():
             return
     except Exception as e:
         logger.warning(f"Could not check GPU VRAM for autotest decision: {e}")
-        # Proceed cautiously
 
     # Fetch test image
     img_url = "https://pub-67f874d172874988b5754734cc4fcb7e.r2.dev/Snapinsta.app_262322643_4937545659591345_7487236998017046274_n_1080.jpg"
@@ -403,7 +508,6 @@ async def run_autotest():
         "Referer": "https://ibb.co",
         "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
     }
-    
     img_b64 = None
     try:
         async with httpx.AsyncClient(headers=headers, timeout=60.0) as client:
@@ -414,88 +518,27 @@ async def run_autotest():
         logger.error(f"❌ Failed to fetch test image: {e}")
         return
 
-    # Import GFPGAN_MODELS from inference file
-    from inference_face_enhancer import GFPGAN_MODELS
-
-    # Test all available versions
-    versions_to_test = list(GFPGAN_MODELS.keys())
-    results = {}
-    
     autotest_output_dir = os.path.join(WORKSPACE_DIR, "autotest_outputs")
     os.makedirs(autotest_output_dir, exist_ok=True)
-    
-    logger.info(f"Testing {len(versions_to_test)} versions: {versions_to_test}")
+    cases = _build_autotest_cases(img_b64, autotest_output_dir)
+    results: Dict[str, Dict] = {}
+
+    logger.info(f"Testing {len(cases)} cases: GFPGAN modes={FACE_ENHANCER_MODES}, bg_models={REALESRGAN_BG_MODES}, general upscale + face_enhance per bg")
     logger.info(f"Results will be saved to: {autotest_output_dir}")
 
     async with httpx.AsyncClient(timeout=300.0) as client:
-        for i, version in enumerate(versions_to_test):
-            test_job_id = f"autotest-face-enhancer-{version.replace(' ', '-').replace('.', '-')}-{uuid.uuid4()}"
-            
-            params = {
-                "init_image": img_b64,
-                "version": version,
-                "scale": 2.0,
-                "output_dir": autotest_output_dir,  # Save to dedicated autotest output dir
-            }
-            
-            try:
-                start_time = time.time()
-                resp = await client.post(
-                    "http://127.0.0.1:8000/run",
-                    json={
-                        "job_id": test_job_id,
-                        "prompt": "",
-                        "model": "face_enhancer",
-                        "params": params,
-                        "upload_url": "http://dummy-upload/skip",  # Don't upload autotest results
-                        "result_key": f"{test_job_id}.png",
-                    },
-                )
-                resp.raise_for_status()
-                response_data = resp.json()
-                
-                # Wait for job to complete
-                status_url = f"http://127.0.0.1:8000/status"
-                job_completed = False
-                wait_start = time.time()
-                while not job_completed and (time.time() - wait_start < 300):  # Max 5 min wait per job
-                    await asyncio.sleep(2)
-                    status_resp = await client.get(status_url)
-                    status_resp_data = status_resp.json()
-                    job_info = status_resp_data.get("jobs", {}).get(test_job_id)
-                    if job_info and job_info.get("status") in ["completed", "failed"]:
-                        job_completed = True
-                        results[version] = {
-                            "status": job_info["status"],
-                            "processing_time": job_info.get("processing_time"),
-                            "error": job_info.get("error"),
-                            "output_path": os.path.join(autotest_output_dir, f"face_enhancer_{test_job_id}.png")
-                        }
-                        break
-                    elif job_info and job_info.get("status") == "running":
-                        if (time.time() - wait_start) % 60 < 2:  # Log every minute
-                            logger.info(f"[{test_job_id}] Still running... ({int(time.time() - wait_start)}s)")
-                
-                if not job_completed:
-                    results[version] = {"status": "pending", "error": "Job timed out"}
-                    logger.warning(f"[{test_job_id}] Job timed out after 300s.")
+        for label, params in cases:
+            await _run_one_autotest(client, label, params, results)
+            await asyncio.sleep(2)
 
-                logger.info(f"🔥 Auto-test response for {version}: {resp.status_code} {resp.text}")
-                
-            except Exception as e:
-                logger.error(f"❌ Auto-test for {version} failed: {e}")
-                results[version] = {"status": "failed", "error": str(e)}
-            
-            await asyncio.sleep(2)  # Small delay between tests
-    
     logger.info("\n--- Auto-test Summary ---")
-    for version, res in results.items():
+    for label, res in results.items():
         if res["status"] == "completed":
-            logger.info(f"✅ {version}: Completed in {res.get('processing_time', 0):.1f}s. Output: {res.get('output_path', 'N/A')}")
+            logger.info(f"✅ {label}: Completed. Output: {res.get('output_path', 'N/A')}")
         elif res["status"] == "failed":
-            logger.error(f"❌ {version}: Failed. Error: {res.get('error', 'N/A')}")
+            logger.error(f"❌ {label}: Failed. Error: {res.get('error', 'N/A')}")
         else:
-            logger.warning(f"⏳ {version}: {res['status']}. Error: {res.get('error', 'N/A')}")
+            logger.warning(f"⏳ {label}: {res['status']}. Error: {res.get('error', 'N/A')}")
     logger.info("--- End of Auto-test Summary ---")
 
 # -----------------------
@@ -536,7 +579,7 @@ async def lifespan(app: FastAPI):
         register_with_controller()
     except Exception as e:
         logger.exception("Registration failed: %s", e)
-    if os.getenv("ENABLE_AUTOTEST", "1") == "1":
+    if os.getenv("ENABLE_AUTOTEST", "0") == "1":
         asyncio.create_task(run_autotest())
     yield
     startup_completed = False
@@ -573,7 +616,13 @@ async def run_endpoint(req: RunRequest):
         raise HTTPException(status_code=503, detail="Worker not ready")
     if req.model not in MODEL_REGISTRY:
         raise HTTPException(status_code=400, detail=f"Unknown model: {req.model}")
-    await job_queue.put(req.dict())
+    if req.mode is not None and req.mode not in FACE_ENHANCER_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown mode: {req.mode}. Valid modes: {FACE_ENHANCER_MODES}",
+        )
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    await job_queue.put(payload)
     asyncio.create_task(_record_job_status_later(req.job_id, req.model))
     return {"status": "accepted", "job_id": req.job_id, "queue_position": job_queue.qsize(), "worker_id": WORKER_ID}
 
@@ -615,7 +664,8 @@ async def run_bulk_endpoint(req: BulkRunRequest):
         except asyncio.TimeoutError:
             pass
         
-        await job_queue.put(job.dict())
+        job_payload = job.model_dump() if hasattr(job, "model_dump") else job.dict()
+        await job_queue.put(job_payload)
         asyncio.create_task(_record_job_status_later(job.job_id, job.model))
         accepted_ids.append(job.job_id)
     
@@ -651,3 +701,26 @@ async def health():
 async def status():
     async with job_status_lock:
         return {"queue_size": job_queue.qsize(), "jobs": job_status.copy(), "worker_id": WORKER_ID}
+
+
+@app.get("/models")
+async def list_models():
+    """
+    Return available models and modes for the face enhancer worker.
+    Frontend sends model and mode; mode selects the GFPGAN variant (aligned with prep_model.py).
+    """
+    return {
+        "models": list(MODEL_REGISTRY.keys()),
+        "modes": {
+            "face_enhancer": {
+                "description": "GFPGAN face enhancement model variant",
+                "options": FACE_ENHANCER_MODES,
+                "default": "v1.4",
+            },
+        },
+        "bg_models": {
+            "description": "RealESRGAN background upsampler (params.bg_model)",
+            "options": REALESRGAN_BG_MODES,
+            "default": "realesr-general-x4v3",
+        },
+    }

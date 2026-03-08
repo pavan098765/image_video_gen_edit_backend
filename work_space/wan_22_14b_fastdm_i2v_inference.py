@@ -53,12 +53,13 @@ os.environ["HF_HOME"] = "/models_storage/all_models/fastdm"
 # "sdnq_uint4" = SDNQ UINT4 + SVD rank 32 (created by quantize_fastdm_sdnq.py with uint4, ~10-15GB)
 # "sdnq_int8"  = SDNQ INT8 + SVD rank 32 (created by quantize_fastdm_sdnq.py with int8, ~20-28GB)
 # "sdnq_fp8"   = SDNQ FP8 (float8_e4m3fn) + SVD rank 32 (created by quantize_fastdm_sdnq.py with fp8, ~20-28GB)
-QUANTIZATION_TYPE = "sdnq_fp8"  # <-- Change this to switch between quantization backends
+# "sdnq_fp8_2" = SDNQ FP8 + SVD rank 64 (wan2.2 480p lightning nsfw, from HuggingFace)
+QUANTIZATION_TYPE = "sdnq_fp8_2"  # <-- Change this to switch between quantization backends
 
 # ============================================================================
 # Conditional imports based on quantization type
 # ============================================================================
-if QUANTIZATION_TYPE in ["sdnq_uint4", "sdnq_int8", "sdnq_fp8"]:
+if QUANTIZATION_TYPE in ["sdnq_uint4", "sdnq_int8", "sdnq_fp8", "sdnq_fp8_2"]:
     # Add local SDNQ source to path (if not installed via pip)
     WORKSPACE_DIR_EARLY = os.path.dirname(os.path.abspath(__file__))
     SDNQ_SRC_DIR = os.path.join(WORKSPACE_DIR_EARLY, "sdnq", "src")
@@ -111,6 +112,7 @@ QUANTIZED_MODEL_REPOS = {
     "sdnq_uint4": "rockapaper/wan22-14b-i2v-lightning-sdnq-uint4-svd-r32",  # SDNQ UINT4+SVD model repo
     "sdnq_int8": "rockapaper/wan22-14b-i2v-lightning-sdnq-int8-svd-r32",  # SDNQ INT8+SVD model repo
     "sdnq_fp8": "rockapaper/wan22-14b-i2v-lightning-sdnq-fp8-svd-r32",  # SDNQ FP8+SVD model repo
+    "sdnq_fp8_2":"rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_sndq_fp8_svd_64"
 }
 
 # Original repo (for reference only)
@@ -126,6 +128,7 @@ MODEL_PATHS = {
     "sdnq_uint4": os.path.join(MODELS_DIR, "fastdm_wan22_i2v_lightning_sdnq_uint4_svd_r32"),
     "sdnq_int8": os.path.join(MODELS_DIR, "fastdm_wan22_i2v_lightning_sdnq_int8_svd_r32"),
     "sdnq_fp8": os.path.join(MODELS_DIR, "fastdm_wan22_i2v_lightning_sdnq_fp8_svd_r32"),
+    "sdnq_fp8_2": os.path.join(MODELS_DIR, "wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_sndq_fp8_svd_64"),
 }
 MODEL_LOCAL_DIR = MODEL_PATHS[QUANTIZATION_TYPE]
 QUANTIZED_MODEL_REPO = QUANTIZED_MODEL_REPOS.get(QUANTIZATION_TYPE)  # Current quantization type's repo
@@ -138,8 +141,8 @@ QUANTIZED_MODEL_REPO = QUANTIZED_MODEL_REPOS.get(QUANTIZATION_TYPE)  # Current q
 # Option 2: Process a list of images (set INPUT_IMAGE_NAMES to list of filenames)
 # Images must be in the same directory as this script
 INPUT_IMAGE_NAMES = [
-    "testimg11.jpeg",
-    "testimg12.jpeg",
+    "ssd.jpeg",
+    "ssd2.jpeg",
    
 ]
 
@@ -153,8 +156,7 @@ OUTPUT_VIDEO_PATH = os.path.join(WORKSPACE_DIR, "i2v_fastdm_output.mp4")
 # since the Lightning distillation is fully merged into the model weights.
 
 _nsfw_pr = """
-Completely remove all the subjects clothes. Her clothes are now completely removed to expose her big breasts and vagina. Maintain identical camera angle, framing, skintone and perspective and make sure to leave her facial features identical. The rest of the image remains the same, only remove her clothes to expose her naked body.
-"""
+Make the image come alive, cinematic motion and smooth animation."""
 
 PROMPT = _nsfw_pr  # "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
 
@@ -206,6 +208,9 @@ def check_quantized_model():
     elif QUANTIZATION_TYPE == "sdnq_fp8":
         quant_label = "SDNQ FP8+SVD r32"
         quant_script = "quantize_fastdm_sdnq.py"
+    elif QUANTIZATION_TYPE == "sdnq_fp8_2":
+        quant_label = "SDNQ FP8+SVD r64 (wan2.2 480p lightning nsfw)"
+        quant_script = "quantize_fastdm_sdnq.py"
     else:
         quant_label = "Unknown"
         quant_script = "quantize_fastdm.py"
@@ -239,7 +244,7 @@ def check_quantized_model():
             size_hint = "~32GB"
         elif QUANTIZATION_TYPE == "sdnq_uint4":
             size_hint = "~10-15GB"
-        else:  # sdnq_int8 or sdnq_fp8
+        else:  # sdnq_int8, sdnq_fp8, sdnq_fp8_2
             size_hint = "~20-28GB"
         print(
             f"\n⬇️ Downloading quantized model ({quant_label}) from HuggingFace: {QUANTIZED_MODEL_REPO}"
@@ -352,7 +357,7 @@ def load_pipeline_sdnq(model_path, device):
         model_type_str = "UINT4+SVD"
     elif QUANTIZATION_TYPE == "sdnq_int8":
         model_type_str = "INT8+SVD"
-    else:  # sdnq_fp8
+    else:  # sdnq_fp8, sdnq_fp8_2
         model_type_str = "FP8+SVD"
     print(f"   Loading SDNQ {model_type_str} quantized model...")
     pipe = WanImageToVideoPipeline.from_pretrained(
@@ -641,6 +646,8 @@ def run_inference():
         quant_label = "SDNQ INT8+SVD r32"
     elif QUANTIZATION_TYPE == "sdnq_fp8":
         quant_label = "SDNQ FP8+SVD r32"
+    elif QUANTIZATION_TYPE == "sdnq_fp8_2":
+        quant_label = "SDNQ FP8+SVD r64 (wan2.2 480p lightning nsfw)"
     else:
         quant_label = "Unknown"
     print("\n" + "=" * 60)
@@ -690,7 +697,7 @@ def run_inference():
     print(f"\n📦 Loading pipeline from {model_path} ({quant_label})...")
     load_start_time = time.time()
 
-    if QUANTIZATION_TYPE in ["sdnq_uint4", "sdnq_int8", "sdnq_fp8"]:
+    if QUANTIZATION_TYPE in ["sdnq_uint4", "sdnq_int8", "sdnq_fp8", "sdnq_fp8_2"]:
         pipe = load_pipeline_sdnq(model_path, device)
     else:
         pipe = load_pipeline_int8(model_path, device)
@@ -723,21 +730,21 @@ def run_inference():
         except Exception:
             pass
 
-    # Try to enable VAE tiling if available (reduces VRAM for VAE)
-    try:
-        if hasattr(pipe, 'vae') and hasattr(pipe.vae, 'enable_tiling'):
-            pipe.vae.enable_tiling()
-            print("   ✓ VAE tiling enabled (reduces VRAM usage)")
-    except Exception:
-        pass  # VAE tiling not available, skip silently
+    # # Try to enable VAE tiling if available (reduces VRAM for VAE)
+    # try:
+    #     if hasattr(pipe, 'vae') and hasattr(pipe.vae, 'enable_tiling'):
+    #         pipe.vae.enable_tiling()
+    #         print("   ✓ VAE tiling enabled (reduces VRAM usage)")
+    # except Exception:
+    #     pass  # VAE tiling not available, skip silently
 
     # Try to enable attention slicing if available (reduces VRAM for attention)
-    try:
-        if hasattr(pipe, 'enable_attention_slicing'):
-            pipe.enable_attention_slicing(slice_size="max")
-            print("   ✓ Attention slicing enabled (reduces VRAM usage)")
-    except Exception:
-        pass  # Attention slicing not available, skip silently
+    # try:
+    #     if hasattr(pipe, 'enable_attention_slicing'):
+    #         pipe.enable_attention_slicing(slice_size="max")
+    #         print("   ✓ Attention slicing enabled (reduces VRAM usage)")
+    # except Exception:
+    #     pass  # Attention slicing not available, skip silently
 
     load_time = time.time() - load_start_time
     print(f"✓ Pipeline loaded and optimized ({format_time(load_time)})")

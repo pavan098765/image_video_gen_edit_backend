@@ -115,14 +115,14 @@ def check_quantized_model(model_dir):
             f"Please run quantize_sdnq.py first to create the quantized model."
         )
 
-    # Check for config.json or quantization_config.json
-    config_file = os.path.join(model_dir, "config.json")
-    sdnq_config_file = os.path.join(model_dir, "quantization_config.json")
+    # # Check for config.json or quantization_config.json
+    # config_file = os.path.join(model_dir, "config.json")
+    # sdnq_config_file = os.path.join(model_dir, "quantization_config.json")
 
-    if not os.path.exists(config_file) and not os.path.exists(sdnq_config_file):
-        raise FileNotFoundError(
-            f"Quantized model appears incomplete. Missing config files at {model_dir}"
-        )
+    # if not os.path.exists(config_file) and not os.path.exists(sdnq_config_file):
+    #     raise FileNotFoundError(
+    #         f"Quantized model appears incomplete. Missing config files at {model_dir}"
+    #     )
 
     # Calculate size
     total_size = 0

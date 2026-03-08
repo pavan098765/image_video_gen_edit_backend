@@ -337,6 +337,8 @@ async def run_inference_and_save(
     loop = asyncio.get_event_loop()
     params = params.copy()
     params.setdefault("output_dir", WORKSPACE_DIR)
+    if mode:
+        params.setdefault("mode", mode)
 
     inference_func = resolve_inference_callable(model, mode)
 
@@ -362,20 +364,22 @@ async def process_job_item(item: Dict[str, Any]):
     result_key = item["result_key"]
 
     start_time = datetime.utcnow()
-    logger.info(f"[{job_id}] Processing job with model={model}")
-    # Resolve any URL-valued media fields to base64 before inference
-    try:
-        params = resolve_media_urls(params, job_id)
-    except Exception as e:
-        logger.error(f"[{job_id}] Failed to resolve media URLs: {e}")
-        # Will be caught by outer try/except and reported as failure
+    logger.info(f"[{job_id}] Dequeued, processing with model={model}")
 
+    # Set running immediately so pollers see progress (avoid appearing stuck as "queued")
     async with job_status_lock:
         job_status[job_id] = {
             "status": "running",
             "started_at": start_time.isoformat(),
             "model": model,
         }
+
+    # Resolve any URL-valued media fields to base64 before inference
+    try:
+        params = resolve_media_urls(params, job_id)
+    except Exception as e:
+        logger.error(f"[{job_id}] Failed to resolve media URLs: {e}")
+        # Will be caught by outer try/except and reported as failure
 
     try:
         async with semaphore:
@@ -850,6 +854,40 @@ async def health():
         }
 
 
+@app.get("/logs/comfyui")
+async def get_comfyui_logs(tail: int = 200, format: str = "text"):
+    """
+    Return the last N lines of the ComfyUI server log (stdout/stderr).
+    Use this to see what ComfyUI is actually processing instead of only 'queued'/'running'.
+
+    Query params:
+      tail: number of lines from the end (default 200, max 5000)
+      format: 'text' (plain, default) or 'json' (array of lines)
+    """
+    try:
+        import comfyui_bridge
+        log_path = comfyui_bridge.get_comfyui_log_path()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ComfyUI bridge not available: {e}")
+
+    if not os.path.isfile(log_path):
+        return {"lines": [], "message": "Log file not created yet (ComfyUI may not have started)."} if format == "json" else "Log file not created yet (ComfyUI may not have started).\n"
+
+    tail = max(1, min(5000, tail))
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read log: {e}")
+
+    last = lines[-tail:] if len(lines) > tail else lines
+    last = [ln.rstrip("\n\r") for ln in last]
+
+    if format == "json":
+        return {"lines": last, "total_lines": len(lines), "path": log_path}
+    return "\n".join(last) + ("\n" if last else "")
+
+
 @app.get("/status")
 async def status():
     """Detailed status including all jobs."""
@@ -869,8 +907,10 @@ async def status():
         "queue_capacity": job_queue.maxsize,
         "jobs": jobs_copy,
         "worker_id": WORKER_ID,
+        "models": list(MODEL_REGISTRY.keys()),
         "startup_completed": startup_completed,
         "comfyui_ready": _comfyui_ready,
         "comfyui_healthy": comfyui_healthy,
         "comfyui_error": _comfyui_error,
+        "comfyui_log_url": "/logs/comfyui",
     }

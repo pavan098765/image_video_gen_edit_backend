@@ -41,6 +41,16 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 VIRTUAL_NODE_TYPES: Set[str] = {"Reroute", "SetNode", "GetNode", "Note"}
 
+# Some workflows save Reroute (or similar pass-through) nodes with an internal
+# UUID instead of "Reroute". These are typically ComfyUI built-in pass-through
+# nodes that got exported with an internal type ID. Treat them as Reroute:
+# resolve through them and do not emit into the API prompt.
+REROUTE_UUID_TYPES: Set[str] = {
+    "340f324c-f8b3-46e1-a35b-4561ecd7027c",
+    "a7d2f0d7-ff69-400d-aa64-ca94fcff6246",
+    "c7b2a9fc-a78e-4638-ab98-6ee92ecc3067",
+}
+
 # ---------------------------------------------------------------------------
 # Filename corrections
 # ---------------------------------------------------------------------------
@@ -50,6 +60,8 @@ VIRTUAL_NODE_TYPES: Set[str] = {"Reroute", "SetNode", "GetNode", "Note"}
 
 _FILENAME_CORRECTIONS: Dict[str, str] = {
     "svi-film-opt-10212025.safetensors": "svi-film-opt-10212025_lora_rank_128_fp16.safetensors",
+    "wan_2.1_vae.safetensors": "Wan2_1_VAE_bf16.safetensors",
+    "umt5_xxl_fp16.safetensors": "umt5-xxl-enc-fp8_e4m3fn.safetensors",
 }
 
 
@@ -129,7 +141,7 @@ def convert_visual_to_api(visual_workflow: dict) -> dict:
 
         node_type = node.get("type", "")
 
-        if node_type == "Reroute":
+        if node_type == "Reroute" or node_type in REROUTE_UUID_TYPES:
             # Follow the reroute's input to find the real source
             node_inputs = node.get("inputs", [])
             if node_inputs:
@@ -181,7 +193,7 @@ def convert_visual_to_api(visual_workflow: dict) -> dict:
         node_type = node["type"]
 
         # Skip virtual / decorative nodes - they are resolved, not emitted
-        if node_type in VIRTUAL_NODE_TYPES:
+        if node_type in VIRTUAL_NODE_TYPES or node_type in REROUTE_UUID_TYPES:
             continue
 
         inputs_dict: Dict[str, Any] = {}

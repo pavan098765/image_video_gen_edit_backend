@@ -101,6 +101,11 @@ def start_server() -> subprocess.Popen:
     return _comfyui_process
 
 
+def get_comfyui_log_path() -> str:
+    """Return the path to the ComfyUI server log file (for tail/debug)."""
+    return os.path.join(COMFYUI_DIR, "comfyui_server.log")
+
+
 def wait_until_ready(timeout: int = COMFYUI_STARTUP_TIMEOUT) -> bool:
     """
     Block until ComfyUI responds to ``GET /system_stats``.

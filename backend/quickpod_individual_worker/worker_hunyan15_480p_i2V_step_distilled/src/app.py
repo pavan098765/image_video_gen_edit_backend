@@ -8,7 +8,7 @@ import asyncio
 import hmac
 import hashlib
 import gc
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime
 import uuid
 import httpx
@@ -21,6 +21,13 @@ from contextlib import asynccontextmanager
 import concurrent.futures
 
 import torch
+
+# -----------------------
+# Pod startup time tracking
+# -----------------------
+POD_START_TIME = time.time()
+FIRST_INFERENCE_START_TIME = None
+_first_inference_lock = asyncio.Lock()
 
 # -----------------------
 # Dedicated Thread Pool for Inference
@@ -79,7 +86,6 @@ def cleanup_gpu(verbose: bool = False):
 # -----------------------
 from hunyan15_video_inference import (
     run_inference_hunyan15_i2v,
-    preload_pipeline,
     unload_pipeline,
     get_gpu_info,
 )
@@ -174,7 +180,7 @@ job_status_lock = asyncio.Lock()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 last_model_key: Optional[str] = None
 worker_ready = asyncio.Event()
-startup_completed = False
+startup_completed = True  # Qwen-style: ready immediately, pipeline loads on first job
 
 
 def _peek_next_job_id() -> Optional[str]:
@@ -185,10 +191,6 @@ def _peek_next_job_id() -> Optional[str]:
     except (IndexError, AttributeError):
         pass
     return None
-
-# Model loading state
-_model_loading_complete = False
-_model_loading_error: Optional[str] = None
 
 # -----------------------
 # Request Models
@@ -204,18 +206,23 @@ class RunRequest(BaseModel):
     result_key: str = Field(..., description="R2 key for result")
 
 
+class BulkRunRequest(BaseModel):
+    jobs: List[RunRequest]
+
+
 # -----------------------
 # Media URL Resolution
 # -----------------------
 # Fields that may contain URLs (presigned R2 GET URLs) instead of base64 data.
-# At dispatch time the server converts R2 keys to presigned GET URLs.
-# This helper downloads the binary and converts to base64 so inference code
-# (which expects base64 strings) works without modification.
+# init_image / image: download to local path and pass path (no base64 encode/decode).
+# Other media fields: download and convert to base64 for backward compatibility.
 MEDIA_FIELDS = frozenset([
-    "init_image", "mask_image", "image", "source_image", "face_image",
+    "init_image", "image", "mask_image", "source_image", "face_image",
     "reference_image", "style_image", "control_image", "input_image",
     "ref_image", "ref_video", "input_video",
 ])
+# I2V: resolve by downloading to path so inference gets path (no base64)
+INIT_IMAGE_FIELDS = frozenset(["init_image", "image"])
 
 
 def _is_url(value: str) -> bool:
@@ -229,15 +236,23 @@ def _download_to_base64(url: str, timeout: int = 120) -> str:
     return base64.b64encode(resp.content).decode("utf-8")
 
 
+def _download_url_to_path(url: str, dest_path: str, timeout: int = 120) -> None:
+    """Download binary from URL and write to file. No base64."""
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    with open(dest_path, "wb") as f:
+        f.write(resp.content)
+
+
+def _sanitize_job_id_for_path(job_id: str) -> str:
+    """Make job_id safe for use in filenames."""
+    return re.sub(r"[^\w\-.]", "_", job_id)
+
+
 def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, Any]:
     """
-    Resolve any URL-valued media fields in params to base64 strings.
-    
-    If a known media field contains a URL (e.g. presigned R2 download URL),
-    download the binary and replace with base64 so downstream inference
-    functions work unchanged.
-    
-    Handles both single string values and lists of strings.
+    Resolve URL-valued media fields: init_image/image -> download to path (no base64).
+    Other media fields -> download and replace with base64 for downstream code.
     """
     resolved = dict(params)
     for field in MEDIA_FIELDS:
@@ -246,9 +261,19 @@ def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, An
             continue
         if isinstance(value, str) and _is_url(value):
             try:
-                logger.info(f"[{job_id}] Downloading {field} from URL ({len(value)} chars)...")
-                resolved[field] = _download_to_base64(value)
-                logger.info(f"[{job_id}] Downloaded {field}: {len(resolved[field])} base64 chars")
+                if field in INIT_IMAGE_FIELDS:
+                    # Download to path; inference will use path (no base64)
+                    ext = ".jpg"
+                    safe_id = _sanitize_job_id_for_path(job_id or "job")
+                    path = os.path.join(WORKSPACE_DIR, f"init_{safe_id}{ext}")
+                    logger.info(f"[{job_id}] Downloading {field} from R2 to path ({len(value)} chars)...")
+                    _download_url_to_path(value, path)
+                    resolved[field] = path
+                    logger.info(f"[{job_id}] Downloaded {field} -> {path}")
+                else:
+                    logger.info(f"[{job_id}] Downloading {field} from URL ({len(value)} chars)...")
+                    resolved[field] = _download_to_base64(value)
+                    logger.info(f"[{job_id}] Downloaded {field}: {len(resolved[field])} base64 chars")
             except Exception as e:
                 logger.error(f"[{job_id}] Failed to download {field} from URL: {e}")
                 raise
@@ -257,8 +282,16 @@ def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, An
             for i, item in enumerate(value):
                 if isinstance(item, str) and _is_url(item):
                     try:
-                        logger.info(f"[{job_id}] Downloading {field}[{i}] from URL...")
-                        new_list.append(_download_to_base64(item))
+                        if field in INIT_IMAGE_FIELDS:
+                            ext = ".jpg"
+                            safe_id = _sanitize_job_id_for_path(f"{job_id or 'job'}_{i}")
+                            path = os.path.join(WORKSPACE_DIR, f"init_{safe_id}{ext}")
+                            logger.info(f"[{job_id}] Downloading {field}[{i}] from R2 to path...")
+                            _download_url_to_path(item, path)
+                            new_list.append(path)
+                        else:
+                            logger.info(f"[{job_id}] Downloading {field}[{i}] from URL...")
+                            new_list.append(_download_to_base64(item))
                     except Exception as e:
                         logger.error(f"[{job_id}] Failed to download {field}[{i}]: {e}")
                         raise
@@ -397,20 +430,15 @@ def send_heartbeat():
         queue_size = 0
         active_jobs = 0
     
-    # Determine status based on model loading state and job activity
-    if not _model_loading_complete:
-        status = "starting"
-    elif startup_completed:
-        status = "busy" if (active_jobs > 0 or queue_size > 0) else "ready"
-    else:
-        status = "starting"
+    # Determine status based on job activity (Qwen-style: always ready)
+    status = "busy" if (active_jobs > 0 or queue_size > 0) else "ready"
     
     payload = {
         "worker_id": WORKER_ID,
         "pod_uuid": POD_UUID,
         "timestamp": int(time.time()),
         "status": status,
-        "model_loaded": _model_loading_complete,
+        "model_loaded": True,
         "metrics": {
             "queue_size": queue_size,
             "active_jobs": active_jobs,
@@ -533,27 +561,24 @@ def resolve_inference_callable(model: str, mode: Optional[str]):
 
 async def run_inference_and_save(
     job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]
-) -> str:
-    """Run inference in dedicated thread pool.
-    Params for model:
-            - num_frames (int): Number of frames (default: 121)
-            - num_inference_steps (int): Denoising steps (default: 12)
-            - seed (int): Random seed
-            - fps (int): Frames per second (default: 24)
-            - output_dir (str): Output directory
-            - init_image (str): Base64 encoded image (required for i2v)
-            Note: guidance_scale is not supported by HunyuanVideo15ImageToVideoPipeline
-    """
-    global last_model_key
+) -> Tuple[str, Dict[str, float]]:
+    """Run inference in dedicated thread pool. Returns (output_path, metrics_dict)."""
+    global last_model_key, FIRST_INFERENCE_START_TIME
     loop = asyncio.get_event_loop()
     params = params.copy()
     params.setdefault("output_dir", WORKSPACE_DIR)
+
+    async with _first_inference_lock:
+        if FIRST_INFERENCE_START_TIME is None:
+            FIRST_INFERENCE_START_TIME = time.time()
+            startup_time = FIRST_INFERENCE_START_TIME - POD_START_TIME
+        else:
+            startup_time = None
 
     # Prompt enhancement for video I2V
     if params.get("enhance_prompt", False):
         prompt = await loop.run_in_executor(IO_EXECUTOR, _enhance_prompt, prompt, job_id)
     
-    # Set mode in params if provided
     if mode:
         params.setdefault("mode", mode)
 
@@ -564,28 +589,27 @@ async def run_inference_and_save(
         logger.info(f"Switching model {last_model_key} -> {model_key}, cleaning up GPU first")
         cleanup_gpu()
 
+    inference_start_time = time.time()
     try:
-        # Extract image_input from params for i2v models
-        # The image can be passed as "init_image" or "image" in params
         image_input = params.pop("init_image", None) or params.pop("image", None)
-        
-        # For i2v models, image_input is required
         if model == "hunyan15_480p_i2v_step_distilled":
             if not image_input:
                 raise ValueError(
                     "image_input is required for i2v models. "
-                    "Provide 'init_image' or 'image' in params (base64 encoded image or URL)."
+                    "Provide 'init_image' or 'image' in params (presigned R2 download URL)."
                 )
-            # Pass image_input as separate argument for i2v models
             out_path = await loop.run_in_executor(
                 INFERENCE_EXECUTOR, inference_func, job_id, prompt, image_input, params
             )
         else:
-            # For models that don't need image_input, call without it
             out_path = await loop.run_in_executor(
                 INFERENCE_EXECUTOR, inference_func, job_id, prompt, params
             )
-        return out_path
+        processing_time = time.time() - inference_start_time
+        metrics = {"processing_time_seconds": round(processing_time, 2)}
+        if startup_time is not None:
+            metrics["startup_time_seconds"] = round(startup_time, 2)
+        return out_path, metrics
     finally:
         last_model_key = model_key
 
@@ -595,6 +619,7 @@ async def run_inference_and_save(
 # -----------------------
 async def process_job_item(item: Dict[str, Any]):
     """Process a single job with comprehensive error handling."""
+    global FIRST_INFERENCE_START_TIME
     job_id = item["job_id"]
     model = item["model"]
     mode = item.get("mode")
@@ -625,7 +650,7 @@ async def process_job_item(item: Dict[str, Any]):
             logger.info(f"[{job_id}] Starting inference...")
             logger.info(f"[{job_id}] Inference parameters: model={model}, mode={mode}, output_dir={params.get('output_dir', 'default')}")
             try:
-                out_local = await run_inference_and_save(job_id, prompt, model, mode, params)
+                out_local, metrics = await run_inference_and_save(job_id, prompt, model, mode, params)
                 logger.info(f"[{job_id}] ✅ Inference completed successfully, output: {out_local}")
                 
                 # Verify output file exists
@@ -655,7 +680,7 @@ async def process_job_item(item: Dict[str, Any]):
             is_autotest = job_id.startswith("autotest-")
             if CONTROLLER_URL and not is_autotest:
                 logger.info(f"[{job_id}] Notifying controller of completion...")
-                payload = {"job_id": job_id, "result_r2_key": result_key, "next_job_id": _peek_next_job_id()}
+                payload = {"job_id": job_id, "result_r2_key": result_key, "next_job_id": _peek_next_job_id(), "metrics": metrics}
                 url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
                 try:
                     loop = asyncio.get_running_loop()
@@ -668,7 +693,7 @@ async def process_job_item(item: Dict[str, Any]):
 
             # Mark completed
             completion_time = datetime.utcnow()
-            processing_time = (completion_time - start_time).total_seconds()
+            processing_time = metrics.get("processing_time_seconds", (completion_time - start_time).total_seconds())
             
             async with job_status_lock:
                 job_status[job_id] = {
@@ -707,7 +732,12 @@ async def process_job_item(item: Dict[str, Any]):
         
         is_autotest = job_id.startswith("autotest-")
         if CONTROLLER_URL and not is_autotest:
-            payload = {"job_id": job_id, "result_r2_key": None, "failed": True, "error": error_str, "next_job_id": _peek_next_job_id()}
+            fail_metrics = {}
+            async with _first_inference_lock:
+                if FIRST_INFERENCE_START_TIME is None:
+                    FIRST_INFERENCE_START_TIME = time.time()
+                    fail_metrics["startup_time_seconds"] = round(FIRST_INFERENCE_START_TIME - POD_START_TIME, 2)
+            payload = {"job_id": job_id, "result_r2_key": None, "failed": True, "error": error_str, "next_job_id": _peek_next_job_id(), "metrics": fail_metrics if fail_metrics else None}
             try:
                 url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
                 loop = asyncio.get_running_loop()
@@ -885,6 +915,7 @@ async def run_autotest():
             os.makedirs(autotest_output_dir, exist_ok=True)
             logger.info(f"📁 Autotest output directory: {autotest_output_dir}")
             
+            # init_image as URL (R2/presigned style) - no base64
             i2v_params = {
                 "mode": "image-to-video 480p i2v step distilled",
                 "height": 480,
@@ -892,8 +923,8 @@ async def run_autotest():
                 "duration": 5.0,
                 "num_inference_steps": 12,
                 "cfg_scale": 7.5,
-                "init_image": test_image_b64,  # Base64 encoded image
-                "output_dir": autotest_output_dir,  # Use absolute path
+                "init_image": TEST_IMAGE_URL,
+                "output_dir": autotest_output_dir,
             }
             
             try:
@@ -1048,107 +1079,6 @@ async def run_autotest():
 
 
 # -----------------------
-# Model Preloading
-# -----------------------
-def _preload_model_sync():
-    """Preload model synchronously in a thread."""
-    global _model_loading_complete, _model_loading_error
-    
-    try:
-        logger.info(f"🔄 Starting model preload in background thread... (pipeline={DEFAULT_PIPELINE})")
-        print(f"MODEL PRELOAD: Starting in background thread (pipeline={DEFAULT_PIPELINE})")
-        sys.stdout.flush()
-        start_time = time.time()
-        
-        logger.info(f"📞 Calling preload_pipeline('{DEFAULT_PIPELINE}')...")
-        print(f"MODEL PRELOAD: Calling preload_pipeline('{DEFAULT_PIPELINE}')...")
-        sys.stdout.flush()
-        success = preload_pipeline(DEFAULT_PIPELINE)
-        logger.info(f"📞 preload_pipeline returned: {success}")
-        print(f"MODEL PRELOAD: preload_pipeline returned {success}")
-        sys.stdout.flush()
-        
-        elapsed = time.time() - start_time
-        
-        if success:
-            logger.info(f"✅ Model preloaded successfully in {elapsed:.1f}s")
-            print(f"MODEL PRELOAD: SUCCESS in {elapsed:.1f}s")
-            sys.stdout.flush()
-            _model_loading_complete = True
-            _model_loading_error = None
-        else:
-            logger.error("❌ Model preload returned failure")
-            print("MODEL PRELOAD: FAILED - preload_pipeline returned False")
-            sys.stdout.flush()
-            _model_loading_error = "Preload returned False"
-            _model_loading_complete = False
-            
-    except Exception as e:
-        logger.exception(f"❌ Model preload failed: {e}")
-        print(f"MODEL PRELOAD: EXCEPTION - {e}")
-        import traceback
-        traceback.print_exc()
-        sys.stdout.flush()
-        _model_loading_error = str(e)
-        _model_loading_complete = False
-
-
-async def _wait_for_model_and_register():
-    """Wait for model to load, then register."""
-    global startup_completed
-    
-    max_wait = 300
-    waited = 0
-    
-    while not _model_loading_complete and waited < max_wait:
-        if _model_loading_error:
-            logger.error(f"Model loading failed: {_model_loading_error}")
-            break
-        
-        await asyncio.sleep(2)
-        waited += 2
-        
-        if waited % 30 == 0:
-            logger.info(f"⏳ Still waiting for model... ({waited}s elapsed)")
-    
-    if not _model_loading_complete:
-        logger.error(f"Model loading did not complete within {max_wait}s. Error: {_model_loading_error or 'timeout'}")
-    
-    startup_completed = _model_loading_complete
-    worker_ready.set()
-    
-    if startup_completed:
-        logger.info("✅ Model loaded, worker is now READY")
-        logger.info(f"✅ startup_completed={startup_completed}, _model_loading_complete={_model_loading_complete}")
-    else:
-        logger.warning("⚠️ Worker starting but model not fully loaded")
-        logger.warning(f"⚠️ startup_completed={startup_completed}, _model_loading_complete={_model_loading_complete}, _model_loading_error={_model_loading_error}")
-    
-    # Register with controller
-    try:
-        register_with_controller()
-        logger.info("✅ Worker registered with controller")
-    except Exception as e:
-        logger.exception("Failed to register worker: %s", e)
-    
-    # Run autotest
-    enable_autotest = os.getenv("ENABLE_AUTOTEST", "1") == "1"
-    logger.info(f"🔍 Autotest check: startup_completed={startup_completed}, ENABLE_AUTOTEST={os.getenv('ENABLE_AUTOTEST', '1')}, enable_autotest={enable_autotest}")
-    print(f"AUTOTEST CHECK: startup_completed={startup_completed}, ENABLE_AUTOTEST={os.getenv('ENABLE_AUTOTEST', '1')}, enable_autotest={enable_autotest}")
-    if startup_completed and enable_autotest:
-        logger.info("✅ Starting autotest task...")
-        print("AUTOTEST: Starting autotest task...")
-        asyncio.create_task(run_autotest())
-    else:
-        if not startup_completed:
-            logger.warning("⚠️ Autotest skipped: startup_completed is False (model may not have loaded)")
-            print(f"AUTOTEST: SKIPPED - startup_completed={startup_completed}, _model_loading_complete={_model_loading_complete}")
-        if not enable_autotest:
-            logger.info("ℹ️ Autotest disabled via ENABLE_AUTOTEST env var")
-            print("AUTOTEST: DISABLED via ENABLE_AUTOTEST env var")
-
-
-# -----------------------
 # Health monitoring
 # -----------------------
 async def _health_monitor_loop():
@@ -1219,8 +1149,6 @@ async def _record_job_status_later(job_id: str, model: str):
 # -----------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global startup_completed
-    
     logger.info("🚀 Hunyan15 480p I2V Step Distilled Worker starting up...")
     print("=" * 80)
     print("WORKER STARTUP: Hunyan15 480p I2V Step Distilled Worker")
@@ -1231,21 +1159,20 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_hb_loop())
     asyncio.create_task(_health_monitor_loop())
     
-    startup_completed = False
+    # Qwen-style: register immediately, pipeline loads on first job
+    worker_ready.set()
+    try:
+        register_with_controller()
+        logger.info("✅ Worker registered with controller")
+    except Exception as e:
+        logger.exception("Failed to register worker: %s", e)
     
-    # Start model loading in dedicated thread
-    loop = asyncio.get_event_loop()
-    logger.info(f"🔄 Starting model preload in INFERENCE_EXECUTOR thread... (DEFAULT_PIPELINE={DEFAULT_PIPELINE})")
-    logger.info(f"🔄 ENABLE_AUTOTEST={os.getenv('ENABLE_AUTOTEST', '1')}")
-    print(f"MODEL PRELOAD: Starting with DEFAULT_PIPELINE={DEFAULT_PIPELINE}")
-    print(f"AUTOTEST: ENABLE_AUTOTEST={os.getenv('ENABLE_AUTOTEST', '1')}")
-    loop.run_in_executor(INFERENCE_EXECUTOR, _preload_model_sync)
+    # Run autotest if enabled
+    if os.getenv("ENABLE_AUTOTEST", "1") == "1":
+        asyncio.create_task(run_autotest())
     
-    # Wait for model and register
-    asyncio.create_task(_wait_for_model_and_register())
-    
-    logger.info("📡 Worker starting - model loading in background, health endpoint responding")
-    print("WORKER: Background tasks started, model loading in progress...")
+    logger.info("📡 Worker ready - accepting jobs (pipeline loads on first inference)")
+    print("WORKER: Ready, accepting jobs...")
     
     yield
     
@@ -1320,13 +1247,6 @@ async def run_endpoint(req: RunRequest):
         logger.error(f"[{req.job_id}] Queue full ({job_queue.maxsize})")
         raise HTTPException(status_code=503, detail="Worker queue full")
     
-    if not startup_completed:
-        if not _model_loading_complete:
-            logger.warning(f"[{req.job_id}] Model still loading")
-            raise HTTPException(status_code=503, detail="Worker model still loading")
-        else:
-            logger.warning(f"[{req.job_id}] Worker not fully ready, but model loaded")
-    
     if req.model not in MODEL_REGISTRY:
         logger.error(f"[{req.job_id}] Unknown model: {req.model}")
         raise HTTPException(status_code=400, detail=f"Unknown model: {req.model}")
@@ -1346,6 +1266,50 @@ async def run_endpoint(req: RunRequest):
     except Exception as e:
         logger.exception(f"[{req.job_id}] Failed to enqueue: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/run_bulk")
+async def run_bulk_endpoint(req: BulkRunRequest):
+    """Accept multiple jobs in one request. Used for bulk edit and multi-variation."""
+    if not req.jobs:
+        raise HTTPException(status_code=400, detail="No jobs provided")
+    if not startup_completed:
+        raise HTTPException(status_code=503, detail="Worker not ready")
+    available_slots = job_queue.maxsize - job_queue.qsize()
+    if available_slots < len(req.jobs):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Not enough queue capacity. Available: {available_slots}, Requested: {len(req.jobs)}"
+        )
+    accepted_ids = []
+    for job in req.jobs:
+        if job.model not in MODEL_REGISTRY:
+            logger.warning(f"[BULK] Unknown model {job.model} for job {job.job_id}, skipping")
+            continue
+        try:
+            await asyncio.wait_for(job_status_lock.acquire(), timeout=2.0)
+            try:
+                if job.job_id in job_status and job_status[job.job_id].get("status") in ("queued", "running"):
+                    logger.warning(f"[BULK] Job {job.job_id} already queued/running, skipping")
+                    continue
+                if job.job_id in job_status:
+                    del job_status[job.job_id]
+            finally:
+                job_status_lock.release()
+        except asyncio.TimeoutError:
+            pass
+        await job_queue.put(job.dict())
+        asyncio.create_task(_record_job_status_later(job.job_id, job.model))
+        accepted_ids.append(job.job_id)
+    logger.info(f"[BULK] Enqueued {len(accepted_ids)} of {len(req.jobs)} jobs")
+    return {
+        "status": "accepted",
+        "job_ids": accepted_ids,
+        "total_accepted": len(accepted_ids),
+        "total_requested": len(req.jobs),
+        "worker_id": WORKER_ID,
+        "queue_size": job_queue.qsize(),
+    }
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -1372,12 +1336,8 @@ async def health():
             active_jobs = MAX_CONCURRENT_JOBS
             queued_jobs = job_queue.qsize()
         
-        # Determine status
-        if not _model_loading_complete:
-            overall_status = "starting"
-        elif not startup_completed:
-            overall_status = "starting"
-        elif job_queue.full():
+        # Determine status (Qwen-style: always ready)
+        if job_queue.full():
             overall_status = "overloaded"
         elif active_jobs >= MAX_CONCURRENT_JOBS:
             overall_status = "busy"
@@ -1401,10 +1361,10 @@ async def health():
             active_jobs=active_jobs,
             queued_jobs=queued_jobs,
             max_concurrent=MAX_CONCURRENT_JOBS,
-            model_loaded=_model_loading_complete,
-            model_error=_model_loading_error,
-            startup_completed=startup_completed,
-            ready=startup_completed and not job_queue.full(),
+            model_loaded=True,
+            model_error=None,
+            startup_completed=True,
+            ready=not job_queue.full(),
             processing=is_processing,
             healthy=True,
             gpu_info=gpu_info,
@@ -1419,9 +1379,9 @@ async def health():
             active_jobs=1,
             queued_jobs=0,
             max_concurrent=MAX_CONCURRENT_JOBS,
-            model_loaded=_model_loading_complete,
+            model_loaded=True,
             model_error=str(e),
-            startup_completed=startup_completed,
+            startup_completed=True,
             ready=False,
             processing=True,
             healthy=True,
@@ -1440,9 +1400,9 @@ async def status():
         "queue_capacity": job_queue.maxsize,
         "jobs": jobs_copy,
         "worker_id": WORKER_ID,
-        "startup_completed": startup_completed,
-        "model_loaded": _model_loading_complete,
-        "model_error": _model_loading_error,
+        "startup_completed": True,
+        "model_loaded": True,
+        "model_error": None,
         "gpu_info": get_gpu_info() if torch.cuda.is_available() else None,
     }
 
