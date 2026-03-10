@@ -436,6 +436,68 @@ class MachineCacheManager:
         await self.save()
         logger.info(f"Marked {image_name} cached on machine {machine_id}")
     
+    def list_all_cached_pairs(self) -> List[Tuple[str, str]]:
+        """
+        List all (machine_id, model) pairs from machines[*].cached_images.
+        Used by the cache refresh service to know what to refresh.
+        
+        Returns:
+            List of (machine_id, model) tuples
+        """
+        result = []
+        machines = self.cache.get("machines", {})
+        for mid, info in machines.items():
+            cached = info.get("cached_images", {})
+            for model in cached:
+                result.append((mid, model))
+        return result
+    
+    def get_refresh_blacklisted_streak(self, machine_id: str) -> int:
+        """Get consecutive refresh runs this machine was blacklisted (0 if not set)."""
+        machines = self.cache.get("machines", {})
+        machine = machines.get(str(machine_id), {})
+        return machine.get("refresh_blacklisted_streak", 0)
+    
+    async def increment_refresh_blacklisted_streak(self, machine_id: str) -> int:
+        """Increment blacklist streak for a machine. Returns new streak value."""
+        async with self._lock:
+            machines = self.cache.setdefault("machines", {})
+            machine = machines.setdefault(str(machine_id), {"cached_images": {}, "is_priority": False})
+            streak = machine.get("refresh_blacklisted_streak", 0) + 1
+            machine["refresh_blacklisted_streak"] = streak
+            self.cache["meta"]["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        await self.save()
+        return streak
+    
+    async def reset_refresh_blacklisted_streak(self, machine_id: str):
+        """Reset blacklist streak to 0 when machine was successfully used."""
+        async with self._lock:
+            machines = self.cache.get("machines", {})
+            machine = machines.get(str(machine_id))
+            if machine is not None:
+                machine["refresh_blacklisted_streak"] = 0
+                self.cache["meta"]["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        await self.save()
+    
+    def get_machines_with_streak_ge_3(self) -> List[str]:
+        """Get machine IDs that have refresh_blacklisted_streak >= 3 (to be removed)."""
+        result = []
+        machines = self.cache.get("machines", {})
+        for mid, info in machines.items():
+            if info.get("refresh_blacklisted_streak", 0) >= 3:
+                result.append(mid)
+        return result
+    
+    async def remove_machine(self, machine_id: str):
+        """Remove a machine from the cache (e.g. after 3 consecutive blacklisted refresh runs)."""
+        async with self._lock:
+            machines = self.cache.get("machines", {})
+            if str(machine_id) in machines:
+                del machines[str(machine_id)]
+                self.cache["meta"]["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        await self.save()
+        logger.info(f"Removed machine {machine_id} from cache (3 consecutive blacklisted refresh runs)")
+    
     def get_cached_machines_for_model(self, model: str) -> List[Tuple[str, float]]:
         """
         Get machines that have a model cached, sorted by score.
@@ -1217,6 +1279,8 @@ class PodManager:
         starting_pod_uuid = None
         async with self._lock:
             for pod_uuid, info in self.individual_pods.items():
+                if info.meta.get("is_cache_refresh_pod"):
+                    continue
                 if info.model == model and info.status == PodStatus.STARTING:
                     # Skip blacklisted machines
                     if info.machine_id and self.is_machine_bad(info.machine_id):
@@ -1284,6 +1348,8 @@ class PodManager:
         # Collect all eligible READY pods for this model
         eligible_ready_pods = []
         for pod_uuid, info in candidates:
+            if info.meta.get("is_cache_refresh_pod"):
+                continue
             if info.machine_id and self.is_machine_bad(info.machine_id):
                 continue
             if self.lifecycle.is_recently_destroyed(pod_uuid):
@@ -1376,6 +1442,8 @@ class PodManager:
         starting_pod_uuid = None
         async with self._lock:
             for pod_uuid, info in self.individual_pods.items():
+                if info.meta.get("is_cache_refresh_pod"):
+                    continue
                 if info.model == model and info.status == PodStatus.STARTING:
                     # Skip blacklisted machines
                     if info.machine_id and self.is_machine_bad(info.machine_id):
@@ -1420,6 +1488,8 @@ class PodManager:
                     candidates_after_timeout = list(self.individual_pods.items())
                 
                 for pod_uuid, info in candidates_after_timeout:
+                    if info.meta.get("is_cache_refresh_pod"):
+                        continue
                     if info.machine_id and self.is_machine_bad(info.machine_id):
                         continue
                     if self.lifecycle.is_recently_destroyed(pod_uuid):
@@ -1497,6 +1567,8 @@ class PodManager:
                 for retry_attempt in range(10):  # Try up to 10 times (5 seconds)
                     async with self._lock:
                         for pu, pi in self.individual_pods.items():
+                            if pi.meta.get("is_cache_refresh_pod"):
+                                continue
                             if pi.model == model and pi.status in [PodStatus.STARTING, PodStatus.READY]:
                                 if pi.machine_id and self.is_machine_bad(pi.machine_id):
                                     continue
@@ -2073,9 +2145,8 @@ class PodManager:
                 tried_machines = set()
                 
                 # ---------------------------------------------------------------
-                # GPU PRIORITY FIX: Fetch all offers ONCE per variant iteration.
-                # Used for: (1) sorting cached candidates by GPU priority
-                #           (2) the "all available machines" fallback (avoids re-fetch)
+                # Fetch all offers ONCE per variant iteration to avoid API spam.
+                # We then iterate through each GPU tier in order, trying cached then uncached.
                 # ---------------------------------------------------------------
                 _all_variant_offers: list = []
                 try:
@@ -2083,231 +2154,136 @@ class PodManager:
                         self.global_qp.get_rentable_machines
                     )
                 except Exception as _fetch_err:
-                    logger.debug(f"Pre-fetch offers for GPU priority sorting failed: {_fetch_err}")
-                
-                # Build machine_id -> GPU priority index (lower = higher priority
-                # per the order specified in allowed_gpus from model_requirements).
-                _machine_gpu_prio: Dict[str, int] = {}
-                for _o in _all_variant_offers:
-                    _mid_val = None
-                    for _k in ("machines_id", "machine_id", "machineId"):
-                        if _k in _o and _o[_k] is not None:
+                    logger.debug(f"Pre-fetch offers for GPU sorting failed: {_fetch_err}")
+
+                def extract_machine_id(o: dict) -> str:
+                    for k in ("machines_id", "machine_id", "machineId"):
+                        if k in o and o[k] is not None:
                             try:
-                                _mid_val = str(int(_o[_k]))
-                                break
+                                return str(int(o[k]))
                             except (ValueError, TypeError):
                                 pass
-                    if _mid_val:
-                        _oname = str(_o.get("offer_name", "")).upper()
-                        for _gi, _gn in enumerate(allowed_gpus or []):
-                            if _gn.upper() in _oname:
-                                if _mid_val not in _machine_gpu_prio or _gi < _machine_gpu_prio[_mid_val]:
-                                    _machine_gpu_prio[_mid_val] = _gi
-                                break
-                
-                # Sort cached candidates by GPU priority (e.g. 5090 before 4090).
-                # Stable sort: within same GPU priority, original cache-score order is preserved.
-                candidates_by_gpu_priority = sorted(
-                    candidates, key=lambda c: _machine_gpu_prio.get(c[0], 999)
-                )
-                
-                if candidates_by_gpu_priority:
-                    logger.info(
-                        f"Cached candidates sorted by GPU priority for variant {variant}: "
-                        f"{[(c[0], _machine_gpu_prio.get(c[0], '?')) for c in candidates_by_gpu_priority[:5]]}"
-                    )
-                
-                # First, try cached machines (in GPU priority order)
-                for mid, desc in candidates_by_gpu_priority:
-                    if mid in tried_machines:
-                        continue
-                    tried_machines.add(mid)
-                    
-                    # Skip blacklisted
-                    if self.is_machine_bad(mid):
-                        continue
-                    
+                    return ""
+
+                def extract_offer_id(o: dict):
+                    return o.get("offer_id") or o.get("id")
+
+                def extract_price(o: dict) -> float:
                     try:
-                        # Get current ACTIVE blacklisted machines (excludes expired)
-                        blacklisted = self.blacklist.get_active_blacklist()
-                        
-                        # Get offer with full details including pricing
-                        offer_info = await asyncio.to_thread(
-                            self.global_qp.get_best_offer_with_details,
-                            int(mid),
-                            min_tflops,
-                            allowed_gpus,
-                            1,  # min_gpu_count
-                            blacklisted,  # Pass active blacklist to get_best_offer
-                        )
-                        
-                        if not offer_info:
-                            logger.debug(f"No offer available for cached machine {mid}")
-                            continue
-                        
-                        # Double-check: Verify the returned machine is not blacklisted
-                        final_machine_id = str(offer_info.machine_id or mid)
-                        if self.is_machine_bad(final_machine_id):
-                            logger.warning(
-                                f"Skipping machine {final_machine_id} returned by get_best_offer: "
-                                f"machine is blacklisted (double-check caught this)"
-                            )
-                            continue
-                        
-                        # Create pod with cost tracking info
-                        pod_uuid = await self._try_create_pod_on_machine(
-                            final_machine_id,
-                            model,
-                            mode,
-                            variant,
-                            offer_info.offer_id,
-                            template_uuid,
-                            disk_size,
-                            hourly_cost=offer_info.hourly_cost,
-                            gpu_type=offer_info.gpu_type,
-                        )
-                        
-                        if pod_uuid:
-                            return pod_uuid
-                            
-                    except Exception as e:
-                        logger.warning(f"Failed on cached machine {mid}: {e}")
-                        continue
-                
-                # If cached machines failed, try ALL available machines of this GPU type
-                # This handles new machines that don't have the image cached yet
-                logger.info(
-                    f"Cached machines exhausted for variant {variant} (GPUs: {allowed_gpus}). "
-                    f"Trying all available machines of this GPU type..."
-                )
-                
-                # Get current ACTIVE blacklisted machines
+                        return float(o.get("hourly_cost", 1e9))
+                    except (ValueError, TypeError):
+                        return 1e9
+
+                def has_valid_tflops(o: dict) -> bool:
+                    try:
+                        offer_tflops = float(o.get("tflops", 0))
+                        if isinstance(min_tflops, dict):
+                            offer_name = str(o.get("offer_name", "")).upper()
+                            required_tflops = float(min_tflops.get("default", 0))
+                            for gpu, tflops_val in min_tflops.items():
+                                if gpu.upper() in offer_name and gpu.upper() != "DEFAULT":
+                                    required_tflops = float(tflops_val)
+                                    break
+                            return offer_tflops >= required_tflops
+                        else:
+                            return offer_tflops >= float(min_tflops)
+                    except (ValueError, TypeError):
+                        return False
+
+                def is_multi_gpu_offer(o: dict) -> bool:
+                    name = str(o.get("offer_name", "")).upper()
+                    if name.startswith(("2X", "3X", "4X")):
+                        return True
+                    gpu_indexes = str(o.get("gpu_indexes", "") or "")
+                    tokens = [t for t in gpu_indexes.split("|") if t.strip()]
+                    return len(tokens) > 1
+
+                def has_allowed_geolocation(o: dict) -> bool:
+                    allowed = {"US", "NZ"}
+                    machines = o.get("_machines", {})
+                    if isinstance(machines, dict):
+                        geo = machines.get("geolocation", "")
+                        if geo in allowed:
+                            return True
+                    return o.get("geolocation", "") in allowed
+
                 blacklisted = self.blacklist.get_active_blacklist()
                 blacklist_set = set(blacklisted)
+
+                # Iterate through EACH GPU tier specified in this variant's plan
+                pod_created_for_variant = False
                 
-                try:
-                    # Use pre-fetched offers from variant start (avoids redundant API call)
-                    all_offers = _all_variant_offers
-                    if not all_offers:
-                        # Fallback: try fetching again if the earlier pre-fetch failed
-                        all_offers = await asyncio.to_thread(
-                            self.global_qp.get_rentable_machines
-                        )
+                for target_gpu in (allowed_gpus or []):
+                    logger.info(f"Evaluating GPU tier '{target_gpu}' for variant {variant}")
                     
-                    if not all_offers:
-                        logger.warning(f"No offers available for variant {variant}")
-                        continue
-                    
-                    # Helper functions to filter offers
-                    def extract_machine_id(o: Dict) -> Optional[int]:
-                        for key in ("machines_id", "machine_id", "machineId"):
-                            if key in o and o[key] is not None:
-                                try:
-                                    return int(o[key])
-                                except (ValueError, TypeError):
-                                    pass
-                        return None
-                    
-                    def extract_offer_id(o: Dict) -> Optional[int]:
-                        return o.get("offer_id") or o.get("id")
-                    
-                    def extract_price(o: Dict) -> float:
-                        try:
-                            return float(o.get("hourly_cost", 1e9))
-                        except (ValueError, TypeError):
-                            return 1e9
-                    
-                    def has_valid_tflops(o: Dict) -> bool:
-                        try:
-                            return float(o.get("tflops", 0)) >= min_tflops
-                        except (ValueError, TypeError):
-                            return False
-                    
-                    def matches_gpu_name(o: Dict) -> bool:
-                        if not allowed_gpus:
-                            return True
-                        offer_name = str(o.get("offer_name", "")).upper()
-                        for gpu in allowed_gpus:
-                            if gpu.upper() in offer_name:
-                                return True
-                        return False
-                    
-                    def is_blacklisted_offer(o: Dict) -> bool:
+                    # --- 1. Filter ALL offers for THIS specific GPU tier ---
+                    eligible_offers_for_gpu = []
+                    for o in _all_variant_offers:
                         mid = extract_machine_id(o)
-                        return mid and str(mid) in blacklist_set
-                    
-                    def has_sufficient_memory(o: Dict) -> bool:
+                        if not mid or mid in tried_machines or mid in blacklist_set:
+                            continue
+                            
+                        # Must match the CURRENT target GPU tier
+                        if target_gpu.upper() not in str(o.get("offer_name", "")).upper():
+                            continue
+                            
+                        if is_multi_gpu_offer(o): continue
+                        if not has_valid_tflops(o): continue
+                        
+                        # Memory > 30GB
                         try:
-                            return float(o.get("memory", 0)) > 30
+                            if float(o.get("memory", 0)) <= 30: continue
                         except (ValueError, TypeError):
-                            return False
+                            continue
+                            
+                        if not has_allowed_geolocation(o): continue
+                        
+                        eligible_offers_for_gpu.append(o)
                     
-                    def is_multi_gpu_offer(o: Dict) -> bool:
-                        name = str(o.get("offer_name", "")).upper()
-                        if name.startswith(("2X", "3X", "4X")):
-                            return True
-                        gpu_indexes = str(o.get("gpu_indexes", "") or "")
-                        tokens = [t for t in gpu_indexes.split("|") if t.strip()]
-                        return len(tokens) > 1
+                    if not eligible_offers_for_gpu:
+                        logger.info(f"No eligible machines found for GPU tier '{target_gpu}'")
+                        continue
+                        
+                    # --- 2. Sort the eligible machines: CACHED first, then CHEAPEST ---
+                    # We know all these machines are the correct GPU tier and are available to rent.
+                    # We sort them such that if a machine ID is in `candidates` (our cache list), it goes first.
+                    # Among cached machines, preserve their original order (which is based on cache score).
+                    cached_mids = [c[0] for c in candidates]
                     
-                    # Filter offers for this GPU type, excluding blacklisted and already-tried machines
-                    eligible_offers = [
-                        o for o in all_offers
-                        if not is_multi_gpu_offer(o)
-                        and has_valid_tflops(o)
-                        and matches_gpu_name(o)
-                        and has_sufficient_memory(o)
-                        and not is_blacklisted_offer(o)
-                        and extract_machine_id(o) is not None
-                        and str(extract_machine_id(o)) not in tried_machines
-                    ]
-                    
-                    # GPU PRIORITY FIX: Sort by allowed_gpus order first, then by
-                    # price within each GPU tier.  This ensures e.g. 5090 machines
-                    # are tried before 4090 machines when allowed_gpus=["5090","4090"].
-                    def gpu_priority_then_price(o):
-                        offer_name = str(o.get("offer_name", "")).upper()
-                        for idx, gpu in enumerate(allowed_gpus or []):
-                            if gpu.upper() in offer_name:
-                                return (idx, extract_price(o))
-                        return (len(allowed_gpus or []), extract_price(o))
-                    
-                    eligible_offers.sort(key=gpu_priority_then_price)
+                    def sort_key(o):
+                        mid = extract_machine_id(o)
+                        is_cached = mid in cached_mids
+                        cache_idx = cached_mids.index(mid) if is_cached else 999999
+                        price = extract_price(o)
+                        # Tuple comparison: (0 if cached else 1, cache index, price)
+                        return (0 if is_cached else 1, cache_idx, price)
+                        
+                    eligible_offers_for_gpu.sort(key=sort_key)
                     
                     logger.info(
-                        f"Found {len(eligible_offers)} eligible machines for variant {variant} "
-                        f"(GPUs: {allowed_gpus})"
+                        f"Found {len(eligible_offers_for_gpu)} eligible machines for GPU '{target_gpu}' "
+                        f"({sum(1 for o in eligible_offers_for_gpu if extract_machine_id(o) in cached_mids)} cached)"
                     )
                     
-                    # Try each eligible machine
-                    for offer in eligible_offers:
-                        machine_id = extract_machine_id(offer)
-                        if not machine_id:
-                            continue
-                        
-                        machine_id_str = str(machine_id)
-                        
-                        # Double-check: Verify the machine is not blacklisted (race condition protection)
-                        if self.is_machine_bad(machine_id_str):
-                            logger.debug(
-                                f"Skipping blacklisted machine {machine_id_str} for variant {variant}"
-                            )
-                            continue
-                        
+                    # --- 3. Try each eligible machine ---
+                    for offer in eligible_offers_for_gpu:
+                        machine_id_str = extract_machine_id(offer)
                         offer_id = extract_offer_id(offer)
-                        if not offer_id:
-                            continue
+                        if not offer_id: continue
                         
-                        # Extract offer details
+                        # Double-check blacklist (race condition)
+                        if self.is_machine_bad(machine_id_str):
+                            continue
+                            
                         hourly_cost = extract_price(offer)
                         gpu_type = offer.get("gpu_type", offer.get("offer_name", "Unknown"))
+                        is_cached = machine_id_str in cached_mids
                         
                         logger.info(
-                            f"Trying machine {machine_id_str} for variant {variant} "
-                            f"(GPUs: {allowed_gpus}, price=${hourly_cost:.3f}/hr)"
+                            f"Trying {'CACHED' if is_cached else 'UNCACHED'} machine {machine_id_str} "
+                            f"for variant {variant} (GPU: {target_gpu}, price=${hourly_cost:.3f}/hr)"
                         )
                         
-                        # Create pod with cost tracking info
                         pod_uuid = await self._try_create_pod_on_machine(
                             machine_id_str,
                             model,
@@ -2321,28 +2297,11 @@ class PodManager:
                         )
                         
                         if pod_uuid:
-                            # Success! Machine will be added to cache in _try_create_pod_on_machine
-                            logger.info(
-                                f"Successfully created pod on machine {machine_id_str} "
-                                f"for variant {variant}. Machine will be cached for future use."
-                            )
+                            logger.info(f"Successfully created pod on machine {machine_id_str}")
                             return pod_uuid
-                        
-                        # If pod creation failed, machine was blacklisted in _try_create_pod_on_machine
-                        # Continue to next machine
-                        logger.debug(
-                            f"Pod creation failed on machine {machine_id_str} for variant {variant}. "
-                            f"Trying next machine..."
-                        )
-                    
-                    logger.warning(
-                        f"All eligible machines for variant {variant} (GPUs: {allowed_gpus}) "
-                        f"have been tried and failed. Moving to next variant."
-                    )
-                    
-                except Exception as e:
-                    logger.error(f"Error getting offers for variant {variant}: {e}")
-                    continue
+                            
+                        # If failed, mark as tried and continue
+                        tried_machines.add(machine_id_str)
                 
                 # If we reach here, this variant failed on all available machines of this GPU type
                 logger.warning(
@@ -2664,8 +2623,12 @@ class PodManager:
         hourly_cost: float = 0.0,
         gpu_type: str = "",
         offer_id: int = 0,
+        is_cache_refresh_pod: bool = False,
     ):
         """Register a pod in local tracking with cost info"""
+        meta: Dict[str, Any] = {"variant": variant}
+        if is_cache_refresh_pod:
+            meta["is_cache_refresh_pod"] = True
         async with self._lock:
             self.individual_pods[pod_uuid] = PodInfo(
                 pod_uuid=pod_uuid,
@@ -2676,7 +2639,7 @@ class PodManager:
                 last_active=datetime.utcnow(),
                 machine_id=machine_id,
                 variant=variant,
-                meta={"variant": variant},
+                meta=meta,
                 hourly_cost=hourly_cost,
                 gpu_type=gpu_type,
                 offer_id=offer_id,
@@ -2822,10 +2785,10 @@ class PodManager:
                             break
                 
                 if worker:
-                    # Find all RUNNING or DISPATCHING jobs on this worker
+                    # Find all QUEUED, RUNNING or DISPATCHING jobs on this worker
                     jobs_to_recover = db.query(Job).filter(
                         Job.worker_id == worker.worker_id,
-                        Job.status.in_([JobState.RUNNING.value, JobState.DISPATCHING.value]),
+                        Job.status.in_([JobState.QUEUED.value, JobState.RUNNING.value, JobState.DISPATCHING.value]),
                     ).all()
                     
                     max_retries_default = int(os.getenv("JOB_MAX_RETRIES", "3"))
@@ -2864,6 +2827,7 @@ class PodManager:
                             # Under limit - recover and requeue
                             job.status = JobState.QUEUED.value
                             job.worker_id = None
+                            job.started_at = None  # Clear stale started_at from previous run
                             job.updated_at = datetime.utcnow()
                             job.retry_count = retry_count + 1
                             recovered_jobs.append(
@@ -3005,6 +2969,8 @@ class PodManager:
                 or "startup timeout" in reason_l
                 or "dispatch failure" in reason_l
                 or "stuck in starting" in reason_l
+                or "oom" in reason_l
+                or "out of memory" in reason_l
             ):
                 try:
                     await self.mark_machine_bad(str(machine_id), duration=600)
@@ -3137,4 +3103,114 @@ class PodManager:
         except Exception as e:
             logger.exception(f"Scale up error for {model}: {e}")
             # Don't re-raise - autoscaler will retry after cooldown
+
+    # -------------------------------------------------------------------------
+    # Cache Refresh Service
+    # -------------------------------------------------------------------------
+
+    async def run_cache_refresh(self) -> None:
+        """
+        Periodic cache refresh: start pods for each (machine_id, model) in cache,
+        wait for worker registration, keep alive briefly, then destroy.
+        Purpose: ensure Docker images stay cached on machines.
+        Runs standalone (cron) and does not interfere with job-driven pod management.
+        """
+        refresh_registration_min = int(os.getenv("REFRESH_REGISTRATION_TIMEOUT_MINUTES", "8"))
+        refresh_keep_alive_min = int(os.getenv("REFRESH_POD_KEEP_ALIVE_MINUTES", "5"))
+        max_items = int(os.getenv("REFRESH_MAX_ITEMS_PER_RUN", "50"))
+        registration_timeout_sec = refresh_registration_min * 60
+
+        pairs = self.machine_cache.list_all_cached_pairs()
+        pairs = pairs[:max_items]
+        logger.info(f"Cache refresh: processing {len(pairs)} (machine, model) pairs (max {max_items})")
+
+        blacklisted_machines = self.blacklist.get_active_blacklist()
+
+        # Login once before the loop; if auth fails we exit immediately instead of retrying per pair
+        await self._ensure_global_login()
+
+        for machine_id, model in pairs:
+            try:
+                if self.is_machine_bad(machine_id):
+                    streak = await self.machine_cache.increment_refresh_blacklisted_streak(machine_id)
+                    logger.info(f"Cache refresh: skip blacklisted machine {machine_id}, streak={streak}")
+                    continue
+
+                template_uuid = self.get_template_for_variant(model, None)
+                if not template_uuid:
+                    logger.debug(f"Cache refresh: skip {model} (no template)")
+                    continue
+
+                disk_size = self.get_disk_size_for_variant(model, None)
+                base_model = self.resolve_model_alias(model)
+                req = self.model_requirements.get(base_model, {})
+                min_tflops = req.get("min_tflops", 0)
+                allowed_gpu_names = req.get("allowed_gpu_names")
+
+                offer_info = self.global_qp.get_offer_for_machine_only(
+                    machine_id=int(machine_id),
+                    min_tflops=min_tflops,
+                    allowed_gpu_names=allowed_gpu_names,
+                    blacklisted_machines=blacklisted_machines,
+                )
+                if not offer_info:
+                    logger.warning(f"Cache refresh: no offer for machine {machine_id}, skip")
+                    continue
+
+                pod_uuid = await self.lifecycle.create_pod(
+                    offer_id=offer_info.offer_id,
+                    template_uuid=template_uuid,
+                    disk_size=disk_size,
+                    model=model,
+                    mode=None,
+                    variant=None,
+                    machine_id=machine_id,
+                )
+                if not pod_uuid:
+                    logger.warning(f"Cache refresh: create pod failed for {model} on {machine_id}")
+                    continue
+
+                await self._register_pod_locally(
+                    pod_uuid=pod_uuid,
+                    model=model,
+                    mode=None,
+                    machine_id=machine_id,
+                    variant=None,
+                    hourly_cost=offer_info.hourly_cost,
+                    gpu_type=offer_info.gpu_type,
+                    offer_id=offer_info.offer_id,
+                    is_cache_refresh_pod=True,
+                )
+
+                start = time.time()
+                registered = False
+                while time.time() - start < registration_timeout_sec:
+                    if await self._check_worker_registered_for_pod(pod_uuid, require_ready=False):
+                        registered = True
+                        break
+                    await asyncio.sleep(5)
+
+                if registered:
+                    await self.machine_cache.mark_image_cached(machine_id, model)
+                    await self.machine_cache.reset_refresh_blacklisted_streak(machine_id)
+                    logger.info(f"Cache refresh: {model} on {machine_id} registered, keeping alive {refresh_keep_alive_min} min")
+                else:
+                    logger.info(
+                        f"Cache refresh: {model} on {machine_id} did not register in time "
+                        f"(download in progress?), keeping alive {refresh_keep_alive_min} min"
+                    )
+
+                await asyncio.sleep(refresh_keep_alive_min * 60)
+                await self.destroy_individual_pod(pod_uuid, reason="Cache refresh keep-alive done")
+
+            except Exception as e:
+                logger.exception(f"Cache refresh: error for {model} on {machine_id}: {e}")
+
+        to_remove = self.machine_cache.get_machines_with_streak_ge_3()
+        for mid in to_remove:
+            await self.machine_cache.remove_machine(mid)
+            logger.info(f"Cache refresh: removed machine {mid} from cache (3 consecutive blacklisted runs)")
+
+        await self.machine_cache.save()
+        logger.info("Cache refresh: completed")
 

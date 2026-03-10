@@ -382,9 +382,14 @@ _ENHANCE_SYSTEM_PROMPTS = {
 }
 
 
-def _enhance_prompt(prompt: str, model_type: str, job_id: str) -> str:
+def _is_init_image_url(value: Any) -> bool:
+    return isinstance(value, str) and (value.startswith("http://") or value.startswith("https://"))
+
+
+def _enhance_prompt(prompt: str, model_type: str, job_id: str, init_image_url: Optional[str] = None) -> str:
     """
     Enhance a prompt using Together AI LLM.
+    If init_image_url is provided (presigned URL), sends image + prompt for image-aware enhancement.
 
     Parameters
     ----------
@@ -394,6 +399,8 @@ def _enhance_prompt(prompt: str, model_type: str, job_id: str) -> str:
         One of "image", "image_edit", "video_t2v", "video_i2v".
     job_id : str
         Job ID for logging.
+    init_image_url : str, optional
+        Presigned URL of init image for image-aware enhancement.
 
     Returns
     -------
@@ -410,6 +417,15 @@ def _enhance_prompt(prompt: str, model_type: str, job_id: str) -> str:
     logger.info("[%s] ENHANCE: calling Together AI (%s) to enhance prompt (type=%s)", job_id, TOGETHER_MODEL, model_type)
     logger.info("[%s] ENHANCE: original prompt = '%s'", job_id, prompt[:200] + ("..." if len(prompt) > 200 else ""))
 
+    if init_image_url and _is_init_image_url(init_image_url):
+        user_content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": init_image_url}},
+        ]
+        logger.info("[%s] ENHANCE: sending prompt + init_image URL to LLM (image-aware)", job_id)
+    else:
+        user_content = prompt
+
     try:
         resp = requests.post(
             TOGETHER_API_URL,
@@ -421,7 +437,7 @@ def _enhance_prompt(prompt: str, model_type: str, job_id: str) -> str:
                 "model": TOGETHER_MODEL,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": user_content},
                 ],
                 "temperature": 0.7,
                 "max_tokens": 1024,
@@ -486,7 +502,8 @@ async def run_inference_and_save(job_id: str, prompt: str, model: str, mode: Opt
     # Prompt enhancement (dynamic: image_edit if init_image present, else image)
     if params.get("enhance_prompt", False):
         model_type = "image_edit" if params.get("init_image") else "image"
-        prompt = await loop.run_in_executor(IO_EXECUTOR, _enhance_prompt, prompt, model_type, job_id)
+        init_image_url = params.get("init_image")
+        prompt = await loop.run_in_executor(IO_EXECUTOR, _enhance_prompt, prompt, model_type, job_id, init_image_url)
 
     inference_func = resolve_inference_callable(model, mode)
     if last_model_key and last_model_key != model:

@@ -5365,7 +5365,7 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
         # Success! Mark job as RUNNING
         if _job_manager:
             try:
-                _job_manager.mark_running(job_id, worker_id)
+                _job_manager.mark_running(job_id, worker_id, started_at=None)
             except Exception as e:
                 logger.error(f"Failed to mark job {job_id} as running: {e}")
                 # Job might have been recovered already - don't fail
@@ -5374,8 +5374,7 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             job = db.query(Job).filter(Job.job_id == job_id).first()
             if job:
                 job.status = JobState.RUNNING.value
-                job.started_at = utc_naive_now()
-        
+                # Do NOT set started_at - same as bulk; job_complete chains it
         # Store pod_uuid in job for cost tracking
         job = db.query(Job).filter(Job.job_id == job_id).first()
         if job and pod_uuid:
@@ -6318,6 +6317,27 @@ async def register_worker(
                         health_info = await _check_worker_health_enhanced(
                             endpoint_to_check, timeout=5
                         )
+                        
+                        # Check for OOM during model load
+                        model_error = health_info.get("details", {}).get("model_error")
+                        if model_error and isinstance(model_error, str):
+                            model_error_l = model_error.lower()
+                            if "oom" in model_error_l or "out of memory" in model_error_l:
+                                logger.error(
+                                    f"Worker {worker_id_to_check} reported OOM during model loading: {model_error}"
+                                )
+                                w.status = "offline"
+                                db.commit()
+                                # Trigger pod destruction in background
+                                if _pod_manager:
+                                    asyncio.create_task(
+                                        _handle_oom_pod_destruction(
+                                            _pod_manager, 
+                                            pod_uuid_to_check, 
+                                            "OOM during model load"
+                                        )
+                                    )
+                                return
                         
                         if health_info.get("ready"):
                             w.status = "ready"

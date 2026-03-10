@@ -66,8 +66,8 @@
         },
         "qwen_image_edit_2511_rapid_aio": {
           "added_at": "2026-02-20T07:49:22.854774Z",
-          "score": 10.0,
-          "last_used": "2026-03-08T08:48:12.748690Z"
+          "score": 11.0,
+          "last_used": "2026-03-08T15:57:13.952355Z"
         },
         "hunyan15_480p_i2v_step_distilled": {
           "added_at": "2026-03-02T09:02:52.064430Z",
@@ -76,12 +76,12 @@
         }
       },
       "is_priority": false,
-      "last_seen": "2026-03-08T08:48:12.748690Z",
+      "last_seen": "2026-03-08T15:57:13.952355Z",
       "stats": {
-        "success": 96,
-        "failure": 176
+        "success": 97,
+        "failure": 178
       },
-      "success_rate": 0.35294117647058826
+      "success_rate": 0.3527272727272727
     },
     "283": {
       "cached_images": {
@@ -278,16 +278,16 @@
       "last_seen": "2026-03-02T14:18:55.383480Z",
       "stats": {
         "success": 103,
-        "failure": 67
+        "failure": 69
       },
-      "success_rate": 0.6058823529411764
+      "success_rate": 0.5988372093023255
     },
     "275": {
       "stats": {
-        "success": 111,
+        "success": 114,
         "failure": 74
       },
-      "success_rate": 0.6,
+      "success_rate": 0.6063829787234043,
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2025-12-21T09:17:07.113498Z",
@@ -316,18 +316,23 @@
         },
         "wan_22_fp8_lightx2v_i2v": {
           "added_at": "2026-03-08T01:43:43.229467Z",
-          "score": 5.0,
-          "last_used": "2026-03-08T09:24:54.708285Z"
+          "score": 8.0,
+          "last_used": "2026-03-08T22:52:05.712674Z"
+        },
+        "qwen_image_edit_2511_rapid_aio": {
+          "added_at": "2026-03-08T13:13:07.227952Z",
+          "score": 1.0,
+          "last_used": "2026-03-08T13:13:07.227952Z"
         }
       },
-      "last_seen": "2026-03-08T09:24:54.708285Z"
+      "last_seen": "2026-03-08T22:52:05.712674Z"
     },
     "461": {
       "stats": {
-        "success": 15,
+        "success": 19,
         "failure": 78
       },
-      "success_rate": 0.16129032258064516,
+      "success_rate": 0.1958762886597938,
       "cached_images": {
         "qwen_image_edit_2509": {
           "added_at": "2026-01-04T07:36:49.866944Z",
@@ -341,11 +346,11 @@
         },
         "qwen_image_edit_2511_rapid_aio": {
           "added_at": "2026-02-22T08:40:04.528481Z",
-          "score": 7.0,
-          "last_used": "2026-03-08T08:50:22.019520Z"
+          "score": 15.0,
+          "last_used": "2026-03-08T22:41:10.010243Z"
         }
       },
-      "last_seen": "2026-03-08T08:50:22.019520Z"
+      "last_seen": "2026-03-08T22:41:10.010243Z"
     },
     "14838": {
       "stats": {
@@ -768,12 +773,12 @@
         }
       },
       "is_priority": false,
-      "last_seen": "2026-03-08T08:37:51.416802Z",
+      "last_seen": "2026-03-09T07:54:25.079381Z",
       "stats": {
         "success": 32,
-        "failure": 166
+        "failure": 168
       },
-      "success_rate": 0.16161616161616163
+      "success_rate": 0.16
     },
     "233": {
       "stats": {
@@ -1081,6 +1086,6 @@
   },
   "meta": {
     "version": 1,
-    "updated_at": "2026-03-08T09:24:54.708285Z"
+    "updated_at": "2026-03-09T07:54:25.079381Z"
   }
 }

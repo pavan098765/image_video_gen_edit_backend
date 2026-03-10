@@ -378,7 +378,8 @@ class JobManager:
                 job.started_at = utc_naive_now()  # default: set to now
             elif started_at is not None:
                 job.started_at = started_at       # explicit datetime
-            # else: started_at is None -> leave job.started_at unchanged (NULL)
+            else:
+                job.started_at = None  # explicit NULL for bulk/individual; job_complete chains it
             job.updated_at = utc_naive_now()
             
             # Update worker

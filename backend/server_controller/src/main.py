@@ -223,6 +223,14 @@ class AppState:
         self.background_tasks.append(task)
         logger.info("Started R2 input media reaper task")
         
+        # DB cleanup (delete old rows from workers, jobs, rewarded_ad_events, daily_spins)
+        task = asyncio.create_task(
+            self._db_cleanup_task(),
+            name="db_cleanup"
+        )
+        self.background_tasks.append(task)
+        logger.info("Started DB cleanup task")
+        
         logger.info(f"Started {len(self.background_tasks)} background tasks")
     
     async def shutdown(self):
@@ -798,6 +806,49 @@ class AppState:
             except Exception:
                 logger.exception("R2 input media reaper task error")
     
+    async def _db_cleanup_task(self):
+        """
+        Periodically delete old rows from workers, jobs, rewarded_ad_events,
+        and daily_spins to prevent DB growth. Runs once per week.
+        Uses batched deletes to avoid long-running transactions.
+        """
+        from db_cleanup import run_db_cleanup
+
+        interval_days = int(os.getenv("DB_CLEANUP_INTERVAL_DAYS", "7"))
+        retention_days = int(os.getenv("DB_CLEANUP_RETENTION_DAYS", "7"))
+        batch_size = int(os.getenv("DB_CLEANUP_BATCH_SIZE", "500"))
+        interval_seconds = interval_days * 24 * 3600
+
+        logger.info(
+            f"DB cleanup task started (interval={interval_days}d, "
+            f"retention={retention_days}d, batch_size={batch_size})"
+        )
+
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(interval_seconds)
+
+                try:
+                    results = await asyncio.to_thread(
+                        run_db_cleanup,
+                        retention_days=retention_days,
+                        batch_size=batch_size,
+                    )
+                    total = sum(results.values())
+                    if total > 0:
+                        logger.info(
+                            f"[DB_CLEANUP] Deleted old rows: workers={results['workers']}, "
+                            f"jobs={results['jobs']}, rewarded_ad_events={results['rewarded_ad_events']}, "
+                            f"daily_spins={results['daily_spins']} (total={total})"
+                        )
+                except Exception as e:
+                    logger.exception(f"[DB_CLEANUP] Failed: {e}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("DB cleanup task error")
+
     async def _job_recovery_task(self):
         """Check for stuck jobs and recover them"""
         sweep_interval = 30  # Check every 30 seconds

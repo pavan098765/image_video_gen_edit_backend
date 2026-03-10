@@ -496,9 +496,10 @@ _ENHANCE_SYSTEM_PROMPT_VIDEO_I2V = (
 )
 
 
-def _enhance_prompt(prompt: str, job_id: str) -> str:
+def _enhance_prompt(prompt: str, job_id: str, init_image_url: Optional[str] = None) -> str:
     """
     Enhance a prompt using Together AI LLM for video I2V generation.
+    If init_image_url is provided (presigned URL), sends image + prompt for image-aware enhancement.
 
     Returns enhanced prompt, or original prompt on failure.
     """
@@ -508,6 +509,15 @@ def _enhance_prompt(prompt: str, job_id: str) -> str:
 
     logger.info("[%s] ENHANCE: calling Together AI (%s) to enhance prompt (type=video_i2v)", job_id, TOGETHER_MODEL)
     logger.info("[%s] ENHANCE: original prompt = '%s'", job_id, prompt[:200] + ("..." if len(prompt) > 200 else ""))
+
+    if init_image_url and _is_url(init_image_url):
+        user_content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": init_image_url}},
+        ]
+        logger.info("[%s] ENHANCE: sending prompt + init_image URL to LLM (image-aware)", job_id)
+    else:
+        user_content = prompt
 
     try:
         resp = requests.post(
@@ -520,7 +530,7 @@ def _enhance_prompt(prompt: str, job_id: str) -> str:
                 "model": TOGETHER_MODEL,
                 "messages": [
                     {"role": "system", "content": _ENHANCE_SYSTEM_PROMPT_VIDEO_I2V},
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": user_content},
                 ],
                 "temperature": 0.7,
                 "max_tokens": 1024,
@@ -577,7 +587,8 @@ async def run_inference_and_save(
 
     # Prompt enhancement for video I2V
     if params.get("enhance_prompt", False):
-        prompt = await loop.run_in_executor(IO_EXECUTOR, _enhance_prompt, prompt, job_id)
+        init_image_url = params.get("init_image") or params.get("image")
+        prompt = await loop.run_in_executor(IO_EXECUTOR, _enhance_prompt, prompt, job_id, init_image_url)
     
     if mode:
         params.setdefault("mode", mode)

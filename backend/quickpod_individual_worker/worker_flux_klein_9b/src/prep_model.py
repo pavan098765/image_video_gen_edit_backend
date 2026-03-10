@@ -40,64 +40,26 @@ else:
     print(f"✓ Model already exists at {MODEL_LOCAL_DIR}")
 
 # ------------------------
-# 2. Download Real-ESRGAN models (2x, 4x)
+# 2. Download Real-ESRGAN models (2x, 4x) from rockapaper/realesrgan
 # ------------------------
-# Download Real-ESRGAN models - try "plus" versions first, fallback to regular versions
-realesrgan_models = [
-    ("RealESRGAN_x2plus.pth", "RealESRGAN_x2.pth", 2),
-    ("RealESRGAN_x4plus.pth", "RealESRGAN_x4.pth", 4),
-]
-
-for preferred_name, fallback_name, scale in realesrgan_models:
-    model_file = os.path.join(REALESRGAN_DIR, preferred_name)
-    
+REALESRGAN_HF_REPO = "rockapaper/realesrgan"
+for filename in ("RealESRGAN_x2plus.pth", "RealESRGAN_x4plus.pth"):
+    model_file = os.path.join(REALESRGAN_DIR, filename)
     if os.path.exists(model_file):
-        print(f"✓ Real-ESRGAN {scale}x model already exists at {model_file}")
+        print(f"✓ Real-ESRGAN {filename} already exists at {model_file}")
         continue
-    
-    # Try downloading preferred name first
-    downloaded = False
     try:
-        print(f"⬇️ Downloading Real-ESRGAN {scale}x model ({preferred_name})...")
+        print(f"⬇️ Downloading {filename} from {REALESRGAN_HF_REPO}...")
         hf_hub_download(
-            repo_id="ai-forever/Real-ESRGAN",
-            filename=preferred_name,
+            repo_id=REALESRGAN_HF_REPO,
+            filename=filename,
             local_dir=REALESRGAN_DIR,
+            resume_download=True,
         )
-        # Verify the file was downloaded
-        if os.path.exists(model_file):
-            downloaded = True
-            print(f"✓ Real-ESRGAN {scale}x model downloaded successfully as {preferred_name}")
-        else:
-            raise FileNotFoundError(f"Downloaded file not found at expected path: {model_file}")
+        print(f"✓ {filename} downloaded to {REALESRGAN_DIR}")
     except Exception as e:
-        # If preferred name doesn't exist, try fallback name
-        try:
-            print(f"  ⚠️  {preferred_name} not found, trying {fallback_name}...")
-            downloaded_path = hf_hub_download(
-                repo_id="ai-forever/Real-ESRGAN",
-                filename=fallback_name,
-                local_dir=REALESRGAN_DIR,
-            )
-            # Copy/rename to expected name
-            if os.path.exists(downloaded_path):
-                shutil.copy2(downloaded_path, model_file)
-                # Remove the fallback file if it's different
-                if downloaded_path != model_file and os.path.exists(downloaded_path):
-                    try:
-                        os.remove(downloaded_path)
-                    except:
-                        pass
-                if os.path.exists(model_file):
-                    downloaded = True
-                    print(f"✓ Real-ESRGAN {scale}x model downloaded and renamed to {preferred_name}")
-                else:
-                    raise FileNotFoundError(f"Failed to create {model_file} from {downloaded_path}")
-            else:
-                raise FileNotFoundError(f"Downloaded file not found: {downloaded_path}")
-        except Exception as e2:
-            print(f"❌ Failed to download Real-ESRGAN {scale}x model: {e2}")
-            traceback.print_exc()
+        print(f"❌ Failed to download {filename}: {e}")
+        traceback.print_exc()
 
 # ------------------------
 # 3. Split large safetensors recursively

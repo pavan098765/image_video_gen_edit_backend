@@ -307,9 +307,11 @@ _ENHANCE_SYSTEM_PROMPT_VIDEO_I2V = (
 )
 
 
-def _enhance_prompt(prompt: str, job_id: str) -> str:
+def _enhance_prompt(prompt: str, job_id: str, init_image_url: Optional[str] = None) -> str:
     """
     Enhance a prompt using Together AI LLM for video I2V generation.
+    If init_image_url is provided (presigned R2 URL), sends image + prompt so the
+    LLM can produce an image-aware enhanced prompt instead of generic text.
 
     Returns enhanced prompt, or original prompt on failure.
     """
@@ -319,6 +321,16 @@ def _enhance_prompt(prompt: str, job_id: str) -> str:
 
     logger.info("[%s] ENHANCE: calling Together AI (%s) to enhance prompt (type=video_i2v)", job_id, TOGETHER_MODEL)
     logger.info("[%s] ENHANCE: original prompt = '%s'", job_id, prompt[:200] + ("..." if len(prompt) > 200 else ""))
+
+    # Build user message content: text only, or text + image when init_image URL is available
+    if init_image_url and _is_init_image_url(init_image_url):
+        user_content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": init_image_url}},
+        ]
+        logger.info("[%s] ENHANCE: sending prompt + init_image URL to LLM (image-aware)", job_id)
+    else:
+        user_content = prompt
 
     try:
         resp = requests.post(
@@ -331,7 +343,7 @@ def _enhance_prompt(prompt: str, job_id: str) -> str:
                 "model": TOGETHER_MODEL,
                 "messages": [
                     {"role": "system", "content": _ENHANCE_SYSTEM_PROMPT_VIDEO_I2V},
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": user_content},
                 ],
                 "temperature": 0.7,
                 "max_tokens": 1024,
@@ -490,7 +502,8 @@ async def run_inference_and_save(job_id: str, prompt: str, model: str, mode: Opt
     if last_model_key and last_model_key != model_key:
         cleanup_gpu()
     if params.get("enhance_prompt", False):
-        prompt = await loop.run_in_executor(IO_EXECUTOR, _enhance_prompt, prompt, job_id)
+        init_image_url = params.get("init_image")  # pass URL as-is for LLM; do not pop, inference needs it later
+        prompt = await loop.run_in_executor(IO_EXECUTOR, _enhance_prompt, prompt, job_id, init_image_url)
 
     # Prompt extension for long video (multi-clip): expand into N segment prompts
     prompts: Union[str, List[str]] = prompt

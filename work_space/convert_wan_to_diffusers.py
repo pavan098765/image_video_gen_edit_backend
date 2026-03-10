@@ -1,6 +1,31 @@
+"""
+Convert WAN (Wan Animate) checkpoint weights to Diffusers format.
+
+WAN models use two transformers (high and low lighting). Weights can be loaded from
+a local path (see model_type configs) or downloaded from Hugging Face (full repo or specific files).
+
+Usage:
+    # From Hugging Face - full repo (subdirs transformer/ and transformer_2/)
+    python convert_wan_to_diffusers.py --output_path <OUT_DIR> --model_type <TYPE> --hf_repo <REPO_ID> [--revision <REV>] [--dtype fp32|fp16|bf16|none]
+
+    # From Hugging Face - specific files only (downloads only these files)
+    python convert_wan_to_diffusers.py --output_path <OUT_DIR> --model_type <TYPE> --hf_repo <REPO_ID> --hf_transformer_file <PATH> --hf_transformer_2_file <PATH> [--revision <REV>] [--dtype ...]
+
+    # From local path (model_type's model_id in config)
+    python convert_wan_to_diffusers.py --output_path <OUT_DIR> --model_type <TYPE> [--dtype fp32|fp16|bf16|none]
+
+Examples:
+    python convert_wan_to_diffusers.py --output_path ./wan_out --model_type Wan2.2-T2V-A14B --hf_repo Wan-AI/Wan2.2-T2V-A14B
+    python convert_wan_to_diffusers.py --output_path ./wan_out --model_type Wan2.2-T2V-A14B --hf_repo Wan-AI/Wan2.2-T2V-A14B --hf_transformer_file transformer/diffusion_pytorch_model.safetensors --hf_transformer_2_file transformer_2/diffusion_pytorch_model.safetensors
+    python convert_wan_to_diffusers.py --output_path ./wan_out --model_type Wan2.2-T2V-A14B --dtype fp16
+
+model_type must match a known config. When using --hf_transformer_file / --hf_transformer_2_file, paths are relative to repo root; downloaded files are normalized to diffusion_pytorch_model*.safetensors so the loader finds them.
+"""
 import argparse
 import pathlib
-from typing import Any, Dict, Tuple
+import shutil
+import tempfile
+from typing import Any, Dict, List, Tuple
 
 import torch
 from accelerate import init_empty_weights
@@ -602,14 +627,15 @@ def get_transformer_config(model_type: str) -> Tuple[Dict[str, Any], ...]:
     return config, RENAME_DICT, SPECIAL_KEYS_REMAP
 
 
-def convert_transformer(model_type: str, stage: str = None):
+def convert_transformer(model_type: str, stage: str = None, override_model_dir: str = None):
     config, RENAME_DICT, SPECIAL_KEYS_REMAP = get_transformer_config(model_type)
 
     diffusers_config = config["diffusers_config"]
     model_id = config["model_id"]
-    # model_dir = pathlib.Path(snapshot_download(model_id, repo_type="model"))
-    model_dir = pathlib.Path(model_id)
-
+    if override_model_dir is not None:
+        model_dir = pathlib.Path(override_model_dir)
+    else:
+        model_dir = pathlib.Path(model_id)
 
     if stage is not None:
         model_dir = model_dir / stage
@@ -1162,9 +1188,15 @@ def convert_vae_22():
 
 
 def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default=None)
-    parser.add_argument("--output_path", type=str, required=True)
+    parser = argparse.ArgumentParser(
+        description="Convert WAN checkpoint to Diffusers. Supports local paths or --hf_repo (full repo or specific files via --hf_transformer_file / --hf_transformer_2_file)."
+    )
+    parser.add_argument("--model_type", type=str, required=True, help="Config name (e.g. Wan2.2-T2V-A14B, Wan-I2V-14B-480p)")
+    parser.add_argument("--output_path", type=str, required=True, help="Directory to save converted transformer and transformer_2")
+    parser.add_argument("--hf_repo", type=str, default=None, help="Hugging Face repo id (e.g. Wan-AI/Wan2.2-T2V-A14B). Use with full snapshot or with --hf_transformer_file and --hf_transformer_2_file.")
+    parser.add_argument("--revision", type=str, default=None, help="Hugging Face revision (branch/tag/commit) when using --hf_repo")
+    parser.add_argument("--hf_transformer_file", type=str, default=None, help="Path(s) in repo for transformer weights (comma-separated for sharded). Requires --hf_repo.")
+    parser.add_argument("--hf_transformer_2_file", type=str, default=None, help="Path(s) in repo for transformer_2 weights (comma-separated for sharded). Requires --hf_repo.")
     parser.add_argument("--dtype", default="fp32", choices=["fp32", "fp16", "bf16", "none"])
     return parser.parse_args()
 
@@ -1176,6 +1208,26 @@ DTYPE_MAPPING = {
 }
 
 
+def _download_hf_files_to_dir(
+    repo_id: str,
+    file_paths: List[str],
+    stage_dir: pathlib.Path,
+    revision: str = "main",
+) -> None:
+    """Download one or more files from a HF repo into stage_dir. Names are normalized to diffusion_pytorch_model*.safetensors so the loader finds them."""
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    paths = [p.strip() for p in file_paths if p.strip()]
+    for i, path in enumerate(paths):
+        local_path = hf_hub_download(repo_id=repo_id, filename=path, revision=revision, repo_type="model")
+        if len(paths) == 1:
+            dest = stage_dir / "diffusion_pytorch_model.safetensors"
+        else:
+            dest = stage_dir / f"diffusion_pytorch_model-{i + 1:05d}-of-{len(paths):05d}.safetensors"
+        src_path = pathlib.Path(local_path)
+        if src_path.resolve() != dest.resolve():
+            shutil.copy2(local_path, dest)
+
+
 # AFTER — replace everything after the two convert_transformer calls with this:
 if __name__ == "__main__":
     import os, gc
@@ -1183,9 +1235,51 @@ if __name__ == "__main__":
     os.makedirs(args.output_path, exist_ok=True)
     dtype = DTYPE_MAPPING[args.dtype] if args.dtype != "none" else None
 
+    override_dir = None
+    revision = args.revision or "main"
+    temp_download_dir = None
+
+    if args.hf_repo:
+        if args.hf_transformer_file and args.hf_transformer_2_file:
+            # Download only the specified files into a temp layout: override_dir/transformer/, override_dir/transformer_2/
+            temp_download_dir = pathlib.Path(tempfile.mkdtemp(prefix="wan_convert_"))
+            override_dir = temp_download_dir
+            try:
+                print(f"\n=== Downloading selected files from Hugging Face: {args.hf_repo} (revision={revision}) ===")
+                for path in args.hf_transformer_file.split(","):
+                    path = path.strip()
+                    if path:
+                        print(f"  transformer: {path}")
+                for path in args.hf_transformer_2_file.split(","):
+                    path = path.strip()
+                    if path:
+                        print(f"  transformer_2: {path}")
+                _download_hf_files_to_dir(
+                    args.hf_repo,
+                    [p.strip() for p in args.hf_transformer_file.split(",") if p.strip()],
+                    override_dir / "transformer",
+                    revision=revision,
+                )
+                _download_hf_files_to_dir(
+                    args.hf_repo,
+                    [p.strip() for p in args.hf_transformer_2_file.split(",") if p.strip()],
+                    override_dir / "transformer_2",
+                    revision=revision,
+                )
+                override_dir = str(override_dir)
+                print(f"Downloaded to {override_dir}")
+            except Exception:
+                shutil.rmtree(temp_download_dir, ignore_errors=True)
+                raise
+        else:
+            # Full repo snapshot
+            print(f"\n=== Downloading from Hugging Face: {args.hf_repo} (revision={revision}) ===")
+            override_dir = snapshot_download(args.hf_repo, revision=revision, repo_type="model")
+            print(f"Downloaded to {override_dir}")
+
     # Convert and save transformer (high lighting) first, then free memory
     print("\n=== Converting transformer (high lighting) ===")
-    transformer = convert_transformer(args.model_type, stage="transformer")
+    transformer = convert_transformer(args.model_type, stage="transformer", override_model_dir=override_dir)
     if dtype:
         transformer = transformer.to(dtype)
     print("Saving transformer...")
@@ -1200,7 +1294,7 @@ if __name__ == "__main__":
 
     # Convert and save transformer_2 (low lighting)
     print("\n=== Converting transformer_2 (low lighting) ===")
-    transformer_2 = convert_transformer(args.model_type, stage="transformer_2")
+    transformer_2 = convert_transformer(args.model_type, stage="transformer_2", override_model_dir=override_dir)
     if dtype:
         transformer_2 = transformer_2.to(dtype)
     print("Saving transformer_2...")
@@ -1209,6 +1303,9 @@ if __name__ == "__main__":
 
     del transformer_2
     gc.collect()
+
+    if temp_download_dir is not None and pathlib.Path(temp_download_dir).exists():
+        shutil.rmtree(temp_download_dir, ignore_errors=True)
 
     print(f"\n✅ Done. Converted transformers saved to {args.output_path}")
     print("Now run:")

@@ -18,7 +18,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import traceback
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Union
 from enum import Enum
 
 import requests
@@ -750,7 +750,7 @@ class QuickPodManager:
     def get_best_offer(
         self,
         preferred_machine_id: Optional[int] = None,
-        min_tflops: float = 0,
+        min_tflops: Union[float, Dict[str, float]] = 0,
         allowed_gpu_names: Optional[List[str]] = None,
         min_gpu_count: int = 1,
         blacklisted_machines: Optional[List[str]] = None,
@@ -814,7 +814,17 @@ class QuickPodManager:
         
         def has_valid_tflops(o: Dict) -> bool:
             try:
-                return float(o.get("tflops", 0)) >= min_tflops
+                offer_tflops = float(o.get("tflops", 0))
+                if isinstance(min_tflops, dict):
+                    offer_name = str(o.get("offer_name", "")).upper()
+                    required_tflops = float(min_tflops.get("default", 0))
+                    for gpu, tflops_val in min_tflops.items():
+                        if gpu.upper() in offer_name and gpu.upper() != "DEFAULT":
+                            required_tflops = float(tflops_val)
+                            break
+                    return offer_tflops >= required_tflops
+                else:
+                    return offer_tflops >= float(min_tflops)
             except (ValueError, TypeError):
                 return False
         
@@ -923,7 +933,7 @@ class QuickPodManager:
     def get_best_offer_with_details(
         self,
         preferred_machine_id: Optional[int] = None,
-        min_tflops: float = 0,
+        min_tflops: Union[float, Dict[str, float]] = 0,
         allowed_gpu_names: Optional[List[str]] = None,
         min_gpu_count: int = 1,
         blacklisted_machines: Optional[List[str]] = None,
@@ -976,7 +986,17 @@ class QuickPodManager:
         
         def has_valid_tflops(o: Dict) -> bool:
             try:
-                return float(o.get("tflops", 0)) >= min_tflops
+                offer_tflops = float(o.get("tflops", 0))
+                if isinstance(min_tflops, dict):
+                    offer_name = str(o.get("offer_name", "")).upper()
+                    required_tflops = float(min_tflops.get("default", 0))
+                    for gpu, tflops_val in min_tflops.items():
+                        if gpu.upper() in offer_name and gpu.upper() != "DEFAULT":
+                            required_tflops = float(tflops_val)
+                            break
+                    return offer_tflops >= required_tflops
+                else:
+                    return offer_tflops >= float(min_tflops)
             except (ValueError, TypeError):
                 return False
         
@@ -1095,6 +1115,133 @@ class QuickPodManager:
         
         logger.error("No suitable offers found")
         return None
+    
+    def get_offer_for_machine_only(
+        self,
+        machine_id: int,
+        min_tflops: Union[float, Dict[str, float]] = 0,
+        allowed_gpu_names: Optional[List[str]] = None,
+        blacklisted_machines: Optional[List[str]] = None,
+    ) -> Optional[OfferInfo]:
+        """
+        Get offer for a specific machine only. No fallback to env or GPU tier.
+        Used by cache refresh so we never create a pod on a different machine.
+        
+        Returns:
+            OfferInfo if the machine has a valid offer, None otherwise
+        """
+        blacklist_set = set(str(m) for m in (blacklisted_machines or []))
+        try:
+            offers = self.get_rentable_machines()
+        except Exception as e:
+            logger.error(f"Failed to fetch offers: {e}")
+            return None
+        
+        if not offers:
+            return None
+        
+        def extract_offer_id(o: Dict) -> Optional[int]:
+            return o.get("offer_id") or o.get("id")
+        
+        def extract_machine_id(o: Dict) -> Optional[int]:
+            for key in ("machines_id", "machine_id", "machineId"):
+                if key in o and o[key] is not None:
+                    try:
+                        return int(o[key])
+                    except (ValueError, TypeError):
+                        pass
+            return None
+        
+        def is_multi_gpu_offer(o: Dict) -> bool:
+            name = str(o.get("offer_name", "")).upper()
+            if name.startswith(("2X", "3X", "4X")):
+                return True
+            gpu_indexes = str(o.get("gpu_indexes", "") or "")
+            tokens = [t for t in gpu_indexes.split("|") if t.strip()]
+            return len(tokens) > 1
+        
+        def extract_price(o: Dict) -> float:
+            try:
+                return float(o.get("hourly_cost", 1e9))
+            except (ValueError, TypeError):
+                return 1e9
+        
+        def has_valid_tflops(o: Dict) -> bool:
+            try:
+                offer_tflops = float(o.get("tflops", 0))
+                if isinstance(min_tflops, dict):
+                    offer_name = str(o.get("offer_name", "")).upper()
+                    required_tflops = float(min_tflops.get("default", 0))
+                    for gpu, tflops_val in min_tflops.items():
+                        if gpu.upper() in offer_name and gpu.upper() != "DEFAULT":
+                            required_tflops = float(tflops_val)
+                            break
+                    return offer_tflops >= required_tflops
+                return offer_tflops >= float(min_tflops)
+            except (ValueError, TypeError):
+                return False
+        
+        def matches_gpu_name(o: Dict) -> bool:
+            if not allowed_gpu_names:
+                return True
+            offer_name = str(o.get("offer_name", "")).upper()
+            for gpu in allowed_gpu_names:
+                if gpu.upper() in offer_name:
+                    return True
+            return False
+        
+        def is_blacklisted(o: Dict) -> bool:
+            mid = extract_machine_id(o)
+            return mid is not None and str(mid) in blacklist_set
+        
+        def has_sufficient_memory(o: Dict) -> bool:
+            try:
+                return float(o.get("memory", 0)) > 30
+            except (ValueError, TypeError):
+                return False
+        
+        def has_allowed_geolocation(o: Dict) -> bool:
+            allowed = {"US", "NZ"}
+            machines = o.get("_machines", {})
+            if isinstance(machines, dict):
+                geo = machines.get("geolocation", "")
+                if geo in allowed:
+                    return True
+            return o.get("geolocation", "") in allowed
+        
+        def is_valid_offer(o: Dict) -> bool:
+            return (
+                not is_multi_gpu_offer(o)
+                and has_valid_tflops(o)
+                and matches_gpu_name(o)
+                and has_sufficient_memory(o)
+                and has_allowed_geolocation(o)
+                and not is_blacklisted(o)
+            )
+        
+        def to_offer_info(o: Dict) -> OfferInfo:
+            return OfferInfo(
+                offer_id=extract_offer_id(o) or 0,
+                machine_id=extract_machine_id(o) or 0,
+                hourly_cost=extract_price(o),
+                gpu_type=o.get("gpu_type", o.get("offer_name", "Unknown")),
+                gpu_vram=int(o.get("gpu_vram", 0)),
+                tflops=float(o.get("tflops", 0)),
+                memory=float(o.get("memory", 0)),
+            )
+        
+        filtered = [
+            o for o in offers
+            if extract_machine_id(o) == int(machine_id) and is_valid_offer(o)
+        ]
+        if not filtered:
+            logger.warning(f"No valid offer for machine {machine_id}")
+            return None
+        
+        filtered.sort(key=extract_price)
+        info = to_offer_info(filtered[0])
+        logger.info(f"Offer for machine {machine_id}: offer_id={info.offer_id}, hourly=${info.hourly_cost:.3f}")
+        return info
     
     def create_pod(
         self,
