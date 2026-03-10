@@ -127,18 +127,33 @@ def run_inference_aurasr_upscale(job_id: str, params: Dict[str, Any]) -> str:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
     
     init_image = _load_image(params.get("init_image"))
     if init_image is None:
         raise ValueError("init_image is required for upscaling")
 
-    output_dir = params.get("output_dir", "./outputs")
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f"aurasr_upscaled_{job_id}.png")
-
     scale = int(params.get("scale", 4))
     if scale not in [2, 4]:
         raise ValueError("Scale must be 2 or 4 for AuraSR upscaling.")
+
+    # Cap output to 4K: resize input if upscaled result would exceed 4K
+    max_output_dim = 4096  # 4K cap
+    orig_w, orig_h = init_image.size
+    target_w = int(orig_w * scale)
+    target_h = int(orig_h * scale)
+    
+    if max(target_w, target_h) > max_output_dim:
+        # Calculate scale factor to cap at 4K
+        scale_factor = max_output_dim / max(target_w, target_h)
+        new_w = int(orig_w * scale_factor)
+        new_h = int(orig_h * scale_factor)
+        print(f"⚠️ Input image ({orig_w}x{orig_h}) would produce {target_w}x{target_h} output (>4K). Resizing to {new_w}x{new_h} before upscaling.")
+        init_image = init_image.resize((new_w, new_h), Image.LANCZOS)
+
+    output_dir = params.get("output_dir", "./outputs")
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"aurasr_upscaled_{job_id}.png")
 
     result = upscale_image(np.array(init_image), scale=scale)
     Image.fromarray(result).save(out_path)
@@ -148,6 +163,7 @@ def run_inference_aurasr_upscale(job_id: str, params: Dict[str, Any]) -> str:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
 
     print(f"✅ Upscaled image saved to {out_path}")
     return os.path.abspath(out_path)

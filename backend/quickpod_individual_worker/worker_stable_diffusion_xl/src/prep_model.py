@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import os, shutil, traceback, subprocess
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, hf_hub_download
 
 # ------------------------
 # Resolve project root (one dir up from src/)
@@ -12,16 +12,16 @@ MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 # ------------------------
 # Config
 # ------------------------
-SDXL_REPO = "John6666/realism-illustrious-by-stable-yogi-v50-fp16-sdxl"
-SDXL_DIR = os.path.join(MODELS_DIR, "sdxl_realism_illustrious")
+SDXL_REPO = "HyHorX/SDXL-Lighting-8-steps"
+SDXL_DIR = os.path.join(MODELS_DIR, "sdxl_lighting_8_steps")
 
-LOCAL_REALESRGAN_SRC = os.path.join(PROJECT_ROOT, "realesrgan_models")
-LOCAL_REALESRGAN_DST = os.path.join(MODELS_DIR, "realesrgan")
+REALESRGAN_DIR = os.path.join(MODELS_DIR, "realesrgan")
 
 os.makedirs(SDXL_DIR, exist_ok=True)
+os.makedirs(REALESRGAN_DIR, exist_ok=True)
 
 # ------------------------
-# 1. Download SDXL Realism Illustrious repo
+# 1. Download SDXL Lighting 8-steps model
 # ------------------------
 if not os.listdir(SDXL_DIR):
     try:
@@ -33,37 +33,38 @@ if not os.listdir(SDXL_DIR):
             resume_download=True,
             token="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",
         )
-        print(f"✓ SDXL Realism Illustrious ready at {SDXL_DIR}")
+        print(f"✓ SDXL Lighting 8-steps ready at {SDXL_DIR}")
     except Exception as e:
         print(f"❌ Failed to download {SDXL_REPO}: {e}")
         traceback.print_exc()
         exit(1)
 else:
-    print(f"✓ SDXL Realism Illustrious already exists at {SDXL_DIR}")
+    print(f"✓ SDXL Lighting 8-steps already exists at {SDXL_DIR}")
 
 # ------------------------
-# 2. Check for embeddings
+# 2. Download Real-ESRGAN models (2x, 4x) from rockapaper/realesrgan
 # ------------------------
-emb_dir = os.path.join(SDXL_DIR, "embeddings")
-pos = os.path.join(emb_dir, "Stable_Yogis_Illustrious_Positives.safetensors")
-neg = os.path.join(emb_dir, "Stable_Yogis_Illustrious_Negatives-neg.safetensors")
+REALESRGAN_HF_REPO = "rockapaper/realesrgan"
+for filename in ("RealESRGAN_x2plus.pth", "RealESRGAN_x4plus.pth"):
+    model_file = os.path.join(REALESRGAN_DIR, filename)
+    if os.path.exists(model_file):
+        print(f"✓ Real-ESRGAN {filename} already exists at {model_file}")
+        continue
+    try:
+        print(f"⬇️ Downloading {filename} from {REALESRGAN_HF_REPO}...")
+        hf_hub_download(
+            repo_id=REALESRGAN_HF_REPO,
+            filename=filename,
+            local_dir=REALESRGAN_DIR,
+            resume_download=True,
+        )
+        print(f"✓ {filename} downloaded to {REALESRGAN_DIR}")
+    except Exception as e:
+        print(f"❌ Failed to download {filename}: {e}")
+        traceback.print_exc()
 
-print("🔍 Checking embeddings...")
-print("  POS:", "✓ found" if os.path.exists(pos) else "❌ missing")
-print("  NEG:", "✓ found" if os.path.exists(neg) else "❌ missing")
-
 # ------------------------
-# 3. Copy local Realesrgan models (optional)
-# ------------------------
-if os.path.exists(LOCAL_REALESRGAN_SRC):
-    print(f"📦 Copying {LOCAL_REALESRGAN_SRC} -> {LOCAL_REALESRGAN_DST}")
-    shutil.copytree(LOCAL_REALESRGAN_SRC, LOCAL_REALESRGAN_DST, dirs_exist_ok=True)
-    print("✓ Realesrgan models copied.")
-else:
-    print("⚠️ No local realesrgan_models/ found, skipping.")
-
-# ------------------------
-# 4. Split large safetensors recursively
+# 3. Split large safetensors recursively
 # ------------------------
 def split_large_safetensors(base_dir, max_size=500 * 1024 * 1024):
     print(f"🔍 Scanning for .safetensors > {max_size/1024/1024}MB in {base_dir}")
@@ -86,7 +87,7 @@ def split_large_safetensors(base_dir, max_size=500 * 1024 * 1024):
 split_large_safetensors(MODELS_DIR)
 
 # ------------------------
-# 5. Generate runtime Dockerfile with per-part COPY
+# 4. Generate runtime Dockerfile with per-part COPY
 # ------------------------
 try:
     print("⚙️ Generating Dockerfile via generate_dockerfile.py ...")
@@ -99,9 +100,7 @@ except Exception as e:
 # ------------------------
 # Done
 # ------------------------
-print("✅ SDXL Realism Illustrious prep finished successfully.")
+print("✅ SDXL Lighting 8-steps prep finished successfully.")
 print(f"Model available at: {SDXL_DIR}")
-print(f"Embedding directory: {emb_dir}")
 print("Set environment variables:")
 print(f"  SDXL_LOCAL_PATH={SDXL_DIR}")
-print(f"  SDXL_EMBEDDINGS_PATH={emb_dir}")

@@ -6,7 +6,7 @@ import asyncio
 import hmac
 import hashlib
 import gc
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 import uuid
 import base64
@@ -17,6 +17,14 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from tenacity import retry, wait_exponential, stop_after_attempt
+
+
+# -----------------------
+# Pod startup time tracking
+# -----------------------
+POD_START_TIME = time.time()
+FIRST_INFERENCE_START_TIME = None
+_first_inference_lock = asyncio.Lock()
 
 
 # -----------------------
@@ -117,10 +125,20 @@ os.makedirs(WORKSPACE_DIR, exist_ok=True)
 # -----------------------
 # Job queue
 # -----------------------
-job_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+job_queue: asyncio.Queue = asyncio.Queue(maxsize=30)
 job_status: Dict[str, Dict[str, Any]] = {}
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 last_model_key: Optional[str] = None
+
+
+def _peek_next_job_id() -> Optional[str]:
+    """Peek at the next job in the queue without removing it."""
+    try:
+        if not job_queue.empty():
+            return job_queue._queue[0].get("job_id")
+    except (IndexError, AttributeError):
+        pass
+    return None
 
 
 # -----------------------
@@ -134,6 +152,73 @@ class RunRequest(BaseModel):
     params: Dict[str, Any] = {}
     upload_url: str
     result_key: str
+
+
+class BulkRunRequest(BaseModel):
+    jobs: List[RunRequest]
+
+# -----------------------
+# Media URL Resolution
+# -----------------------
+# Fields that may contain URLs (presigned R2 GET URLs) instead of base64 data.
+# At dispatch time the server converts R2 keys to presigned GET URLs.
+# This helper downloads the binary and converts to base64 so inference code
+# (which expects base64 strings) works without modification.
+MEDIA_FIELDS = frozenset([
+    "init_image", "mask_image", "image", "source_image", "face_image",
+    "reference_image", "style_image", "control_image", "input_image",
+    "ref_image", "ref_video", "input_video",
+])
+
+
+def _is_url(value: str) -> bool:
+    return isinstance(value, str) and (value.startswith("http://") or value.startswith("https://"))
+
+
+def _download_url_bytes(url: str, timeout: int = 120) -> bytes:
+    """Download binary from URL and return raw bytes."""
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    return resp.content
+
+
+def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, Any]:
+    """
+    Resolve any URL-valued media fields in params to raw bytes.
+    
+    If a known media field contains a URL (e.g. presigned R2 download URL),
+    download the binary and store as raw bytes so downstream _load_image()
+    functions can open them directly without a base64 round-trip.
+    
+    Handles both single string values and lists of strings.
+    """
+    resolved = dict(params)
+    for field in MEDIA_FIELDS:
+        value = resolved.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str) and _is_url(value):
+            try:
+                logger.info(f"[{job_id}] Downloading {field} from URL...")
+                resolved[field] = _download_url_bytes(value)
+                logger.info(f"[{job_id}] Downloaded {field}: {len(resolved[field])} bytes")
+            except Exception as e:
+                logger.error(f"[{job_id}] Failed to download {field} from URL: {e}")
+                raise
+        elif isinstance(value, list):
+            new_list = []
+            for i, item in enumerate(value):
+                if isinstance(item, str) and _is_url(item):
+                    try:
+                        logger.info(f"[{job_id}] Downloading {field}[{i}] from URL...")
+                        new_list.append(_download_url_bytes(item))
+                    except Exception as e:
+                        logger.error(f"[{job_id}] Failed to download {field}[{i}]: {e}")
+                        raise
+                else:
+                    new_list.append(item)
+            resolved[field] = new_list
+    return resolved
 
 
 # -----------------------
@@ -184,10 +269,18 @@ def register_with_controller():
 
 @retry(wait=wait_exponential(min=2, max=20), stop=stop_after_attempt(6))
 def send_heartbeat():
+    # Determine actual worker status based on job state
+    try:
+        has_running = any(j.get("status") == "running" for j in job_status.values())
+        has_queued = not job_queue.empty()
+        status = "busy" if (has_running or has_queued) else "ready"
+    except Exception:
+        status = "ready"
     payload = {
         "worker_id": WORKER_ID,
         "pod_uuid": POD_UUID,
         "timestamp": int(time.time()),
+        "status": status,
     }
     url = f"{CONTROLLER_URL.rstrip('/')}/heartbeat"
     resp = post_signed_json(url, payload, timeout=5)
@@ -216,26 +309,37 @@ async def run_inference_and_save(
     model: str,
     mode: Optional[str],
     params: Dict[str, Any],
-) -> str:
-    global last_model_key
+) -> Tuple[str, Dict[str, float]]:
+    global last_model_key, FIRST_INFERENCE_START_TIME
     loop = asyncio.get_event_loop()
     params = params.copy()
     params.setdefault("output_dir", WORKSPACE_DIR)
 
+    async with _first_inference_lock:
+        if FIRST_INFERENCE_START_TIME is None:
+            FIRST_INFERENCE_START_TIME = time.time()
+            startup_time = FIRST_INFERENCE_START_TIME - POD_START_TIME
+        else:
+            startup_time = None
+
     inference_func = resolve_inference_callable(model, mode)
     model_key = f"{model}:{mode or ''}"
-
     if last_model_key and last_model_key != model_key:
         logger.info(
             f"Switching model {last_model_key} -> {model_key}, cleaning up GPU first"
         )
         cleanup_gpu()
 
+    inference_start_time = time.time()
     try:
         out_path = await loop.run_in_executor(
             None, inference_func, job_id, prompt, params
         )
-        return out_path
+        processing_time = time.time() - inference_start_time
+        metrics = {"processing_time_seconds": round(processing_time, 2)}
+        if startup_time is not None:
+            metrics["startup_time_seconds"] = round(startup_time, 2)
+        return out_path, metrics
     finally:
         last_model_key = model_key
 
@@ -253,6 +357,12 @@ async def process_job_item(item: Dict[str, Any]):
     result_key = item["result_key"]
 
     logger.info(f"Processing job {job_id} with model={model}, mode={mode}")
+    # Resolve any URL-valued media fields to base64 before inference
+    try:
+        params = resolve_media_urls(params, job_id)
+    except Exception as e:
+        logger.error(f"[{job_id}] Failed to resolve media URLs: {e}")
+        # Will be caught by outer try/except and reported as failure
     job_status[job_id] = {
         "status": "running",
         "started_at": datetime.utcnow().isoformat(),
@@ -260,7 +370,7 @@ async def process_job_item(item: Dict[str, Any]):
 
     try:
         async with semaphore:
-            out_local = await run_inference_and_save(
+            out_local, metrics = await run_inference_and_save(
                 job_id, prompt, model, mode, params
             )
             if upload_url.startswith("http://dummy-upload"):
@@ -270,7 +380,7 @@ async def process_job_item(item: Dict[str, Any]):
                     resp = requests.put(upload_url, data=f)
                     resp.raise_for_status()
 
-            payload = {"job_id": job_id, "result_r2_key": result_key}
+            payload = {"job_id": job_id, "result_r2_key": result_key, "next_job_id": _peek_next_job_id()}
             url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
             post_signed_json(url, payload)
 
@@ -287,6 +397,7 @@ async def process_job_item(item: Dict[str, Any]):
             "job_id": job_id,
             "result_r2_key": "None",
             "failed": True,
+            "next_job_id": _peek_next_job_id(),
         }
         try:
             post_signed_json(f"{CONTROLLER_URL.rstrip('/')}/job_complete", payload)
@@ -424,6 +535,45 @@ async def run_endpoint(req: RunRequest):
     }
     logger.info("Enqueued job %s", req.job_id)
     return {"status": "accepted", "job_id": req.job_id}
+
+
+@app.post("/run_bulk")
+async def run_bulk_endpoint(req: BulkRunRequest):
+    """
+    Accept multiple jobs for processing in a single request.
+    Used for bulk edit and multi-variation requests.
+    """
+    if not req.jobs:
+        raise HTTPException(status_code=400, detail="No jobs provided")
+    
+    available_slots = job_queue.maxsize - job_queue.qsize()
+    if available_slots < len(req.jobs):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Not enough queue capacity. Available: {available_slots}, Requested: {len(req.jobs)}"
+        )
+    
+    accepted_ids = []
+    for job in req.jobs:
+        if job.job_id in job_status and job_status[job.job_id].get("status") in ("queued", "running"):
+            logger.warning(f"[BULK] Job {job.job_id} already {job_status[job.job_id]['status']}, skipping")
+            continue
+        
+        await job_queue.put(job.dict())
+        job_status[job.job_id] = {
+            "status": "queued",
+            "queued_at": datetime.utcnow().isoformat(),
+        }
+        accepted_ids.append(job.job_id)
+    
+    logger.info(f"[BULK] Enqueued {len(accepted_ids)} of {len(req.jobs)} jobs")
+    return {
+        "status": "accepted",
+        "job_ids": accepted_ids,
+        "total_accepted": len(accepted_ids),
+        "total_requested": len(req.jobs),
+        "worker_id": WORKER_ID,
+    }
 
 
 @app.get("/health")

@@ -161,20 +161,40 @@ def _load_image(img_b64: str) -> Image.Image:
 
 
 def _get_dynamic_size(img: Image.Image, max_dim: int = 1152) -> tuple[int, int]:
-    """Return width/height close to input, within max_dim, multiple-of-64 (no upscaling)."""
+    """Return width/height close to input, within max_dim, multiple-of-64 (no upscaling), preserving aspect ratio."""
     w, h = img.size
     aspect = w / h
+    
+    # First, scale down if needed
     if max(w, h) > max_dim:
         if w > h:
             new_w = max_dim
-            new_h = int(new_w / aspect)
+            new_h = int(round(new_w / aspect))
         else:
             new_h = max_dim
-            new_w = int(new_h * aspect)
+            new_w = int(round(new_h * aspect))
     else:
         new_w, new_h = w, h
-    new_w = max(64, (new_w // 64) * 64)
-    new_h = max(64, (new_h // 64) * 64)
+    
+    # Round to multiples of 64 while preserving aspect ratio
+    # Round the larger dimension first, then compute the other dimension
+    if new_w >= new_h:
+        new_w = max(64, (new_w // 64) * 64)
+        # Compute height from rounded width to maintain aspect ratio
+        new_h = int(round(new_w / aspect))
+        # Round height, then recompute width to ensure both are multiples of 64
+        new_h = max(64, (new_h // 64) * 64)
+        new_w = int(round(new_h * aspect))
+        new_w = max(64, (new_w // 64) * 64)
+    else:
+        new_h = max(64, (new_h // 64) * 64)
+        # Compute width from rounded height to maintain aspect ratio
+        new_w = int(round(new_h * aspect))
+        # Round width, then recompute height to ensure both are multiples of 64
+        new_w = max(64, (new_w // 64) * 64)
+        new_h = int(round(new_w / aspect))
+        new_h = max(64, (new_h // 64) * 64)
+    
     return new_w, new_h
 
 

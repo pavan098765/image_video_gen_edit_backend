@@ -1,0 +1,8 @@
+# FlashVSR Video Upscaler Worker - API layer deps
+# Base image (flashvsr-pro) has torch, etc. These are for FastAPI/uvicorn.
+fastapi
+uvicorn[standard]
+pydantic
+tenacity
+httpx
+requests

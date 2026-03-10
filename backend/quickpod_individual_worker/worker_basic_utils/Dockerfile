@@ -5,9 +5,8 @@ FROM pavanalur3/deps-base-extended:py311-cu129 AS builder
 
 WORKDIR /app
 
-# Copy prep script + pre-baked models in one go
+# Copy prep script + pre-baked models in one go (realesrgan downloaded from HF in prep_model.py)
 COPY src/prep_model.py /app/prep_model.py
-COPY realesrgan_models /app/models/realesrgan
 COPY lama.pt /app/models/basic_utils/lama/lama.pt
 
 # Run prep_model.py to download and bake all models into this stage
@@ -28,10 +27,14 @@ COPY --from=builder /app/models /app/models
 # Copy code *after* models so model layer is cached when only code changes
 COPY . /app/worker
 
+# Install Python dependencies from requirements.txt
+RUN pip install --no-cache-dir -r /app/worker/src/requirements.txt
+
 # Set env vars so inference loads baked model paths
-ENV RMBG_LOCAL_PATH="/app/models/basic_utils/rmbg" \
+ENV BIREFNET_LOCAL_PATH="/app/models/basic_utils/birefnet" \
     LAMA_LOCAL_PATH="/app/models/basic_utils/lama/lama.pt" \
     LAMA_MODEL="/app/models/basic_utils/lama/lama.pt" \
+    REALESRGAN_LOCAL_PATH="/app/models/basic_utils/realesrgan" \
     PYTHONPATH="/app/worker/src:${PYTHONPATH}"
 
 # Ensure log file exists

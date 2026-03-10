@@ -1,0 +1,117 @@
+340f324c-f8b3-46e1-a35b-4561ecd7027c
+Any Switch (rgthree)
+BasicScheduler
+Bookmark (rgthree)
+CLIPTextEncode
+CLIPVisionLoader
+CM_FloatToInt
+CM_IntToFloat
+CR String To Combo
+CR Text
+ColorCorrect
+ColorMatchToReference
+CreateCFGScheduleFloatList
+DF_Int_to_Float
+Display Int (rgthree)
+DownloadAndLoadFlorence2Model
+DummyComfyWanModelObject
+EG_WXZ_QH
+FL_RIFE
+Fast Groups Bypasser (rgthree)
+Fast Groups Muter (rgthree)
+FastFilmGrain
+FloatConstant
+Florence2Run
+FramePackFindNearestBucket
+GetImageSizeAndCount
+INTConstant
+Image Overlay
+ImageFromBatch+
+ImageResizeKJv2
+ImageScaleBy
+ImageSharpen
+ImageUpscaleWithModelBatched
+ImpactWildcardProcessor
+Incrementer 
+JWFloatToInteger
+K3NKImageGrab
+K3NKImageLoaderWithBlending
+K3NKSaveLatentPassThrought
+Label (rgthree)
+LoadImage
+LoadImagesFromDir //Inspire
+MMAudioFeatureUtilsLoader
+MMAudioModelLoader
+MMAudioSampler
+MarkdownNote
+MathExpression|pysssss
+MelBandRoFormerModelLoader
+MelBandRoFormerSampler
+Mute / Bypass Relay (rgthree)
+Mute / Bypass Repeater (rgthree)
+NormalizeAudioLoudness
+Note
+NovaSR
+PauseWorkflowNode
+PlaySound|pysssss
+Power Lora Loader (rgthree)
+PreviewAny
+PreviewAudio
+PreviewBridge
+PreviewImage
+PrimitiveFloat
+PrimitiveInt
+PrimitiveNode
+Reroute
+Resolutions by Ratio (WLSH)
+SEGSSwitch
+SaveImage
+SaveLatent
+Seed (rgthree)
+Sigmas Split Value
+SimpleMath+
+StringConcatenate
+UpscaleModelLoader
+VHS_LoadAudio
+VHS_LoadVideo
+VHS_LoadVideoFFmpeg
+VHS_SelectEveryNthImage
+VHS_VideoCombine
+WanVideoApplyNAG
+WanVideoBlockList
+WanVideoBlockSwap
+WanVideoClipVisionEncode
+WanVideoContextOptions
+WanVideoDecode
+WanVideoEmptyEmbeds
+WanVideoEncode
+WanVideoEncodeLatentBatch
+WanVideoEnhanceAVideo
+WanVideoExperimentalArgs
+WanVideoImageToVideoEncode
+WanVideoLoraSelect
+WanVideoLoraSelectMulti
+WanVideoModelLoader
+WanVideoSVIProEmbeds
+WanVideoSampler
+WanVideoScheduler
+WanVideoSetBlockSwap
+WanVideoSetLoRAs
+WanVideoSetRadialAttention
+WanVideoSigmaToStep
+WanVideoTextEncodeCached
+WanVideoTorchCompileSettings
+WanVideoVAELoader
+a7d2f0d7-ff69-400d-aa64-ca94fcff6246
+c7b2a9fc-a78e-4638-ab98-6ee92ecc3067
+easy cleanGpuUsed
+easy mathFloat
+easy mathInt
+easy promptReplace
+easy showAnything
+easy textIndexSwitch
+mxSlider2D
+mxStop
+ttN concat
+ttN int
+ttN text

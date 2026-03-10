@@ -215,6 +215,22 @@ class AppState:
         self.background_tasks.append(task)
         logger.info("Started stray pod cleanup task")
         
+        # R2 input media reaper (cleanup orphaned input-media objects)
+        task = asyncio.create_task(
+            self._r2_input_media_reaper_task(),
+            name="r2_input_media_reaper"
+        )
+        self.background_tasks.append(task)
+        logger.info("Started R2 input media reaper task")
+        
+        # DB cleanup (delete old rows from workers, jobs, rewarded_ad_events, daily_spins)
+        task = asyncio.create_task(
+            self._db_cleanup_task(),
+            name="db_cleanup"
+        )
+        self.background_tasks.append(task)
+        logger.info("Started DB cleanup task")
+        
         logger.info(f"Started {len(self.background_tasks)} background tasks")
     
     async def shutdown(self):
@@ -262,14 +278,12 @@ class AppState:
         from job_manager import JobState
         
         heartbeat_stale_secs = self.config.worker.heartbeat_stale_seconds
-        idle_timeout_secs = self.config.worker.idle_timeout
-        # CRITICAL: Sweep interval must be <= minimum adaptive timeout (20s) to catch idle workers promptly
-        # Using 15s ensures workers are destroyed within ~15-35s of exceeding timeout, not 60-80s
-        sweep_interval = 15  # Must be <= minimum adaptive_timeout (20s)
+        idle_cfg = self.config.worker
+        sweep_interval = 30
         
         logger.info(
             f"Idle worker reaper: stale>{heartbeat_stale_secs}s, "
-            f"idle>{idle_timeout_secs}s"
+            f"idle_timeout={idle_cfg.idle_timeout_seconds}s, min_age={idle_cfg.idle_min_age_seconds}s"
         )
         
         while not self.shutdown_event.is_set():
@@ -348,20 +362,24 @@ class AppState:
                                     ])
                                 ).count()
                                 
-                                if active_jobs == 0:
-                                    # Worker says busy but no jobs - might be stuck, reset to ready
-                                    logger.warning(
-                                        f"Worker {w.worker_id} status is {w.status} but has no active jobs, "
-                                        f"resetting to ready"
-                                    )
-                                    w.status = "ready"
-                                    db.commit()
-                                else:
+                                if active_jobs > 0:
                                     logger.debug(
                                         f"Worker {w.worker_id} is {w.status} with {active_jobs} job(s), "
                                         f"skipping idle check"
                                     )
-                                continue
+                                    continue
+                                
+                                # BUG FIX: Worker says busy but no jobs — reset to ready and
+                                # FALL THROUGH to the idle check below instead of `continue`.
+                                # Previously `continue` here caused a thrashing loop: every 15s
+                                # the reaper would reset busy→ready, but the next heartbeat
+                                # would set it back to busy, and the idle timer never advanced.
+                                logger.warning(
+                                    f"Worker {w.worker_id} status is {w.status} but has no active jobs, "
+                                    f"resetting to ready and checking idle timeout"
+                                )
+                                w.status = "ready"
+                                db.commit()
                             
                             # Ready worker idle check
                             if w.status == "ready":
@@ -393,119 +411,37 @@ class AppState:
                                             )
                                             continue
                                 
-                                # Check for pending jobs for this model (but not assigned yet)
-                                pending = db.query(Job).filter(
-                                    Job.model == w.model,
-                                    Job.worker_id.is_(None),  # Not assigned yet
-                                    Job.status.in_([JobState.QUEUED.value, JobState.DISPATCHING.value])
-                                ).count()
-                                
-                                if pending > 0:
-                                    # CRITICAL FIX: Don't blindly keep all workers alive.
-                                    # If there are multiple workers for this model and another worker
-                                    # is actively processing jobs, this worker might be excess.
-                                    
-                                    # Count ready/busy workers for this model
-                                    workers_for_model = db.query(Worker).filter(
-                                        Worker.model == w.model,
-                                        Worker.status.in_(["ready", "busy", "dispatching"])
+                                # Do not destroy if there are PENDING jobs for this model (e.g. next bulk batch)
+                                if w.model:
+                                    pending_for_model = db.query(Job).filter(
+                                        Job.model == w.model,
+                                        Job.status == JobState.PENDING.value,
                                     ).count()
-                                    
-                                    # If we have more workers than pending jobs AND this worker
-                                    # has been idle for a while, it's excess
-                                    last_job_time = w.last_job_finished_at or w.created_at or w.last_active
-                                    idle_seconds = (now - last_job_time).total_seconds() if last_job_time else 0
-                                    
-                                    if workers_for_model > 1 and idle_seconds > 60:
-                                        # Check if OTHER workers are processing jobs (not idle)
-                                        active_other_workers = db.query(Worker).filter(
-                                            Worker.model == w.model,
-                                            Worker.worker_id != w.worker_id,
-                                            Worker.status.in_(["busy", "dispatching"])
-                                        ).count()
-                                        
-                                        if active_other_workers > 0:
-                                            logger.info(
-                                                f"Worker {w.worker_id} idle for {idle_seconds:.0f}s while "
-                                                f"{active_other_workers} other worker(s) are active. "
-                                                f"Marking as excess (pending={pending}, workers={workers_for_model})"
-                                            )
-                                            # Don't skip - continue to idle timeout check below
-                                        else:
-                                            logger.debug(
-                                                f"Model {w.model} has {pending} pending job(s) and "
-                                                f"{workers_for_model} workers, keeping worker {w.worker_id} alive"
-                                            )
-                                            continue
-                                    else:
+                                    if pending_for_model > 0:
                                         logger.debug(
-                                            f"Model {w.model} has {pending} pending job(s), "
-                                            f"keeping worker {w.worker_id} alive"
+                                            f"Worker {w.worker_id} model {w.model} has {pending_for_model} "
+                                            f"PENDING job(s), skipping idle destroy"
                                         )
                                         continue
                                 
-                                # Check idle time
+                                # Idle timeout: pod completed all assigned jobs, no new jobs came to it.
+                                # Destroy only if idle for configured timeout (errors handled separately).
                                 last_job = w.last_job_finished_at or w.created_at or w.last_active
-                                idle_for = (now - last_job).total_seconds()
-                                
-                                # Add cooldown period after worker creation to avoid premature destruction
+                                idle_for = (now - last_job).total_seconds() if last_job else 0
                                 worker_age = (now - w.created_at).total_seconds() if w.created_at else 0
-                                min_worker_age = 120  # 2 minutes minimum lifetime (increased from 60s)
                                 
-                                if worker_age < min_worker_age:
+                                if worker_age < idle_cfg.idle_min_age_seconds:
                                     logger.debug(
                                         f"Worker {w.worker_id} is only {worker_age:.1f}s old, "
-                                        f"minimum age is {min_worker_age}s, skipping idle check"
+                                        f"min_age={idle_cfg.idle_min_age_seconds}s, skipping idle check"
                                     )
                                     continue
                                 
-                                # CRITICAL: Truly adaptive idle timeout balancing cost vs. readiness
-                                # Goal: Aggressive destruction when no work, patient when work exists
-                                
-                                total_pending_jobs = db.query(Job).filter(
-                                    Job.status.in_([JobState.QUEUED.value, JobState.PENDING.value])
-                                ).count()
-                                
-                                # Check recent job submission rate (jobs created in last 2 minutes)
-                                recent_cutoff = now - timedelta(minutes=2)
-                                recent_jobs = db.query(Job).filter(
-                                    Job.model == w.model,
-                                    Job.created_at >= recent_cutoff
-                                ).count()
-                                
-                                # SMART ADAPTIVE TIMEOUT:
-                                # - No queue + no recent jobs = aggressive (90s) - save money!
-                                # - Pending jobs OR recent activity = patient (300-600s) - avoid startup costs
-                                
-                                if total_pending_jobs > 5:
-                                    # High load: 10 minute idle timeout (worth keeping worker ready)
-                                    adaptive_idle_timeout = 300
-                                    timeout_reason = f"high load ({total_pending_jobs} pending)"
-                                elif total_pending_jobs > 0:
-                                    # Medium load: 5 minute idle timeout
-                                    adaptive_idle_timeout = 100
-                                    timeout_reason = f"pending jobs ({total_pending_jobs})"
-                                elif recent_jobs > 0:
-                                    # Recent activity but no queue: 3 minute timeout
-                                    # Keep worker alive in case more jobs come
-                                    adaptive_idle_timeout = 30
-                                    timeout_reason = f"recent activity ({recent_jobs} jobs in last 2min)"
-                                else:
-                                    # NO LOAD: aggressive timeout to save money
-                                    # 90 seconds = enough for genuine brief gaps, but destroys truly idle
-                                    adaptive_idle_timeout = 20
-                                    timeout_reason = "no load (no pending, no recent)"
-                                
-                                logger.debug(
-                                    f"Worker {w.worker_id} adaptive timeout: {adaptive_idle_timeout}s "
-                                    f"({timeout_reason})"
-                                )
-                                
-                                if idle_for > adaptive_idle_timeout:
+                                timeout_secs = idle_cfg.idle_timeout_seconds
+                                if idle_for > timeout_secs:
                                     logger.info(
                                         f"Worker {w.worker_id} idle for {idle_for:.1f}s "
-                                        f"(timeout: {adaptive_idle_timeout}s, pending_jobs: {total_pending_jobs}), "
-                                        f"destroying pod {w.container_id}"
+                                        f"(timeout: {timeout_secs}s), destroying pod {w.container_id}"
                                     )
                                     if w.container_id and self.pod_manager:
                                         await self.pod_manager.destroy_individual_pod(
@@ -551,7 +487,7 @@ class AppState:
                                     
                                     logger.debug(
                                         f"Worker {w.worker_id} idle for {idle_for:.1f}s, "
-                                        f"but within timeout ({adaptive_idle_timeout}s)"
+                                        f"within timeout ({timeout_secs}s)"
                                     )
                                     
                         except Exception as e:
@@ -798,6 +734,121 @@ class AppState:
             except Exception:
                 logger.exception("Ban cleanup task error")
     
+    async def _r2_input_media_reaper_task(self):
+        """
+        Safety-net reaper: delete orphaned objects under input-media/ and
+        input-videos/ in R2 that are older than 2 hours.  This catches cases
+        where job_complete cleanup was missed (e.g. server crash, timeout).
+        
+        Two prefixes are checked:
+          - input-media/  : images and videos uploaded via /get_media_upload_urls
+          - input-videos/ : videos uploaded via legacy /get_video_upload_url
+        
+        Runs every 60 minutes.
+        """
+        from datetime import datetime
+        from routes import _s3_client, _r2_bucket, _image_prefix
+        
+        reaper_interval = 3600  # 60 minutes
+        max_age_seconds = 7200  # 2 hours
+        
+        logger.info(
+            f"R2 input media reaper started (interval={reaper_interval}s, "
+            f"max_age={max_age_seconds}s)"
+        )
+        
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(reaper_interval)
+                
+                if not _s3_client or not _r2_bucket:
+                    continue
+                
+                # Scan both input-media/ (new) and input-videos/ (legacy) prefixes
+                prefixes = [
+                    f"{_image_prefix}/input-media/",
+                    f"{_image_prefix}/input-videos/",
+                ]
+                now = datetime.utcnow()
+                total_deleted = 0
+                
+                for prefix in prefixes:
+                    try:
+                        paginator = _s3_client.get_paginator("list_objects_v2")
+                        for page in paginator.paginate(Bucket=_r2_bucket, Prefix=prefix):
+                            for obj in page.get("Contents", []):
+                                last_modified = obj.get("LastModified")
+                                if last_modified:
+                                    # Make comparison timezone-naive
+                                    if last_modified.tzinfo:
+                                        last_modified = last_modified.replace(tzinfo=None)
+                                    age = (now - last_modified).total_seconds()
+                                    if age > max_age_seconds:
+                                        try:
+                                            _s3_client.delete_object(
+                                                Bucket=_r2_bucket, Key=obj["Key"]
+                                            )
+                                            total_deleted += 1
+                                        except Exception as e:
+                                            logger.warning(
+                                                f"[R2_REAPER] Failed to delete {obj['Key']}: {e}"
+                                            )
+                    except Exception as e:
+                        logger.warning(f"[R2_REAPER] Failed to list/clean {prefix}: {e}")
+                
+                if total_deleted > 0:
+                    logger.info(
+                        f"[R2_REAPER] Cleaned up {total_deleted} orphaned input objects"
+                    )
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("R2 input media reaper task error")
+    
+    async def _db_cleanup_task(self):
+        """
+        Periodically delete old rows from workers, jobs, rewarded_ad_events,
+        and daily_spins to prevent DB growth. Runs once per week.
+        Uses batched deletes to avoid long-running transactions.
+        """
+        from db_cleanup import run_db_cleanup
+
+        interval_days = int(os.getenv("DB_CLEANUP_INTERVAL_DAYS", "7"))
+        retention_days = int(os.getenv("DB_CLEANUP_RETENTION_DAYS", "7"))
+        batch_size = int(os.getenv("DB_CLEANUP_BATCH_SIZE", "500"))
+        interval_seconds = interval_days * 24 * 3600
+
+        logger.info(
+            f"DB cleanup task started (interval={interval_days}d, "
+            f"retention={retention_days}d, batch_size={batch_size})"
+        )
+
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(interval_seconds)
+
+                try:
+                    results = await asyncio.to_thread(
+                        run_db_cleanup,
+                        retention_days=retention_days,
+                        batch_size=batch_size,
+                    )
+                    total = sum(results.values())
+                    if total > 0:
+                        logger.info(
+                            f"[DB_CLEANUP] Deleted old rows: workers={results['workers']}, "
+                            f"jobs={results['jobs']}, rewarded_ad_events={results['rewarded_ad_events']}, "
+                            f"daily_spins={results['daily_spins']} (total={total})"
+                        )
+                except Exception as e:
+                    logger.exception(f"[DB_CLEANUP] Failed: {e}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("DB cleanup task error")
+
     async def _job_recovery_task(self):
         """Check for stuck jobs and recover them"""
         sweep_interval = 30  # Check every 30 seconds
@@ -835,7 +886,6 @@ class AppState:
         from db import SessionLocal, Job, Worker
         from models import JobState
         from routes import _dispatch_job_background
-        from pod_manager import PodStatus
         
         dispatch_interval = 5  # Check every 5 seconds
         
@@ -909,52 +959,29 @@ class AppState:
                     
                     # Check for available workers for each model
                     for model, jobs in jobs_by_model.items():
-                        # Check if we have any READY pods for this model
-                        has_ready_pod = False
-                        
-                        # Take a snapshot of pods to check (prevents dict iteration issues)
-                        async with self.pod_manager._lock:
-                            pods_snapshot = list(self.pod_manager.individual_pods.items())
-                        
-                        for pod_uuid, info in pods_snapshot:
-                            if info.model == model and info.status == PodStatus.READY:
-                                # Verify pod isn't blacklisted
-                                if info.machine_id and self.pod_manager.is_machine_bad(info.machine_id):
-                                    continue
-                                has_ready_pod = True
-                                break
-                        
-                        if has_ready_pod or len(pods_snapshot) == 0:
-                            # Either we have a ready pod, or no pods at all
-                            # (in which case dispatch will create one)
-                            for job in jobs:
-                                logger.info(
-                                    f"[DISPATCHER] Triggering dispatch for QUEUED job {job.job_id} "
-                                    f"(model={model}, queued_since={job.updated_at})"
-                                )
-                                
-                                # Mark as recently dispatched
-                                recently_dispatched[job.job_id] = now
-                                
-                                # Get job mode from params
-                                job_mode = None
-                                if job.params and isinstance(job.params, dict):
-                                    job_mode = job.params.get("mode")
-                                
-                                # Dispatch in background
-                                asyncio.create_task(
-                                    _dispatch_job_background(job.job_id, model, job_mode)
-                                )
-                                
-                                # Small delay between dispatches to avoid thundering herd
-                                await asyncio.sleep(0.5)
-                        else:
-                            # No ready pods for this model - log but don't spam
-                            # (jobs will be picked up when a pod becomes ready)
-                            logger.debug(
-                                f"[DISPATCHER] No READY pods for model {model}, "
-                                f"{len(jobs)} job(s) waiting"
+                        # Always attempt dispatch for eligible QUEUED jobs.
+                        # _dispatch_job_background handles finding/creating pods.
+                        for job in jobs:
+                            logger.info(
+                                f"[DISPATCHER] Triggering dispatch for QUEUED job {job.job_id} "
+                                f"(model={model}, queued_since={job.updated_at})"
                             )
+                            
+                            # Mark as recently dispatched
+                            recently_dispatched[job.job_id] = now
+                            
+                            # Get job mode from params
+                            job_mode = None
+                            if job.params and isinstance(job.params, dict):
+                                job_mode = job.params.get("mode")
+                            
+                            # Dispatch in background
+                            asyncio.create_task(
+                                _dispatch_job_background(job.job_id, model, job_mode)
+                            )
+                            
+                            # Small delay between dispatches to avoid thundering herd
+                            await asyncio.sleep(0.5)
                 finally:
                     db.close()
                     

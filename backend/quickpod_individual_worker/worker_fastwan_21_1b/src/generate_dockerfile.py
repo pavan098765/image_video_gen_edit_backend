@@ -7,7 +7,7 @@ import os
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-BASE_IMAGE = "pavanalur3/deps-base-extended:py311-cu129"
+BASE_IMAGE = "pavanalur3/deps-base-new:py311-cu128"
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 WORKER_DIR = os.path.join(PROJECT_ROOT, "src")
 OUT_DOCKERFILE = os.path.join(PROJECT_ROOT, "Dockerfile")
@@ -22,7 +22,7 @@ def copy_non_chunk_files(f):
     """
     Copy everything under models/ except:
       - .part-* files (handled separately)
-      - safetensors > 500MB (should be split)
+      - safetensors > 700MB (should be split)
       - .cache or hidden dirs
     """
     for root, dirs, files in os.walk(MODELS_DIR):
@@ -34,7 +34,7 @@ def copy_non_chunk_files(f):
                 continue
             if fn.endswith(".safetensors"):
                 full = os.path.join(root, fn)
-                if os.path.getsize(full) > 500 * 1024 * 1024:
+                if os.path.getsize(full) > 700 * 1024 * 1024:
                     continue
 
             abs_path = os.path.join(root, fn)
@@ -63,15 +63,21 @@ def copy_chunks_one_per_line(f):
 
 
 def write_rest(f):
+    f.write("\n# Copy requirements.txt first for dependency installation\n")
+    f.write("COPY requirements.txt /app/requirements.txt\n\n")
+
+    f.write("# Install system dependencies and Python packages\n")
+    f.write("RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client build-essential \\\n")
+    f.write("    && pip install --no-cache-dir -r /app/requirements.txt \\\n")
+    f.write("    && pip install --no-cache-dir sageattention --only-binary=:all: \\\n")
+    f.write("    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*\n\n")
+
     f.write("\n# Worker code (last to leverage cache)\n")
     f.write("COPY src /app/worker/src\n\n")
 
-    f.write("# Install SageAttention from pip (pre-built wheels only)\n")
-    f.write("RUN pip install --no-cache-dir sageattention --only-binary=:all:\n\n")
-
     # Export model environment paths
     f.write('ENV FASTWAN_1B_LOCAL_PATH="/app/models/wan_21_1b"\n')
-    f.write('ENV REALESRGAN_LOCAL_PATH="/app/models/realesrgan"\n')
+    f.write('ENV MODELS_DIR="/app/models"\n')
     f.write('ENV PYTHONPATH="/app/worker/src:${PYTHONPATH}"\n\n')
 
     # Worker setup

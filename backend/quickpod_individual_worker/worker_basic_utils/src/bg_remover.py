@@ -1,4 +1,4 @@
-# rmbg_remover.py
+# bg_remover.py
 
 import base64
 import os
@@ -7,33 +7,47 @@ from io import BytesIO
 from PIL import Image
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torchvision.transforms.functional import normalize
+from torchvision import transforms
+from transformers import AutoModelForImageSegmentation
 from upscaler import upscale_image
 
 # -------------------------
 # Config: model location
 # -------------------------
-RMBG_LOCAL_PATH = os.environ.get("RMBG_LOCAL_PATH", "/models/rmbg").strip()
+BIREFNET_LOCAL_PATH = os.environ.get("BIREFNET_LOCAL_PATH", "/app/models/basic_utils/birefnet").strip()
+
+# Set float32 matmul precision for better performance
+torch.set_float32_matmul_precision(["high", "highest"][0])
 
 # -------------------------
-# Initialize RMBG model (GPU only) - using direct model loading like official HF space
+# Initialize BiRefNet model (GPU only)
 # -------------------------
-from briarmbg import BriaRMBG
-
-_model_source = RMBG_LOCAL_PATH if RMBG_LOCAL_PATH and os.path.exists(RMBG_LOCAL_PATH) else "briaai/RMBG-1.4"
+_model_source = BIREFNET_LOCAL_PATH if BIREFNET_LOCAL_PATH and os.path.exists(BIREFNET_LOCAL_PATH) else "ZhengPeng7/BiRefNet"
 
 try:
-    _rmbg_model = BriaRMBG.from_pretrained(_model_source)
+    _birefnet_model = AutoModelForImageSegmentation.from_pretrained(
+        _model_source, trust_remote_code=True
+    )
     _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    _rmbg_model.to(_device)
-    _rmbg_model.eval()
-    print(f"✅ RMBG model initialized from: {_model_source} on {_device}")
+    _birefnet_model.to(_device)
+    _birefnet_model.eval()
+    print(f"✅ BiRefNet model initialized from: {_model_source} on {_device}")
 except Exception as e:
     raise RuntimeError(
-        f"❌ Failed to initialize RMBG model from {_model_source}. "
+        f"❌ Failed to initialize BiRefNet model from {_model_source}. "
         f"Ensure the model is baked into the container. Error: {e}"
     )
+
+# -------------------------
+# Image transforms for BiRefNet
+# -------------------------
+_transform_image = transforms.Compose(
+    [
+        transforms.Resize((1024, 1024)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ]
+)
 
 # -------------------------
 # Helpers
@@ -55,44 +69,34 @@ def _load_image(img: Optional[str | Image.Image | bytes]) -> Optional[Image.Imag
         raise ValueError(f"Unable to decode image from input: {e}")
 
 
-def _preprocess_image(image: Image.Image) -> tuple[torch.Tensor, tuple[int, int]]:
-    """Preprocess image for RMBG model - matches official HF space implementation."""
-    orig_size = image.size  # (w, h)
+def _process_image(image: Image.Image) -> Image.Image:
+    """
+    Apply BiRefNet-based image segmentation to remove the background.
     
-    # Resize to model input size
-    model_input_size = (1024, 1024)
-    image_resized = image.resize(model_input_size, Image.BILINEAR)
+    This function preprocesses the input image, runs it through a BiRefNet segmentation model to obtain a mask,
+    and applies the mask as an alpha (transparency) channel to the original image.
     
-    # Convert to tensor
-    im_np = np.array(image_resized)
-    im_tensor = torch.tensor(im_np, dtype=torch.float32).permute(2, 0, 1)
-    im_tensor = torch.unsqueeze(im_tensor, 0)
-    im_tensor = torch.divide(im_tensor, 255.0)
-    im_tensor = normalize(im_tensor, [0.5, 0.5, 0.5], [1.0, 1.0, 1.0])
+    Args:
+        image (PIL.Image): The input RGB image.
     
-    if torch.cuda.is_available():
-        im_tensor = im_tensor.cuda()
+    Returns:
+        PIL.Image: The image with the background removed, using the segmentation mask as transparency.
+    """
+    image_size = image.size
+    input_images = _transform_image(image).unsqueeze(0).to(_device)
     
-    return im_tensor, orig_size
-
-
-def _postprocess_mask(result: torch.Tensor, orig_size: tuple[int, int]) -> Image.Image:
-    """Postprocess model output to mask - matches official HF space implementation."""
-    w, h = orig_size
+    # Prediction
+    with torch.no_grad():
+        preds = _birefnet_model(input_images)[-1].sigmoid().cpu()
     
-    # Get first output and interpolate to original size
-    result = torch.squeeze(F.interpolate(result[0][0], size=(h, w), mode='bilinear'), 0)
+    pred = preds[0].squeeze()
+    pred_pil = transforms.ToPILImage()(pred)
+    mask = pred_pil.resize(image_size)
     
-    # Normalize mask values
-    ma = torch.max(result)
-    mi = torch.min(result)
-    result = (result - mi) / (ma - mi)
-    
-    # Convert to PIL mask
-    result_array = (result * 255).cpu().data.numpy().astype(np.uint8)
-    pil_mask = Image.fromarray(np.squeeze(result_array))
-    
-    return pil_mask
+    # Create a copy to avoid modifying the original image
+    result_image = image.copy()
+    result_image.putalpha(mask)
+    return result_image
 
 
 # -------------------------
@@ -100,7 +104,7 @@ def _postprocess_mask(result: torch.Tensor, orig_size: tuple[int, int]) -> Image
 # -------------------------
 def remove_background(input_image: np.ndarray, return_mask: bool = False) -> np.ndarray:
     """
-    Remove background from input image using RMBG.
+    Remove background from input image using BiRefNet.
     return_mask=True -> segmentation mask (white foreground, black background)
     return_mask=False -> image with transparent background (RGBA)
     """
@@ -110,26 +114,25 @@ def remove_background(input_image: np.ndarray, return_mask: bool = False) -> np.
     pil_image = Image.fromarray(input_image).convert("RGB")
 
     try:
-        # Preprocess
-        im_tensor, orig_size = _preprocess_image(pil_image)
-        
-        # Inference
-        with torch.no_grad():
-            result = _rmbg_model(im_tensor)
-        
-        # Postprocess to get mask
-        pil_mask = _postprocess_mask(result, orig_size)
-        
         if return_mask:
-            return np.array(pil_mask)
+            # Get mask only
+            image_size = pil_image.size
+            input_images = _transform_image(pil_image).unsqueeze(0).to(_device)
+            
+            with torch.no_grad():
+                preds = _birefnet_model(input_images)[-1].sigmoid().cpu()
+            
+            pred = preds[0].squeeze()
+            pred_pil = transforms.ToPILImage()(pred)
+            mask = pred_pil.resize(image_size)
+            return np.array(mask.convert("L"))
         else:
-            # Apply mask as alpha channel to original image
-            result_image = pil_image.copy()
-            result_image.putalpha(pil_mask)
-            return np.array(result_image)
+            # Get image with transparent background
+            processed_image = _process_image(pil_image)
+            return np.array(processed_image)
             
     except Exception as e:
-        raise RuntimeError(f"RMBG inference failed: {e}")
+        raise RuntimeError(f"BiRefNet inference failed: {e}")
 
 # -------------------------
 # Inference wrapper
@@ -144,7 +147,7 @@ def run_inference_rmbg(job_id: str, prompt: Optional[str], params: Dict[str, Any
 
     return_mask = bool(params.get("return_mask", False))
     suffix = "mask" if return_mask else "nobg"
-    out_path = os.path.join(output_dir, f"rmbg_{suffix}_{job_id}.png")
+    out_path = os.path.join(output_dir, f"birefnet_{suffix}_{job_id}.png")
 
     result = remove_background(np.array(init_image), return_mask=return_mask)
 
@@ -161,14 +164,18 @@ def run_inference_rmbg(job_id: str, prompt: Optional[str], params: Dict[str, Any
     # -------------------------
     
     scale_image = params.get("scale_image", True)
-    scale_factor = params.get("scale_factor", 2) if scale_image else 0
-    model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
+    
+    if scale_image:
+        scale_factor = params.get("scale_factor", 2)
+        model_name = "RealESRGAN_x2plus" if scale_factor == 2 else "RealESRGAN_x4plus"
+        upscaled = upscale_image(out_path, model_name=model_name, scale_factor=scale_factor)
+        final_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
+        upscaled.save(final_path)
+    else:
+        # No upscaling — just strip metadata from the saved result
+        final_path = out_path
 
-    upscaled = upscale_image(out_path,  model_name=model_name, scale_factor=scale_factor)
-
-    upscaled_path = os.path.join(output_dir, f"{job_id}_upscaled.png")
-    upscaled.save(upscaled_path)
-    return os.path.abspath(upscaled_path)
+    return os.path.abspath(final_path)
 
 # -------------------------
 # Example usage

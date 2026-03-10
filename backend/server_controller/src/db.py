@@ -158,9 +158,10 @@ class Job(Base):
     
     # Timing metrics (in seconds)
     total_time_seconds = Column(Float, nullable=True)  # created_at to completed_at
-    processing_time_seconds = Column(Float, nullable=True)  # started_at to completed_at
+    processing_time_seconds = Column(Float, nullable=True)  # started_at to completed_at (or worker-provided actual inference time)
     queue_time_seconds = Column(Float, nullable=True)  # queued_at to started_at
     dispatch_time_seconds = Column(Float, nullable=True)  # dispatched_at to started_at
+    startup_time_seconds = Column(Float, nullable=True)  # pod start to first inference start (worker-provided)
     
     # Retry management
     retry_count = Column(Integer, default=0)
@@ -238,6 +239,7 @@ class Job(Base):
             "processing_time_seconds": self.processing_time_seconds,
             "queue_time_seconds": self.queue_time_seconds,
             "dispatch_time_seconds": self.dispatch_time_seconds,
+            "startup_time_seconds": self.startup_time_seconds,
             # Cost metrics
             "job_cost_usd": self.job_cost_usd,  # Total cost (processing + overhead)
             "processing_cost_usd": self.processing_cost_usd,  # Processing cost only

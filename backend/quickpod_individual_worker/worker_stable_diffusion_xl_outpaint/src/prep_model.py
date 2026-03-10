@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import os, shutil, traceback, subprocess
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, hf_hub_download
 
 # ------------------------
 # Resolve project root (one dir up from src/)
@@ -20,8 +20,8 @@ REPOS = {
     "pipeline": "SG161222/RealVisXL_V5.0_Lightning",    # large, split later
 }
 
-LOCAL_REALESRGAN_SRC = os.path.join(PROJECT_ROOT, "realesrgan_models")
-LOCAL_REALESRGAN_DST = os.path.join(MODELS_DIR, "realesrgan")
+REALESRGAN_DIR = os.path.join(MODELS_DIR, "realesrgan")
+REALESRGAN_HF_REPO = "rockapaper/realesrgan"
 
 os.makedirs(TARGET_DIR, exist_ok=True)
 
@@ -79,14 +79,26 @@ for name, repo in REPOS.items():
         traceback.print_exc()
 
 # ------------------------
-# 2. Copy local Realesrgan models (optional)
+# 2. Download Real-ESRGAN models (2x, 4x) from rockapaper/realesrgan
 # ------------------------
-if os.path.exists(LOCAL_REALESRGAN_SRC):
-    print(f"📦 Copying {LOCAL_REALESRGAN_SRC} -> {LOCAL_REALESRGAN_DST}")
-    shutil.copytree(LOCAL_REALESRGAN_SRC, LOCAL_REALESRGAN_DST, dirs_exist_ok=True)
-    print("✓ Realesrgan models copied.")
-else:
-    print("⚠️ No local realesrgan_models/ found, skipping.")
+os.makedirs(REALESRGAN_DIR, exist_ok=True)
+for filename in ("RealESRGAN_x2plus.pth", "RealESRGAN_x4plus.pth"):
+    model_file = os.path.join(REALESRGAN_DIR, filename)
+    if os.path.exists(model_file):
+        print(f"✓ Real-ESRGAN {filename} already exists at {model_file}")
+        continue
+    try:
+        print(f"⬇️ Downloading {filename} from {REALESRGAN_HF_REPO}...")
+        hf_hub_download(
+            repo_id=REALESRGAN_HF_REPO,
+            filename=filename,
+            local_dir=REALESRGAN_DIR,
+            resume_download=True,
+        )
+        print(f"✓ {filename} downloaded to {REALESRGAN_DIR}")
+    except Exception as e:
+        print(f"❌ Failed to download {filename}: {e}")
+        traceback.print_exc()
 
 # ------------------------
 # 3. Split large safetensors recursively

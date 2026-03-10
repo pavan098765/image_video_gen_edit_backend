@@ -319,11 +319,13 @@ class JobManager:
             logger.info(f"Job {job_id}: {current_state.value} → {new_state.value}")
             return job
     
+    _SENTINEL = object()
+
     def mark_running(
         self,
         job_id: str,
         worker_id: str,
-        started_at: Optional[datetime] = None,
+        started_at=_SENTINEL,
     ) -> Job:
         """
         Mark job as running with worker assignment.
@@ -372,7 +374,12 @@ class JobManager:
             
             job.status = JobState.RUNNING.value
             job.worker_id = worker_id
-            job.started_at = started_at or utc_naive_now()
+            if started_at is self._SENTINEL:
+                job.started_at = utc_naive_now()  # default: set to now
+            elif started_at is not None:
+                job.started_at = started_at       # explicit datetime
+            else:
+                job.started_at = None  # explicit NULL for bulk/individual; job_complete chains it
             job.updated_at = utc_naive_now()
             
             # Update worker
@@ -400,8 +407,11 @@ class JobManager:
         job_id: str,
         result_r2_key: Optional[str] = None,
         output_url: Optional[str] = None,
+        metrics: Optional[Dict[str, Any]] = None,
     ) -> Job:
-        """Mark job as completed with result and calculate timing metrics"""
+        """Mark job as completed with result and calculate timing metrics.
+        If metrics is provided by worker: use processing_time_seconds and startup_time_seconds from it.
+        """
         with self.session_factory() as db:
             job = db.query(Job).filter(Job.job_id == job_id).first()
             if not job:
@@ -420,10 +430,18 @@ class JobManager:
             if output_url:
                 job.output_url = output_url
             
-            # Calculate timing metrics
+            # Worker-provided metrics (accurate inference time and pod startup time)
+            if metrics:
+                if "processing_time_seconds" in metrics:
+                    job.processing_time_seconds = metrics["processing_time_seconds"]
+                if "startup_time_seconds" in metrics:
+                    job.startup_time_seconds = metrics["startup_time_seconds"]
+            
+            # Calculate other timing metrics
             timing_metrics = self._calculate_timing_metrics(job, completion_time)
             job.total_time_seconds = timing_metrics["total_time"]
-            job.processing_time_seconds = timing_metrics["processing_time"]
+            if job.processing_time_seconds is None:
+                job.processing_time_seconds = timing_metrics["processing_time"]
             job.queue_time_seconds = timing_metrics["queue_time"]
             job.dispatch_time_seconds = timing_metrics["dispatch_time"]
             
@@ -695,8 +713,59 @@ class JobManager:
                     "retry_count": job.retry_count or 0,
                 })
         
-        # Handle stuck RUNNING jobs OUTSIDE the session (involves async pod destruction)
+        # =====================================================================
+        # BUG FIX: Consult heartbeat cache & scale timeout for bulk scenarios
+        # When a worker has multiple RUNNING jobs (bulk dispatch), the worker
+        # processes them sequentially. Later jobs naturally appear "stuck" by
+        # wall-clock time even though the worker is healthy.  We:
+        # 1. Check if the worker's heartbeat is recent AND status is busy/processing.
+        # 2. Scale the per-job timeout by the number of RUNNING jobs on that worker.
+        # 3. Only flag a job as truly stuck if it exceeds the *scaled* timeout.
+        # =====================================================================
+        from routes import _heartbeat_cache  # in-memory, zero-cost lookup
+
+        # Count RUNNING jobs per worker (for timeout scaling)
+        worker_running_counts: Dict[str, int] = {}
+        for jd in stuck_running_jobs_data:
+            wid = jd.get("worker_id")
+            if wid:
+                worker_running_counts[wid] = worker_running_counts.get(wid, 0) + 1
+
+        filtered_stuck_jobs: list = []
+        base_timeout_secs = self.running_job_timeout.total_seconds()
+
         for job_data in stuck_running_jobs_data:
+            worker_id = job_data.get("worker_id")
+            if worker_id:
+                cached = _heartbeat_cache.get(worker_id)
+                if cached:
+                    last_hb = cached.get("last_heartbeat")
+                    hb_status = cached.get("status")
+                    hb_age = (now - last_hb).total_seconds() if last_hb else 9999
+
+                    if hb_age < 60 and hb_status in ("busy", "processing"):
+                        # Worker is alive and actively working.
+                        # Scale the timeout: base_timeout * num_running_jobs on this worker.
+                        num_running = worker_running_counts.get(worker_id, 1)
+                        scaled_timeout = base_timeout_secs * max(num_running, 1)
+
+                        if job_data["running_time_seconds"] < scaled_timeout:
+                            logger.debug(
+                                f"Job {job_data['job_id']} running {job_data['running_time_seconds']:.0f}s "
+                                f"but worker {worker_id} heartbeat {hb_age:.0f}s ago, status={hb_status}, "
+                                f"{num_running} running jobs → scaled timeout {scaled_timeout:.0f}s. Skipping."
+                            )
+                            continue
+
+            filtered_stuck_jobs.append(job_data)
+
+        if stuck_running_jobs_data and not filtered_stuck_jobs:
+            logger.info(
+                f"All {len(stuck_running_jobs_data)} stuck-running candidates cleared by heartbeat/bulk check"
+            )
+
+        # Handle truly stuck RUNNING jobs OUTSIDE the session (involves async pod destruction)
+        for job_data in filtered_stuck_jobs:
             try:
                 await self._handle_stuck_running_job(job_data, now)
             except Exception as e:

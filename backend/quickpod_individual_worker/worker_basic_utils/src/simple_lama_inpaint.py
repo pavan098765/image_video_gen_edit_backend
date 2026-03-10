@@ -1,6 +1,6 @@
 """
 Simple LaMa inpainting wrapper with outpainting-friendly mask preparation.
-Optimized for GPU performance with FP16 and inference mode.
+Runs in FP32 to avoid TorchScript/BatchNorm dtype mismatch (cudnn_batch_norm input vs weight).
 """
 
 import base64
@@ -28,40 +28,34 @@ _LAMA_MODEL = None
 
 def get_lama_model():
     """
-    Lazily load and cache the LaMa model with optimizations.
-    Uses FP16 for faster inference on modern GPUs.
+    Lazily load and cache the LaMa model.
+    Kept in FP32: TorchScript LaMa (BatchNorm, FFC) often has dtype mismatch with .half()
+    (RuntimeError: input FloatTensor vs weight HalfTensor in cudnn_batch_norm). FP32 is safe.
     """
     global _LAMA_MODEL
     if _LAMA_MODEL is not None:
         return _LAMA_MODEL
-    
+
     if not os.path.exists(LAMA_LOCAL_PATH):
         raise FileNotFoundError(f"❌ LaMa model file not found at {LAMA_LOCAL_PATH}")
-    
+
     print(f"🧠 Loading LaMa model from: {LAMA_LOCAL_PATH}")
-    
-    # Load TorchScript model
+
+    # Load TorchScript model in FP32 only (no .half() - avoids BatchNorm dtype mismatch)
     _LAMA_MODEL = torch.jit.load(LAMA_LOCAL_PATH, map_location=DEVICE)
     _LAMA_MODEL = _LAMA_MODEL.to(DEVICE)
     _LAMA_MODEL.eval()
-    
-    # Try to convert to half precision for faster inference
-    try:
-        _LAMA_MODEL = _LAMA_MODEL.half()
-        print("✅ LaMa model loaded with FP16 optimization")
-    except Exception as e:
-        print(f"⚠️ FP16 not supported, using FP32: {e}")
-    
-    # Warm up the model with a dummy inference
+
+    # Warm up with FP32 tensors
     try:
         with torch.inference_mode():
-            dummy_img = torch.zeros(1, 3, 512, 512, device=DEVICE, dtype=_LAMA_MODEL.parameters().__next__().dtype if hasattr(_LAMA_MODEL, 'parameters') else torch.float16)
-            dummy_mask = torch.zeros(1, 1, 512, 512, device=DEVICE, dtype=dummy_img.dtype)
+            dummy_img = torch.zeros(1, 3, 512, 512, device=DEVICE, dtype=torch.float32)
+            dummy_mask = torch.zeros(1, 1, 512, 512, device=DEVICE, dtype=torch.float32)
             _ = _LAMA_MODEL(dummy_img, dummy_mask)
         print("✅ LaMa model warmed up successfully")
     except Exception as e:
         print(f"⚠️ Warmup failed (non-critical): {e}")
-    
+
     return _LAMA_MODEL
 
 
@@ -70,15 +64,9 @@ def _run_lama_inference(image: Image.Image, mask: Image.Image) -> Image.Image:
     Run optimized LaMa inference on a single image-mask pair.
     """
     model = get_lama_model()
-    
-    # Determine model dtype
-    try:
-        model_dtype = next(model.parameters()).dtype
-    except (StopIteration, AttributeError):
-        model_dtype = torch.float16
-    
+
     orig_size = image.size  # (W, H)
-    
+
     # Pad to multiple of 8 for model compatibility
     def pad_to_multiple(img, multiple=8):
         w, h = img.size
@@ -89,25 +77,21 @@ def _run_lama_inference(image: Image.Image, mask: Image.Image) -> Image.Image:
         padded = Image.new(img.mode, (new_w, new_h), 0 if img.mode == 'L' else (0, 0, 0))
         padded.paste(img, (0, 0))
         return padded, (new_w - w, new_h - h)
-    
+
     image_padded, img_pad = pad_to_multiple(image.convert("RGB"))
     mask_padded, _ = pad_to_multiple(mask.convert("L"))
-    
-    # Convert to tensors
+
+    # Convert to tensors (FP32 to match model - avoids cudnn_batch_norm dtype mismatch)
     img_np = np.array(image_padded).astype(np.float32) / 255.0
     mask_np = np.array(mask_padded).astype(np.float32) / 255.0
-    
-    # Ensure mask is binary (threshold at 0.5)
     mask_np = (mask_np > 0.5).astype(np.float32)
-    
-    # To tensor: (H, W, C) -> (1, C, H, W)
-    img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(DEVICE, dtype=model_dtype)
-    mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(DEVICE, dtype=model_dtype)
-    
-    # Run inference with optimizations
+
+    # (H, W, C) -> (1, C, H, W)
+    img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(DEVICE, dtype=torch.float32)
+    mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(DEVICE, dtype=torch.float32)
+
     with torch.inference_mode():
-        with torch.cuda.amp.autocast(enabled=(model_dtype == torch.float16)):
-            result = model(img_tensor, mask_tensor)
+        result = model(img_tensor, mask_tensor)
     
     # Convert back to PIL
     result = result.squeeze(0).permute(1, 2, 0).cpu().float().numpy()

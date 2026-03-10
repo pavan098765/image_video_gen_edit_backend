@@ -68,8 +68,8 @@ def write_rest(f):
     f.write("COPY src /app/worker/src\n\n")
 
     # Install core runtime deps (minimal)
-    f.write("RUN apt-get update && apt-get install -y --no-install-recommends git \\\n")
-    f.write("    && pip install --no-cache-dir git+https://github.com/huggingface/diffusers.git \\\n")
+    f.write("RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client \\\n")
+    f.write("    && pip install --no-cache-dir diffusers==0.36.0 \\\n")
     # f.write("    && pip install --no-cache-dir sageattention \\\n") 
     f.write("    && apt-get purge -y git \\\n")
     f.write("    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*\n\n")
@@ -84,7 +84,6 @@ def write_rest(f):
     f.write("RUN mkdir -p /app/worker && touch /app/worker/uvicorn.log\n\n")
     f.write("WORKDIR /app/worker\n")
     f.write("EXPOSE 8000\n\n")
-    f.write('CMD ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]\n')
 
 
 def main():

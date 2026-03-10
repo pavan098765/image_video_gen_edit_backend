@@ -104,11 +104,16 @@ class WorkerConfig:
     """Worker management configuration"""
     heartbeat_interval: int = 20
     heartbeat_grace_multiplier: int = 2
-    idle_timeout: int = 10
     registration_timeout: int = 180
-    max_jobs_per_pod: int = 5
+    max_jobs_per_pod: int = 30
     max_same_job_per_pod: int = 5
     heartbeat_stale_seconds: int = 90
+    # Pod idle timeout: destroy pod after N seconds with no work.
+    # Only applies when: pod has completed all assigned jobs AND no new jobs assigned to it.
+    # Pods with active jobs (RUNNING/QUEUED/DISPATCHING) are never destroyed by idle reaper.
+    idle_timeout_seconds: int = 90
+    # Safety: Don't destroy pods younger than this (avoids thrashing on fresh startups)
+    idle_min_age_seconds: int = 60
 
 
 @dataclass
@@ -116,7 +121,7 @@ class JobConfig:
     """Job management configuration"""
     max_retries: int = 3
     timeout_minutes: int = 30  # General timeout for PENDING/QUEUED/DISPATCHING jobs
-    running_timeout_minutes: int = 5  # Hard timeout for RUNNING jobs (shorter - detect stuck workers)
+    running_timeout_minutes: int = 10  # Hard timeout for RUNNING jobs (shorter - detect stuck workers)
     auto_recover: bool = True
     queue_size_threshold: int = 5
 
@@ -305,17 +310,19 @@ class ConfigManager:
         worker_config = self._config.worker
         worker_config.heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL", "20"))
         worker_config.heartbeat_grace_multiplier = int(os.getenv("HEARTBEAT_GRACE_MULTIPLIER", "2"))
-        worker_config.idle_timeout = int(os.getenv("WORKER_IDLE_TIMEOUT", "15"))
         worker_config.registration_timeout = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "180"))
-        worker_config.max_jobs_per_pod = int(os.getenv("MAX_JOBS_PER_POD", "5"))
+        worker_config.max_jobs_per_pod = int(os.getenv("MAX_JOBS_PER_POD", "30"))
         worker_config.heartbeat_stale_seconds = int(os.getenv("HEARTBEAT_STALE_SECS", "90"))
+        # Pod idle timeout: destroy after N seconds with no work assigned
+        worker_config.idle_timeout_seconds = int(os.getenv("WORKER_IDLE_TIMEOUT", "90"))
+        worker_config.idle_min_age_seconds = int(os.getenv("WORKER_IDLE_MIN_AGE", "60"))
     
     def _load_job_config(self):
         """Load job configuration"""
         job_config = self._config.job
         job_config.max_retries = int(os.getenv("JOB_MAX_RETRIES", "3"))
         job_config.timeout_minutes = int(os.getenv("JOB_TIMEOUT_MINUTES", "30"))
-        job_config.running_timeout_minutes = int(os.getenv("JOB_RUNNING_TIMEOUT_MINUTES", "5"))
+        job_config.running_timeout_minutes = int(os.getenv("JOB_RUNNING_TIMEOUT_MINUTES", "10"))
         job_config.auto_recover = os.getenv("JOB_AUTO_RECOVER", "true").lower() == "true"
         job_config.queue_size_threshold = int(os.getenv("QUEUE_SIZE_THRESHOLD", "5"))
     
@@ -348,6 +355,7 @@ class ConfigManager:
             "diffusers_outpaint": os.getenv("DIFFUSERS_OUTPAINT_TEMPLATE_UUID"),
             "qwen_image_edit": os.getenv("QWEN_IMAGE_EDIT_TEMPLATE_UUID"),
             "qwen_image_edit_2509": os.getenv("QWEN_IMAGE_EDIT_2509_TEMPLATE_UUID"),
+            "qwen_image_edit_2511_rapid_aio": os.getenv("QWEN_IMAGE_EDIT_25011_RAPID_AIO_TEMPLATE_UUID"),
             "flux_kontext_dev": os.getenv("FLUX_KONTEXT_DEV_TEMPLATE_UUID"),
             "qwen_image": os.getenv("QWEN_IMAGE_TEMPLATE_UUID"),
             "qwen_image_edit_int4": os.getenv("QWEN_IMAGE_EDIT_INT4_TEMPLATE_UUID"),
@@ -355,9 +363,21 @@ class ConfigManager:
             "flux_kontext_dev_int4": os.getenv("FLUX_KONTEXT_DEV_INT4_TEMPLATE_UUID"),
             "fastwan_21_1b": os.getenv("FASTWAN_21_1B_TEMPLATE_UUID"),
             "fastwan_22_5b": os.getenv("FASTWAN_22_5B_TEMPLATE_UUID"),
+            "wan_22_14b_rapid": os.getenv("WAN_22_14B_RAPID_TEMPLATE_UUID"),
+            "wan_22_uint4_lightx2v_i2v": os.getenv("WAN_22_14B_I2V_LIGHTX2V"),
+            "wan_22_uint4_lightx2v_t2v": os.getenv("WAN_22_14B_T2V_LIGHTX2V"),
+            "wan_22_fp8_lightx2v_i2v": os.getenv("WAN_22_14B_I2V_LIGHTX2V"),
+            "wan_22_fp8_lightx2v_t2v": os.getenv("WAN_22_14B_T2V_LIGHTX2V"),
+            "video_upscaler": os.getenv("VIDEO_UPSCALER_REALESRGAN_TEMPLATE_UUID"),
+            "flashvsr_video_upscaler": os.getenv("FLASHVSR_VIDEO_UPSCALER_TEMPLATE_UUID"),
+            "dreamid": os.getenv("DREAMID_TEMPLATE_UUID"),
+            "hunyan15_480p_t2v_distilled": os.getenv("HUNYUAN_480P_T2V_TEMPLATE_UUID"),
+            "hunyan15_480p_i2v_step_distilled": os.getenv("HUNYUAN_480P_I2V_TEMPLATE_UUID"),
+            "glm_ocr": os.getenv("GLM_OCR_TEMPLATE_UUID"),
             "aurasrv2": os.getenv("AURASRV2_TEMPLATE_UUID"),
             "realesrgan": os.getenv("REALESRGAN_TEMPLATE_UUID"),
             "swin2sr": os.getenv("SWIN2SR_TEMPLATE_UUID"),
+            "face_enhancer": os.getenv("REALESRGAN_TEMPLATE_UUID"),  # Uses same template as realesrgan
             "basic_utils": os.getenv("BASIC_UTILS_TEMPLATE_UUID"),
             "warm_pod": os.getenv("WARM_POD_TEMPLATE_UUID"),
             "default": os.getenv("DEFAULT_TEMPLATE_UUID"),
@@ -372,6 +392,7 @@ class ConfigManager:
             "qwen_image": 80,
             "qwen_image_edit": 80,
             "qwen_image_edit_2509": 85,
+            "qwen_image_edit_2511_rapid_aio": 90,
             "flux_kontext_dev": 45,
             "qwen_image_int4": 80,
             "qwen_image_edit_int4": 80,
@@ -379,9 +400,21 @@ class ConfigManager:
             "flux_kontext_dev_int4": 45,
             "fastwan_21_1b": 60,
             "fastwan_22_5b": 60,
+            "wan_22_14b_rapid": 100,
+            "wan_22_uint4_lightx2v_i2v": 60,
+            "wan_22_uint4_lightx2v_t2v": 60,
+            "wan_22_fp8_lightx2v_i2v": 80,
+            "wan_22_fp8_lightx2v_t2v": 80,
+            "video_upscaler": 40,  # RIFE + Real-ESRGAN models ~10GB + workspace
+            "flashvsr_video_upscaler": 50,  # FlashVSR-Pro models ~7GB + workspace
+            "dreamid": 70,
+            "hunyan15_480p_t2v_distilled": 100,
+            "hunyan15_480p_i2v_step_distilled": 100,
+            "glm_ocr": 30,
             "aurasrv2": 30,
             "realesrgan": 30,
             "swin2sr": 30,
+            "face_enhancer": 30,
             "basic_utils": 30,
         }
         self._config.template_disk_sizes = disk_sizes
@@ -444,6 +477,10 @@ class ConfigManager:
         logger.info(f"Pod Strategy: {self._config.pod.strategy.value}")
         logger.info(f"Max Individual Pods: {self._config.pod.max_individual_pods}")
         logger.info(f"Worker Registration Timeout: {self._config.worker.registration_timeout}s")
+        logger.info(
+            f"Pod Idle Timeout: {self._config.worker.idle_timeout_seconds}s "
+            f"(destroy when idle with no jobs assigned)"
+        )
         logger.info(f"Job Timeout: {self._config.job.timeout_minutes} minutes")
         logger.info(f"Job Max Retries: {self._config.job.max_retries}")
         logger.info(f"R2 Configured: {bool(self._config.r2.endpoint)}")

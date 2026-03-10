@@ -112,6 +112,7 @@ from models import (
     SubmitResponse,
     RegisterWorkerRequest,
     HeartbeatRequest,
+    JobStartedRequest,
     JobCompleteRequest,
     JobStatusResponse,
     HealthResponse,
@@ -136,6 +137,7 @@ from exceptions import (
     WorkerTimeoutError,
 )
 from job_manager import JobManager, JobState
+from pod_manager import MAX_JOBS_PER_POD
 from logging_config import get_audit_logger
 
 logger = logging.getLogger("routes")
@@ -357,6 +359,22 @@ def create_presigned_put_url(key: str, expires_in: int = 3600) -> Optional[str]:
         return None
 
 
+def create_presigned_get_url(key: str, expires_in: int = 3600) -> Optional[str]:
+    """Generate presigned GET URL for R2 (used for worker to download input videos)"""
+    if not _s3_client or not _r2_bucket:
+        return None
+    
+    try:
+        return _s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": _r2_bucket, "Key": key},
+            ExpiresIn=expires_in,
+        )
+    except Exception as e:
+        logger.error(f"Failed to generate presigned GET URL: {e}")
+        return None
+
+
 def validate_model(model: str) -> str:
     """Validate model name against requirements or known aliases"""
     from pod_manager import PodManager
@@ -564,6 +582,84 @@ async def verify_firebase_token(authorization: Optional[str]) -> Dict[str, Any]:
             status_code=401,
             detail=f"Failed to verify Firebase token: {type(e).__name__}"
         )
+
+
+def _save_json_request(
+    data: Dict[str, Any],
+    request_type: str,
+    job_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    additional_labels: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """
+    Save JSON request data to file with proper grouping and labeling.
+    
+    Args:
+        data: The JSON-serializable data to save
+        request_type: Type of request (e.g., "client_submit", "worker_dispatch")
+        job_id: Optional job ID for grouping
+        user_id: Optional user ID for grouping
+        additional_labels: Optional additional labels to include in filename
+    
+    Returns:
+        Path to saved file, or None if save failed
+    """
+    import datetime
+    import os
+    import json
+    
+    try:
+        # Base directory for all JSON dumps
+        base_dir = os.environ.get("JSON_REQUEST_DUMPS_PATH", "./json_request_dumps")
+        
+        # Create subdirectories by request type
+        type_dir = os.path.join(base_dir, request_type)
+        os.makedirs(type_dir, exist_ok=True)
+        
+        # Create subdirectory by date for better organization
+        date_str = datetime.datetime.utcnow().strftime("%Y%m%d")
+        date_dir = os.path.join(type_dir, date_str)
+        os.makedirs(date_dir, exist_ok=True)
+        
+        # Build filename with labels
+        now_str = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        filename_parts = [request_type, now_str]
+        
+        if job_id:
+            filename_parts.append(f"job_{job_id[:8]}")  # First 8 chars of job_id
+        
+        if user_id:
+            filename_parts.append(f"user_{user_id[:8]}")  # First 8 chars of user_id
+        
+        if additional_labels:
+            for key, value in additional_labels.items():
+                if value:
+                    filename_parts.append(f"{key}_{str(value)[:16]}")  # Truncate long values
+        
+        filename = "_".join(filename_parts) + ".json"
+        file_path = os.path.join(date_dir, filename)
+        
+        # Prepare data with metadata
+        save_data = {
+            "request_type": request_type,
+            "timestamp_utc": datetime.datetime.utcnow().isoformat(),
+            "timestamp_filename": now_str,
+            "job_id": job_id,
+            "user_id": user_id,
+            "labels": additional_labels or {},
+            "data": data,
+        }
+        
+        # Save to file
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(save_data, f, indent=2, ensure_ascii=False)
+        
+        logger.debug(f"Saved {request_type} JSON request to: {file_path}")
+        return file_path
+        
+    except Exception as e:
+        logger.warning(f"Failed to save {request_type} JSON request: {e}")
+        return None
 
 
 def get_or_create_user(db: Session, firebase_uid: str, email: Optional[str] = None) -> User:
@@ -2712,6 +2808,11 @@ def _log_timing_metrics(
             f"   🚀 Dispatch Time: {timing_metrics['dispatch_time']:.2f}s (dispatched → started)"
         )
     
+    if timing_metrics.get("startup_time") is not None:
+        logger.info(
+            f"   🌱 Startup Time: {timing_metrics['startup_time']:.2f}s (pod start → first inference)"
+        )
+    
     logger.info("=" * 80)
 
 
@@ -2805,6 +2906,112 @@ async def get_signed_download_url(job_id: str):
 # =============================================================================
 
 
+@client_router.post("/get_video_upload_url")
+async def get_video_upload_url(
+    request: Request,
+    auth: Dict = Depends(require_firebase_auth),
+):
+    """
+    Get a presigned URL for uploading an input video directly to R2 as binary.
+    
+    Frontend flow:
+    1. Call this endpoint to get upload_url and r2_key
+    2. PUT the raw video binary to upload_url (Content-Type: video/mp4)
+    3. Submit the job via /submit with params.input_video_r2_key = r2_key
+    
+    This avoids sending large base64-encoded video data in JSON payloads.
+    
+    Returns:
+        upload_url: Presigned PUT URL for R2 (valid for 30 minutes)
+        r2_key: R2 object key to include in job submission as input_video_r2_key
+    """
+    video_id = str(uuid.uuid4())
+    r2_key = f"{_image_prefix}/input-videos/{video_id}.mp4"
+    
+    upload_url = create_presigned_put_url(r2_key, expires_in=1800)  # 30 min to upload
+    if not upload_url:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to generate video upload URL. R2 storage may not be configured."
+        )
+    
+    logger.info(
+        f"[VIDEO_UPLOAD] Generated upload URL for user {auth.get('user_id')}, "
+        f"r2_key={r2_key}"
+    )
+    
+    return {
+        "upload_url": upload_url,
+        "r2_key": r2_key,
+    }
+
+
+@client_router.post("/get_media_upload_urls")
+async def get_media_upload_urls(
+    request: Request,
+    auth: Dict = Depends(require_firebase_auth),
+):
+    """
+    Get presigned URLs for uploading input media (images/videos) directly to R2.
+    
+    Frontend flow:
+    1. Call this endpoint with count (number of files needed)
+    2. PUT raw binary data to each upload_url
+    3. Submit the job via /submit with the r2_keys in params
+       (e.g. params.init_image_r2_key, bulk_image_r2_keys, etc.)
+    
+    This avoids sending large base64-encoded media in JSON payloads.
+    
+    Request body (JSON):
+        count: Number of upload URLs to generate (1-22, required)
+        media_type: "image" or "video" (default: "image")
+    
+    Returns:
+        uploads: List of {upload_url, r2_key} pairs
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    
+    count = body.get("count", 1)
+    media_type = body.get("media_type", "image")
+    
+    if not isinstance(count, int) or count < 1 or count > 22:
+        raise HTTPException(
+            status_code=400,
+            detail="count must be an integer between 1 and 22"
+        )
+    
+    if media_type not in ("image", "video"):
+        raise HTTPException(
+            status_code=400,
+            detail="media_type must be 'image' or 'video'"
+        )
+    
+    ext = ".bin" if media_type == "image" else ".mp4"
+    prefix_dir = "input-media"
+    
+    uploads = []
+    for _ in range(count):
+        file_id = str(uuid.uuid4())
+        r2_key = f"{_image_prefix}/{prefix_dir}/{file_id}{ext}"
+        upload_url = create_presigned_put_url(r2_key, expires_in=1800)  # 30 min
+        if not upload_url:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to generate upload URL. R2 storage may not be configured."
+            )
+        uploads.append({"upload_url": upload_url, "r2_key": r2_key})
+    
+    logger.info(
+        f"[MEDIA_UPLOAD] Generated {count} upload URLs (type={media_type}) "
+        f"for user {auth.get('user_id')}"
+    )
+    
+    return {"uploads": uploads}
+
+
 @client_router.post("/submit", response_model=SubmitResponse)
 async def submit_job(
     request: Request,
@@ -2831,23 +3038,60 @@ async def submit_job(
     Returns job ID and optionally dispatches immediately if a worker is ready.
     For variations > 1 or bulk edit, returns batch_id and all job_ids.
     """
+    
     ip = get_client_ip(request)
     user_id = auth.get("user_id")
     is_vip = auth.get("is_vip", False)
-    
+
+    # Save the client request as JSON (as received from client)
+    try:
+        # Convert payload to dict (handle Pydantic models)
+        try:
+            payload_data = payload.dict()
+        except Exception:
+            payload_data = dict(payload)
+        
+        # Prepare client request data (exactly as received)
+        client_request_data = {
+            "request_info": {
+                "ip": ip,
+                "user_id": user_id,
+                "is_vip": is_vip,
+                "auth_info": {k: v for k, v in auth.items() if k != "firebase_token"},
+            },
+            "payload": payload_data,  # Original payload from client
+        }
+        
+        # Save with proper grouping and labeling
+        _save_json_request(
+            data=client_request_data,
+            request_type="client_submit",
+            user_id=user_id,
+            additional_labels={
+                "model": payload.model if hasattr(payload, "model") else None,
+                "is_vip": "vip" if is_vip else "free",
+            },
+        )
+    except Exception as e:
+        logger.warning(f"Failed to save client submit request JSON: {e}")
+
     # Check if user account is active
     if not auth.get("is_active", True):
         raise HTTPException(
             status_code=403,
             detail="Account is disabled. Please contact support."
         )
-    
+
     # ==========================================================================
     # BULK EDIT: VIP Feature Check
     # ==========================================================================
     # Bulk edit allows processing multiple images with the same prompt/settings
     # Requires active VIP subscription
-    is_bulk_request = payload.is_bulk or (payload.bulk_images and len(payload.bulk_images) > 0)
+    is_bulk_request = (
+        payload.is_bulk
+        or (payload.bulk_images and len(payload.bulk_images) > 0)
+        or (payload.input_image_r2_keys and len(payload.input_image_r2_keys) > 1)
+    )
     
     if is_bulk_request and not is_vip:
         raise HTTPException(
@@ -2873,6 +3117,11 @@ async def submit_job(
     if "mask" in full_params and "mask_image" not in full_params:
         full_params["mask_image"] = full_params.pop("mask")
         logger.debug("[PARAMS] Mapped 'mask' → 'mask_image'")
+    
+    # Upscale capability uses input id "image"; face_enhancer and other upscalers expect "init_image"
+    if "image" in full_params and "init_image" not in full_params:
+        full_params["init_image"] = full_params.pop("image")
+        logger.debug("[PARAMS] Mapped 'image' → 'init_image' for upscale")
     
     # Frontend may send "is_custom" (string) but workers expect "is_custom_mode" (boolean)
     if "is_custom" in full_params and "is_custom_mode" not in full_params:
@@ -2901,29 +3150,102 @@ async def submit_job(
     # ==========================================================================
     # BUILD IMAGE LIST for processing
     # ==========================================================================
-    # For bulk edit: process all images in bulk_images
-    # For single edit: process only params.init_image
+    # Priority: R2 keys > base64 bulk_images > params.init_image > text-to-image
+    # When R2 keys are provided, images_to_process entries are R2 key strings
+    # (prefixed with "r2:") so downstream code can distinguish them from base64.
     images_to_process = []
+    using_r2_images = False   # True when images come from presigned R2 uploads
+    r2_input_keys = []        # Track all input R2 keys for cleanup after job completion
     
-    if is_bulk_request and payload.bulk_images:
-        # Bulk edit: use all images from bulk_images array
+    if payload.input_image_r2_keys and len(payload.input_image_r2_keys) > 0:
+        # R2 presigned upload path – images are already in R2
+        using_r2_images = True
+        images_to_process = [f"r2:{k}" for k in payload.input_image_r2_keys[:10]]
+        r2_input_keys.extend(payload.input_image_r2_keys[:10])
+        logger.info(f"[R2_MEDIA] Processing {len(images_to_process)} images via R2 keys")
+        
+        # If a single R2 mask key was provided (non-bulk), store it
+        if payload.mask_image_r2_key:
+            r2_input_keys.append(payload.mask_image_r2_key)
+        
+        # Bulk mask R2 keys
+        if payload.bulk_mask_r2_keys:
+            for mk in payload.bulk_mask_r2_keys:
+                if mk:
+                    r2_input_keys.append(mk)
+        
+        # Log configs
+        if payload.bulk_outpaint_configs:
+            logger.info(f"[R2_MEDIA] Received {len(payload.bulk_outpaint_configs)} outpaint configs")
+            for i, cfg in enumerate(payload.bulk_outpaint_configs):
+                if cfg:
+                    logger.debug(f"[R2_MEDIA] Outpaint config {i}: {cfg}")
+    
+    elif is_bulk_request and payload.bulk_images:
+        # Legacy base64 bulk path
         images_to_process = payload.bulk_images[:10]  # Max 10 images
-        logger.info(f"[BULK] Processing {len(images_to_process)} images in bulk edit")
+        logger.info(f"[BULK] Processing {len(images_to_process)} images in bulk edit (base64)")
+        
+        # Log bulk configs for debugging
+        if payload.bulk_outpaint_configs:
+            logger.info(f"[BULK] Received {len(payload.bulk_outpaint_configs)} outpaint configs")
+            for i, cfg in enumerate(payload.bulk_outpaint_configs):
+                if cfg:
+                    logger.debug(f"[BULK] Outpaint config {i}: {cfg}")
+        if payload.bulk_masks:
+            mask_count = sum(1 for m in payload.bulk_masks if m)
+            logger.info(f"[BULK] Received {mask_count} non-null masks out of {len(payload.bulk_masks)}")
     else:
-        # Single image: use init_image from params (or None for text-to-image)
-        single_image = full_params.get("init_image")
-        if single_image:
-            images_to_process = [single_image]
+        # Single image or text-to-image
+        # Check for single-image R2 key in params
+        single_r2_key = full_params.get("init_image_r2_key")
+        if single_r2_key:
+            using_r2_images = True
+            images_to_process = [f"r2:{single_r2_key}"]
+            r2_input_keys.append(single_r2_key)
+            # Remove the transient key so it doesn't reach worker raw
+            full_params.pop("init_image_r2_key", None)
+            logger.info(f"[R2_MEDIA] Single image via R2 key")
         else:
-            images_to_process = [None]  # Text-to-image, no init_image
+            single_image = full_params.get("init_image")
+            if single_image:
+                images_to_process = [single_image]
+            else:
+                images_to_process = [None]  # Text-to-image, no init_image
+    
+    # Handle input video R2 key (from payload-level field or from params)
+    if payload.input_video_r2_key:
+        full_params["input_video_r2_key"] = payload.input_video_r2_key
+        r2_input_keys.append(payload.input_video_r2_key)
+        logger.info(f"[R2_MEDIA] Input video via R2 key: {payload.input_video_r2_key}")
     
     num_images = len(images_to_process)
+    
+    # ==========================================================================
+    # VIDEO UPSCALER VALIDATION
+    # ==========================================================================
+    # Validate video_duration for video upscalers (max 10 minutes)
+    if model in ("video_upscaler", "flashvsr_video_upscaler") and "video_duration" in full_params:
+        try:
+            video_duration = float(full_params.get("video_duration", 0))
+            MAX_VIDEO_DURATION = 600  # 10 minutes in seconds
+            if video_duration > MAX_VIDEO_DURATION:
+                logger.warning(
+                    f"[VIDEO_UPSCALER] Video duration {video_duration}s exceeds max {MAX_VIDEO_DURATION}s, "
+                    f"capping to {MAX_VIDEO_DURATION}s"
+                )
+                full_params["video_duration"] = MAX_VIDEO_DURATION
+        except (ValueError, TypeError) as e:
+            logger.warning(f"[VIDEO_UPSCALER] Invalid video_duration: {full_params.get('video_duration')}, error: {e}")
+            # Remove invalid video_duration, will use default cost calculation
+            full_params.pop("video_duration", None)
     
     # ==========================================================================
     # CREDIT CALCULATION
     # ==========================================================================
     # VIP benefits: Free upscale
     # Total cost = per_job_cost * variations * num_images
+    # For video_upscaler: dynamic cost based on video_duration (2 credits per 5 seconds)
     credit_cost = get_credit_cost(
         model, 
         full_params, 
@@ -2981,18 +3303,36 @@ async def submit_job(
     try:
         now = utc_naive_now()
         
+        # Determine output extension based on model type
+        # Video models output .mp4, image models output .png
+        VIDEO_MODELS = {
+            "ltx2_video", "fastwan_21_1b", "fastwan_22_5b", "wan_22_14b_rapid",
+            "wan_22_uint4_lightx2v_i2v", "wan_22_uint4_lightx2v_t2v",
+            "wan_22_fp8_lightx2v_i2v", "wan_22_fp8_lightx2v_t2v",
+            "wan21", "wan22",
+            "video_upscaler", "flashvsr_video_upscaler",
+            "hunyan15_480p_i2v_step_distilled", "hunyan15_480p_t2v_distilled",
+        }
+        is_video_model = model.lower() in VIDEO_MODELS or "video" in model.lower()
+        output_extension = ".mp4" if is_video_model else ".png"
+        
         # Loop through images (for bulk edit) and variations
         job_index = 0
         for image_idx, image_data in enumerate(images_to_process):
             for variation_idx in range(variations):
                 # Generate unique job ID for each job
                 job_id = str(uuid.uuid4())
-                result_key = f"{_image_prefix}/{job_id}.png"
+                result_key = f"{_image_prefix}/{job_id}{output_extension}"
                 
                 # Build full params for this specific job (with specific image)
                 job_full_params = dict(full_params)
                 if image_data:
-                    job_full_params["init_image"] = image_data
+                    if using_r2_images and isinstance(image_data, str) and image_data.startswith("r2:"):
+                        # Store R2 key – dispatch will convert to presigned GET URL
+                        job_full_params["init_image_r2_key"] = image_data[3:]  # strip "r2:" prefix
+                        job_full_params.pop("init_image", None)
+                    else:
+                        job_full_params["init_image"] = image_data
                 
                 # Apply per-image outpaint config (for expand scene bulk edit)
                 if payload.bulk_outpaint_configs and image_idx < len(payload.bulk_outpaint_configs):
@@ -3004,43 +3344,134 @@ async def submit_job(
                             "is_custom": "is_custom_mode",  # Frontend → Worker key mapping
                         }
                         
-                        # Keys to extract from outpaint_config
-                        extract_keys = [
+                        # Determine if this is custom mode (check both is_custom and is_custom_mode)
+                        is_custom = outpaint_config.get("is_custom", "false")
+                        is_custom_mode_from_config = outpaint_config.get("is_custom_mode", False)
+                        is_actually_custom = (
+                            is_custom == "true" or is_custom is True or 
+                            is_custom_mode_from_config is True
+                        )
+                        
+                        # Base keys that are always extracted (for both custom and non-custom mode)
+                        base_keys = [
                             "alignment", "aspect_ratio", "is_custom", "is_custom_mode",
-                            "custom_scale", "norm_offset_x", "norm_offset_y",
                             "overlap_left", "overlap_right", "overlap_top", "overlap_bottom",
-                            "canvas_width", "canvas_height",
                         ]
                         
-                        # Apply outpaint-specific params from per-image config
-                        for key in extract_keys:
-                            if key in outpaint_config:
-                                value = outpaint_config[key]
-                                # Convert string booleans to actual booleans
-                                if value == "true":
-                                    value = True
-                                elif value == "false":
-                                    value = False
-                                # Convert numeric strings to floats where needed
-                                elif key in ["custom_scale", "norm_offset_x", "norm_offset_y", 
-                                            "canvas_width", "canvas_height"]:
-                                    try:
-                                        value = float(value)
-                                    except (ValueError, TypeError):
-                                        pass
-                                
-                                # Apply key mapping (e.g., is_custom → is_custom_mode)
-                                target_key = key_mapping.get(key, key)
-                                job_full_params[target_key] = value
+                        # Custom positioning keys - ONLY extract when is_custom_mode is True
+                        custom_keys = [
+                            "custom_scale", "norm_offset_x", "norm_offset_y",
+                            "canvas_width", "canvas_height",
+                            "image_width", "image_height", "image_left", "image_top",
+                            "fitted_width", "fitted_height", "offset_x", "offset_y",
+                        ]
                         
-                        logger.debug(f"[BULK] Applied outpaint config for image {image_idx}: {outpaint_config}")
+                        # Build extract_keys list based on mode
+                        extract_keys = base_keys.copy()
+                        if is_actually_custom:
+                            extract_keys.extend(custom_keys)
+                            logger.debug(f"[BULK] Custom mode detected for image {image_idx}, including custom positioning params")
+                        else:
+                            logger.debug(f"[BULK] Non-custom mode for image {image_idx}, excluding custom positioning params")
+                        
+                        # IMPORTANT: Only remove keys that are actually in the per-image config
+                        # This ensures defaults from base params are preserved if not overridden
+                        # First, identify which keys from extract_keys are actually in outpaint_config
+                        keys_to_replace = [key for key in extract_keys if key in outpaint_config]
+                        
+                        # Remove only the keys that will be replaced
+                        for key in keys_to_replace:
+                            target_key = key_mapping.get(key, key)
+                            if target_key in job_full_params:
+                                del job_full_params[target_key]
+                                logger.debug(f"[BULK] Removed base param {target_key} (will be replaced from per-image config)")
+                        
+                        # Also remove custom positioning params if NOT in custom mode
+                        # (to prevent them from being sent when they shouldn't be)
+                        if not is_actually_custom:
+                            for key in custom_keys:
+                                target_key = key_mapping.get(key, key)
+                                if target_key in job_full_params:
+                                    del job_full_params[target_key]
+                                    logger.debug(f"[BULK] Removed custom param {target_key} (not in custom mode)")
+                        
+                        # Apply outpaint-specific params from per-image config
+                        # Only apply keys that are actually in the config
+                        for key in keys_to_replace:
+                            value = outpaint_config[key]
+                            # Convert string booleans to actual booleans
+                            if value == "true":
+                                value = True
+                            elif value == "false":
+                                value = False
+                            # Convert numeric strings to floats where needed
+                            elif key in ["custom_scale", "norm_offset_x", "norm_offset_y", 
+                                        "canvas_width", "canvas_height",
+                                        "image_width", "image_height", "image_left", "image_top",
+                                        "fitted_width", "fitted_height", "offset_x", "offset_y"]:
+                                try:
+                                    value = float(value)
+                                except (ValueError, TypeError):
+                                    pass
+                            
+                            # Apply key mapping (e.g., is_custom → is_custom_mode)
+                            target_key = key_mapping.get(key, key)
+                            job_full_params[target_key] = value
+                            logger.debug(f"[BULK] Applied per-image param {target_key}={value}")
+                        
+                        # Verify critical params are set after extraction
+                        alignment_set = job_full_params.get("alignment")
+                        aspect_ratio_set = job_full_params.get("aspect_ratio")
+                        is_custom_mode_set = job_full_params.get("is_custom_mode", False)
+                        expansion_factor_set = job_full_params.get("expansion_factor")
+                        
+                        logger.info(f"[BULK] Applied outpaint config for image {image_idx}: alignment={alignment_set}, aspect_ratio={aspect_ratio_set}, is_custom_mode={is_custom_mode_set}, expansion_factor={expansion_factor_set}")
+                        
+                        if not alignment_set or not aspect_ratio_set:
+                            logger.error(f"[BULK] CRITICAL: Missing alignment or aspect_ratio for image {image_idx} after applying outpaint config!")
+                            logger.error(f"[BULK] outpaint_config keys: {list(outpaint_config.keys()) if outpaint_config else 'None'}")
+                            logger.error(f"[BULK] job_full_params keys: {list(job_full_params.keys())}")
+                    else:
+                        logger.warning(f"[BULK] outpaint_config for image {image_idx} is None or empty")
+                elif is_bulk_request and model == "diffusers_outpaint":
+                    # For outpaint bulk requests, outpaint configs are REQUIRED
+                    logger.error(f"[BULK] CRITICAL: Missing outpaint config for image {image_idx} in bulk outpaint request!")
+                    logger.error(f"[BULK] bulk_outpaint_configs exists: {payload.bulk_outpaint_configs is not None}, len: {len(payload.bulk_outpaint_configs) if payload.bulk_outpaint_configs else 0}, image_idx: {image_idx}")
                 
                 # Apply per-image mask (for inpaint/erase bulk edit)
-                if payload.bulk_masks and image_idx < len(payload.bulk_masks):
+                # Priority: R2 bulk mask keys > base64 bulk masks > single mask R2 key
+                if using_r2_images and payload.bulk_mask_r2_keys and image_idx < len(payload.bulk_mask_r2_keys):
+                    mask_r2_key = payload.bulk_mask_r2_keys[image_idx]
+                    if mask_r2_key:
+                        job_full_params.pop("mask_image", None)
+                        job_full_params.pop("mask", None)
+                        job_full_params["mask_image_r2_key"] = mask_r2_key
+                        logger.info(f"[R2_MEDIA] Applied mask R2 key for image {image_idx}")
+                elif using_r2_images and not is_bulk_request and payload.mask_image_r2_key:
+                    # Single-image mode with R2 mask
+                    job_full_params.pop("mask_image", None)
+                    job_full_params.pop("mask", None)
+                    job_full_params["mask_image_r2_key"] = payload.mask_image_r2_key
+                    logger.info(f"[R2_MEDIA] Applied single mask R2 key")
+                elif payload.bulk_masks and image_idx < len(payload.bulk_masks):
                     mask_data = payload.bulk_masks[image_idx]
                     if mask_data:
+                        # IMPORTANT: Remove any existing mask from base params first
+                        # This ensures per-image mask always takes precedence
+                        job_full_params.pop("mask_image", None)
+                        job_full_params.pop("mask", None)
                         job_full_params["mask_image"] = mask_data
-                        logger.debug(f"[BULK] Applied mask for image {image_idx}")
+                        logger.info(f"[BULK] Applied mask for image {image_idx} (mask size: {len(mask_data)} chars)")
+                
+                # Final verification for outpaint bulk requests: ensure critical params are set
+                if is_bulk_request and model == "diffusers_outpaint":
+                    if "alignment" not in job_full_params or "aspect_ratio" not in job_full_params:
+                        logger.error(f"[BULK] CRITICAL ERROR: Missing alignment or aspect_ratio for job {job_id}!")
+                        logger.error(f"[BULK] job_full_params keys: {list(job_full_params.keys())}")
+                        logger.error(f"[BULK] This will cause the image to not expand properly!")
+                    # Ensure expansion_factor is set (should be in base params, but verify)
+                    if "expansion_factor" not in job_full_params:
+                        logger.warning(f"[BULK] expansion_factor not in params for job {job_id}, worker will use default 1.25")
                 
                 # Store for later dispatch (includes full base64 image)
                 job_full_params_map[job_id] = job_full_params
@@ -3061,6 +3492,23 @@ async def submit_job(
                     # For variations, track variation index
                     db_params["_variation_index"] = variation_idx
                     db_params["_total_variations"] = variations
+                
+                # Store R2 input keys for cleanup after job completion
+                # Collect per-job R2 keys (init_image + mask)
+                job_r2_keys = []
+                if job_full_params.get("init_image_r2_key"):
+                    job_r2_keys.append(job_full_params["init_image_r2_key"])
+                if job_full_params.get("mask_image_r2_key"):
+                    job_r2_keys.append(job_full_params["mask_image_r2_key"])
+                if job_full_params.get("input_video_r2_key"):
+                    job_r2_keys.append(job_full_params["input_video_r2_key"])
+                # Also check for ref_image_r2_key / ref_video_r2_key (dreamid)
+                if job_full_params.get("ref_image_r2_key"):
+                    job_r2_keys.append(job_full_params["ref_image_r2_key"])
+                if job_full_params.get("ref_video_r2_key"):
+                    job_r2_keys.append(job_full_params["ref_video_r2_key"])
+                if job_r2_keys:
+                    db_params["_input_r2_keys"] = job_r2_keys
                 
                 # Add enhanced prompt indicator if applicable
                 if prompt_enhanced:
@@ -3194,7 +3642,7 @@ async def submit_job(
     except Exception:
         pass
     
-    # Cache full params and dispatch each job
+    # Cache full params for all jobs first
     for job_data in created_jobs:
         jid = job_data["job_id"]
         
@@ -3203,16 +3651,27 @@ async def submit_job(
         
         # Cache full params (including base64 images) for dispatch to worker
         cache_job_params(jid, job_params)
-        
-        # Dispatch in background task
-        if _pod_manager:
-            background_tasks.add_task(
-                _dispatch_job_background, jid, model, job_params.get("mode")
-            )
-        elif _job_manager:
-            logger.warning(
-                f"No pod_manager available, job {jid} will be handled by recovery system"
-            )
+    
+    # Dispatch job(s) to worker
+    if len(created_jobs) > 1 and _pod_manager:
+        # MULTI-JOB (bulk edit OR variations): dispatch all to ONE worker in a single /run_bulk request
+        all_job_ids = [j["job_id"] for j in created_jobs]
+        background_tasks.add_task(
+            _dispatch_bulk_jobs_background, all_job_ids, model, full_params.get("mode")
+        )
+    else:
+        # SINGLE JOB: dispatch individually (unchanged)
+        for job_data in created_jobs:
+            jid = job_data["job_id"]
+            job_params = job_full_params_map.get(jid, full_params)
+            if _pod_manager:
+                background_tasks.add_task(
+                    _dispatch_job_background, jid, model, job_params.get("mode")
+                )
+            elif _job_manager:
+                logger.warning(
+                    f"No pod_manager available, job {jid} will be handled by recovery system"
+                )
     
     # Build download URL for primary job
     primary_job = created_jobs[0]
@@ -3463,6 +3922,143 @@ async def _dispatch_job_background(
                 )
         finally:
             db.close()
+
+
+async def _release_bulk_chunk_and_dispatch_individually(
+    chunk: List[str],
+    pod_uuid: Optional[str],
+    model: str,
+    mode: Optional[str],
+):
+    """
+    Release all slots for a chunk on the pod, set chunk jobs to QUEUED and worker_id=None,
+    then schedule individual dispatch for each job. Used when a chunk fails (reserve or bulk send).
+    """
+    if _pod_manager and pod_uuid:
+        for jid in chunk:
+            try:
+                await _pod_manager.release_slot_on_pod(pod_uuid, jid)
+            except Exception as e:
+                logger.warning(f"[BULK_DISPATCH] Release slot for {jid} failed: {e}")
+    db = SessionLocal()
+    try:
+        for jid in chunk:
+            job = db.query(Job).filter(Job.job_id == jid).first()
+            if job and job.status not in [
+                JobState.RUNNING.value, JobState.COMPLETED.value, JobState.FAILED.value,
+            ]:
+                job.status = JobState.QUEUED.value
+                job.worker_id = None
+                job.updated_at = utc_naive_now()
+        db.commit()
+    finally:
+        db.close()
+    for jid in chunk:
+        asyncio.create_task(_dispatch_job_background(jid, model, mode, retry_count=0))
+
+
+async def _dispatch_bulk_jobs_background(
+    job_ids: List[str], model: str, mode: Optional[str]
+):
+    """
+    Background task to dispatch multiple jobs in chunks by pod capacity.
+    Chunks by available_slots (MAX_JOBS_PER_POD - queue_size) so we never send more
+    than the worker can accept. Reserves one slot per job before sending each chunk.
+    Fallback: on reserve or bulk send failure, release chunk slots, revert to QUEUED,
+    and dispatch that chunk individually.
+    """
+    if not job_ids:
+        return
+    if not _job_manager or not _pod_manager:
+        logger.warning(
+            "[BULK_DISPATCH] job_manager or pod_manager not available, skipping bulk dispatch"
+        )
+        for jid in job_ids:
+            asyncio.create_task(_dispatch_job_background(jid, model, mode, retry_count=0))
+        return
+
+    logger.info(
+        f"[BULK_DISPATCH] Starting bulk dispatch of {len(job_ids)} jobs for model={model}"
+    )
+    remaining = list(job_ids)
+
+    try:
+        while remaining:
+            # Reserve one slot via assign_job for the first remaining job
+            worker_id = await _job_manager.assign_job(remaining[0], model, mode)
+            pod_uuid = None
+            db = SessionLocal()
+            try:
+                worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+                if worker:
+                    pod_uuid = worker.container_id
+            finally:
+                db.close()
+
+            # Get pod's current queue_size and compute available_slots (under lock)
+            async with _pod_manager._lock:
+                pi = _pod_manager.individual_pods.get(pod_uuid) if pod_uuid else None
+                if pi is not None:
+                    limit = MAX_JOBS_PER_POD
+                    available_slots = limit - pi.queue_size
+                else:
+                    # Pod not in tracking (e.g. race); use conservative default
+                    available_slots = max(1, MAX_JOBS_PER_POD - 1)
+            chunk_size = min(len(remaining), available_slots)
+            chunk = remaining[0:chunk_size]
+
+            # Reserve slots for chunk[1:] (chunk[0] already reserved by assign_job)
+            reserve_failed = False
+            for jid in chunk[1:]:
+                reserved = await _pod_manager.reserve_slot_on_pod(pod_uuid, jid)
+                if not reserved:
+                    reserve_failed = True
+                    break
+            if reserve_failed:
+                await _release_bulk_chunk_and_dispatch_individually(chunk, pod_uuid, model, mode)
+                remaining = remaining[len(chunk):]
+                continue
+
+            # Assign chunk[1:] to worker_id in DB
+            db = SessionLocal()
+            try:
+                for jid in chunk[1:]:
+                    job = db.query(Job).filter(Job.job_id == jid).first()
+                    if job:
+                        job.worker_id = worker_id
+                        job.updated_at = utc_naive_now()
+                db.commit()
+            finally:
+                db.close()
+
+            # Send chunk to worker
+            success = await _dispatch_bulk_to_worker(chunk, worker_id)
+            if not success:
+                await _release_bulk_chunk_and_dispatch_individually(chunk, pod_uuid, model, mode)
+            else:
+                logger.info(
+                    f"[BULK_DISPATCH] Dispatched chunk of {len(chunk)} jobs to worker {worker_id}"
+                )
+            remaining = remaining[len(chunk):]
+
+    except Exception as e:
+        logger.error(f"[BULK_DISPATCH] Error during bulk dispatch: {e}")
+        # Revert all job_ids (this bulk's full list) to QUEUED and dispatch individually
+        db = SessionLocal()
+        try:
+            for jid in job_ids:
+                job = db.query(Job).filter(Job.job_id == jid).first()
+                if job and job.status not in [
+                    JobState.RUNNING.value, JobState.COMPLETED.value, JobState.FAILED.value,
+                ]:
+                    job.status = JobState.QUEUED.value
+                    job.worker_id = None
+                    job.updated_at = utc_naive_now()
+            db.commit()
+        finally:
+            db.close()
+        for jid in job_ids:
+            asyncio.create_task(_dispatch_job_background(jid, model, mode, retry_count=0))
 
 
 async def _check_worker_health(endpoint: str, timeout: int = 5) -> bool:
@@ -3771,6 +4367,77 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
         cached_params = get_cached_job_params(job.job_id)
         dispatch_params = cached_params if cached_params else (job.params or {})
         
+        # ---------------------------------------------------------------
+        # R2 MEDIA: Convert all *_r2_key fields to presigned download URLs
+        # so workers receive plain URLs they can HTTP GET.
+        # ---------------------------------------------------------------
+        dispatch_params = dict(dispatch_params)  # Don't mutate cached params
+        
+        # init_image_r2_key → init_image (presigned GET URL)
+        if "init_image_r2_key" in dispatch_params:
+            r2_key = dispatch_params.pop("init_image_r2_key")
+            download_url = create_presigned_get_url(r2_key, expires_in=3600)
+            if download_url:
+                dispatch_params["init_image"] = download_url
+                logger.info(f"[R2_MEDIA] Job {job_id}: init_image R2 key → download URL")
+            else:
+                raise Exception(f"Failed to generate init_image download URL for R2 key: {r2_key}")
+        
+        # mask_image_r2_key → mask_image (presigned GET URL)
+        if "mask_image_r2_key" in dispatch_params:
+            r2_key = dispatch_params.pop("mask_image_r2_key")
+            download_url = create_presigned_get_url(r2_key, expires_in=3600)
+            if download_url:
+                dispatch_params["mask_image"] = download_url
+                logger.info(f"[R2_MEDIA] Job {job_id}: mask_image R2 key → download URL")
+            else:
+                raise Exception(f"Failed to generate mask_image download URL for R2 key: {r2_key}")
+        
+        # ref_image_r2_key → ref_image (presigned GET URL) — for dreamid
+        if "ref_image_r2_key" in dispatch_params:
+            r2_key = dispatch_params.pop("ref_image_r2_key")
+            download_url = create_presigned_get_url(r2_key, expires_in=3600)
+            if download_url:
+                dispatch_params["ref_image"] = download_url
+                logger.info(f"[R2_MEDIA] Job {job_id}: ref_image R2 key → download URL")
+            else:
+                raise Exception(f"Failed to generate ref_image download URL for R2 key: {r2_key}")
+        
+        # ref_video_r2_key → ref_video (presigned GET URL) — for dreamid
+        if "ref_video_r2_key" in dispatch_params:
+            r2_key = dispatch_params.pop("ref_video_r2_key")
+            download_url = create_presigned_get_url(r2_key, expires_in=3600)
+            if download_url:
+                dispatch_params["ref_video"] = download_url
+                logger.info(f"[R2_MEDIA] Job {job_id}: ref_video R2 key → download URL")
+            else:
+                raise Exception(f"Failed to generate ref_video download URL for R2 key: {r2_key}")
+        
+        # input_video_r2_key → input_video (presigned GET URL)
+        if "input_video_r2_key" in dispatch_params:
+            r2_key = dispatch_params.pop("input_video_r2_key")
+            video_download_url = create_presigned_get_url(r2_key, expires_in=3600)
+            if video_download_url:
+                dispatch_params["input_video"] = video_download_url
+                logger.info(
+                    f"[R2_MEDIA] Job {job_id}: Converted input_video R2 key "
+                    f"({r2_key}) to presigned download URL for worker"
+                )
+            else:
+                logger.error(
+                    f"[R2_MEDIA] Job {job_id}: Failed to generate download URL "
+                    f"for R2 key: {r2_key}"
+                )
+                raise Exception(
+                    f"Failed to generate video download URL for R2 key: {r2_key}"
+                )
+        
+        # Strip internal tracking keys that shouldn't reach the worker
+        # (these exist in db_params fallback; cache doesn't have them)
+        for internal_key in list(dispatch_params.keys()):
+            if internal_key.startswith("_"):
+                dispatch_params.pop(internal_key)
+        
         run_payload = {
             "job_id": job.job_id,
             "prompt": job.prompt,
@@ -3780,6 +4447,38 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             "upload_url": presigned_url,
             "result_key": job.result_r2_key,
         }
+        
+        # Save dispatch payload as JSON (as sent to worker)
+        try:
+            dispatch_data = {
+                "worker_info": {
+                    "worker_id": worker_id,
+                    "worker_endpoint": worker.endpoint,
+                    "pod_uuid": pod_uuid,
+                    "machine_id": worker.machine_id,
+                },
+                "job_info": {
+                    "job_id": job.job_id,
+                    "model": job.model,
+                    "status": job.status,
+                },
+                "dispatch_payload": run_payload,  # Exact payload sent to worker
+            }
+            
+            # Save with proper grouping and labeling
+            _save_json_request(
+                data=dispatch_data,
+                request_type="worker_dispatch",
+                job_id=job.job_id,
+                user_id=job.user_id if hasattr(job, "user_id") else None,
+                additional_labels={
+                    "model": job.model,
+                    "worker_id": worker_id[:8] if worker_id else None,
+                    "mode": dispatch_params.get("mode"),
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save worker dispatch JSON: {e}")
         
         # Log if we're using cached vs DB params
         if cached_params:
@@ -4298,7 +4997,7 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                     # CRITICAL FIX: Check if RUNNING jobs are actually stuck (exceeded timeout)
                     # This catches jobs that failed silently on the worker
                     
-                    job_timeout_minutes = int(os.getenv("JOB_TIMEOUT_MINUTES", "30"))
+                    job_timeout_minutes = int(os.getenv("JOB_RUNNING_TIMEOUT_MINUTES", "5"))
                     running_job_timeout = timedelta(minutes=job_timeout_minutes)
                     now = utc_naive_now()
                     
@@ -4430,8 +5129,8 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                         # Track retry count to prevent infinite retries
                         
                         running_retry_count = affected_job.retry_count or 0
-                        max_running_retries = 2  # Allow 2 retries for RUNNING jobs
-                        
+                        max_running_retries = 3  # Allow 3 retries for RUNNING jobs (consistent with other paths)
+
                         if running_retry_count < max_running_retries:
                             # Requeue for retry on different machine
                             logger.warning(
@@ -4666,7 +5365,7 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
         # Success! Mark job as RUNNING
         if _job_manager:
             try:
-                _job_manager.mark_running(job_id, worker_id)
+                _job_manager.mark_running(job_id, worker_id, started_at=None)
             except Exception as e:
                 logger.error(f"Failed to mark job {job_id} as running: {e}")
                 # Job might have been recovered already - don't fail
@@ -4675,8 +5374,7 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             job = db.query(Job).filter(Job.job_id == job_id).first()
             if job:
                 job.status = JobState.RUNNING.value
-                job.started_at = utc_naive_now()
-        
+                # Do NOT set started_at - same as bulk; job_complete chains it
         # Store pod_uuid in job for cost tracking
         job = db.query(Job).filter(Job.job_id == job_id).first()
         if job and pod_uuid:
@@ -4710,6 +5408,310 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
     except Exception as e:
         logger.exception(f"_dispatch_to_worker error for job {job_id}: {e}")
         # Don't clear cache on error - job may be retried
+        return False
+    finally:
+        db.close()
+
+
+async def _dispatch_bulk_to_worker(job_ids: List[str], worker_id: str) -> bool:
+    """
+    Dispatch multiple jobs to a worker via HTTP POST to /run_bulk endpoint.
+    
+    Builds individual payloads for each job (same structure as /run) and sends
+    them all in one request. Worker splits and enqueues them internally.
+    
+    Returns True on success, False on failure.
+    """
+    db = SessionLocal()
+    try:
+        # Get worker details
+        worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+        if not worker:
+            logger.error(f"[BULK_DISPATCH] Worker {worker_id} not found")
+            return False
+        
+        endpoint = worker.endpoint
+        if not endpoint:
+            logger.error(f"[BULK_DISPATCH] Worker {worker_id} has no endpoint")
+            return False
+        
+        pod_uuid = worker.container_id
+        
+        # Verify pod still exists
+        if _pod_manager and pod_uuid:
+            async with _pod_manager._lock:
+                pod_exists = pod_uuid in _pod_manager.individual_pods
+            if not pod_exists:
+                logger.warning(
+                    f"[BULK_DISPATCH] Pod {pod_uuid} no longer exists. Cannot dispatch."
+                )
+                return False
+        
+        # Check worker health once for all jobs
+        health_check = await _check_worker_health_enhanced(endpoint, timeout=5)
+        if not health_check.get("healthy", False) and not health_check.get("processing", False):
+            logger.error(
+                f"[BULK_DISPATCH] Worker {worker_id} is unhealthy "
+                f"(status: {health_check.get('status')}). Cannot dispatch."
+            )
+            return False
+        
+        # Build payloads for all jobs
+        bulk_payloads = []
+        valid_job_ids = []
+        
+        for jid in job_ids:
+            job = db.query(Job).filter(Job.job_id == jid).first()
+            if not job:
+                logger.warning(f"[BULK_DISPATCH] Job {jid} not found, skipping")
+                continue
+            
+            # Skip jobs already in terminal/running state
+            current_state = JobState(job.status)
+            if current_state in [JobState.RUNNING, JobState.COMPLETED, JobState.FAILED,
+                                 JobState.TIMEOUT, JobState.CANCELLED]:
+                logger.info(
+                    f"[BULK_DISPATCH] Job {jid} already in {current_state.value}, skipping"
+                )
+                continue
+            
+            # Mark job as DISPATCHING
+            if _job_manager:
+                _job_manager.update_job_state(jid, JobState.DISPATCHING)
+            else:
+                job.status = JobState.DISPATCHING.value
+                job.dispatched_at = utc_naive_now()
+                job.updated_at = utc_naive_now()
+                db.commit()
+            
+            # Generate presigned URL for upload
+            presigned_url = (
+                create_presigned_put_url(job.result_r2_key) if job.result_r2_key else None
+            )
+            
+            # Get cached params (with base64 images or R2 keys)
+            cached_params = get_cached_job_params(jid)
+            dispatch_params = dict(cached_params) if cached_params else dict(job.params or {})
+            
+            # ---------------------------------------------------------------
+            # R2 MEDIA: Convert all *_r2_key fields to presigned download URLs
+            # ---------------------------------------------------------------
+            r2_convert_failed = False
+            for r2_field, target_field in [
+                ("init_image_r2_key", "init_image"),
+                ("mask_image_r2_key", "mask_image"),
+                ("ref_image_r2_key", "ref_image"),
+                ("ref_video_r2_key", "ref_video"),
+                ("input_video_r2_key", "input_video"),
+            ]:
+                if r2_field in dispatch_params:
+                    r2_key = dispatch_params.pop(r2_field)
+                    download_url = create_presigned_get_url(r2_key, expires_in=3600)
+                    if download_url:
+                        dispatch_params[target_field] = download_url
+                        logger.info(f"[BULK_DISPATCH] Job {jid}: {r2_field} → download URL")
+                    else:
+                        logger.error(f"[BULK_DISPATCH] Job {jid}: Failed to generate download URL for {r2_field}")
+                        r2_convert_failed = True
+                        break
+            
+            if r2_convert_failed:
+                continue
+            
+            # Strip internal tracking keys (prefixed with _)
+            for internal_key in list(dispatch_params.keys()):
+                if internal_key.startswith("_"):
+                    dispatch_params.pop(internal_key)
+            
+            run_payload = {
+                "job_id": job.job_id,
+                "prompt": job.prompt,
+                "model": job.model,
+                "mode": dispatch_params.get("mode"),
+                "params": dispatch_params,
+                "upload_url": presigned_url,
+                "result_key": job.result_r2_key,
+            }
+            
+            bulk_payloads.append(run_payload)
+            valid_job_ids.append(jid)
+        
+        if not bulk_payloads:
+            logger.warning("[BULK_DISPATCH] No valid jobs to dispatch")
+            return False
+        
+        # Save bulk dispatch payload for debugging
+        try:
+            dispatch_data = {
+                "worker_info": {
+                    "worker_id": worker_id,
+                    "worker_endpoint": endpoint,
+                    "pod_uuid": pod_uuid,
+                },
+                "bulk_dispatch": {
+                    "total_jobs": len(bulk_payloads),
+                    "job_ids": valid_job_ids,
+                },
+            }
+            _save_json_request(
+                data=dispatch_data,
+                request_type="worker_bulk_dispatch",
+                job_id=valid_job_ids[0],
+                additional_labels={
+                    "model": bulk_payloads[0]["model"],
+                    "worker_id": worker_id[:8] if worker_id else None,
+                    "bulk_count": str(len(bulk_payloads)),
+                },
+            )
+        except Exception as e:
+            logger.warning(f"[BULK_DISPATCH] Failed to save dispatch JSON: {e}")
+        
+        # Send HTTP POST to /run_bulk
+        url = f"{endpoint.rstrip('/')}/run_bulk"
+        logger.info(
+            f"[BULK_DISPATCH] Dispatching {len(bulk_payloads)} jobs to {url}"
+        )
+        
+        bulk_request_body = {"jobs": bulk_payloads}
+        
+        last_error = None
+        max_attempts = 3
+        
+        for attempt in range(max_attempts):
+            try:
+                timeout = 30 + (attempt * 10)  # Longer timeout for bulk
+                logger.debug(
+                    f"[BULK_DISPATCH] Attempt {attempt + 1}/{max_attempts} "
+                    f"(timeout={timeout}s)"
+                )
+                
+                resp = requests.post(url, json=bulk_request_body, timeout=timeout)
+                resp.raise_for_status()
+                
+                # Success!
+                last_error = None
+                resp_data = resp.json()
+                logger.info(
+                    f"[BULK_DISPATCH] Worker accepted {len(bulk_payloads)} jobs: {resp_data}"
+                )
+                break
+                
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                error_str = str(e).lower()
+                if "read timeout" in error_str or "read timed out" in error_str:
+                    # Worker likely received it
+                    logger.warning(
+                        f"[BULK_DISPATCH] READ TIMEOUT on attempt {attempt + 1}. "
+                        f"Worker likely received the bulk request."
+                    )
+                    last_error = None
+                    break
+                else:
+                    logger.warning(
+                        f"[BULK_DISPATCH] CONNECT TIMEOUT on attempt {attempt + 1}: {e}"
+                    )
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(5 * (2 ** attempt))
+                    
+            except requests.exceptions.HTTPError as e:
+                last_error = e
+                if e.response and e.response.status_code == 503:
+                    logger.warning(
+                        f"[BULK_DISPATCH] Worker queue full (503). Cannot accept bulk."
+                    )
+                    break  # Don't retry on 503
+                logger.warning(
+                    f"[BULK_DISPATCH] HTTP error on attempt {attempt + 1}: {e}"
+                )
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(3 * (attempt + 1))
+                    
+            except requests.exceptions.ConnectionError as e:
+                last_error = e
+                logger.warning(
+                    f"[BULK_DISPATCH] Connection error on attempt {attempt + 1}: {e}"
+                )
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(5 * (2 ** attempt))
+                    
+            except Exception as e:
+                last_error = e
+                logger.error(f"[BULK_DISPATCH] Unexpected error: {e}")
+                break
+        
+        if last_error:
+            logger.error(
+                f"[BULK_DISPATCH] All attempts failed for {len(valid_job_ids)} jobs: {last_error}"
+            )
+            # Revert all jobs to QUEUED
+            for jid in valid_job_ids:
+                job = db.query(Job).filter(Job.job_id == jid).first()
+                if job and job.status not in [
+                    JobState.RUNNING.value, JobState.COMPLETED.value, JobState.FAILED.value
+                ]:
+                    job.status = JobState.QUEUED.value
+                    job.worker_id = None
+                    job.updated_at = utc_naive_now()
+            db.commit()
+            return False
+        
+        # SUCCESS: Mark all jobs as RUNNING
+        # Verify pod is still valid first
+        pod_still_valid = True
+        if _pod_manager and pod_uuid:
+            async with _pod_manager._lock:
+                pod_still_valid = pod_uuid in _pod_manager.individual_pods
+        
+        if not pod_still_valid:
+            logger.warning(
+                f"[BULK_DISPATCH] Pod {pod_uuid} destroyed during dispatch. "
+                f"Jobs will be recovered by destruction handler."
+            )
+            return False
+        
+        for i, jid in enumerate(valid_job_ids):
+            try:
+                if _job_manager:
+                    # Do NOT set started_at for any bulk job. Stuck detection uses started_at;
+                    # only the job actually being processed should have started_at set, which
+                    # happens when the worker reports job_complete with next_job_id (or fallback below).
+                    _job_manager.mark_running(jid, worker_id, started_at=None)
+                else:
+                    job = db.query(Job).filter(Job.job_id == jid).first()
+                    if job:
+                        job.status = JobState.RUNNING.value
+                        # Leave started_at NULL for all; chained via job_complete (next_job_id or fallback)
+                
+                # Store pod_uuid in job
+                job = db.query(Job).filter(Job.job_id == jid).first()
+                if job and pod_uuid:
+                    job.pod_uuid = pod_uuid
+                
+                # Remove from pending jobs
+                if _pod_manager and job:
+                    try:
+                        await _pod_manager.remove_pending_job(jid, job.model)
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.error(f"[BULK_DISPATCH] Failed to mark job {jid} as running: {e}")
+        
+        # Update worker status
+        worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+        if worker:
+            worker.status = "processing" if worker.is_warm_pod else "busy"
+            worker.last_active = utc_naive_now()
+        
+        db.commit()
+        
+        logger.info(
+            f"[BULK_DISPATCH] All {len(valid_job_ids)} jobs marked as RUNNING on worker {worker_id}"
+        )
+        return True
+        
+    except Exception as e:
+        logger.exception(f"[BULK_DISPATCH] Error: {e}")
         return False
     finally:
         db.close()
@@ -5316,6 +6318,27 @@ async def register_worker(
                             endpoint_to_check, timeout=5
                         )
                         
+                        # Check for OOM during model load
+                        model_error = health_info.get("details", {}).get("model_error")
+                        if model_error and isinstance(model_error, str):
+                            model_error_l = model_error.lower()
+                            if "oom" in model_error_l or "out of memory" in model_error_l:
+                                logger.error(
+                                    f"Worker {worker_id_to_check} reported OOM during model loading: {model_error}"
+                                )
+                                w.status = "offline"
+                                db.commit()
+                                # Trigger pod destruction in background
+                                if _pod_manager:
+                                    asyncio.create_task(
+                                        _handle_oom_pod_destruction(
+                                            _pod_manager, 
+                                            pod_uuid_to_check, 
+                                            "OOM during model load"
+                                        )
+                                    )
+                                return
+                        
                         if health_info.get("ready"):
                             w.status = "ready"
                             db.commit()
@@ -5557,6 +6580,83 @@ def clear_cached_job_params(job_id: str):
     _job_params_cache.pop(job_id, None)
 
 
+def cleanup_input_r2_keys(job_id: str, r2_keys: List[str], batch_id: Optional[str] = None):
+    """
+    Delete input media objects from R2 after job reaches terminal state.
+    
+    This prevents R2 bloat from accumulated input images/videos.
+    Called from job_complete for both success and permanent failure paths.
+    
+    IMPORTANT: For batch/variation jobs, multiple jobs may share the same R2 key
+    (e.g. 1 image × 4 variations = 4 jobs with the same init_image_r2_key).
+    We must NOT delete shared keys until ALL sibling jobs in the batch are in a
+    terminal state, otherwise still-processing variations will fail to download
+    the input media.  The reaper task serves as the ultimate safety net.
+    """
+    if not _s3_client or not _r2_bucket or not r2_keys:
+        return
+    
+    # If this job is part of a batch, check if ALL sibling jobs are done.
+    # If not, skip cleanup -- the last completing job will handle it,
+    # and the reaper task is the safety net.
+    if batch_id:
+        try:
+            db = SessionLocal()
+            try:
+                TERMINAL_STATES = {
+                    JobState.COMPLETED.value,
+                    JobState.FAILED.value,
+                    JobState.TIMEOUT.value,
+                    JobState.CANCELLED.value,
+                }
+                
+                # Find all sibling jobs in this batch
+                siblings = db.query(Job).filter(
+                    cast(Job.params, SQLString).like(f'%"_batch_id": "{batch_id}"%')
+                ).all()
+                
+                # Fallback: try alternative JSON format (no space after colon)
+                if not siblings:
+                    siblings = db.query(Job).filter(
+                        cast(Job.params, SQLString).like(f'%"_batch_id":"{batch_id}"%')
+                    ).all()
+                
+                if siblings:
+                    non_terminal = [
+                        s for s in siblings if s.status not in TERMINAL_STATES
+                    ]
+                    if non_terminal:
+                        logger.info(
+                            f"[R2_CLEANUP] Job {job_id}: batch {batch_id} still has "
+                            f"{len(non_terminal)} non-terminal sibling(s). "
+                            f"Deferring R2 cleanup to avoid race condition."
+                        )
+                        return
+                    else:
+                        logger.info(
+                            f"[R2_CLEANUP] Job {job_id}: All {len(siblings)} siblings in "
+                            f"batch {batch_id} are terminal. Proceeding with R2 cleanup."
+                        )
+            finally:
+                db.close()
+        except Exception as e:
+            # If we can't check siblings, err on the side of NOT deleting.
+            # The reaper task will clean up orphaned objects later.
+            logger.warning(
+                f"[R2_CLEANUP] Job {job_id}: Failed to check batch siblings: {e}. "
+                f"Deferring cleanup to reaper."
+            )
+            return
+    
+    for key in r2_keys:
+        try:
+            _s3_client.delete_object(Bucket=_r2_bucket, Key=key)
+            logger.debug(f"[R2_CLEANUP] Deleted input media: {key} (job {job_id})")
+        except Exception as e:
+            # Non-fatal: lifecycle rules will clean up eventually
+            logger.warning(f"[R2_CLEANUP] Failed to delete {key} for job {job_id}: {e}")
+
+
 def get_cached_last_heartbeat(worker_id: str) -> Optional[datetime]:
     """
     Return last heartbeat timestamp from the in-memory cache (if present).
@@ -5648,11 +6748,41 @@ async def sync_heartbeat_cache_to_db():
                         if worker.status in ("offline", "terminated", "error"):
                             continue
 
+                        # CRITICAL FIX: Don't overwrite "dispatching" or "busy" with "ready" from heartbeat.
+                        # The server sets these states during dispatch, and heartbeat should not reset them.
+                        # Only accept heartbeat status if:
+                        # 1. Heartbeat reports non-idle status (busy/starting), OR
+                        # 2. Server-side status is already idle/starting (safe to update)
+                        heartbeat_status = data.get("status")
+                        current_status = worker.status
+                        active_states = ("dispatching", "busy")
+                        idle_states = ("ready", "starting", "idle")
+                        
+                        should_update_status = False
+                        if heartbeat_status:
+                            if heartbeat_status not in idle_states:
+                                # Heartbeat reports non-idle (busy/starting) - always accept
+                                should_update_status = True
+                            elif current_status in idle_states:
+                                # Both are idle - safe to update
+                                should_update_status = True
+                            elif current_status in active_states and heartbeat_status == "ready":
+                                # CRITICAL: Don't overwrite active state with "ready"
+                                # Server knows worker is dispatching/busy, heartbeat may be stale
+                                should_update_status = False
+                                logger.debug(
+                                    f"Worker {worker_id} heartbeat reports 'ready' but server status is '{current_status}'. "
+                                    f"Skipping status update to prevent overwriting active state."
+                                )
+                            else:
+                                # Other cases - update
+                                should_update_status = True
+
                         # Normal sync path
                         worker.last_heartbeat = data["last_heartbeat"]
                         worker.last_active = data["last_heartbeat"]
-                        if data["status"]:
-                            worker.status = data["status"]
+                        if should_update_status and heartbeat_status:
+                            worker.status = heartbeat_status
                         if data["metrics"]:
                             worker.resource_metrics = data["metrics"]
                 
@@ -5671,6 +6801,71 @@ async def sync_heartbeat_cache_to_db():
             break
         except Exception as e:
             logger.exception(f"Heartbeat sync task error: {e}")
+
+
+@worker_router.post("/job_started")
+async def job_started(
+    request: Request,
+    payload: JobStartedRequest,
+    _: bool = Depends(require_worker_signature),
+):
+    """
+    Job started notification from worker.
+    
+    Worker calls this when it actually begins processing a job (not just when queued).
+    This allows the server to update started_at timestamp accurately for timeout calculation.
+    """
+    job_id = payload.job_id
+    worker_id = payload.worker_id
+    
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if not job:
+            logger.warning(f"Job {job_id} not found for job_started notification")
+            return {"status": "ok", "message": "Job not found (may have been recovered)"}
+        
+        # Only update started_at if job is in RUNNING state and started_at is not already set
+        # or if it was set at dispatch time (we want to overwrite with actual start time)
+        if job.status == JobState.RUNNING.value:
+            # Update started_at to actual processing start time
+            actual_start_time = utc_naive_now()
+            if not job.started_at or job.started_at != actual_start_time:
+                old_started_at = job.started_at
+                job.started_at = actual_start_time
+                job.updated_at = actual_start_time
+                db.commit()
+                logger.info(
+                    f"Job {job_id} started_at updated: {old_started_at} -> {actual_start_time} "
+                    f"(actual inference start time from worker)"
+                )
+            else:
+                logger.debug(f"Job {job_id} started_at already set correctly")
+        else:
+            logger.debug(
+                f"Job {job_id} is in {job.status} state, not updating started_at "
+                f"(expected RUNNING for job_started callback)"
+            )
+        
+        # Validate worker_id if provided
+        if worker_id and job.worker_id and worker_id != job.worker_id:
+            logger.warning(
+                f"Job {job_id} job_started callback: worker_id mismatch "
+                f"(payload: {worker_id}, DB: {job.worker_id})"
+            )
+        
+        return {"status": "ok"}
+        
+    except Exception as e:
+        logger.error(f"Error processing job_started notification for {job_id}: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        # Don't raise - this is a best-effort notification
+        return {"status": "error", "message": str(e)}
+    finally:
+        db.close()
 
 
 @worker_router.post("/job_complete")
@@ -5732,6 +6927,15 @@ async def job_complete(
                 pod_uuid = worker.container_id
         
         if payload.failed:
+            # Chain started_at to the next job the worker will process (even on failure)
+            if payload.next_job_id:
+                next_job = db.query(Job).filter(Job.job_id == payload.next_job_id).first()
+                if next_job and next_job.status == JobState.RUNNING.value:
+                    next_job.started_at = utc_naive_now()
+                    next_job.updated_at = utc_naive_now()
+                    db.commit()
+                    logger.info(f"Chained started_at to next job {payload.next_job_id} (after failure of {job_id})")
+
             error_str = (payload.error or "Unknown error").lower()
             
             # Check if this is a retryable infrastructure failure
@@ -5750,7 +6954,7 @@ async def job_complete(
                 if hasattr(job, "retry_count") and job.retry_count
                 else 0
             )
-            max_retries = 3  # Allow up to 3 retries for infrastructure failures
+            max_retries = 3  # Allow up to 3 retries for any worker error (consistent pattern)
             
             # Get variant and machine info
             variant = None
@@ -5851,10 +7055,10 @@ async def job_complete(
             elif is_other_cuda_error:
                 logger.warning(f"CUDA error detected for job {job_id}: {payload.error}")
             
-            # CRITICAL: Retry infrastructure failures instead of marking as permanently failed
-            if is_infrastructure_failure and retry_count < max_retries:
+            # CRITICAL: Retry any worker error up to max_retries (consistent with other paths)
+            if retry_count < max_retries:
                 logger.warning(
-                    f"Job {job_id} failed due to infrastructure issue (retry {retry_count + 1}/{max_retries}). "
+                    f"Job {job_id} failed (retry {retry_count + 1}/{max_retries}). "
                     f"Requeuing for retry on different machine/variant. Error: {payload.error}"
                 )
                 
@@ -5895,12 +7099,11 @@ async def job_complete(
                 return {"status": "requeued", "retry_count": job.retry_count}
             
             else:
-                # Either not a retryable error or retries exhausted
-                if is_infrastructure_failure:
-                    logger.error(
-                        f"Job {job_id} failed after {retry_count} retries. "
-                        f"Marking as permanently failed. Error: {payload.error}"
-                    )
+                # Retries exhausted - mark as permanently failed
+                logger.error(
+                    f"Job {job_id} failed after {retry_count} retries. "
+                    f"Marking as permanently failed. Error: {payload.error}"
+                )
                 
                 # Mark job as permanently failed
                 if _job_manager:
@@ -5927,6 +7130,15 @@ async def job_complete(
                 
                 # Clear cached params - job permanently failed, no more retries
                 clear_cached_job_params(job_id)
+                
+                # Cleanup input media from R2 (non-blocking, batch-aware)
+                job_params_dict = job.params if isinstance(job.params, dict) else {}
+                input_r2_keys = job_params_dict.get("_input_r2_keys", [])
+                if input_r2_keys:
+                    batch_id_for_cleanup = job_params_dict.get("_batch_id")
+                    background_tasks.add_task(
+                        cleanup_input_r2_keys, job_id, input_r2_keys, batch_id_for_cleanup
+                    )
             
         else:
             # Validate R2 file exists
@@ -5941,15 +7153,31 @@ async def job_complete(
             
             # Mark job completed - use signed URL endpoint
             if _job_manager:
-                _job_manager.mark_completed(
-                    job_id,
-                    result_r2_key=payload.result_r2_key,
-                    output_url=(
-                        f"{_controller_url}/download_url/{job_id}"
-                        if _controller_url
-                        else None
-                    ),
-                )
+                try:
+                    _job_manager.mark_completed(
+                        job_id,
+                        result_r2_key=payload.result_r2_key,
+                        output_url=(
+                            f"{_controller_url}/download_url/{job_id}"
+                            if _controller_url
+                            else None
+                        ),
+                        metrics=payload.metrics,
+                    )
+                except TypeError as te:
+                    if "metrics" in str(te):
+                        # Backward compat: older server_controller without metrics param
+                        _job_manager.mark_completed(
+                            job_id,
+                            result_r2_key=payload.result_r2_key,
+                            output_url=(
+                                f"{_controller_url}/download_url/{job_id}"
+                                if _controller_url
+                                else None
+                            ),
+                        )
+                    else:
+                        raise
             else:
                 completion_time = utc_naive_now()
                 job.status = JobState.COMPLETED.value
@@ -5957,25 +7185,82 @@ async def job_complete(
                 job.completed_at = completion_time
                 job.updated_at = completion_time
                 
-                # Calculate timing metrics
+                # Use worker-provided metrics if available, otherwise calculate
+                if payload.metrics:
+                    # Worker provides accurate processing_time_seconds (actual inference time including upscaler)
+                    if "processing_time_seconds" in payload.metrics:
+                        job.processing_time_seconds = payload.metrics["processing_time_seconds"]
+                    # Worker provides startup_time_seconds (pod start to first inference start)
+                    if "startup_time_seconds" in payload.metrics:
+                        job.startup_time_seconds = payload.metrics["startup_time_seconds"]
+                
+                # Calculate other timing metrics (total_time, queue_time, dispatch_time)
                 timing_metrics = _calculate_timing_metrics(job, completion_time)
                 job.total_time_seconds = timing_metrics["total_time"]
-                job.processing_time_seconds = timing_metrics["processing_time"]
+                # Only set processing_time_seconds if not provided by worker
+                if job.processing_time_seconds is None:
+                    job.processing_time_seconds = timing_metrics["processing_time"]
                 job.queue_time_seconds = timing_metrics["queue_time"]
                 job.dispatch_time_seconds = timing_metrics["dispatch_time"]
                 
                 db.commit()
                 
-                # Log timing metrics
+                # Log timing metrics (include worker-provided startup_time if set)
+                if job.startup_time_seconds is not None:
+                    timing_metrics = dict(timing_metrics, startup_time=job.startup_time_seconds)
                 _log_timing_metrics(job_id, job.model, timing_metrics)
             
+            # Chain started_at to the next job the worker will process (so stuck detection only times actual execution)
+            if payload.next_job_id:
+                next_job = db.query(Job).filter(Job.job_id == payload.next_job_id).first()
+                if next_job and next_job.status == JobState.RUNNING.value:
+                    next_job.started_at = utc_naive_now()
+                    next_job.updated_at = utc_naive_now()
+                    db.commit()
+                    logger.info(f"Chained started_at to next job {payload.next_job_id}")
+            elif worker_id:
+                # Fallback: worker did not send next_job_id; set started_at for oldest RUNNING job on this worker with started_at NULL
+                from sqlalchemy import and_
+                next_job = (
+                    db.query(Job)
+                    .filter(
+                        and_(
+                            Job.worker_id == worker_id,
+                            Job.status == JobState.RUNNING.value,
+                            Job.job_id != job_id,
+                            Job.started_at.is_(None),
+                        )
+                    )
+                    .order_by(Job.updated_at.asc())
+                    .limit(1)
+                    .first()
+                )
+                if next_job:
+                    next_job.started_at = utc_naive_now()
+                    next_job.updated_at = utc_naive_now()
+                    db.commit()
+                    logger.info(f"Chained started_at to next job {next_job.job_id} (fallback, no next_job_id in payload)")
+
             # Update worker's last_job_finished_at timestamp
             gpu_hourly_rate = 0.0
             if worker_id:
                 worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
                 if worker:
                     worker.last_job_finished_at = utc_naive_now()
-                    worker.status = "ready"  # Reset to ready after job completion
+                    if payload.next_job_id:
+                        # Worker still has jobs queued -- keep busy
+                        pass  # Do NOT set worker.status = "ready"
+                    else:
+                        # Check if other RUNNING jobs exist on this worker
+                        other_running = db.query(Job).filter(
+                            Job.worker_id == worker_id,
+                            Job.status == JobState.RUNNING.value,
+                            Job.job_id != job_id,
+                        ).count()
+                        if other_running > 0:
+                            pass  # Do NOT set worker.status = "ready"
+                        else:
+                            worker.status = "ready"
                     gpu_hourly_rate = worker.gpu_hourly_rate or 0.0
                     db.commit()
             
@@ -6026,6 +7311,15 @@ async def job_complete(
             
             # Clear cached params - job completed successfully
             clear_cached_job_params(job_id)
+            
+            # Cleanup input media from R2 (non-blocking, batch-aware)
+            job_params_dict = job.params if isinstance(job.params, dict) else {}
+            input_r2_keys = job_params_dict.get("_input_r2_keys", [])
+            if input_r2_keys:
+                batch_id_for_cleanup = job_params_dict.get("_batch_id")
+                background_tasks.add_task(
+                    cleanup_input_r2_keys, job_id, input_r2_keys, batch_id_for_cleanup
+                )
         
         # Send FCM notification
         # CRITICAL: Only send notifications for jobs that are actually COMPLETED or FAILED

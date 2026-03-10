@@ -4,7 +4,13 @@
         "fallback_variants": [
             "int4"
         ],
-        "min_tflops": 100,
+        "min_tflops": {
+            "default": 100,
+            "4080": 45,
+            "4090": 80,
+            "5090": 100,
+            "4070": 35
+        },
         "allowed_gpu_names": [
             "5090",
             "4090"
@@ -19,8 +25,14 @@
             "int4": 80
         },
         "variant_allowed_gpus": {
-            "fp4": ["5090"],
-            "int4": ["4090", "4080", "4070"]
+            "fp4": [
+                "5090"
+            ],
+            "int4": [
+                "4090",
+                "4080",
+                "4070"
+            ]
         }
     },
     "z_image_turbo": {
@@ -28,7 +40,13 @@
         "fallback_variants": [
             "int4"
         ],
-        "min_tflops": 100,
+        "min_tflops": {
+            "default": 100,
+            "4080": 45,
+            "4090": 80,
+            "5090": 100,
+            "4070": 35
+        },
         "allowed_gpu_names": [
             "5090",
             "4090"
@@ -43,8 +61,14 @@
             "int4": 80
         },
         "variant_allowed_gpus": {
-            "fp4": ["5090"],
-            "int4": ["4090", "4080", "4070"]
+            "fp4": [
+                "5090"
+            ],
+            "int4": [
+                "4090",
+                "4080",
+                "4070"
+            ]
         }
     },
     "flux_kontext_dev": {
@@ -52,7 +76,13 @@
         "fallback_variants": [
             "int4"
         ],
-        "min_tflops": 100,
+        "min_tflops": {
+            "default": 100,
+            "4080": 45,
+            "4090": 80,
+            "5090": 100,
+            "4070": 35
+        },
         "allowed_gpu_names": [
             "5090",
             "4090"
@@ -67,16 +97,43 @@
             "int4": 45
         },
         "variant_allowed_gpus": {
-            "fp4": ["5090"],
-            "int4": ["4090", "4080", "4070"]
+            "fp4": [
+                "5090"
+            ],
+            "int4": [
+                "4090",
+                "4080",
+                "4070"
+            ]
         }
+    },
+    "flux_klein": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 100,
+            "4090": 80,
+            "5090": 100
+        },
+        "allowed_gpu_names": [
+            "4090",
+            "5090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "Flux Klein 9B: Lightning model"
     },
     "qwen_image": {
         "preferred_variant": "fp4",
         "fallback_variants": [
             "int4"
         ],
-        "min_tflops": 100,
+        "min_tflops": {
+            "default": 100,
+            "4080": 45,
+            "4090": 80,
+            "5090": 100,
+            "4070": 35
+        },
         "allowed_gpu_names": [
             "5090",
             "4090"
@@ -91,8 +148,14 @@
             "int4": 80
         },
         "variant_allowed_gpus": {
-            "fp4": ["5090"],
-            "int4": ["4090", "4080", "4070"]
+            "fp4": [
+                "5090"
+            ],
+            "int4": [
+                "4090",
+                "4080",
+                "4070"
+            ]
         }
     },
     "qwen_image_edit_2509": {
@@ -100,13 +163,18 @@
         "fallback_variants": [
             "int4"
         ],
-        "min_tflops": 100,
+        "min_tflops": {
+            "default": 100,
+            "4080": 45,
+            "4090": 80,
+            "5090": 100,
+            "4070": 35
+        },
         "allowed_gpu_names": [
             "5090",
             "4090"
         ],
         "min_gpu_count": 1,
-        "max_jobs_per_pod": 1,
         "variant_template_key": {
             "fp4": "qwen_image_edit_2509",
             "int4": "qwen_image_edit_2509_int4"
@@ -116,14 +184,62 @@
             "int4": 85
         },
         "variant_allowed_gpus": {
-            "fp4": ["5090"],
-            "int4": ["4090", "4080", "4070"]
+            "fp4": [
+                "5090"
+            ],
+            "int4": [
+                "4090",
+                "4080",
+                "4070"
+            ]
         }
     },
-    "sdxl": {
+    "sdxl_t2i": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 20,
+        "min_tflops": {
+            "default": 80,
+            "5060": 25,
+            "4090": 90,
+            "3090": 40,
+            "5090": 20
+        },
+        "allowed_gpu_names": [
+            "3090",
+            "5060",
+            "4090",
+            "5090"
+        ],
+        "min_gpu_count": 1
+    },
+    "sdxl_i2i": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 80,
+            "5060": 25,
+            "4090": 90,
+            "3090": 40,
+            "5090": 20
+        },
+        "allowed_gpu_names": [
+            "3090",
+            "5060",
+            "4090",
+            "5090"
+        ],
+        "min_gpu_count": 1
+    },
+    "sdxl_inpaint": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 80,
+            "5060": 25,
+            "4090": 90,
+            "3090": 40,
+            "5090": 20
+        },
         "allowed_gpu_names": [
             "3090",
             "5060",
@@ -135,7 +251,14 @@
     "basic_utils": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 20,
+        "min_tflops": {
+            "default": 80,
+            "3060": 15,
+            "4090": 90,
+            "A4000": 24,
+            "5060": 25,
+            "3090": 40
+        },
         "allowed_gpu_names": [
             "A4000",
             "3060",
@@ -147,7 +270,14 @@
     "diffusers_outpaint": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 20,
+        "min_tflops": {
+            "default": 80,
+            "3060": 15,
+            "4090": 90,
+            "A4000": 24,
+            "5060": 25,
+            "3090": 40
+        },
         "allowed_gpu_names": [
             "A4000",
             "3060",
@@ -160,7 +290,11 @@
     "fastwan_21_1b": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 95,
+        "min_tflops": {
+            "default": 95,
+            "4090": 80,
+            "5090": 95
+        },
         "allowed_gpu_names": [
             "5090",
             "4090"
@@ -170,18 +304,137 @@
     "fastwan_22_5b": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 95,
+        "min_tflops": {
+            "default": 95,
+            "4090": 80,
+            "5090": 95
+        },
         "allowed_gpu_names": [
             "5090",
             "4090"
         ],
         "min_gpu_count": 1
     },
+    "wan_22_14b_rapid": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 120,
+            "5090": 100
+        },
+        "allowed_gpu_names": [
+            "5090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "WAN 2.2 14B Rapid I2V: FP8 quantized with AoT compilation, 75GB model, requires 5090"
+    },
+    "wan_22_uint4_lightx2v_i2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 100,
+            "4090": 80,
+            "5090": 100
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "WAN 2.2 14B I2V: UINT4 quantized with SDNQ, Lightx2v LoRA, requires 5090/4090"
+    },
+    "wan_22_uint4_lightx2v_t2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 100,
+            "4090": 80,
+            "5090": 100
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "WAN 2.2 14B T2V: UINT4 quantized with SDNQ, Lightx2v LoRA, requires 5090/4090"
+    },
+    "wan_22_fp8_lightx2v_i2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 120,
+            "4090": 80,
+            "5090": 100
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "WAN 2.2 14B I2V: FP8 quantized with SDNQ, FastDM merged Lightning (no LoRA needed), requires 5090/4090"
+    },
+    "wan_22_fp8_lightx2v_t2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 120,
+            "4090": 80,
+            "5090": 100
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "WAN 2.2 14B T2V: FP8 quantized with SDNQ, FastDM merged Lightning (no LoRA needed), requires 5090/4090"
+    },
+    "video_upscaler": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 80,
+            "3060": 15,
+            "4090": 90,
+            "A4000": 24,
+            "5060": 25,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "A4000",
+            "5060",
+            "3090",
+            "3060",
+            "4090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "Video upscaler: RIFE frame interpolation (up to 60fps) and Real-ESRGAN upscaling (2x, 4x)"
+    },
+    "ltx2_video": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 120,
+            "5090": 100
+        },
+        "allowed_gpu_names": [
+            "5090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "LTX-2 Video: FP4 model (20GB), works on 5090 without OOM"
+    },
     "aurasrv2": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 20,
+        "min_tflops": {
+            "default": 80,
+            "3060": 15,
+            "4090": 90,
+            "A4000": 24,
+            "5060": 25,
+            "3090": 40
+        },
         "allowed_gpu_names": [
+            "A4000",
             "5060",
             "3090",
             "3060",
@@ -192,7 +445,14 @@
     "realesrgan": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 20,
+        "min_tflops": {
+            "default": 80,
+            "3060": 15,
+            "4090": 90,
+            "A4000": 24,
+            "5060": 25,
+            "3090": 40
+        },
         "allowed_gpu_names": [
             "A4000",
             "3060",
@@ -205,7 +465,14 @@
     "realesrgan_anime": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 20,
+        "min_tflops": {
+            "default": 80,
+            "3060": 15,
+            "4090": 90,
+            "A4000": 24,
+            "5060": 25,
+            "3090": 40
+        },
         "allowed_gpu_names": [
             "A4000",
             "3060",
@@ -218,7 +485,14 @@
     "realesrgan_face": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 20,
+        "min_tflops": {
+            "default": 80,
+            "3060": 15,
+            "4090": 90,
+            "A4000": 24,
+            "5060": 25,
+            "3090": 40
+        },
         "allowed_gpu_names": [
             "A4000",
             "3060",
@@ -231,7 +505,14 @@
     "realesrgan_denoise": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 20,
+        "min_tflops": {
+            "default": 80,
+            "3060": 15,
+            "4090": 90,
+            "A4000": 24,
+            "5060": 25,
+            "3090": 40
+        },
         "allowed_gpu_names": [
             "A4000",
             "3060",
@@ -244,7 +525,114 @@
     "swin2sr": {
         "preferred_variant": null,
         "fallback_variants": [],
-        "min_tflops": 20,
+        "min_tflops": {
+            "default": 80,
+            "3060": 15,
+            "4090": 90,
+            "A4000": 24,
+            "5060": 25,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "A4000",
+            "3060",
+            "5060",
+            "3090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "dreamid": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 95,
+            "4090": 80,
+            "5090": 95
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "hunyan15_480p_t2v_distilled": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 95,
+            "4090": 80,
+            "5090": 95
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "hunyan15_480p_i2v_step_distilled": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 95,
+            "4090": 80,
+            "5090": 95
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090"
+        ],
+        "min_gpu_count": 1
+    },
+    "glm_ocr": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 80,
+            "3060": 15,
+            "4090": 90,
+            "5090": 20,
+            "A4000": 24,
+            "5060": 25,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "A4000",
+            "3060",
+            "5060",
+            "3090",
+            "4090",
+            "5090"
+        ],
+        "min_gpu_count": 1
+    },
+    "qwen_image_edit_2511_rapid_aio": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 100,
+            "4090": 80,
+            "3090": 30,
+            "5090": 100
+        },
+        "allowed_gpu_names": [
+            "4090",
+            "3090",
+            "5090"
+        ],
+        "min_gpu_count": 1
+    },
+    "face_enhancer": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 80,
+            "3060": 15,
+            "4090": 90,
+            "A4000": 24,
+            "5060": 25,
+            "3090": 40
+        },
         "allowed_gpu_names": [
             "A4000",
             "3060",

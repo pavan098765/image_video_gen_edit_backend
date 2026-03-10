@@ -184,19 +184,43 @@ def _ensure_image_list(maybe_one_or_many) -> List[Image.Image]:
 
 
 def _get_dynamic_size_for_images(images: List[Image.Image], max_dim: int = 1152) -> Tuple[int, int]:
-    """Keep aspect ratio, clamp to max_dim, round to multiples of 64."""
+    """Keep aspect ratio, clamp to max_dim, round to multiples of 64, preserving aspect ratio."""
     if not images:
         raise ValueError("No images provided")
     w, h = images[0].size
     aspect = w / h
+    
+    # First, scale down if needed
     if max(w, h) > max_dim:
         if w > h:
-            w, h = max_dim, int(max_dim / aspect)
+            new_w = max_dim
+            new_h = int(round(max_dim / aspect))
         else:
-            h, w = max_dim, int(max_dim * aspect)
-    w = (w // 64) * 64
-    h = (h // 64) * 64
-    return w, h
+            new_h = max_dim
+            new_w = int(round(max_dim * aspect))
+    else:
+        new_w, new_h = w, h
+    
+    # Round to multiples of 64 while preserving aspect ratio
+    # Round the larger dimension first, then compute the other dimension
+    if new_w >= new_h:
+        new_w = (new_w // 64) * 64
+        # Compute height from rounded width to maintain aspect ratio
+        new_h = int(round(new_w / aspect))
+        # Round height, then recompute width to ensure both are multiples of 64
+        new_h = (new_h // 64) * 64
+        new_w = int(round(new_h * aspect))
+        new_w = (new_w // 64) * 64
+    else:
+        new_h = (new_h // 64) * 64
+        # Compute width from rounded height to maintain aspect ratio
+        new_w = int(round(new_h * aspect))
+        # Round width, then recompute height to ensure both are multiples of 64
+        new_w = (new_w // 64) * 64
+        new_h = int(round(new_w / aspect))
+        new_h = (new_h // 64) * 64
+    
+    return new_w, new_h
 
 
 def _resize_images_to(images: List[Image.Image], size: Tuple[int, int]) -> List[Image.Image]:

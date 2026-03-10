@@ -18,8 +18,8 @@ NUNCHAKU_REPO = "nunchaku-tech/nunchaku-qwen-image"
 QWEN_DIR = os.path.join(MODELS_DIR, "qwen_image")
 NUNCHAKU_DIR = os.path.join(MODELS_DIR, "nunchaku_qwen")
 
-LOCAL_REALESRGAN_SRC = os.path.join(PROJECT_ROOT, "realesrgan_models")
-LOCAL_REALESRGAN_DST = os.path.join(MODELS_DIR, "realesrgan")
+REALESRGAN_DIR = os.path.join(MODELS_DIR, "realesrgan")
+REALESRGAN_HF_REPO = "rockapaper/realesrgan"
 
 os.makedirs(QWEN_DIR, exist_ok=True)
 os.makedirs(NUNCHAKU_DIR, exist_ok=True)
@@ -69,14 +69,26 @@ else:
     print(f"✓ Transformer already exists at {target_path}")
 
 # ------------------------
-# 3. Copy local Realesrgan models (optional)
+# 3. Download Real-ESRGAN models (2x, 4x) from rockapaper/realesrgan
 # ------------------------
-if os.path.exists(LOCAL_REALESRGAN_SRC):
-    print(f"📦 Copying {LOCAL_REALESRGAN_SRC} -> {LOCAL_REALESRGAN_DST}")
-    shutil.copytree(LOCAL_REALESRGAN_SRC, LOCAL_REALESRGAN_DST, dirs_exist_ok=True)
-    print("✓ Realesrgan models copied.")
-else:
-    print("⚠️ No local realesrgan_models/ found, skipping.")
+os.makedirs(REALESRGAN_DIR, exist_ok=True)
+for filename in ("RealESRGAN_x2plus.pth", "RealESRGAN_x4plus.pth"):
+    model_file = os.path.join(REALESRGAN_DIR, filename)
+    if os.path.exists(model_file):
+        print(f"✓ Real-ESRGAN {filename} already exists at {model_file}")
+        continue
+    try:
+        print(f"⬇️ Downloading {filename} from {REALESRGAN_HF_REPO}...")
+        hf_hub_download(
+            repo_id=REALESRGAN_HF_REPO,
+            filename=filename,
+            local_dir=REALESRGAN_DIR,
+            resume_download=True,
+        )
+        print(f"✓ {filename} downloaded to {REALESRGAN_DIR}")
+    except Exception as e:
+        print(f"❌ Failed to download {filename}: {e}")
+        traceback.print_exc()
 
 # ------------------------
 # 4. Split large safetensors recursively

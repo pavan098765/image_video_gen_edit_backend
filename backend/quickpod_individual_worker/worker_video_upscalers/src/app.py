@@ -1,3 +1,4 @@
+from io import BytesIO
 import os
 import time
 import json
@@ -8,7 +9,14 @@ import hashlib
 import gc
 from typing import Dict, Any, Optional
 from datetime import datetime
+import uuid
+import httpx
+import base64
+from PIL import Image
 import concurrent.futures
+import requests
+import tempfile
+import shutil
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -53,41 +61,20 @@ def cleanup_gpu(verbose: bool = False):
 # -----------------------
 # Import inference functions
 # -----------------------
-from quickpod_worker.worker_ltx_video.src.ltx_video_I2V_inference import run_inference_ltx_video_i2v
-from quickpod_worker.worker_ltx_video.src.ltx_video_V2V_inference import run_inference_ltx_video_v2v
-from quickpod_worker.worker_fastwan.src.fastwan_1b_inference import run_inference_wan_1b_t2i, run_inference_wan_1b_t2v
-from quickpod_worker.worker_fastwan.src.fastwan_5b_inference import run_inference_wan_5b_t2i, run_inference_wan_5b_t2v
-from quickpod_worker.worker_flux_kontext_dev.src.flux_kontext_dev_inference import run_inference_flux_kontext_dev
-from quickpod_worker.worker_qwen_image_edit.src.qwen_image_edit_inference import run_inference_qwen_image_edit
-from quickpod_worker.worker_stable_diffusion_15.src.sd15_I2I_inference import run_inference_sd15_i2i
-from quickpod_worker.worker_stable_diffusion_15.src.sd15_inpaint_inference import run_inference_sd15_inpaint
-from quickpod_worker.worker_stable_diffusion_15.src.sd15_T2I_inference import run_inference_sd15_t2i
-from quickpod_worker.worker_stable_diffusion_35.src.sd35_I2I_inference import run_inference_sd35_i2i
-from quickpod_worker.worker_stable_diffusion_35.src.sd35_inpaint_inference import run_inference_sd35_inpaint
-from quickpod_worker.worker_stable_diffusion_35.src.sd35_T2I_inference import run_inference_sd35_t2i
-from quickpod_worker.worker_stable_diffusion_xl.src.sdxl_I2I_inference import run_inference_sdxl_i2i
-from quickpod_worker.worker_stable_diffusion_xl.src.sdxl_inpaint_inference import run_inference_sdxl_inpaint
-from quickpod_worker.worker_stable_diffusion_xl.src.sdxl_T2I_inference import run_inference_sdxl_t2i
-from quickpod_worker.worker_stable_diffusion_xl_outpaint.src.diffuser_outpaint_inference import run_inference_diffuser_outpaint
-from quickpod_worker.worker_basic_utils.src.bg_remover import run_inference_rmbg
-from quickpod_worker.worker_basic_utils.src.simple_lama_inpaint import run_inference_simple_lama_inpaint
-from quickpod_worker.worker_image_upscaler.src.aurasrv2_upscaler import run_inference_aurasr_upscale
-from quickpod_worker.worker_image_upscaler.src.swin2sr_upscaler import run_inference_swin2sr
+# Auto-merge split safetensors if merge.py exists
+try:
+    from merge import main as merge_main
+    merge_main()
+except Exception as e:
+    pass  # merge.py auto-merge skipped or failed
+
+from inference import run_inference_video_upscaler
 
 # -----------------------
 # Model Registry
 # -----------------------
 MODEL_REGISTRY = {
-    "ltx_video": {"i2v": run_inference_ltx_video_i2v, "v2v": run_inference_ltx_video_v2v},
-    "fastwan": {"1b_t2v": run_inference_wan_1b_t2v, "1b_t2i": run_inference_wan_1b_t2i, "5b_i2v": run_inference_wan_5b_t2v, "5b_t2v": run_inference_wan_5b_t2v, "5b_t2i": run_inference_wan_5b_t2i},
-    "flux_kontext_dev": run_inference_flux_kontext_dev,
-    "qwen_image_edit": run_inference_qwen_image_edit,
-    "sd15": {"i2i": run_inference_sd15_i2i, "t2i": run_inference_sd15_t2i, "inpaint": run_inference_sd15_inpaint},
-    "sd35": {"i2i": run_inference_sd35_i2i, "t2i": run_inference_sd35_t2i, "inpaint": run_inference_sd35_inpaint},
-    "sdxl": {"i2i": run_inference_sdxl_i2i, "t2i": run_inference_sdxl_t2i, "inpaint": run_inference_sdxl_inpaint},
-    "diffusers_outpaint": run_inference_diffuser_outpaint,
-    "basic_utils": {"bg_remove": run_inference_rmbg, "lama_inpaint": run_inference_simple_lama_inpaint},
-    "image_upscale": {"aurasrv2": run_inference_aurasr_upscale, "swin2sr": run_inference_swin2sr},
+    "video_upscaler": run_inference_video_upscaler,
 }
 
 # -----------------------
@@ -99,14 +86,18 @@ logger = logging.getLogger("worker")
 # -----------------------
 # Configuration from env
 # -----------------------
-WORKER_ID = os.getenv("WORKER_ID")
-MODEL_KEY = os.getenv("MODEL_KEY", "multi-model-worker")
+CONTAINER_ID = os.getenv("CONTAINER_LABEL")
+POD_UUID = CONTAINER_ID
+PUBLIC_IPADDR = os.getenv("PUBLIC_IPADDR")
+WORKER_ID = POD_UUID
+
+MODEL_KEY = os.getenv("MODEL_KEY", "video-upscaler-worker")
 CONTROLLER_URL = os.getenv("CONTROLLER_URL", "").strip()
 CONTROLLER_SHARED_SECRET = os.getenv("CONTROLLER_SHARED_SECRET", "")
 CONTROLLER_API_KEY = os.getenv("CONTROLLER_API_KEY", "")
-WORKER_PUBLIC_URL = os.getenv("WORKER_PUBLIC_URL")
-CONTAINER_ID = os.getenv("CONTAINER_ID")
-PORT = int(os.getenv("PORT", "8000"))
+INTERNAL_PORT = 8000
+EXTERNAL_PORT = os.getenv(f"QUICKPOD_PORT_{INTERNAL_PORT}")
+PORT = int(EXTERNAL_PORT) if EXTERNAL_PORT else INTERNAL_PORT
 
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "20"))
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
@@ -117,12 +108,22 @@ os.makedirs(WORKSPACE_DIR, exist_ok=True)
 # -----------------------
 # Job queue and state
 # -----------------------
-job_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+job_queue: asyncio.Queue = asyncio.Queue(maxsize=30)
 job_status: Dict[str, Dict[str, Any]] = {}
 job_status_lock = asyncio.Lock()
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 last_model_key: Optional[str] = None
 startup_completed = False
+
+
+def _peek_next_job_id() -> Optional[str]:
+    """Peek at the next job in the queue without removing it."""
+    try:
+        if not job_queue.empty():
+            return job_queue._queue[0].get("job_id")
+    except (IndexError, AttributeError):
+        pass
+    return None
 
 # -----------------------
 # Request Model
@@ -136,6 +137,69 @@ class RunRequest(BaseModel):
     upload_url: str
     result_key: str
 
+
+# -----------------------
+# Media URL Resolution
+# -----------------------
+# Fields that may contain URLs (presigned R2 GET URLs) instead of base64 data.
+# At dispatch time the server converts R2 keys to presigned GET URLs.
+# This helper downloads the binary and converts to base64 so inference code
+# (which expects base64 strings) works without modification.
+MEDIA_FIELDS = frozenset([
+    "init_image", "mask_image", "image", "source_image", "face_image",
+    "reference_image", "style_image", "control_image", "input_image",
+    "ref_image", "ref_video", "input_video",
+])
+
+
+def _is_url(value: str) -> bool:
+    return isinstance(value, str) and (value.startswith("http://") or value.startswith("https://"))
+
+
+def _download_to_base64(url: str, timeout: int = 120) -> str:
+    """Download binary from URL and return base64-encoded string."""
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    return base64.b64encode(resp.content).decode("utf-8")
+
+
+def resolve_media_urls(params: Dict[str, Any], job_id: str = "") -> Dict[str, Any]:
+    """
+    Resolve any URL-valued media fields in params to base64 strings.
+    
+    If a known media field contains a URL (e.g. presigned R2 download URL),
+    download the binary and replace with base64 so downstream inference
+    functions work unchanged.
+    
+    Handles both single string values and lists of strings.
+    """
+    resolved = dict(params)
+    for field in MEDIA_FIELDS:
+        value = resolved.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str) and _is_url(value):
+            try:
+                logger.info(f"[{job_id}] Downloading {field} from URL ({len(value)} chars)...")
+                resolved[field] = _download_to_base64(value)
+                logger.info(f"[{job_id}] Downloaded {field}: {len(resolved[field])} base64 chars")
+            except Exception as e:
+                logger.error(f"[{job_id}] Failed to download {field} from URL: {e}")
+                raise
+        elif isinstance(value, list):
+            new_list = []
+            for i, item in enumerate(value):
+                if isinstance(item, str) and _is_url(item):
+                    try:
+                        logger.info(f"[{job_id}] Downloading {field}[{i}] from URL...")
+                        new_list.append(_download_to_base64(item))
+                    except Exception as e:
+                        logger.error(f"[{job_id}] Failed to download {field}[{i}]: {e}")
+                        raise
+                else:
+                    new_list.append(item)
+            resolved[field] = new_list
+    return resolved
 # -----------------------
 # HMAC utils
 # -----------------------
@@ -180,8 +244,9 @@ def register_with_controller():
         return {"skipped": True}
     payload = {
         "worker_id": WORKER_ID, "models": list(MODEL_REGISTRY.keys()),
-        "endpoint": WORKER_PUBLIC_URL or f"http://{os.getenv('HOSTNAME')}:{PORT}",
-        "container_id": CONTAINER_ID, "info": {"started_at": datetime.utcnow().isoformat()},
+        "endpoint": f"http://{PUBLIC_IPADDR}:{PORT}", "container_id": POD_UUID,
+        "pod_uuid": POD_UUID, "public_ip": PUBLIC_IPADDR,
+        "info": {"started_at": datetime.utcnow().isoformat()},
     }
     return post_signed_json(f"{CONTROLLER_URL.rstrip('/')}/register_worker", payload, timeout=15, max_retries=6).json()
 
@@ -189,7 +254,17 @@ def register_with_controller():
 def send_heartbeat():
     if not CONTROLLER_URL:
         return {"skipped": True}
-    payload = {"worker_id": WORKER_ID, "timestamp": int(time.time()), "status": "ready" if startup_completed else "starting"}
+    # Determine actual worker status based on job state
+    if not startup_completed:
+        status = "starting"
+    else:
+        try:
+            has_running = any(j.get("status") == "running" for j in job_status.values())
+            has_queued = not job_queue.empty()
+            status = "busy" if (has_running or has_queued) else "ready"
+        except Exception:
+            status = "ready"
+    payload = {"worker_id": WORKER_ID, "pod_uuid": POD_UUID, "timestamp": int(time.time()), "status": status}
     try:
         return post_signed_json(f"{CONTROLLER_URL.rstrip('/')}/heartbeat", payload, timeout=8, max_retries=3).json()
     except Exception:
@@ -202,17 +277,67 @@ def resolve_inference_callable(model: str, mode: Optional[str]):
     if model not in MODEL_REGISTRY:
         raise ValueError(f"Unknown model: {model}")
     func = MODEL_REGISTRY[model]
+    # If func is a dict (mode-based), resolve the mode
     if isinstance(func, dict):
         if not mode or mode not in func:
             raise ValueError(f"Mode required for {model}. Available: {list(func.keys())}")
         func = func[mode]
+    # If func is callable directly, return it (mode is optional/ignored)
     return func
+
+async def download_video_from_url(url: str, output_path: str) -> str:
+    """Download video from URL (e.g. presigned R2 URL) to local path."""
+    loop = asyncio.get_event_loop()
+    def _download():
+        logger.info(f"Downloading video from URL to {output_path}...")
+        # Use connect timeout of 30s, read timeout of 300s (5 min for large videos)
+        response = requests.get(url, stream=True, timeout=(30, 300))
+        response.raise_for_status()
+        total_bytes = 0
+        with open(output_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192 * 16):  # 128KB chunks
+                if chunk:
+                    f.write(chunk)
+                    total_bytes += len(chunk)
+        logger.info(f"Downloaded video: {total_bytes / (1024*1024):.1f} MB → {output_path}")
+        return output_path
+    return await loop.run_in_executor(IO_EXECUTOR, _download)
 
 async def run_inference_and_save(job_id: str, prompt: str, model: str, mode: Optional[str], params: Dict[str, Any]) -> str:
     global last_model_key
     loop = asyncio.get_event_loop()
     params = params.copy()
     params.setdefault("output_dir", WORKSPACE_DIR)
+    
+    # Handle input_video - can be URL, base64 encoded video, or file path
+    input_video = params.get("input_video")
+    if input_video:
+        # Check if it's a URL (presigned R2 URL or any HTTP URL)
+        if input_video.startswith("http://") or input_video.startswith("https://"):
+            # Download video from URL
+            video_path = os.path.join(WORKSPACE_DIR, f"input_{job_id}.mp4")
+            await download_video_from_url(input_video, video_path)
+            params["input_video"] = video_path
+        elif input_video.startswith("data:video/") or len(input_video) > 1000:
+            # Legacy: base64 encoded video (backward compatibility)
+            try:
+                logger.info(f"[{job_id}] Decoding base64 video ({len(input_video)} chars)...")
+                # Extract base64 data
+                if "," in input_video:
+                    header, data = input_video.split(",", 1)
+                else:
+                    data = input_video
+                
+                video_bytes = base64.b64decode(data)
+                video_path = os.path.join(WORKSPACE_DIR, f"input_{job_id}.mp4")
+                with open(video_path, "wb") as f:
+                    f.write(video_bytes)
+                params["input_video"] = video_path
+                logger.info(f"[{job_id}] Decoded base64 video: {len(video_bytes) / (1024*1024):.1f} MB")
+            except Exception as e:
+                raise ValueError(f"Failed to decode base64 video: {e}")
+        # If it's already a file path, use it as-is
+    
     inference_func = resolve_inference_callable(model, mode)
     model_key = f"{model}:{mode or ''}"
 
@@ -231,6 +356,12 @@ async def process_job_item(item: Dict[str, Any]):
     job_id, model, mode, prompt = item["job_id"], item["model"], item.get("mode"), item["prompt"]
     params, upload_url, result_key = item.get("params", {}), item["upload_url"], item["result_key"]
 
+    # Resolve any URL-valued media fields to base64 before inference
+    try:
+        params = resolve_media_urls(params, job_id)
+    except Exception as e:
+        logger.error(f"[{job_id}] Failed to resolve media URLs: {e}")
+
     async with job_status_lock:
         job_status[job_id] = {"status": "running", "started_at": datetime.utcnow().isoformat()}
 
@@ -241,10 +372,11 @@ async def process_job_item(item: Dict[str, Any]):
                 if not await _upload_with_retry(out_local, upload_url, job_id):
                     raise Exception("Upload failed")
 
-            if CONTROLLER_URL:
+            is_autotest = job_id.startswith("autotest-")
+            if CONTROLLER_URL and not is_autotest:
                 try:
                     await asyncio.get_running_loop().run_in_executor(IO_EXECUTOR, post_signed_json,
-                        f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": result_key}, 10, 5)
+                        f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": result_key, "next_job_id": _peek_next_job_id()}, 10, 5)
                 except Exception:
                     pass
 
@@ -258,10 +390,11 @@ async def process_job_item(item: Dict[str, Any]):
             cleanup_gpu(verbose=True)
         async with job_status_lock:
             job_status[job_id] = {"status": "failed", "error": str(e)}
-        if CONTROLLER_URL:
+        is_autotest = job_id.startswith("autotest-")
+        if CONTROLLER_URL and not is_autotest:
             try:
                 await asyncio.get_running_loop().run_in_executor(IO_EXECUTOR, post_signed_json,
-                    f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": None, "failed": True, "error": str(e)}, 10, 5)
+                    f"{CONTROLLER_URL.rstrip('/')}/job_complete", {"job_id": job_id, "result_r2_key": None, "failed": True, "next_job_id": _peek_next_job_id()}, 10, 5)
             except Exception:
                 pass
         asyncio.create_task(_cleanup_job_status(job_id, 60))
@@ -304,6 +437,15 @@ async def worker_loop():
             await asyncio.sleep(1)
 
 # -----------------------
+# Auto-test
+# -----------------------
+async def run_autotest():
+    await asyncio.sleep(5)
+    logger.info("Starting Video Upscaler auto-test")
+    # Auto-test would need a sample video URL
+    # Skipping for now as it requires a test video
+
+# -----------------------
 # Loops
 # -----------------------
 async def _health_monitor_loop():
@@ -311,7 +453,7 @@ async def _health_monitor_loop():
         await asyncio.sleep(60)
         try:
             if torch.cuda.is_available() and torch.cuda.memory_allocated() / 1024**3 > 22:
-                logger.warning("⚠️ HIGH GPU MEMORY")
+                logger.warning("HIGH GPU MEMORY")
         except Exception:
             pass
 
@@ -341,6 +483,8 @@ async def lifespan(app: FastAPI):
         register_with_controller()
     except Exception as e:
         logger.exception("Registration failed: %s", e)
+    if os.getenv("ENABLE_AUTOTEST", "1") == "1":
+        asyncio.create_task(run_autotest())
     yield
     startup_completed = False
     if not job_queue.empty():

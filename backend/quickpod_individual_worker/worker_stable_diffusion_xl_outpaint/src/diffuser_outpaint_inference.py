@@ -395,6 +395,7 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
 
     output_dir = params.get("output_dir", "./outputs")
     os.makedirs(output_dir, exist_ok=True)
@@ -421,6 +422,8 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
     max_dim = int(params.get("max_dim", 1152))
     alignment = params.get("alignment", "Middle")
     
+    print(f"[SDXL Outpaint] Mode check: is_custom_mode={is_custom_mode}, alignment={alignment}, aspect_ratio={params.get('aspect_ratio')}, expansion_factor={params.get('expansion_factor')}")
+    
     if is_custom_mode:
         # Custom mode: use explicit positioning from frontend
         print(f"[SDXL Outpaint] Using custom mode positioning")
@@ -444,15 +447,30 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
         print(f"[Custom Mode] Expansion edges - left:{overlap_left}, right:{overlap_right}, top:{overlap_top}, bottom:{overlap_bottom}")
     else:
         # Existing behavior: compute canvas based on alignment/aspect_ratio
+        # IGNORE any custom positioning params when not in custom mode
         aspect_ratio = params.get("aspect_ratio", "9:16")
         expansion_factor = float(params.get("expansion_factor", 1.25))
+        
+        print(f"[SDXL Outpaint] Non-custom mode: computing canvas with aspect_ratio={aspect_ratio}, expansion_factor={expansion_factor}, alignment={alignment}")
+        print(f"[SDXL Outpaint] Original image size: {image.size}")
+        
         canvas = compute_target_canvas(image, aspect_ratio, alignment, max_dim, expansion_factor)
+        
+        print(f"[SDXL Outpaint] Computed canvas: target={canvas['target_w']}x{canvas['target_h']}, final_image={canvas['final_image_w']}x{canvas['final_image_h']}, paste=({canvas['paste_x']}, {canvas['paste_y']})")
         
         # Use params for overlap flags in non-custom mode
         overlap_left = params.get("overlap_left", False)
         overlap_right = params.get("overlap_right", False)
         overlap_top = params.get("overlap_top", False)
         overlap_bottom = params.get("overlap_bottom", False)
+        
+        # For "All Sides" alignment, we should expand on all sides
+        if alignment == "All Sides":
+            overlap_left = True
+            overlap_right = True
+            overlap_top = True
+            overlap_bottom = True
+            print(f"[SDXL Outpaint] 'All Sides' alignment: enabling expansion on all sides")
 
     resized_source = image.resize(
         (canvas["final_image_w"], canvas["final_image_h"]), Image.LANCZOS
@@ -523,6 +541,7 @@ def run_inference_sdxl_outpaint(job_id: str, prompt: str, params: Dict[str, Any]
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
 
     output_path = os.path.join(output_dir, f"{job_id}_final.png")
     generated_image.save(output_path)
