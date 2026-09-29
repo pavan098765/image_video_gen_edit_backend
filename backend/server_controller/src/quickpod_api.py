@@ -1317,7 +1317,7 @@ if __name__ == "__main__":
     print()
     # Set your credentials here
     QUICKPOD_EMAIL = "pavanalur3@gmail.com"
-    QUICKPOD_PASSWORD = "C@9rw6fxATDm8sM"
+    QUICKPOD_PASSWORD = "T7CfN@@CTtQETn6"
     
     # Initialize manager with email and password
     print("[1] Initializing QuickPodManager...")
@@ -1339,10 +1339,10 @@ if __name__ == "__main__":
         print(f"    → GET {manager.base}/templates")
         templates = manager.get_templates()
         print(f"    ✓ Found {len(templates)} templates")
-        print(f"    Templates: {json.dumps(templates, indent=2)}")
+        # print(f"    Templates: {json.dumps(templates, indent=2)}")
         with open("templates.json", "w") as f:
             json.dump(templates, f, indent=2)
-
+        print("templates.json file created")
         exit()
         if templates:
             template = templates[0]

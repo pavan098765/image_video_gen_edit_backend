@@ -1,0 +1,7 @@
+# Optional extras for inference_hub_space_torchao.py (V3).
+# Install on top of worker requirements.txt when using WAN_I2V_INFERENCE_MODULE=inference_hub_space_torchao.py
+#
+# torchao: FP8 / int8 quantization for transformers (Space-aligned)
+torchao
+# aoti: AoTI compiled blocks for Wan2 (zerogpu-aoti/Wan2 fp8da) — verify PyPI name/version for your CUDA+torch stack
+aoti

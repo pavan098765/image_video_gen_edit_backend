@@ -403,6 +403,22 @@ def run_inference_face_enhancer(job_id: str, params: Dict[str, Any]) -> str:
     return os.path.abspath(out_path)
 
 
+def unload_models():
+    """Free cached RealESRGAN background upsamplers and reclaim GPU memory."""
+    global LOADED_BG_UPSAMPLERS
+    for name, upsampler in list(LOADED_BG_UPSAMPLERS.items()):
+        try:
+            if hasattr(upsampler, "model"):
+                del upsampler.model
+            del upsampler
+        except Exception:
+            pass
+    LOADED_BG_UPSAMPLERS.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 # -------------------------
 # CLI test mode
 # -------------------------

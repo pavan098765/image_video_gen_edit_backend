@@ -12,7 +12,7 @@ import torch
 
 from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
 from nunchaku import NunchakuZImageTransformer2DModel
-from nunchaku.utils import get_precision, is_turing
+from nunchaku.utils import is_turing
 from upscaler import upscale_image
 
 # Aggressive GPU cleanup at import to prevent OOM
@@ -44,8 +44,29 @@ if not NUNCHAKU_Z_IMAGE_TURBO_LOCAL_PATH or not os.path.exists(NUNCHAKU_Z_IMAGE_
 NUM_INFERENCE_STEPS = 8  # This actually results in 8 DiT forwards
 RANK = 128  # Use 32 for faster sampling; 256 (INT4 only) for best quality
 
-# Detect precision and dtype based on GPU
-precision = get_precision()  # auto-detect 'int4' or 'fp4' based on GPU
+# Nunchaku DiT weights: int4 on <25GB VRAM, fp4 on >=25GB VRAM.
+# Override with NUNCHAKU_FORCE_PRECISION=int4|fp4 if needed.
+_VRAM_INT4_CUTOFF_BYTES = int(
+    float(os.environ.get("NUNCHAKU_VRAM_INT4_CUTOFF_GB", "25")) * (1024**3)
+)
+
+
+def _select_nunchaku_precision() -> str:
+    o = os.environ.get("NUNCHAKU_FORCE_PRECISION", "").strip().lower()
+    if o in ("int4", "fp4"):
+        return o
+    if torch.cuda.is_available():
+        try:
+            total = int(torch.cuda.get_device_properties(0).total_memory)
+            if total < _VRAM_INT4_CUTOFF_BYTES:
+                return "int4"
+            return "fp4"
+        except Exception:
+            return "int4"
+    return "int4"
+
+
+precision = _select_nunchaku_precision()
 dtype = torch.float16 if is_turing() else torch.bfloat16  # float16 for Turing (20-series) GPUs
 
 transformer_file = f"svdq-{precision}_r{RANK}-z-image-turbo.safetensors"

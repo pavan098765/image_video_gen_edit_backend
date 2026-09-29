@@ -1,0 +1,80 @@
+{
+  "comfyui": {
+    "repo": "https://github.com/Comfy-Org/ComfyUI",
+    "ref": "v0.37.0"
+  },
+  "custom_nodes": [
+    {
+      "name": "ComfyUI-KJNodes",
+      "repo": "https://github.com/kijai/ComfyUI-KJNodes",
+      "commit": "d3cfe21625e5170126ce06fbfcfe1d88108688c3"
+    },
+    {
+      "name": "ComfyUI-SolAttn_triton",
+      "repo": "https://github.com/kijai/ComfyUI-SolAttn_triton",
+      "commit": "dfc2e31a41afd72bd53dd2137fc8b2931d5ec192",
+      "note": "Fast MiniMax H3 SolAttnPatch (author ditched Sage Attention)."
+    },
+    {
+      "name": "Comfyui-MMH3-UltimateUpscale",
+      "repo": "https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateUpscale",
+      "commit": "fe6658f6d144066f14150d3526247b417683ff2b",
+      "note": "Fast MiniMax H3 second-pass Ultimate Upscale (0.6-1.0 MP)."
+    },
+    {
+      "name": "rgthree-comfy",
+      "repo": "https://github.com/rgthree/rgthree-comfy",
+      "commit": "449c58fcdd612f7733e54c51f6758ead63fa180b"
+    },
+    {
+      "name": "ComfyUI-VideoHelperSuite",
+      "repo": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
+      "commit": "4d907bee61e92c2e65af3bd6383a4e4d356126d1"
+    },
+    {
+      "name": "ComfyUI-Impact-Pack",
+      "repo": "https://github.com/ltdrdata/ComfyUI-Impact-Pack",
+      "commit": "429d0159ad429e64d2b3916e6e7be9c22d025c3c"
+    },
+    {
+      "name": "cg-use-everywhere",
+      "repo": "https://github.com/chrisgoringe/cg-use-everywhere",
+      "commit": "50ae9f8c5d8b9538589663c90a15d4067a02969c"
+    },
+    {
+      "name": "ComfyUI-Easy-Use",
+      "repo": "https://github.com/yolain/ComfyUI-Easy-Use",
+      "commit": "8730ffd14044ee9392db3b192646266576bc67df"
+    },
+    {
+      "name": "ComfyUI-Pixaroma",
+      "repo": "https://github.com/pixaroma/ComfyUI-Pixaroma",
+      "commit": "7c464447ce2a17dff9489b79d4daf32e55b28f38"
+    },
+    {
+      "name": "ComfyUI-H3-Prompt-IDE",
+      "repo": "https://github.com/ethanfel/ComfyUI-H3-Prompt-IDE",
+      "commit": "36f8a720e0b0775ecdb7bae41fceae3b513ff2cd"
+    },
+    {
+      "name": "ComfyUI-Fantastic-MiniMaxH3-PromptBuilder",
+      "repo": "https://github.com/Adudeguyman/ComfyUI-Fantastic-MiniMaxH3-PromptBuilder",
+      "commit": "23038f5050acdcbb8e938bfd7c87a18d2cc84aab"
+    },
+    {
+      "name": "ComfyUI-MiniMaxH3Mod",
+      "repo": "https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod",
+      "commit": "6131c1f62c612a074d6aac8435c26ffa19c00563"
+    },
+    {
+      "name": "Comfyui_Minimax_h3_latent_Upscaler",
+      "repo": "https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler",
+      "commit": "40316cf008b2fd8663263270669eb4da23f89d2c"
+    },
+    {
+      "name": "ComfyUI-VFI",
+      "repo": "https://github.com/GACLove/ComfyUI-VFI",
+      "commit": "6176a430f12cd16003f4664c1e3c6af8e96cc3c6"
+    }
+  ]
+}

@@ -1,0 +1,1459 @@
+00:04 Hey, I'm napping here. Quit it.
+00:07 
+
+00:07 >> Well, folks, version 2.0 is here. This
+00:10 
+
+00:10 update adds ref mods by popular demand,
+00:13 
+
+00:13 redesigns the whole reference and media
+00:16 
+
+00:16 loading section, removes several custom
+00:18 
+
+00:18 node requirements, and updates several
+00:20 
+
+00:20 features to [music] be easier to use.
+00:23 
+
+00:23 Let's jump right in.
+00:25 
+
+00:25 The first step when loading any new
+00:26 
+
+00:26 workflow is always going to be heading
+00:28 
+
+00:28 up to the model loading group and making
+00:30 
+
+00:30 sure that you have all of your model
+00:32 
+
+00:32 files downloaded and correctly
+00:34 
+
+00:34 configured. Now, every link you're going
+00:35 
+
+00:35 to need is right here in this node.
+00:37 
+
+00:37 Secondly, [music]
+00:38 
+
+00:38 while the Comfy UI manager will download
+00:41 
+
+00:41 most of the custom nodes needed for
+00:43 
+
+00:43 this, there are several that aren't in
+00:44 
+
+00:44 the Comfy registry. therefore need to be
+00:47 
+
+00:47 manually installed by downloading the
+00:49 
+
+00:49 files from these GitHub links and
+00:52 
+
+00:52 placing them into your Comfy UI custom
+00:55 
+
+00:55 nodes folder.
+00:58 
+
+00:58 Next, we can take a look at the
+00:59 
+
+00:59 workflows options and settings. So, by
+01:02 
+
+01:02 default, I have a Turbolor loaded and
+01:05 
+
+01:05 [music] it is the Darities or Silver
+01:07 
+
+01:07 Oxides Light X2V version. Uh, and it
+01:10 
+
+01:10 just recently came out and I think it's
+01:12 
+
+01:12 really good for both liveaction [music]
+01:13 
+
+01:13 and 2D. Um, we scroll down and we see a
+01:17 
+
+01:17 bunch of different things that you can
+01:18 
+
+01:18 turn on and off. Some bells and whistles
+01:20 
+
+01:20 in the workflow. I usually leave things
+01:22 
+
+01:22 like comfy kitchen on because it's just
+01:24 
+
+01:24 a blanket [music] speed up for the
+01:25 
+
+01:25 model. Um, attention for block or sparse
+01:29 
+
+01:29 for upscale pass only is a good option
+01:31 
+
+01:31 as well. RI frame interpolation. Laura's
+01:34 
+
+01:34 for upscale pass only. We have seamless
+01:36 
+
+01:36 video continuation. We can turn the
+01:38 
+
+01:38 workflow into a single pass [music]
+01:40 
+
+01:40 workflow which skips upscale. We can use
+01:42 
+
+01:42 ref mods. We have some VRAM
+01:44 
+
+01:44 optimizations here. We can shift the
+01:46 
+
+01:46 sampler sigas [music] and of course we
+01:48 
+
+01:48 can use KJ's uh model previewer as well,
+01:51 
+
+01:51 but it has a little performance hit.
+01:53 
+
+01:53 Now, we're going to take a look at the
+01:54 
+
+01:54 video settings. So, the main thing that
+01:56 
+
+01:56 you're going to be changing here
+01:58 
+
+01:58 frequently, of course, is step counts,
+01:60 
+
+01:60 your megapixel settings for the first
+02:02 
+
+02:02 pass, aspect ratio, and your video
+02:05 
+
+02:05 length. Next, we look at our prompting
+02:07 
+
+02:07 and references area. So, as you'll
+02:09 
+
+02:09 notice, this is where our ref mods are,
+02:12 
+
+02:12 and those can be toggled on and off in
+02:14 
+
+02:14 the options, of course. And you'll also
+02:16 
+
+02:16 notice that we have our new media
+02:18 
+
+02:18 loader, which I think is a fantastic
+02:20 
+
+02:20 addition because everything's suddenly
+02:22 
+
+02:22 in one place, and it's highly
+02:23 
+
+02:23 customizable. As you can see here, if I
+02:25 
+
+02:25 click on this, we have a cropping of the
+02:27 
+
+02:27 image that gets rid of all of that
+02:29 
+
+02:29 superfluous white pixel space on the
+02:31 
+
+02:31 left and right sides of the image,
+02:32 
+
+02:32 making the model run more efficiently,
+02:34 
+
+02:34 right? And we can also do the same thing
+02:36 
+
+02:36 with videos by clicking this little
+02:38 
+
+02:38 scissors icon. We can trim, of course,
+02:40 
+
+02:40 by selecting the left and right sides of
+02:42 
+
+02:42 this blue handlebar. We can mirror
+02:44 
+
+02:44 videos and of course we can crop videos.
+02:47 
+
+02:47 All of this is extremely useful and
+02:49 
+
+02:49 applies to audio as well. So everything
+02:51 
+
+02:51 in one place.
+02:55 
+
+02:55 Also wanted to take a moment to cover
+02:57 
+
+02:57 these useful little options here. If you
+02:60 
+
+02:60 want to use I2V, simply toggle picture
+03:02 
+
+03:02 one is first frame and this image will
+03:05 
+
+03:05 be pinned onto the gen and used as a
+03:08 
+
+03:08 first frame. Similarly with last frame,
+03:10 
+
+03:10 just toggle on picture two is last frame
+03:13 
+
+03:13 and here [music] the last frame will be
+03:14 
+
+03:14 what'sever in slot two. The third useful
+03:18 
+
+03:18 little thing is [music] forced custom
+03:20 
+
+03:20 supplied audio. So if you turn this on,
+03:23 
+
+03:23 anything in audio one will be [music]
+03:25 
+
+03:25 forced into the audio latent and the
+03:28 
+
+03:28 model will need to look at it and
+03:30 
+
+03:30 conform its video to that. So this is
+03:33 
+
+03:33 great for forcing lip syncing for
+03:35 
+
+03:35 dialogue that you already have [music]
+03:37 
+
+03:37 or in the case of lip syncing to music
+03:40 
+
+03:40 as well for music videos.
+03:45 
+
+03:45 Following right along, we come to our
+03:46 
+
+03:46 prompting area, which I use [music] a
+03:49 
+
+03:49 node called prompt IDE, which makes
+03:52 
+
+03:52 prompting feel a little bit more like
+03:53 
+
+03:53 coding with these symbols here, where
+03:55 
+
+03:55 you can easily uh autocomplete various
+03:58 
+
+03:58 different symbols that you type
+03:59 
+
+03:59 regularly, even things like dialogue,
+04:02 
+
+04:02 right? And common tags. So, this is very
+04:05 
+
+04:05 useful. It's also useful because it
+04:07 
+
+04:07 comes with templates. So, for instance,
+04:09 
+
+04:09 if you're starting with blank, you can
+04:11 
+
+04:11 click sections and then just click the
+04:12 
+
+04:12 button add missing and you're going to
+04:14 
+
+04:14 get a template for your basic prompting
+04:16 
+
+04:16 structure for a refu.
+04:20 
+
+04:20 Okay, so this workflow has three main
+04:22 
+
+04:22 modes. Seed hunter, single [music] pass,
+04:25 
+
+04:25 and video continuation. Let's start with
+04:28 
+
+04:28 the first and default mode, seed
+04:30 
+
+04:30 hunting. So, the idea is that we
+04:33 
+
+04:33 generate up to three lowresolution
+04:36 
+
+04:36 sample previews quickly and then choose
+04:38 
+
+04:38 the one we like the most to upscale in
+04:40 
+
+04:40 the second final pass. You don't have to
+04:43 
+
+04:43 use all three previews and you [music]
+04:44 
+
+04:44 can toggle them off quite easily up
+04:47 
+
+04:47 here. We could have just one um and then
+04:50 
+
+04:50 we could also have all three. For the
+04:52 
+
+04:52 sake of this example, let's go ahead and
+04:54 
+
+04:54 just generate two. We've already written
+04:56 
+
+04:56 a prompt. We've already loaded our
+04:58 
+
+04:58 resources and we've set our options. So,
+05:01 
+
+05:01 we're going to go ahead and click the
+05:03 
+
+05:03 manual random seed button up here to
+05:06 
+
+05:06 start our first [music] pass. Now,
+05:08 
+
+05:08 you're going to notice that it's going
+05:09 
+
+05:09 to generate in a random order. So, in
+05:11 
+
+05:11 this case, it's generating preview 2
+05:13 
+
+05:13 before preview 1. That's [music] just
+05:15 
+
+05:15 how Comfy UI is programmed. It chooses a
+05:17 
+
+05:17 random order at the beginning each time
+05:19 
+
+05:19 you start Comfy UI up from scratch. So,
+05:21 
+
+05:21 sometimes you'll get the 1 2 3, but in
+05:23 
+
+05:23 this case, we're getting 2 31 or
+05:25 
+
+05:25 something like that. But obviously our
+05:27 
+
+05:27 third preview isn't going to generate
+05:29 
+
+05:29 because we have that disabled. So we're
+05:30 
+
+05:30 only seed hunting with two preview
+05:32 
+
+05:32 options. I'm going to go ahead and wait
+05:34 
+
+05:34 to let this finish and then we'll
+05:35 
+
+05:35 continue to upscale on the one that
+05:37 
+
+05:37 comes out looking the best.
+05:39 
+
+05:39 So our stage one previews have finished.
+05:42 
+
+05:42 And I decide that I like the look of
+05:44 
+
+05:44 preview number two better. So I go ahead
+05:47 
+
+05:47 and make sure number two and only two is
+05:50 
+
+05:50 selected up here. and I move over to the
+05:53 
+
+05:53 right of the workflow and enable our
+05:55 
+
+05:55 final upscale pass or stage two by
+05:57 
+
+05:57 toggling it on. As you can see, the
+05:60 
+
+05:60 options appear over here, letting us
+06:02 
+
+06:02 know that upscale pass is enabled. And
+06:04 
+
+06:04 we're going to go ahead and take a look
+06:06 
+
+06:06 at our upscale settings. Make sure that
+06:08 
+
+06:08 they make sense. So, our first pass was
+06:11 
+
+06:11 generated at 0.4 megapixels, right? So,
+06:14 
+
+06:14 we look over here, first pass, 0.4
+06:16 
+
+06:16 megapixels. Okay. So, if I go over here
+06:18 
+
+06:18 and I take a look, we are currently set
+06:20 
+
+06:20 to upscale to 1.2 megapixels, a three
+06:24 
+
+06:24 times increase. Now, I think that's
+06:27 
+
+06:27 fine. And we also want to just make sure
+06:29 
+
+06:29 that we are selecting the right amount
+06:31 
+
+06:31 of steps and the right options for
+06:33 
+
+06:33 upscaling. So, right now, we have block
+06:35 
+
+06:35 attention for upscale pass only set to
+06:38 
+
+06:38 SLA, which is good for using turboloras.
+06:41 
+
+06:41 Uh, we're not using any special
+06:42 
+
+06:42 turbolura just for the upscale pass or
+06:45 
+
+06:45 anything like that. that's already being
+06:47 
+
+06:47 covered from the first pass's Laura
+06:50 
+
+06:50 model loader and we're also using RI
+06:52 
+
+06:52 frame interpolation to increase this to
+06:54 
+
+06:54 48 frames per second at the end. So
+06:56 
+
+06:56 those are the settings that we currently
+06:57 
+
+06:57 have enabled for our upscale
+06:60 
+
+06:60 finalization.
+07:01 
+
+07:01 Once everything looks good, I'm going to
+07:03 
+
+07:03 go ahead and click the manual random
+07:04 
+
+07:04 seed button here. Now what you're going
+07:06 
+
+07:06 to see happen is that it's not going to
+07:10 
+
+07:10 regenerate anything from over here. It's
+07:12 
+
+07:12 simply going to pull the finalized
+07:14 
+
+07:14 latent from the first pass and bring
+07:16 
+
+07:16 them over to the upscale pass. Now, if
+07:19 
+
+07:19 you do suddenly start seeing stage one
+07:22 
+
+07:22 regenerating, that usually means that
+07:24 
+
+07:24 you accidentally or didn't realize you
+07:27 
+
+07:27 change something over in the initial
+07:29 
+
+07:29 area here, like changing a reference, uh
+07:33 
+
+07:33 changing an option over here, such as
+07:35 
+
+07:35 the amount of steps or megapixels or
+07:37 
+
+07:37 video length, or even just deleting one
+07:40 
+
+07:40 space from the prompt. Anything you
+07:43 
+
+07:43 change over here that tells Comfy UI
+07:46 
+
+07:46 that something needs to be regenerated
+07:49 
+
+07:49 from scratch is going to make stage one
+07:52 
+
+07:52 go all over again before it gets to the
+07:54 
+
+07:54 upscale pass. Now, the one exception to
+07:56 
+
+07:56 that is if you're starting Comfy UI with
+07:59 
+
+07:59 the no cache option startup flag. If
+08:02 
+
+08:02 you're using that, you will not be able
+08:04 
+
+08:04 to effectively use this workflow. So, I
+08:06 
+
+08:06 would remove it from your startup
+08:07 
+
+08:07 options. But again, if you don't change
+08:10 
+
+08:10 anything that would affect stage one,
+08:11 
+
+08:11 what happens when you click the manual
+08:13 
+
+08:13 random seed button is that the stored
+08:15 
+
+08:15 latent will pass right on over to the
+08:17 
+
+08:17 second finalization stage. And as you
+08:19 
+
+08:19 can see, our upscale is going smoothly.
+08:23 
+
+08:23 Okay, it looks like our upscale final
+08:25 
+
+08:25 output has finished. And here it is.
+08:29 
+
+08:29 >> Thanks for taking me out here. It's
+08:31 
+
+08:31 beautiful.
+08:33 
+
+08:33 >> Looks and sounds good and took about 2
+08:35 
+
+08:35 minutes to finalize.
+08:37 
+
+08:37 Okay, next we're going to want to take a
+08:38 
+
+08:38 look at the single pass option. Now, why
+08:42 
+
+08:42 would anyone in their right minds want
+08:43 
+
+08:43 to skip upscaling [music] and use single
+08:46 
+
+08:46 pass instead, which you know is going to
+08:48 
+
+08:48 be slower because you're just doing it
+08:49 
+
+08:49 all in one at a high megapixel value?
+08:52 
+
+08:52 Well, the answer simply is that's how
+08:54 
+
+08:54 you get the best possible quality.
+08:56 
+
+08:56 Latent upscaling is very useful because
+08:58 
+
+08:58 you can take these lowresolution gens
+09:00 
+
+09:00 and generate a lot of them until you get
+09:02 
+
+09:02 your prompt exactly the way you want it
+09:04 
+
+09:04 and then upscale it to a finalization,
+09:05 
+
+09:05 but it's it's not a free lunch exactly.
+09:07 
+
+09:07 There are some quality issues that you
+09:09 
+
+09:09 have to deal with. So, we're going to
+09:11 
+
+09:11 try single pass to get a high quality
+09:13 
+
+09:13 production version of this prompt out.
+09:16 
+
+09:16 So, I'm going to go ahead and disable
+09:18 
+
+09:18 our upscale pass. I'm going to go ahead
+09:20 
+
+09:20 and disable preview number two because
+09:22 
+
+09:22 with single pass when we turn that
+09:24 
+
+09:24 option on as you can see we are turning
+09:28 
+
+09:28 this into a single one pass workflow.
+09:30 
+
+09:30 Turn off previews number two three and
+09:32 
+
+09:32 upscale pass at 1.0 to 2 megapixels 6
+09:36 
+
+09:36 through 10 steps with the turbolura. So
+09:38 
+
+09:38 we already have our turbolura turned on.
+09:40 
+
+09:40 Next we need to go ahead and change our
+09:42 
+
+09:42 step count and first pass megapixels.
+09:44 
+
+09:44 Well I like six as our step count. So
+09:46 
+
+09:46 I'm going to go ahead and keep that. But
+09:47 
+
+09:47 I'm going to set this to 1.5. And we're
+09:50 
+
+09:50 just going to get a really nice high
+09:51 
+
+09:51 quality video straight out of the gate.
+09:53 
+
+09:53 We've already set everything over here.
+09:55 
+
+09:55 It's pretty much all happening from our
+09:58 
+
+09:58 first preview here. So, I'm going to go
+10:00 
+
+10:00 ahead and run and we'll hit that manual
+10:03 
+
+10:03 random seed button to generate a new
+10:05 
+
+10:05 seed. And we'll see what comes out the
+10:07 
+
+10:07 other end. If it looks better than what
+10:08 
+
+10:08 we got before. Okay, our single [music]
+10:10 
+
+10:10 pass result has popped out. And what I'm
+10:13 
+
+10:13 immediately noticing since there was no
+10:15 
+
+10:15 upscaling or blurring of lines or
+10:18 
+
+10:18 anything like that, it's just straight
+10:20 
+
+10:20 through in one shot with the model at
+10:22 
+
+10:22 1.5 megapixels, which is well over 720p.
+10:26 
+
+10:26 Is the line art is much cleaner. The
+10:29 
+
+10:29 lighting is more distinct.
+10:32 
+
+10:32 >> Thanks for taking me out here. It's
+10:34 
+
+10:34 beautiful.
+10:35 
+
+10:35 >> And the voice is cleaner. So for people
+10:38 
+
+10:38 who are going for production quality
+10:41 
+
+10:41 output, single pass tends to be the best
+10:44 
+
+10:44 way to achieve it and it's not even
+10:46 
+
+10:46 slower than using the seed hunting
+10:49 
+
+10:49 method because you're kind of skipping
+10:51 
+
+10:51 the line a little bit by going straight
+10:53 
+
+10:53 to the finalized output instead of
+10:55 
+
+10:55 spending your time hunting for seeds. Of
+10:57 
+
+10:57 course, now the seed hunting aspect of
+10:60 
+
+10:60 things is very useful if you're trying
+11:01 
+
+11:01 to work out your prompt [music] and
+11:04 
+
+11:04 being able to upscale a result to any
+11:06 
+
+11:06 size and figure out what looks best,
+11:09 
+
+11:09 that all has value. But if you know what
+11:11 
+
+11:11 you're doing and your prompt is already
+11:14 
+
+11:14 pretty locked in and you're certain
+11:15 
+
+11:15 [music] that you'll be able to get it,
+11:17 
+
+11:17 this single pass method is the best
+11:20 
+
+11:20 possible output you're going to get from
+11:22 
+
+11:22 H3, bar none.
+11:25 
+
+11:25 Okay, the last mode that I want to go
+11:27 
+
+11:27 over is certainly one of the most
+11:29 
+
+11:29 interesting ones, and that's video
+11:30 
+
+11:30 continuation. So, we're seamlessly going
+11:33 
+
+11:33 to extend an existing video. I've gone
+11:36 
+
+11:36 ahead and loaded a video into our first
+11:39 
+
+11:39 slot here, which is how to begin. And
+11:42 
+
+11:42 it's just a simple little clip of Ferin
+11:45 
+
+11:45 in a body of water chilling out. And I'm
+11:48 
+
+11:48 going to use the trim selectors here to
+11:52 
+
+11:52 trim the video to not have that closeup.
+11:57 
+
+11:57 And we need need to go a little bit
+11:58 
+
+11:58 further here.
+12:02 
+
+12:02 The next thing that I'm going to go
+12:03 
+
+12:03 ahead and do
+12:05 
+
+12:05 is crop the video cuz I want to create
+12:08 
+
+12:08 this as a vertical
+12:13 
+
+12:13 shot.
+12:15 
+
+12:15 Uh maybe we'll go with something like um
+12:18 
+
+12:18 3/4s. Just a little thicker there. Give
+12:21 
+
+12:21 a little bit more width. And so that way
+12:23 
+
+12:23 our video is guaranteed to fit the
+12:26 
+
+12:26 aspect ratio that I'm going to go ahead
+12:27 
+
+12:27 and set [music] next. So I'm going to
+12:28 
+
+12:28 hit apply on this. And our video is
+12:31 
+
+12:31 loaded. It has audio even though I'm
+12:33 
+
+12:33 pretty sure it's mostly just silence um
+12:35 
+
+12:35 in that part of the show. And so we
+12:36 
+
+12:36 already have our aspect ratio set to
+12:38 
+
+12:38 portrait standard. Um, so the cropping
+12:41 
+
+12:41 over here in our video and the aspect
+12:42 
+
+12:42 ratio set here means that's going to
+12:44 
+
+12:44 look nice and good. We'll set this to 6
+12:46 
+
+12:46 seconds. And [music] since our video
+12:49 
+
+12:49 continuation is going to be under the
+12:51 
+
+12:51 single pass option, there is no
+12:53 
+
+12:53 upscaling um [music] possible with a
+12:56 
+
+12:56 video continuation. We go ahead and have
+12:58 
+
+12:58 that turned on. And then I'm also going
+13:00 
+
+13:00 to turn on our seamless continuation.
+13:02 
+
+13:02 And you'll note that it says requires
+13:04 
+
+13:04 single pass on. So that way you can
+13:06 
+
+13:06 always be reminded there. [music]
+13:07 
+
+13:07 Since this is anime, I'm going to go
+13:09 
+
+13:09 ahead and turn off right frame
+13:10 
+
+13:10 interpolation. Um, and block attention
+13:12 
+
+13:12 for upscale only. That's not going to do
+13:13 
+
+13:13 anything because we're not getting to
+13:14 
+
+13:14 the upscale step. You can just leave it
+13:16 
+
+13:16 on, but for the sake of the tutorial,
+13:17 
+
+13:17 I'll just turn [music] it off. And so,
+13:19 
+
+13:19 these are really the options that we're
+13:20 
+
+13:20 actually using here. Um, so we'll go
+13:24 
+
+13:24 ahead and run this at 1.0 megapixels uh
+13:27 
+
+13:27 just for a little bit extra speed here.
+13:28 
+
+13:28 Six steps is fine. We have our turbo
+13:31 
+
+13:31 lura turned on. Now, we also need to
+13:35 
+
+13:35 make sure that our settings in the
+13:37 
+
+13:37 seamless continuation um are correct.
+13:39 
+
+13:39 So, we have this thing called overlap
+13:41 
+
+13:41 frames. And what that actually is is
+13:43 
+
+13:43 it's taking the frames to the left of
+13:46 
+
+13:46 our rightmost selector. Um in this case,
+13:49 
+
+13:49 I have it set to 22. So, it' be taking
+13:51 
+
+13:51 22 frames here. And that's what the
+13:54 
+
+13:54 model is going to be looking at for
+13:55 
+
+13:55 figuring out how to continue the gen
+13:57 
+
+13:57 past that [music] point. So this is the
+13:59 
+
+13:59 end point where our gen is going to
+14:01 
+
+14:01 begin from and it's going to look at the
+14:03 
+
+14:03 last 22 frames over here to figure out
+14:06 
+
+14:06 the motion that's currently happening in
+14:08 
+
+14:08 the video. It'll listen to voices in
+14:10 
+
+14:10 that time period as well. Um it's it's
+14:13 
+
+14:13 kind of the frames that are pinned to
+14:15 
+
+14:15 the model and it's going to learn off of
+14:17 
+
+14:17 [music] those. So let us go over here
+14:19 
+
+14:19 and take a look at this just a little
+14:21 
+
+14:21 bit more depth. Notice [music] I give
+14:22 
+
+14:22 some examples here. They all follow this
+14:25 
+
+14:25 algorithm of 17 n + 5. So 17 * 0 + 5 is
+14:31 
+
+14:31 5, right? So that's the smallest amount
+14:33 
+
+14:33 that you can do. 22 is the next 39 to
+14:36 
+
+14:36 56. Now keep in mind 22 frames is close
+14:40 
+
+14:40 to a full second in this [music] model.
+14:42 
+
+14:42 So you're going maximum 56 frames. It's
+14:44 
+
+14:44 over 2 seconds of time uh that the model
+14:47 
+
+14:47 is being, [music] you know, uh used to
+14:49 
+
+14:49 look at these frames. Now that's a lot
+14:50 
+
+14:50 of frames as well. So it's going to slow
+14:52 
+
+14:52 down the gen. So five is your fastest.
+14:55 
+
+14:55 22 is a good healthy medium, especially
+14:57 
+
+14:57 if you're cloning a voice that happens
+14:58 
+
+14:58 to be in the in the audio file as well.
+15:00 
+
+15:00 Um, and uh, we're going to stick with 22
+15:03 
+
+15:03 on this one. So everything else is
+15:04 
+
+15:04 pretty much autopilot. This is going to
+15:06 
+
+15:06 generate a little preview of the overlap
+15:09 
+
+15:09 frame so you can see exactly where your
+15:10 
+
+15:10 gen is going to start. And then lastly,
+15:12 
+
+15:12 if your gen happens to not have any
+15:14 
+
+15:14 audio in it at all, and you can actually
+15:16 
+
+15:16 see that it won't have audio listed
+15:18 
+
+15:18 here. It'll just be like a little purple
+15:20 
+
+15:20 hyphen showing you that nothing's there.
+15:22 
+
+15:22 Um, you'll want to just turn this on
+15:23 
+
+15:23 because what that's going to do is
+15:25 
+
+15:25 prepend the video with silent audio so
+15:26 
+
+15:26 that when it finally stitches everything
+15:28 
+
+15:28 together at the end, um, when it's all
+15:30 
+
+15:30 stitched together in the end, it's going
+15:32 
+
+15:32 to be in sync. So, in this case, this
+15:35 
+
+15:35 video technically has audio, so all the
+15:37 
+
+15:37 timing is going to work out. You just
+15:38 
+
+15:38 leave that off. You don't have to think
+15:40 
+
+15:40 about anything else. Now, the last thing
+15:41 
+
+15:41 that we have to consider here is our
+15:43 
+
+15:43 prompt, right? Um, for simple seamless
+15:46 
+
+15:46 continuations, you don't really need a
+15:48 
+
+15:48 complicated prompt. So, this is the one
+15:50 
+
+15:50 from our last example. I'm just going to
+15:51 
+
+15:51 go ahead and delete this. And just to
+15:53 
+
+15:53 show this off, I'm going to simply write
+15:56 
+
+15:56 the world's most simple prompt here. I'm
+15:58 
+
+15:58 going to always start off with
+16:03 
+
+16:03 I'm going to always start off with a
+16:06 
+
+16:06 continuous
+16:08 
+
+16:08 shot from beginning to end. Now, because
+16:12 
+
+16:12 we have 22 frames that are just forced
+16:15 
+
+16:15 into [music] the latent of the video,
+16:17 
+
+16:17 that's time that the model is trying to
+16:20 
+
+16:20 think about those frames, but it's also
+16:21 
+
+16:21 unaccounted for in terms of our prompt
+16:23 
+
+16:23 so far. So, I'm also going to say what's
+16:25 
+
+16:25 happening for those 22 frames to start
+16:27 
+
+16:27 off with. So, I'll say a top-down shot
+16:31 
+
+16:31 of a woman with silver hair
+16:35 
+
+16:35 laying
+16:36 
+
+16:36 in a body of water. Um, as the water
+16:41 
+
+16:41 flows by,
+16:44 
+
+16:44 she is looking
+16:46 
+
+16:46 up at the sky. Now, that covers the 22
+16:50 
+
+16:50 frames, the model will look at that and
+16:52 
+
+16:52 be like, "Oh, okay. I understand what's
+16:53 
+
+16:53 going on now." Now, we decide what
+16:55 
+
+16:55 actually happens with the gen. So, I
+16:57 
+
+16:57 think just off the top of my head, um, I
+16:58 
+
+16:58 will say, um, suddenly from the top of
+17:00 
+
+17:00 the frame, a school of of fish swims
+17:03 
+
+17:03 past her, weaving around her body, left
+17:05 
+
+17:05 and right, on either side. Um, the fish
+17:07 
+
+17:07 are multicolored and beautiful and very
+17:09 
+
+17:09 insized. I'm just being real off the
+17:10 
+
+17:10 cuff with this. Um, the silver-haired
+17:11 
+
+17:11 woman looks around to either side
+17:13 
+
+17:13 watching the fish go by with a serene
+17:15 
+
+17:15 smile and we'll see how that works.
+17:19 
+
+17:19 Okay, so as you can see, we have a
+17:21 
+
+17:21 preview of the overlap frames from our
+17:23 
+
+17:23 original video and we went ahead and ran
+17:26 
+
+17:26 the six steps of this first pass. So,
+17:28 
+
+17:28 it's going to go ahead and decode now.
+17:30 
+
+17:30 And what we're going to see is [music]
+17:32 
+
+17:32 the output being the overlap frames plus
+17:36 
+
+17:36 the new gen. Uh and then what happens
+17:38 
+
+17:38 over here is what we'll see is the
+17:41 
+
+17:41 entire video that we had selected from
+17:44 
+
+17:44 our resource loader stitched onto the
+17:46 
+
+17:46 new gen seamlessly. So you kind of get
+17:49 
+
+17:49 both versions here. So this is again
+17:51 
+
+17:51 going to come out as overlap frames plus
+17:53 
+
+17:53 the new gen.
+18:02 
+
+18:02 Okay, nice. Interesting interpretation
+18:04 
+
+18:04 of a fish swimming by. Um, but cool
+18:08 
+
+18:08 nonetheless as an example. And as you
+18:10 
+
+18:10 can see up in the top left corner, I
+18:12 
+
+18:12 don't know if it's cut off completely in
+18:13 
+
+18:13 [music] the video, but it says final
+18:15 
+
+18:15 decode. And so what's happening is it's
+18:16 
+
+18:16 running through whatever of your final
+18:18 
+
+18:18 options you need to do and stitching the
+18:20 
+
+18:20 OG video with the gen. Um, we're not
+18:23 
+
+18:23 frame interpreting or anything like
+18:24 
+
+18:24 that, so it's fairly quick and we get
+18:26 
+
+18:26 the entire video from beginning to end.
+18:37 
+
+18:37 A nice little seamless video.

@@ -1,0 +1,39 @@
+{
+  "_class_name": "WanImageToVideoPipeline",
+  "_diffusers_version": "0.36.0",
+  "_name_or_path": "/work_space/models/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers",
+  "boundary_ratio": 0.9,
+  "expand_timesteps": false,
+  "image_encoder": [
+    null,
+    null
+  ],
+  "image_processor": [
+    null,
+    null
+  ],
+  "scheduler": [
+    "diffusers",
+    "UniPCMultistepScheduler"
+  ],
+  "text_encoder": [
+    "transformers",
+    "UMT5EncoderModel"
+  ],
+  "tokenizer": [
+    "transformers",
+    "T5TokenizerFast"
+  ],
+  "transformer": [
+    "diffusers",
+    "WanTransformer3DModel"
+  ],
+  "transformer_2": [
+    "diffusers",
+    "WanTransformer3DModel"
+  ],
+  "vae": [
+    "diffusers",
+    "AutoencoderKLWan"
+  ]
+}

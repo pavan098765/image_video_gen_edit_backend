@@ -1,0 +1,13 @@
+{
+  "exact": {
+    "NovaSR": "https://github.com/your-org/ComfyUI-NovaSR.git",
+    "DF_Int_to_Float": "https://github.com/your-org/your-nodes.git",
+    "JWFloatToInteger": "https://github.com/your-org/your-nodes.git"
+  },
+  "substring_rules": [
+    {
+      "contains": "MyPackMarker",
+      "git_url": "https://github.com/your-org/ComfyUI-MyPack.git"
+    }
+  ]
+}

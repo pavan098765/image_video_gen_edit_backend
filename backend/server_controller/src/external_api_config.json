@@ -1,0 +1,328 @@
+{
+  "defaults": {
+    "timeout_ms": 120000,
+    "poll_interval_ms": 1500,
+    "max_retries": 2
+  },
+  "models": {
+    "basic_utils": {
+      "route_policy": "dual",
+      "default_use_external": false,
+      "provider": {
+        "type": "fal",
+        "model_id": "fal-ai/birefnet",
+        "api_key_env": "FAL_KEY"
+      },
+      "required_params": [
+        "image_url"
+      ],
+      "param_map": {
+        "image_url": {
+          "source": "params.init_image",
+          "transform": "media_input"
+        },
+        "model": {
+          "value": "General Use (Light)"
+        },
+        "refine_foreground": {
+          "value": true
+        },
+        "output_format": {
+          "value": "png"
+        }
+      },
+      "upscale_map": {
+        "when_true": {
+          "set": {
+            "operating_resolution": "2048x2048"
+          }
+        },
+        "when_false": {
+          "set": {
+            "operating_resolution": "1024x1024"
+          }
+        }
+      },
+      "response_map": {
+        "result_url_path": "image.url",
+        "error_path": "error.message"
+      }
+    },
+    "diffusers_outpaint": {
+      "route_policy": "dual",
+      "default_use_external": true,
+      "provider": {
+        "type": "fal",
+        "model_id": "fal-ai/luma-photon/flash/reframe",
+        "api_key_env": "FAL_KEY"
+      },
+      "required_params": [
+        "image_url",
+        "aspect_ratio"
+      ],
+      "param_map": {
+        "image_url": {
+          "source": "params.init_image",
+          "transform": "media_input"
+        },
+        "aspect_ratio": {
+          "source": "params.aspect_ratio",
+          "transform": "default:1:1"
+        },
+        "prompt": {
+          "source": "prompt",
+          "transform": "string_trim"
+        }
+      },
+      "response_map": {
+        "result_url_path": "images[0].url",
+        "error_path": "error.message"
+      }
+    },
+    "aurasrv2": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "fal",
+        "model_id": "fal-ai/recraft/upscale/crisp",
+        "api_key_env": "FAL_KEY"
+      },
+      "required_params": [
+        "image_url"
+      ],
+      "param_map": {
+        "image_url": {
+          "source": "params.init_image",
+          "transform": "media_input"
+        },
+        "enable_safety_checker": {
+          "value": true
+        }
+      },
+      "response_map": {
+        "result_url_path": "image.url",
+        "error_path": "error.message"
+      }
+    },
+    "realesrgan": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "fal",
+        "model_id": "fal-ai/recraft/upscale/crisp",
+        "api_key_env": "FAL_KEY"
+      },
+      "required_params": [
+        "image_url"
+      ],
+      "param_map": {
+        "image_url": {
+          "source": "params.init_image",
+          "transform": "media_input"
+        },
+        "enable_safety_checker": {
+          "value": true
+        }
+      },
+      "response_map": {
+        "result_url_path": "image.url",
+        "error_path": "error.message"
+      }
+    },
+    "realesrgan_anime": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "fal",
+        "model_id": "fal-ai/recraft/upscale/crisp",
+        "api_key_env": "FAL_KEY"
+      },
+      "required_params": [
+        "image_url"
+      ],
+      "param_map": {
+        "image_url": {
+          "source": "params.init_image",
+          "transform": "media_input"
+        },
+        "enable_safety_checker": {
+          "value": true
+        }
+      },
+      "response_map": {
+        "result_url_path": "image.url",
+        "error_path": "error.message"
+      }
+    },
+    "face_enhancer": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "replicate",
+        "version": "juergengunz/real-esrgan-v2:e4265d21c4770b339080060fab33e452d77b8ef3ee9781fec9cae81d1973a2cf",
+        "api_key_env": "REPLICATE_API_TOKEN"
+      },
+      "required_params": [
+        "image"
+      ],
+      "param_map": {
+        "image": {
+          "source": "params.init_image",
+          "transform": "media_input"
+        },
+        "scale": {
+          "source": "params.scale_factor",
+          "transform": "default:2|int_clamp:1:4"
+        }
+      },
+      "response_map": {
+        "result_url_path": "output",
+        "error_path": "error"
+      }
+    },
+    "z_image_turbo": {
+      "route_policy": "dual",
+      "default_use_external": true,
+      "provider": {
+        "type": "replicate",
+        "model": "prunaai/z-image-turbo",
+        "api_key_env": "REPLICATE_API_TOKEN"
+      },
+      "required_params": [
+        "prompt"
+      ],
+      "param_map": {
+        "prompt": {
+          "source": "prompt",
+          "transform": "string_trim"
+        },
+        "height": {
+          "source": "params.height",
+          "transform": "default:768|int_clamp:256:2048"
+        },
+        "width": {
+          "source": "params.width",
+          "transform": "int_clamp:256:2048"
+        }
+      },
+      "upscale_map": {
+        "when_true": {
+          "set": {
+            "target_resolution": 2
+          }
+        },
+        "when_false": {
+          "set": {
+            "target_resolution": 1
+          }
+        }
+      },
+      "response_map": {
+        "result_url_path": "output",
+        "error_path": "error"
+      }
+    },
+    "qwen2_1_t2i": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "kie",
+        "model_id": "qwen2-1/text-to-image",
+        "api_key_env": "KIE_API_KEY"
+      },
+      "required_params": ["prompt"],
+      "has_resolution": true,
+      "force_resolution_1k": true,
+      "param_map": {
+        "prompt": { "source": "prompt", "transform": "string_trim" },
+        "aspect_ratio": { "source": "params.aspect_ratio", "transform": "default:1:1" },
+        "resolution": { "value": "1K" },
+        "output_format": { "value": "png" }
+      }
+    },
+    "grok_imagine_t2i": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "kie",
+        "model_id": "grok-imagine-image-2-0/text-to-image",
+        "api_key_env": "KIE_API_KEY"
+      },
+      "required_params": ["prompt"],
+      "has_resolution": false,
+      "param_map": {
+        "prompt": { "source": "prompt", "transform": "string_trim" },
+        "aspect_ratio": { "source": "params.aspect_ratio", "transform": "default:1:1" }
+      }
+    },
+    "qwen2_1_i2i": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "kie",
+        "model_id": "qwen2-1/image-to-image",
+        "api_key_env": "KIE_API_KEY"
+      },
+      "required_params": ["prompt", "image_urls"],
+      "has_resolution": true,
+      "force_resolution_1k": true,
+      "kie_upload_fields": ["image_urls"],
+      "param_map": {
+        "prompt": { "source": "prompt", "transform": "string_trim" },
+        "image_urls": { "source": "params.init_image", "transform": "as_list" },
+        "aspect_ratio": { "source": "params.aspect_ratio", "transform": "default:1:1" },
+        "resolution": { "value": "1K" }
+      }
+    },
+    "grok_imagine_edit": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "kie",
+        "model_id": "grok-imagine-image-2-0/image-edit",
+        "api_key_env": "KIE_API_KEY"
+      },
+      "required_params": ["prompt", "image_urls"],
+      "has_resolution": false,
+      "kie_upload_fields": ["image_urls"],
+      "param_map": {
+        "prompt": { "source": "prompt", "transform": "string_trim" },
+        "image_urls": { "source": "params.init_image", "transform": "as_list" },
+        "aspect_ratio": { "source": "params.aspect_ratio", "transform": "default:1:1" }
+      }
+    },
+    "recraft_crisp_upscale": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "kie",
+        "model_id": "recraft/crisp-upscale",
+        "api_key_env": "KIE_API_KEY"
+      },
+      "required_params": ["image"],
+      "has_resolution": false,
+      "kie_upload_fields": ["image"],
+      "param_map": {
+        "image": { "source": "params.init_image" }
+      }
+    },
+    "recraft_remove_background": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "kie",
+        "model_id": "recraft/remove-background",
+        "api_key_env": "KIE_API_KEY"
+      },
+      "required_params": ["image"],
+      "has_resolution": false,
+      "recraft_limits": true,
+      "kie_upload_fields": ["image"],
+      "param_map": {
+        "image": { "source": "params.init_image" }
+      }
+    },
+    "gemini_ocr": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "gemini",
+        "model_id": "gemini-3.5-flash-lite",
+        "api_key_env": "GEMINI_API_KEY"
+      },
+      "required_params": ["image"],
+      "param_map": {
+        "image": { "source": "params.init_image" }
+      }
+    }
+  }
+}

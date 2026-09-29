@@ -1,0 +1,29 @@
+{
+  "path_aliases": {},
+  "files": {
+    "diffusion_models/Wan/Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors": {
+      "hf_repo": "Kijai/WanVideo_comfy",
+      "hf_path": "Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors"
+    },
+    "text_encoders/umt5-xxl-enc-fp8_e4m3fn.safetensors": {
+      "hf_repo": "Kijai/WanVideo_comfy",
+      "hf_path": "umt5-xxl-enc-fp8_e4m3fn.safetensors"
+    },
+    "clip_vision/clip_vision_h.safetensors": {
+      "hf_repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+      "hf_path": "split_files/clip_vision/clip_vision_h.safetensors"
+    },
+    "vae/Wan2_1_VAE_bf16.safetensors": {
+      "hf_repo": "Kijai/WanVideo_comfy",
+      "hf_path": "Wan2_1_VAE_bf16.safetensors"
+    },
+    "loras/WAN/CausVid/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors": {
+      "hf_repo": "Kijai/WanVideo_comfy",
+      "hf_path": "Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors"
+    },
+    "loras/WAN/Stable Video Infinity/svi-film-opt-10212025_lora_rank_128_fp16.safetensors": {
+      "hf_repo": "Kijai/WanVideo_comfy",
+      "hf_path": "LoRAs/Stable-Video-Infinity/svi-film-opt-10212025_lora_rank_128_fp16.safetensors"
+    }
+  }
+}

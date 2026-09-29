@@ -33,7 +33,12 @@
                 "4080",
                 "4070"
             ]
-        }
+        },
+        "group_id": "deprecated_unused",
+        "supported_models": [
+            "qwen_image_edit"
+        ],
+        "eta_seconds_default": 85
     },
     "z_image_turbo": {
         "preferred_variant": "fp4",
@@ -69,43 +74,22 @@
                 "4080",
                 "4070"
             ]
-        }
-    },
-    "flux_kontext_dev": {
-        "preferred_variant": "fp4",
-        "fallback_variants": [
-            "int4"
+        },
+        "group_id": "image_aio_4x_utils",
+        "supported_models": [
+            "qwen_image_edit_2511_rapid_aio",
+            "z_image_turbo",
+            "flux_klein",
+            "sdxl_t2i",
+            "diffusers_outpaint",
+            "basic_utils",
+            "aurasrv2",
+            "video_upscaler",
+            "swin2sr",
+            "face_enhancer",
+            "glm_ocr"
         ],
-        "min_tflops": {
-            "default": 100,
-            "4080": 45,
-            "4090": 80,
-            "5090": 100,
-            "4070": 35
-        },
-        "allowed_gpu_names": [
-            "5090",
-            "4090"
-        ],
-        "min_gpu_count": 1,
-        "variant_template_key": {
-            "fp4": "flux_kontext_dev",
-            "int4": "flux_kontext_dev_int4"
-        },
-        "variant_disk_size": {
-            "fp4": 45,
-            "int4": 45
-        },
-        "variant_allowed_gpus": {
-            "fp4": [
-                "5090"
-            ],
-            "int4": [
-                "4090",
-                "4080",
-                "4070"
-            ]
-        }
+        "eta_seconds_default": 55
     },
     "flux_klein": {
         "preferred_variant": null,
@@ -120,7 +104,22 @@
             "5090"
         ],
         "min_gpu_count": 1,
-        "comment": "Flux Klein 9B: Lightning model"
+        "comment": "Flux Klein 9B: Lightning model",
+        "group_id": "image_aio_4x_utils",
+        "supported_models": [
+            "qwen_image_edit_2511_rapid_aio",
+            "z_image_turbo",
+            "flux_klein",
+            "sdxl_t2i",
+            "diffusers_outpaint",
+            "basic_utils",
+            "aurasrv2",
+            "video_upscaler",
+            "swin2sr",
+            "face_enhancer",
+            "glm_ocr"
+        ],
+        "eta_seconds_default": 65
     },
     "qwen_image": {
         "preferred_variant": "fp4",
@@ -156,7 +155,12 @@
                 "4080",
                 "4070"
             ]
-        }
+        },
+        "group_id": "deprecated_unused",
+        "supported_models": [
+            "qwen_image"
+        ],
+        "eta_seconds_default": 75
     },
     "qwen_image_edit_2509": {
         "preferred_variant": "fp4",
@@ -192,7 +196,12 @@
                 "4080",
                 "4070"
             ]
-        }
+        },
+        "group_id": "deprecated_unused",
+        "supported_models": [
+            "qwen_image_edit_2509"
+        ],
+        "eta_seconds_default": 85
     },
     "sdxl_t2i": {
         "preferred_variant": null,
@@ -210,7 +219,22 @@
             "4090",
             "5090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "image_aio_4x_utils",
+        "supported_models": [
+            "qwen_image_edit_2511_rapid_aio",
+            "z_image_turbo",
+            "flux_klein",
+            "sdxl_t2i",
+            "diffusers_outpaint",
+            "basic_utils",
+            "aurasrv2",
+            "video_upscaler",
+            "swin2sr",
+            "face_enhancer",
+            "glm_ocr"
+        ],
+        "eta_seconds_default": 70
     },
     "sdxl_i2i": {
         "preferred_variant": null,
@@ -228,7 +252,12 @@
             "4090",
             "5090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "deprecated_unused",
+        "supported_models": [
+            "sdxl_i2i"
+        ],
+        "eta_seconds_default": 70
     },
     "sdxl_inpaint": {
         "preferred_variant": null,
@@ -246,7 +275,12 @@
             "4090",
             "5090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "deprecated_unused",
+        "supported_models": [
+            "sdxl_inpaint"
+        ],
+        "eta_seconds_default": 80
     },
     "basic_utils": {
         "preferred_variant": null,
@@ -265,7 +299,22 @@
             "5060",
             "3090",
             "4090"
-        ]
+        ],
+        "group_id": "image_aio_4x_utils",
+        "supported_models": [
+            "qwen_image_edit_2511_rapid_aio",
+            "z_image_turbo",
+            "flux_klein",
+            "sdxl_t2i",
+            "diffusers_outpaint",
+            "basic_utils",
+            "aurasrv2",
+            "video_upscaler",
+            "swin2sr",
+            "face_enhancer",
+            "glm_ocr"
+        ],
+        "eta_seconds_default": 40
     },
     "diffusers_outpaint": {
         "preferred_variant": null,
@@ -285,78 +334,22 @@
             "3090",
             "4090"
         ],
-        "min_gpu_count": 1
-    },
-    "fastwan_21_1b": {
-        "preferred_variant": null,
-        "fallback_variants": [],
-        "min_tflops": {
-            "default": 95,
-            "4090": 80,
-            "5090": 95
-        },
-        "allowed_gpu_names": [
-            "5090",
-            "4090"
-        ],
-        "min_gpu_count": 1
-    },
-    "fastwan_22_5b": {
-        "preferred_variant": null,
-        "fallback_variants": [],
-        "min_tflops": {
-            "default": 95,
-            "4090": 80,
-            "5090": 95
-        },
-        "allowed_gpu_names": [
-            "5090",
-            "4090"
-        ],
-        "min_gpu_count": 1
-    },
-    "wan_22_14b_rapid": {
-        "preferred_variant": null,
-        "fallback_variants": [],
-        "min_tflops": {
-            "default": 120,
-            "5090": 100
-        },
-        "allowed_gpu_names": [
-            "5090"
-        ],
         "min_gpu_count": 1,
-        "comment": "WAN 2.2 14B Rapid I2V: FP8 quantized with AoT compilation, 75GB model, requires 5090"
-    },
-    "wan_22_uint4_lightx2v_i2v": {
-        "preferred_variant": null,
-        "fallback_variants": [],
-        "min_tflops": {
-            "default": 100,
-            "4090": 80,
-            "5090": 100
-        },
-        "allowed_gpu_names": [
-            "5090",
-            "4090"
+        "group_id": "image_aio_4x_utils",
+        "supported_models": [
+            "qwen_image_edit_2511_rapid_aio",
+            "z_image_turbo",
+            "flux_klein",
+            "sdxl_t2i",
+            "diffusers_outpaint",
+            "basic_utils",
+            "aurasrv2",
+            "video_upscaler",
+            "swin2sr",
+            "face_enhancer",
+            "glm_ocr"
         ],
-        "min_gpu_count": 1,
-        "comment": "WAN 2.2 14B I2V: UINT4 quantized with SDNQ, Lightx2v LoRA, requires 5090/4090"
-    },
-    "wan_22_uint4_lightx2v_t2v": {
-        "preferred_variant": null,
-        "fallback_variants": [],
-        "min_tflops": {
-            "default": 100,
-            "4090": 80,
-            "5090": 100
-        },
-        "allowed_gpu_names": [
-            "5090",
-            "4090"
-        ],
-        "min_gpu_count": 1,
-        "comment": "WAN 2.2 14B T2V: UINT4 quantized with SDNQ, Lightx2v LoRA, requires 5090/4090"
+        "eta_seconds_default": 95
     },
     "wan_22_fp8_lightx2v_i2v": {
         "preferred_variant": null,
@@ -371,7 +364,13 @@
             "4090"
         ],
         "min_gpu_count": 1,
-        "comment": "WAN 2.2 14B I2V: FP8 quantized with SDNQ, FastDM merged Lightning (no LoRA needed), requires 5090/4090"
+        "comment": "WAN 2.2 14B I2V: FP8 quantized with SDNQ, FastDM merged Lightning (no LoRA needed), requires 5090/4090",
+        "group_id": "wan_lightx2v",
+        "supported_models": [
+            "wan_22_fp8_lightx2v_i2v",
+            "wan_22_fp8_lightx2v_t2v"
+        ],
+        "eta_seconds_default": 165
     },
     "wan_22_fp8_lightx2v_t2v": {
         "preferred_variant": null,
@@ -386,7 +385,36 @@
             "4090"
         ],
         "min_gpu_count": 1,
-        "comment": "WAN 2.2 14B T2V: FP8 quantized with SDNQ, FastDM merged Lightning (no LoRA needed), requires 5090/4090"
+        "comment": "WAN 2.2 14B T2V: FP8 quantized with SDNQ, FastDM merged Lightning (no LoRA needed), requires 5090/4090",
+        "group_id": "wan_lightx2v",
+        "supported_models": [
+            "wan_22_fp8_lightx2v_i2v",
+            "wan_22_fp8_lightx2v_t2v"
+        ],
+        "eta_seconds_default": 140
+    },
+    "fastwan_21_1b": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 80,
+            "4090": 60,
+            "5090": 80
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "4080"
+        ],
+        "min_gpu_count": 1,
+        "comment": "Legacy FastWAN 2.1 1B T2V (optional; UI may keep disabled)",
+        "group_id": "wan_lightx2v",
+        "supported_models": [
+            "fastwan_21_1b",
+            "wan_22_fp8_lightx2v_i2v",
+            "wan_22_fp8_lightx2v_t2v"
+        ],
+        "eta_seconds_default": 90
     },
     "video_upscaler": {
         "preferred_variant": null,
@@ -407,20 +435,22 @@
             "4090"
         ],
         "min_gpu_count": 1,
-        "comment": "Video upscaler: RIFE frame interpolation (up to 60fps) and Real-ESRGAN upscaling (2x, 4x)"
-    },
-    "ltx2_video": {
-        "preferred_variant": null,
-        "fallback_variants": [],
-        "min_tflops": {
-            "default": 120,
-            "5090": 100
-        },
-        "allowed_gpu_names": [
-            "5090"
+        "comment": "Video upscaler: RIFE frame interpolation (up to 60fps) and Real-ESRGAN upscaling (2x, 4x)",
+        "group_id": "image_aio_4x_utils",
+        "supported_models": [
+            "qwen_image_edit_2511_rapid_aio",
+            "z_image_turbo",
+            "flux_klein",
+            "sdxl_t2i",
+            "diffusers_outpaint",
+            "basic_utils",
+            "aurasrv2",
+            "video_upscaler",
+            "swin2sr",
+            "face_enhancer",
+            "glm_ocr"
         ],
-        "min_gpu_count": 1,
-        "comment": "LTX-2 Video: FP4 model (20GB), works on 5090 without OOM"
+        "eta_seconds_default": 220
     },
     "aurasrv2": {
         "preferred_variant": null,
@@ -440,7 +470,22 @@
             "3060",
             "4090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "image_aio_4x_utils",
+        "supported_models": [
+            "qwen_image_edit_2511_rapid_aio",
+            "z_image_turbo",
+            "flux_klein",
+            "sdxl_t2i",
+            "diffusers_outpaint",
+            "basic_utils",
+            "aurasrv2",
+            "video_upscaler",
+            "swin2sr",
+            "face_enhancer",
+            "glm_ocr"
+        ],
+        "eta_seconds_default": 60
     },
     "realesrgan": {
         "preferred_variant": null,
@@ -460,7 +505,12 @@
             "3090",
             "4090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "deprecated_unused",
+        "supported_models": [
+            "realesrgan"
+        ],
+        "eta_seconds_default": 70
     },
     "realesrgan_anime": {
         "preferred_variant": null,
@@ -480,7 +530,12 @@
             "3090",
             "4090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "deprecated_unused",
+        "supported_models": [
+            "realesrgan_anime"
+        ],
+        "eta_seconds_default": 70
     },
     "realesrgan_face": {
         "preferred_variant": null,
@@ -500,7 +555,12 @@
             "3090",
             "4090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "deprecated_unused",
+        "supported_models": [
+            "realesrgan_face"
+        ],
+        "eta_seconds_default": 75
     },
     "realesrgan_denoise": {
         "preferred_variant": null,
@@ -520,7 +580,12 @@
             "3090",
             "4090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "deprecated_unused",
+        "supported_models": [
+            "realesrgan_denoise"
+        ],
+        "eta_seconds_default": 75
     },
     "swin2sr": {
         "preferred_variant": null,
@@ -540,7 +605,22 @@
             "3090",
             "4090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "image_aio_4x_utils",
+        "supported_models": [
+            "qwen_image_edit_2511_rapid_aio",
+            "z_image_turbo",
+            "flux_klein",
+            "sdxl_t2i",
+            "diffusers_outpaint",
+            "basic_utils",
+            "aurasrv2",
+            "video_upscaler",
+            "swin2sr",
+            "face_enhancer",
+            "glm_ocr"
+        ],
+        "eta_seconds_default": 80
     },
     "dreamid": {
         "preferred_variant": null,
@@ -554,35 +634,48 @@
             "5090",
             "4090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "solo_dreamid",
+        "supported_models": [
+            "dreamid"
+        ],
+        "eta_seconds_default": 145
     },
     "hunyan15_480p_t2v_distilled": {
         "preferred_variant": null,
         "fallback_variants": [],
         "min_tflops": {
             "default": 95,
-            "4090": 80,
             "5090": 95
         },
         "allowed_gpu_names": [
-            "5090",
-            "4090"
+            "5090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "hunyuan_480p",
+        "supported_models": [
+            "hunyan15_480p_t2v_distilled",
+            "hunyan15_480p_i2v_step_distilled"
+        ],
+        "eta_seconds_default": 170
     },
     "hunyan15_480p_i2v_step_distilled": {
         "preferred_variant": null,
         "fallback_variants": [],
         "min_tflops": {
             "default": 95,
-            "4090": 80,
             "5090": 95
         },
         "allowed_gpu_names": [
-            "5090",
-            "4090"
+            "5090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "hunyuan_480p",
+        "supported_models": [
+            "hunyan15_480p_t2v_distilled",
+            "hunyan15_480p_i2v_step_distilled"
+        ],
+        "eta_seconds_default": 190
     },
     "glm_ocr": {
         "preferred_variant": null,
@@ -604,7 +697,22 @@
             "4090",
             "5090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "image_aio_4x_utils",
+        "supported_models": [
+            "qwen_image_edit_2511_rapid_aio",
+            "z_image_turbo",
+            "flux_klein",
+            "sdxl_t2i",
+            "diffusers_outpaint",
+            "basic_utils",
+            "aurasrv2",
+            "video_upscaler",
+            "swin2sr",
+            "face_enhancer",
+            "glm_ocr"
+        ],
+        "eta_seconds_default": 45
     },
     "qwen_image_edit_2511_rapid_aio": {
         "preferred_variant": null,
@@ -620,7 +728,22 @@
             "3090",
             "5090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "image_aio_4x_utils",
+        "supported_models": [
+            "qwen_image_edit_2511_rapid_aio",
+            "z_image_turbo",
+            "flux_klein",
+            "sdxl_t2i",
+            "diffusers_outpaint",
+            "basic_utils",
+            "aurasrv2",
+            "video_upscaler",
+            "swin2sr",
+            "face_enhancer",
+            "glm_ocr"
+        ],
+        "eta_seconds_default": 70
     },
     "face_enhancer": {
         "preferred_variant": null,
@@ -640,7 +763,292 @@
             "3090",
             "4090"
         ],
-        "min_gpu_count": 1
+        "min_gpu_count": 1,
+        "group_id": "image_aio_4x_utils",
+        "supported_models": [
+            "qwen_image_edit_2511_rapid_aio",
+            "z_image_turbo",
+            "flux_klein",
+            "sdxl_t2i",
+            "diffusers_outpaint",
+            "basic_utils",
+            "aurasrv2",
+            "video_upscaler",
+            "swin2sr",
+            "face_enhancer",
+            "glm_ocr"
+        ],
+        "eta_seconds_default": 65
+    },
+    "ltx2_video": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 100,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "LTX-2.3 distilled worker (T2V/I2V only) with high_res support and duration controls",
+        "group_id": "solo_ltx2_video",
+        "supported_models": [
+            "ltx2_video"
+        ],
+        "eta_seconds_default": 180
+    },
+    "ltx2_3_t2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 100,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "LTX-2.3 Diffusers text-to-video (full checkpoint; sequential offload)",
+        "group_id": "ltx2_3_diffusers",
+        "supported_models": [
+            "ltx2_3_t2v",
+            "ltx2_3_i2v_distilled",
+            "ltx2_3_flf2v",
+            "ltx2_3_iv2v_distilled"
+        ],
+        "eta_seconds_default": 200
+    },
+    "ltx2_3_i2v_distilled": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 100,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "LTX-2.3 Diffusers distilled I2V + spatial latent upsampler (two-stage)",
+        "group_id": "ltx2_3_diffusers",
+        "supported_models": [
+            "ltx2_3_t2v",
+            "ltx2_3_i2v_distilled",
+            "ltx2_3_flf2v",
+            "ltx2_3_iv2v_distilled"
+        ],
+        "eta_seconds_default": 220
+    },
+    "ltx2_3_flf2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 100,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "LTX-2.3 Diffusers first-and-last-frame conditioning (full checkpoint)",
+        "group_id": "ltx2_3_diffusers",
+        "supported_models": [
+            "ltx2_3_t2v",
+            "ltx2_3_i2v_distilled",
+            "ltx2_3_flf2v",
+            "ltx2_3_iv2v_distilled"
+        ],
+        "eta_seconds_default": 200
+    },
+    "ltx2_3_iv2v_distilled": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 100,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "LTX-2.3 Diffusers distilled image+video-to-video conditioning (two-stage)",
+        "group_id": "ltx2_3_diffusers",
+        "supported_models": [
+            "ltx2_3_t2v",
+            "ltx2_3_i2v_distilled",
+            "ltx2_3_flf2v",
+            "ltx2_3_iv2v_distilled"
+        ],
+        "eta_seconds_default": 220
+    },
+    "ltx2_3_cinereal": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 100,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "App UI id for CineReal (Animate Image); server maps to ltx2_3_i2v_distilled or ltx2_3_flf2v before dispatch",
+        "group_id": "ltx2_3_diffusers",
+        "supported_models": [
+            "ltx2_3_t2v",
+            "ltx2_3_i2v_distilled",
+            "ltx2_3_flf2v",
+            "ltx2_3_iv2v_distilled",
+            "ltx2_3_cinereal"
+        ],
+        "eta_seconds_default": 220
+    },
+    "minimax_h3": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 80,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "MiniMax H3 ComfyUI (pruned int8 FL2VA). 24 GB class floor; latent upscale is more comfortable on 48 GB.",
+        "group_id": "minimax_h3_comfy",
+        "supported_models": [
+            "minimax_h3"
+        ],
+        "eta_seconds_default": 240
+    },
+    "ltx25_int8": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 80,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "LTX-2.5 distilled INT8 ComfyUI AllModes (T2V/I2V/FLF2V). Speed path targets 16GB; Quality Stage 2 prefers 24GB+.",
+        "group_id": "ltx25_int8_comfy",
+        "supported_models": [
+            "ltx25_int8",
+            "ltx25_int8_t2v",
+            "ltx25_int8_i2v",
+            "ltx25_int8_flf2v"
+        ],
+        "eta_seconds_default": 180
+    },
+    "ltx25_int8_t2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 80,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "Alias of ltx25_int8 T2V mode",
+        "group_id": "ltx25_int8_comfy",
+        "supported_models": [
+            "ltx25_int8",
+            "ltx25_int8_t2v",
+            "ltx25_int8_i2v",
+            "ltx25_int8_flf2v"
+        ],
+        "eta_seconds_default": 180
+    },
+    "ltx25_int8_i2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 80,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "Alias of ltx25_int8 I2V mode",
+        "group_id": "ltx25_int8_comfy",
+        "supported_models": [
+            "ltx25_int8",
+            "ltx25_int8_t2v",
+            "ltx25_int8_i2v",
+            "ltx25_int8_flf2v"
+        ],
+        "eta_seconds_default": 180
+    },
+    "ltx25_int8_flf2v": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 80,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "Alias of ltx25_int8 FLF2V mode",
+        "group_id": "ltx25_int8_comfy",
+        "supported_models": [
+            "ltx25_int8",
+            "ltx25_int8_t2v",
+            "ltx25_int8_i2v",
+            "ltx25_int8_flf2v"
+        ],
+        "eta_seconds_default": 180
     },
     "default": {
         "preferred_variant": null,

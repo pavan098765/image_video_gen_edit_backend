@@ -394,10 +394,12 @@ _EXTEND_SYSTEM_PROMPT = (
 )
 
 
-def _extend_prompt(prompt: str, num_segments: int, job_id: str) -> list:
+def _extend_prompt(prompt: str, num_segments: int, job_id: str, init_image_url: Optional[str] = None) -> list:
     """
     Expand one user prompt into N segment prompts using Together AI LLM.
     Used for long video (multi-clip) generation where each clip needs its own prompt.
+    If init_image_url is provided (presigned R2 URL), sends image + prompt so the
+    LLM can produce image-aware segment prompts.
 
     Returns list of N prompts, or [prompt] * num_segments on failure.
     """
@@ -410,10 +412,18 @@ def _extend_prompt(prompt: str, num_segments: int, job_id: str) -> list:
 
     logger.info("[%s] EXTEND: calling Together AI to expand prompt into %d segments", job_id, num_segments)
 
-    user_content = (
+    text_part = (
         f"The user wants to generate a {num_segments * 5}-second video from an image. "
         f"Create exactly {num_segments} segment prompts for the following:\n\n{prompt}"
     )
+    if init_image_url and _is_init_image_url(init_image_url):
+        user_content = [
+            {"type": "text", "text": text_part},
+            {"type": "image_url", "image_url": {"url": init_image_url}},
+        ]
+        logger.info("[%s] EXTEND: sending prompt + init_image URL to LLM (image-aware)", job_id)
+    else:
+        user_content = text_part
 
     try:
         resp = requests.post(
@@ -510,7 +520,8 @@ async def run_inference_and_save(job_id: str, prompt: str, model: str, mode: Opt
     duration = params.get("duration")
     if duration is not None and duration > 5 and params.get("extend_prompt", True):
         num_clips = max(1, math.ceil(float(duration) / 5))
-        prompts = await loop.run_in_executor(IO_EXECUTOR, _extend_prompt, prompt, num_clips, job_id)
+        init_image_url = params.get("init_image")  # pass URL as-is for LLM; do not pop, inference needs it later
+        prompts = await loop.run_in_executor(IO_EXECUTOR, _extend_prompt, prompt, num_clips, job_id, init_image_url)
 
     inference_start_time = time.time()
     try:

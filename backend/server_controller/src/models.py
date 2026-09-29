@@ -15,6 +15,32 @@ from pydantic import BaseModel, Field, field_validator, model_validator, ConfigD
 import re
 
 
+# One bulk *task*: a single R2 object key, or a list of keys for multi-reference models.
+# Example: ["key1", "key2"] → two tasks; [["a","b","c"]] → one task with three references.
+BulkInputImageEntry = Union[str, List[str]]
+
+# Params must not carry raw/base64 media; use *_r2_key fields and presigned uploads instead.
+_FORBIDDEN_RAW_MEDIA_PARAM_KEYS = frozenset({
+    "init_image",
+    "image",
+    "mask_image",
+    "mask",
+    "input_video",
+    "ref_image",
+    "ref_video",
+    "control_image",
+    "source_image",
+    "reference_image",
+    "style_image",
+    "face_image",
+    "input_image",
+    "background_image",
+    "foreground_image",
+    "depth_image",
+    "normal_image",
+    "images",
+})
+
 # =============================================================================
 # Enums
 # =============================================================================
@@ -25,6 +51,7 @@ class JobStatus(str, Enum):
     QUEUED = "queued"
     DISPATCHING = "dispatching"
     RUNNING = "running"
+    REVIEWING = "reviewing"
     COMPLETED = "completed"
     FAILED = "failed"
     TIMEOUT = "timeout"
@@ -143,26 +170,15 @@ class SubmitRequest(BaseModel):
         le=4,
         description="Number of output variations to generate (1-4, image models only)"
     )
-    
-    # Bulk Edit Support (VIP Feature)
-    # Allows processing multiple images with the same prompt/settings
-    bulk_images: Optional[List[str]] = Field(
-        default=None,
-        max_length=10,  # Max 10 images per bulk request
-        description="List of base64-encoded images for bulk edit (VIP feature). "
-                    "Each image creates separate jobs with the same prompt/settings. "
-                    "If provided along with params.init_image, both are processed."
+    on_device: bool = Field(
+        default=False,
+        description="If true, server creates billable jobs but skips worker dispatch; "
+                    "client reports started/completed lifecycle for on-device processing."
     )
+    
     is_bulk: bool = Field(
         default=False,
-        description="Flag indicating this is a bulk edit request (requires VIP)"
-    )
-    
-    # Per-image masks for bulk inpaint/erase (each image can have its own mask)
-    bulk_masks: Optional[List[Optional[str]]] = Field(
-        default=None,
-        description="List of base64-encoded masks for bulk inpaint/erase. "
-                    "Must align with bulk_images array. Use null for images without masks."
+        description="Flag indicating this is a bulk edit request"
     )
     
     # Per-image outpaint configs for bulk expand scene (each image needs placement)
@@ -170,7 +186,7 @@ class SubmitRequest(BaseModel):
         default=None,
         description="List of outpaint configurations for bulk expand scene. "
                     "Each config can contain: alignment, aspect_ratio, is_custom_mode, "
-                    "custom_scale, norm_offset_x, norm_offset_y. Must align with bulk_images array."
+                    "custom_scale, norm_offset_x, norm_offset_y. Must align with input_image_r2_keys by index."
     )
     
     # -------------------------------------------------------------------------
@@ -178,16 +194,16 @@ class SubmitRequest(BaseModel):
     # Frontend uploads media to R2 via /get_media_upload_urls, then sends only
     # the R2 keys here. Server converts keys to presigned GET URLs at dispatch.
     # -------------------------------------------------------------------------
-    input_image_r2_keys: Optional[List[str]] = Field(
+    input_image_r2_keys: Optional[List[BulkInputImageEntry]] = Field(
         default=None,
-        max_length=10,
-        description="R2 keys for pre-uploaded input images (replaces base64 init_image / bulk_images). "
-                    "For single image, provide a list with one key. For bulk, one key per image."
+        max_length=15,
+        description="R2 keys per bulk task: each entry is one key (str) or a list of keys "
+                    "for multi-reference jobs. Aligns with bulk_mask_r2_keys / bulk_outpaint_configs by task index."
     )
     mask_image_r2_key: Optional[str] = Field(
         default=None,
         max_length=512,
-        description="R2 key for pre-uploaded mask image (replaces base64 mask_image)."
+        description="R2 object key for pre-uploaded mask image (presigned upload)."
     )
     bulk_mask_r2_keys: Optional[List[Optional[str]]] = Field(
         default=None,
@@ -197,9 +213,50 @@ class SubmitRequest(BaseModel):
     input_video_r2_key: Optional[str] = Field(
         default=None,
         max_length=512,
-        description="R2 key for pre-uploaded input video (replaces base64 input_video / ref_video)."
+        description="R2 object key for pre-uploaded input video."
     )
     
+    @staticmethod
+    def _normalize_bulk_media_entries(
+        v: Any, field_name: str, max_refs_per_task: int = 8
+    ) -> Optional[List[BulkInputImageEntry]]:
+        """Ensure each bulk entry is a non-empty str or a non-empty list of non-empty str."""
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            raise ValueError(f"{field_name} must be a list")
+        out: List[BulkInputImageEntry] = []
+        for i, item in enumerate(v):
+            if isinstance(item, str):
+                if not item.strip():
+                    raise ValueError(f"{field_name}[{i}] must be a non-empty string")
+                out.append(item)
+            elif isinstance(item, list):
+                inner: List[str] = []
+                for j, x in enumerate(item):
+                    if not isinstance(x, str) or not x.strip():
+                        raise ValueError(
+                            f"{field_name}[{i}][{j}] must be a non-empty string"
+                        )
+                    inner.append(x)
+                if not inner:
+                    raise ValueError(f"{field_name}[{i}] must not be an empty list")
+                if len(inner) > max_refs_per_task:
+                    raise ValueError(
+                        f"{field_name}[{i}]: at most {max_refs_per_task} images per task"
+                    )
+                out.append(inner)
+            else:
+                raise ValueError(
+                    f"{field_name}[{i}] must be a string or a list of strings, not {type(item).__name__}"
+                )
+        return out
+
+    @field_validator("input_image_r2_keys", mode="before")
+    @classmethod
+    def validate_input_image_r2_keys(cls, v: Any) -> Optional[List[BulkInputImageEntry]]:
+        return cls._normalize_bulk_media_entries(v, "input_image_r2_keys")
+
     @field_validator("model")
     @classmethod
     def validate_model_name(cls, v: str) -> str:
@@ -243,8 +300,30 @@ class SubmitRequest(BaseModel):
             height = v["height"]
             if not isinstance(height, int) or height < 32 or height > 2048:
                 raise ValueError("height must be an integer between 32 and 2048")
-        
+
+        for key in _FORBIDDEN_RAW_MEDIA_PARAM_KEYS:
+            if key not in v:
+                continue
+            val = v[key]
+            if val is None or val == "":
+                continue
+            raise ValueError(
+                f"Embedded media in params.{key} is not supported. Upload to R2 and use the "
+                f"matching *_r2_key field (e.g. init_image_r2_key, mask_image_r2_key, input_video_r2_key)."
+            )
+
         return v
+
+    @model_validator(mode="after")
+    def bulk_edit_requires_r2_keys(self) -> "SubmitRequest":
+        if self.is_bulk:
+            if not self.input_image_r2_keys:
+                raise ValueError(
+                    "Bulk jobs require non-empty input_image_r2_keys (R2 object keys after presigned upload)."
+                )
+        return self
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     
     @field_validator("variations")
     @classmethod
@@ -296,6 +375,14 @@ class RegisterWorkerRequest(BaseModel):
         default=None,
         description="Additional worker information"
     )
+    supported_models: Optional[List[str]] = Field(
+        default=None,
+        description="Optional runtime-reported supported models for grouped routing"
+    )
+    model_eta_seconds: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="Optional runtime ETA hints per model in seconds"
+    )
     
     model_config = ConfigDict(str_strip_whitespace=True)
     
@@ -344,6 +431,14 @@ class HeartbeatRequest(BaseModel):
     current_jobs: Optional[List[str]] = Field(
         default=None,
         description="List of currently running job IDs"
+    )
+    supported_models: Optional[List[str]] = Field(
+        default=None,
+        description="Optional runtime-reported supported models refresh"
+    )
+    model_eta_seconds: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="Optional runtime ETA hints refresh"
     )
 
 
@@ -442,6 +537,44 @@ class BanIPRequest(BaseModel):
         raise ValueError("Invalid IP address format")
 
 
+class DescribeAssetForPromptRequest(BaseModel):
+    """
+    R2-only: client uploads bytes via presigned URL, then sends the object key here.
+    v1 supports image bytes in R2 (including a single video frame exported as JPEG).
+    """
+
+    input_r2_key: str = Field(
+        ...,
+        min_length=8,
+        max_length=512,
+        description="R2 object key under the app's input-media prefix",
+    )
+    media_type: str = Field(
+        ...,
+        description="Must be 'image' for vision captioning (video: upload a frame as image).",
+    )
+    content_type: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description="Optional MIME hint from client (e.g. image/jpeg)",
+    )
+
+    @field_validator("media_type")
+    @classmethod
+    def media_type_image_only(cls, v: str) -> str:
+        t = (v or "").strip().lower()
+        if t != "image":
+            raise ValueError(
+                "media_type must be 'image'. For video, extract a frame client-side, "
+                "upload it via presigned URL, and call with media_type=image."
+            )
+        return t
+
+
+class DescribeAssetForPromptResponse(BaseModel):
+    prompt: str = Field(..., description="VLM-generated prompt text for the composer")
+
+
 # =============================================================================
 # Response Models
 # =============================================================================
@@ -460,7 +593,7 @@ class SubmitResponse(BaseModel):
     - job_ids: List of ALL job IDs (including primary)
     - batch_id: Unique batch identifier for this group
     
-    For bulk edit (VIP feature):
+    For bulk edit:
     - Multiple images with same prompt/settings
     - job_ids: List of ALL job IDs (images × variations)
     - batch_id: Unique batch identifier
@@ -513,10 +646,12 @@ class JobStatusResponse(BaseModel):
     # Variation support - all results returned together
     variations: int = Field(1, description="Total variations requested")
     variation_results: Optional[List[VariationResult]] = Field(
-        None, 
+        None,
         description="Results for all variations (only present if variations > 1)"
     )
     all_completed: bool = Field(True, description="True if all variations are complete")
+    estimated_wait_seconds: Optional[int] = Field(None, description="Estimated seconds until job completes (processing jobs only)")
+    queue_position: Optional[int] = Field(None, description="Position in worker queue (processing jobs only)")
 
 
 class WorkerResponse(BaseModel):

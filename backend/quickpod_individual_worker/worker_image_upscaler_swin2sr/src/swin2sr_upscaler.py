@@ -20,7 +20,8 @@ if torch.cuda.is_available():
 # -------------------------
 # Config / paths
 # -------------------------
-MODEL_DIR = "/models/swin2sr"
+# HF processor/model cache (not the same as SWIN2SR_*_LOCAL_PATH weight dirs).
+MODEL_DIR = os.environ.get("SWIN2SR_HF_CACHE_DIR", "/app/models/swin2sr_hf_cache")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 DEFAULT_OUTPUT_DIR = "./outputs"

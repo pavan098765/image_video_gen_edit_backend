@@ -34,7 +34,16 @@ except ImportError as e:
     print(f"⚠️  Video post-processing not available: {e}")
     POSTPROCESSING_AVAILABLE = False
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
+
+
+def _realesrgan_video_ckpt_name(upscale_factor: Any) -> str:
+    """Align with rockapaper/realesrgan baked weights (x2plus / x4plus)."""
+    try:
+        u = int(upscale_factor)
+    except (TypeError, ValueError):
+        u = 4
+    return "RealESRGAN_x2plus.pth" if u <= 2 else "RealESRGAN_x4plus.pth"
 
 # # Disable PyTorch's automatic SDPA optimizations to prevent cutlassF errors
 # # These settings force PyTorch to use eager attention instead of cutlassF kernels
@@ -184,32 +193,29 @@ def load_video_from_base64(video_b64: str, max_frames: int = 121) -> List[Image.
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-
 def resize_image_keep_aspect(
-    image: Image.Image, 
-    target_height: int, 
+    image: Image.Image,
+    target_height: int,
     target_width: int
 ) -> Image.Image:
-    """Resize image maintaining aspect ratio with center crop."""
+    """
+    Resize image to fit within target dimensions maintaining aspect ratio.
+    No cropping, no padding. Output dimensions may differ from target
+    but will always fit within target_width x target_height and be divisible by 8.
+    """
     input_width, input_height = image.size
-    aspect_ratio_target = target_width / target_height
-    aspect_ratio_frame = input_width / input_height
-    
-    if aspect_ratio_frame > aspect_ratio_target:
-        new_width = int(input_height * aspect_ratio_target)
-        new_height = input_height
-        x_start = (input_width - new_width) // 2
-        y_start = 0
-    else:
-        new_width = input_width
-        new_height = int(input_width / aspect_ratio_target)
-        x_start = 0
-        y_start = (input_height - new_height) // 2
-    
-    image = image.crop((x_start, y_start, x_start + new_width, y_start + new_height))
-    image = image.resize((target_width, target_height), Image.LANCZOS)
-    return image
 
+    # Scale to fit within target box
+    scale = min(target_width / input_width, target_height / input_height)
+    
+    new_width = int(input_width * scale)
+    new_height = int(input_height * scale)
+
+    # Align to 8 for model compatibility
+    new_width = max(8, (new_width // 8) * 8)
+    new_height = max(8, (new_height // 8) * 8)
+
+    return image.resize((new_width, new_height), Image.LANCZOS)
 
 def seed_everything(seed: int):
     """Set random seeds for reproducibility."""
@@ -454,7 +460,7 @@ def run_inference_hunyan15_i2v(
     Args:
         job_id: Unique job identifier
         prompt: Text prompt describing the animation
-        image_input: Base64 encoded image or image URL
+        image_input: Presigned https URL to the input image (or local file path for dev)
         params:
             - duration (float): Video duration in seconds (4-8). If set, frames = duration * fps.
             - num_frames (int): Number of frames (default: 121, used when duration not set)
@@ -528,13 +534,14 @@ def run_inference_hunyan15_i2v(
         sys.stdout.flush()
         
         try:
-            if image_input.startswith("http"):
+            if image_input.startswith("http://") or image_input.startswith("https://"):
                 image = load_image_from_url(image_input)
-            elif image_input.startswith("data:") or len(image_input) > 500:
-                image = load_image_from_base64(image_input)
-            else:
-                # Assume it's a file path
+            elif os.path.isfile(image_input):
                 image = Image.open(image_input).convert("RGB")
+            else:
+                raise ValueError(
+                    "image_input must be an http(s) presigned URL or an existing file path"
+                )
             logger.info(f"[{job_id}] Image loaded successfully: {image.size}")
         except Exception as e:
             error_msg = f"Failed to load input image: {e}"
@@ -544,6 +551,8 @@ def run_inference_hunyan15_i2v(
             raise
         
         print(f"   Image size: {image.size}")
+        image = resize_image_keep_aspect(image, target_height=MAX_HEIGHT, target_width=MAX_WIDTH)
+        print(f"   Resized to: {image.size}")  # Will always be 864×480
         sys.stdout.flush()
         
         logger.info(f"[{job_id}] 🚀 Starting video generation (seed={seed})...")
@@ -628,7 +637,11 @@ def run_inference_hunyan15_i2v(
                         print(f"⚠️  RIFE code not available, interpolation disabled")
                 
                 if enable_upscaling:
-                    realesrgan_model_file = os.path.join(MODELS_DIR, "realesrgan", f"RealESRGAN_x{upscale_factor}.pth")
+                    realesrgan_model_file = os.path.join(
+                        MODELS_DIR,
+                        "realesrgan",
+                        _realesrgan_video_ckpt_name(upscale_factor),
+                    )
                     if os.path.exists(realesrgan_model_file):
                         try:
                             upscale_model = load_sd_upscale(realesrgan_model_file, device)

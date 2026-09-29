@@ -37,6 +37,15 @@ except ImportError as e:
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
+
+def _realesrgan_video_ckpt_name(upscale_factor: Any) -> str:
+    """Align with rockapaper/realesrgan baked weights (x2plus / x4plus)."""
+    try:
+        u = int(upscale_factor)
+    except (TypeError, ValueError):
+        u = 4
+    return "RealESRGAN_x2plus.pth" if u <= 2 else "RealESRGAN_x4plus.pth"
+
 # # Disable PyTorch's automatic SDPA optimizations to prevent cutlassF errors
 # # These settings force PyTorch to use eager attention instead of cutlassF kernels
 # if hasattr(torch.backends.cuda, "enable_flash_sdp"):
@@ -629,7 +638,11 @@ def run_inference_hunyan15_t2v(
                         print(f"⚠️  RIFE code not available, interpolation disabled")
                 
                 if enable_upscaling:
-                    realesrgan_model_file = os.path.join(MODELS_DIR, "realesrgan", f"RealESRGAN_x{upscale_factor}.pth")
+                    realesrgan_model_file = os.path.join(
+                        MODELS_DIR,
+                        "realesrgan",
+                        _realesrgan_video_ckpt_name(upscale_factor),
+                    )
                     if os.path.exists(realesrgan_model_file):
                         try:
                             upscale_model = load_sd_upscale(realesrgan_model_file, device)

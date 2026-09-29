@@ -2,6 +2,18 @@
 
 Submit jobs to the **controller** `POST /submit` (not directly to the worker). The controller forwards the run to the wan_22_fp8_lightx2v_i2v worker.
 
+### Inference backend (omni multi-worker)
+
+On the worker image, set **`WAN_I2V_INFERENCE_MODULE`** to choose the Python module:
+
+| Value | Behavior |
+|-------|----------|
+| `inference.py` | **V1** legacy: multi-clip long video when multiple segment prompts / duration chaining; ignores `last_image`. |
+| `inference_sdnq_space_parity.py` | **V2** SDNQ: **single-pass** only (duration → one `num_frames`, up to ~10s @ 16 fps); Space-style schedulers, dual CFG, optional `last_image`, etc. |
+| `inference_hub_space_torchao.py` | **V3** Hub + torchao + AoTI (~70 GB class); requires extra pip deps. |
+
+Details: [INFERENCE_BACKENDS.md](INFERENCE_BACKENDS.md).
+
 ---
 
 ## Request: `POST /submit`
@@ -30,25 +42,32 @@ Submit jobs to the **controller** `POST /submit` (not directly to the worker). T
 |-----|------|-------------|
 | `init_image` | string | Presigned R2 download URL for the input image. Used when controller provides URL directly. |
 | (via `input_image_r2_keys`) | — | Controller turns R2 key into URL and passes as `init_image`. |
+| `last_image` | string | Optional presigned URL for **end** frame (V2/V3). Alias: `last_frame_image`. Ignored by V1. |
 
 ### Long video (duration)
 
 | Key | Type | Default | Description |
 |-----|------|--------|-------------|
-| `duration` | number | 5 | Total video duration in seconds. Each clip ≈ 5 sec. If 10, generates 2 clips and stitches. Examples: 5 (1 clip), 10 (2 clips), 15 (3 clips), 20 (4 clips). |
-| `extend_prompt` | boolean | `true` | If true and `duration` > 5, use LLM (Together API) to expand prompt into N segment prompts (one per clip). Requires `TOGETHER_API_KEY`. |
+| `duration` | number | — | **V1:** Total seconds; multi-clip ≈5s segments + stitch when using segment prompts / controller behavior. **V2:** If `num_frames` omitted, maps to one shot: `num_frames = clamp(round(duration×16), 8, 160)` (single `pipe()`). |
+| `duration_seconds` | number | — | Same as `duration` for V2 resolution (either key accepted). |
+| `extend_prompt` | boolean | `true` | V1 / controller: LLM segment prompts when duration > 5. Not used by V2 single-pass path. |
 
 ### Generation
 
 | Key | Type | Default | Description |
 |-----|------|--------|-------------|
-| `num_frames` | number | 81 | Frames per clip (81 ≈ 5 sec at 16fps). |
-| `fps` | number | 16 | Output frame rate. |
+| `num_frames` | number | 81 | If set, overrides duration-derived frame count (V2). V1: frames **per clip**. |
+| `fps` | number | 16 | Output / base frame rate. |
 | `num_inference_steps` | number | 8 | Inference steps (Lightning model: 4–8). |
-| `guidance_scale` | number | 1.0 | CFG scale. |
+| `guidance_scale` | number | 1.0 | CFG (high-noise stage). |
+| `guidance_scale_2` | number | 1.0 | CFG second stage (**V2/V3**); passed to pipeline when supported. |
 | `seed` | number | random | Random seed for reproducibility. |
-| `resize_image` | boolean | `true` | Resize init image to 480×832 area (mod 16). |
-| `negative_prompt` | string | default | Override negative prompt. Multi-clip uses extended negative (fog/haze, face drift suppression). |
+| `resize_image` | boolean | `true` | Resize init image. |
+| `resize_mode` | string | `area480` (V2) | `area480` = max-area ~480×832 (mod VAE). `wan_space` = Space crop/aspect rules (**V2**). |
+| `scheduler` / `scheduler_name` | string | `UniPCMultistep` | **V2/V3** scheduler key (see INFERENCE_BACKENDS). |
+| `flow_shift` | number | 3.0 | **V2/V3** flow shift for compatible schedulers. |
+| `video_quality` | number | 6 | **V2/V3** `export_to_video` quality 1–10 when supported. |
+| `negative_prompt` | string | default | Override negative prompt. V1 multi-clip may use extended negative. **V2** uses default + override only (no extended multi-clip string). |
 
 ### Post-processing
 
@@ -56,6 +75,7 @@ Submit jobs to the **controller** `POST /submit` (not directly to the worker). T
 |-----|------|--------|-------------|
 | `enable_rife` | boolean | `false` | Enable RIFE frame interpolation. |
 | `rife_target_fps` | number | 30 | Target FPS after interpolation. |
+| `frame_multiplier` | number | — | **V2:** 16 / 32 / 64 / 128 = target output FPS (Space “fluidity”). If `> 16`, enables RIFE via **video_postprocessing** and sets target fps; overrides `rife_target_fps` when set. |
 | `enable_upscaling` | boolean | `false` | Enable Real-ESRGAN upscaling. |
 | `enable_upscale` | boolean | `false` | Alias for `enable_upscaling`. |
 | `upscale_factor` | number | 2 | Upscale factor (2, 4, or 8). |
@@ -139,7 +159,8 @@ Submit jobs to the **controller** `POST /submit` (not directly to the worker). T
 ## Summary
 
 - **Endpoint:** controller `POST /submit` (or worker `POST /run` for direct calls).
-- **Image:** `params.init_image` (presigned URL) or `input_image_r2_keys` (controller resolves to URL).
-- **Duration:** `duration` (seconds). Each clip ≈ 5 sec. 10 sec → 2 clips, 15 sec → 3 clips, etc.
-- **Prompt extension:** When `duration` > 5 and `extend_prompt` is true, LLM expands prompt into N segment prompts. Requires `TOGETHER_API_KEY`.
-- **Post-processing:** `enable_rife`, `enable_upscaling` for interpolation and upscaling. Uses streaming to avoid OOM on long videos.
+- **Image:** `params.init_image` (presigned URL) or `input_image_r2_keys` (controller resolves to URL). Optional **`last_image`** for V2/V3.
+- **Worker backend:** `WAN_I2V_INFERENCE_MODULE` selects V1 / V2 / V3 (see [INFERENCE_BACKENDS.md](INFERENCE_BACKENDS.md)).
+- **V1 duration:** multi-clip ≈5s segments when using extended workflows; **V2 duration:** single trajectory up to ~10s from one `num_frames` (8–160 @ 16 fps).
+- **Prompt extension:** V1/controller: when `duration` > 5 and `extend_prompt` is true, LLM may expand prompts. Requires `TOGETHER_API_KEY` where used.
+- **Post-processing:** `enable_rife`, `frame_multiplier` (V2), `enable_upscaling`; streaming RIFE/upscale for long outputs.

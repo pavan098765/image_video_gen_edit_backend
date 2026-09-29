@@ -40,6 +40,12 @@ class PodStrategyType(str, Enum):
     MACHINE_BASED = "machine_based"
 
 
+class SchedulerMode(str, Enum):
+    """Job scheduling strategy modes"""
+    LEGACY_DYNAMIC_FLEET = "legacy_dynamic_fleet"
+    FIXED_FLEET_WINDOWED = "fixed_fleet_windowed"
+
+
 @dataclass
 class DatabaseConfig:
     """Database configuration"""
@@ -114,6 +120,9 @@ class WorkerConfig:
     idle_timeout_seconds: int = 90
     # Safety: Don't destroy pods younger than this (avoids thrashing on fresh startups)
     idle_min_age_seconds: int = 60
+    # Quickpod leftover window (15 min billing). External providers use 0 unless personal leftover.
+    quickpod_idle_timeout_seconds: int = 900
+    external_pod_idle_timeout_seconds: int = 900
 
 
 @dataclass
@@ -124,6 +133,8 @@ class JobConfig:
     running_timeout_minutes: int = 10  # Hard timeout for RUNNING jobs (shorter - detect stuck workers)
     auto_recover: bool = True
     queue_size_threshold: int = 5
+    queue_fairness_enabled: bool = True
+    queue_fairness_max_consecutive_per_model: int = 2
 
 
 @dataclass
@@ -137,6 +148,29 @@ class PodConfig:
     fallback_window_seconds: int = 600
     fallback_threshold: int = 3
     load_scale_threshold: int = 15
+
+
+@dataclass
+class SchedulerConfig:
+    """Scheduler strategy configuration"""
+    mode: SchedulerMode = SchedulerMode.LEGACY_DYNAMIC_FLEET
+    shadow_mode: bool = False
+    dynamic_eta_enabled: bool = False
+    dynamic_eta_observe_only: bool = True
+    dynamic_eta_min_samples: int = 5
+    dynamic_eta_alpha: float = 0.2
+    dynamic_eta_min_seconds: int = 10
+    dynamic_eta_max_seconds: int = 1200
+    dynamic_eta_allowed_groups: Set[str] = field(default_factory=set)
+    soft_governor_enabled: bool = False
+    soft_governor_ops_window_seconds: int = 3600
+    soft_governor_ops_threshold: int = 80
+    soft_governor_extra_safety_seconds: int = 30
+    soft_governor_extra_drain_guard_seconds: int = 30
+    pending_model_grace_enabled: bool = True
+    pending_model_max_wait_seconds: int = 20
+    pending_model_poll_interval_ms: int = 500
+    pending_model_hint_timeout_seconds: int = 3
 
 
 @dataclass
@@ -156,6 +190,7 @@ class AppConfig:
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     job: JobConfig = field(default_factory=JobConfig)
     pod: PodConfig = field(default_factory=PodConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     
     # Template UUIDs
     template_uuids: Dict[str, Optional[str]] = field(default_factory=dict)
@@ -236,6 +271,7 @@ class ConfigManager:
         self._load_worker_config()
         self._load_job_config()
         self._load_pod_config()
+        self._load_scheduler_config()
         self._load_template_config()
         
         return self._config
@@ -316,15 +352,28 @@ class ConfigManager:
         # Pod idle timeout: destroy after N seconds with no work assigned
         worker_config.idle_timeout_seconds = int(os.getenv("WORKER_IDLE_TIMEOUT", "90"))
         worker_config.idle_min_age_seconds = int(os.getenv("WORKER_IDLE_MIN_AGE", "60"))
+        worker_config.quickpod_idle_timeout_seconds = int(
+            os.getenv("QUICKPOD_IDLE_TIMEOUT_SECONDS", "900")
+        )
+        worker_config.external_pod_idle_timeout_seconds = int(
+            os.getenv("EXTERNAL_POD_IDLE_TIMEOUT_SECONDS", "900")
+        )
     
     def _load_job_config(self):
         """Load job configuration"""
         job_config = self._config.job
         job_config.max_retries = int(os.getenv("JOB_MAX_RETRIES", "3"))
-        job_config.timeout_minutes = int(os.getenv("JOB_TIMEOUT_MINUTES", "30"))
+        job_config.timeout_minutes = int(os.getenv("JOB_TIMEOUT_MINUTES", "60"))
         job_config.running_timeout_minutes = int(os.getenv("JOB_RUNNING_TIMEOUT_MINUTES", "10"))
         job_config.auto_recover = os.getenv("JOB_AUTO_RECOVER", "true").lower() == "true"
         job_config.queue_size_threshold = int(os.getenv("QUEUE_SIZE_THRESHOLD", "5"))
+        job_config.queue_fairness_enabled = (
+            os.getenv("QUEUE_FAIRNESS_ENABLED", "true").lower() == "true"
+        )
+        job_config.queue_fairness_max_consecutive_per_model = max(
+            1,
+            int(os.getenv("QUEUE_FAIRNESS_MAX_CONSECUTIVE_PER_MODEL", "2")),
+        )
     
     def _load_pod_config(self):
         """Load pod configuration"""
@@ -345,6 +394,71 @@ class ConfigManager:
         pod_config.fallback_window_seconds = int(os.getenv("FALLBACK_WINDOW_SECONDS", "600"))
         pod_config.fallback_threshold = int(os.getenv("FALLBACK_THRESHOLD", "3"))
         pod_config.load_scale_threshold = int(os.getenv("LOAD_SCALE_THRESHOLD", "15"))
+
+    def _load_scheduler_config(self):
+        """Load scheduler strategy configuration"""
+        scheduler_config = self._config.scheduler
+        mode_str = os.getenv("SCHEDULER_MODE", "legacy_dynamic_fleet").lower().strip()
+        if mode_str == SchedulerMode.FIXED_FLEET_WINDOWED.value:
+            scheduler_config.mode = SchedulerMode.FIXED_FLEET_WINDOWED
+        else:
+            scheduler_config.mode = SchedulerMode.LEGACY_DYNAMIC_FLEET
+
+        scheduler_config.shadow_mode = (
+            os.getenv("SCHEDULER_SHADOW_MODE", "false").lower() == "true"
+        )
+        scheduler_config.dynamic_eta_enabled = (
+            os.getenv("SCHEDULER_DYNAMIC_ETA_ENABLED", "false").lower() == "true"
+        )
+        scheduler_config.dynamic_eta_observe_only = (
+            os.getenv("SCHEDULER_DYNAMIC_ETA_OBSERVE_ONLY", "true").lower() == "true"
+        )
+        scheduler_config.dynamic_eta_min_samples = max(
+            1, int(os.getenv("SCHEDULER_DYNAMIC_ETA_MIN_SAMPLES", "5"))
+        )
+        try:
+            alpha = float(os.getenv("SCHEDULER_DYNAMIC_ETA_ALPHA", "0.2"))
+        except Exception:
+            alpha = 0.2
+        scheduler_config.dynamic_eta_alpha = max(0.01, min(1.0, alpha))
+        scheduler_config.dynamic_eta_min_seconds = max(
+            1, int(os.getenv("SCHEDULER_DYNAMIC_ETA_MIN_SECONDS", "10"))
+        )
+        scheduler_config.dynamic_eta_max_seconds = max(
+            scheduler_config.dynamic_eta_min_seconds,
+            int(os.getenv("SCHEDULER_DYNAMIC_ETA_MAX_SECONDS", "1200")),
+        )
+        groups_raw = os.getenv("SCHEDULER_DYNAMIC_ETA_ALLOWED_GROUPS", "")
+        scheduler_config.dynamic_eta_allowed_groups = set(
+            x.strip().lower() for x in groups_raw.split(",") if x.strip()
+        )
+        scheduler_config.soft_governor_enabled = (
+            os.getenv("SCHEDULER_SOFT_GOVERNOR_ENABLED", "false").lower() == "true"
+        )
+        scheduler_config.soft_governor_ops_window_seconds = max(
+            60, int(os.getenv("SCHEDULER_SOFT_GOVERNOR_OPS_WINDOW_SECONDS", "3600"))
+        )
+        scheduler_config.soft_governor_ops_threshold = max(
+            1, int(os.getenv("SCHEDULER_SOFT_GOVERNOR_OPS_THRESHOLD", "80"))
+        )
+        scheduler_config.soft_governor_extra_safety_seconds = max(
+            0, int(os.getenv("SCHEDULER_SOFT_GOVERNOR_EXTRA_SAFETY_SECONDS", "30"))
+        )
+        scheduler_config.soft_governor_extra_drain_guard_seconds = max(
+            0, int(os.getenv("SCHEDULER_SOFT_GOVERNOR_EXTRA_DRAIN_GUARD_SECONDS", "30"))
+        )
+        scheduler_config.pending_model_grace_enabled = (
+            os.getenv("PENDING_MODEL_GRACE_ENABLED", "true").lower() == "true"
+        )
+        scheduler_config.pending_model_max_wait_seconds = max(
+            0, int(os.getenv("PENDING_MODEL_MAX_WAIT_SECONDS", "20"))
+        )
+        scheduler_config.pending_model_poll_interval_ms = max(
+            100, int(os.getenv("PENDING_MODEL_POLL_INTERVAL_MS", "500"))
+        )
+        scheduler_config.pending_model_hint_timeout_seconds = max(
+            1, int(os.getenv("PENDING_MODEL_HINT_TIMEOUT_SECONDS", "3"))
+        )
     
     def _load_template_config(self):
         """Load template UUIDs and disk sizes"""
@@ -355,7 +469,7 @@ class ConfigManager:
             "diffusers_outpaint": os.getenv("DIFFUSERS_OUTPAINT_TEMPLATE_UUID"),
             "qwen_image_edit": os.getenv("QWEN_IMAGE_EDIT_TEMPLATE_UUID"),
             "qwen_image_edit_2509": os.getenv("QWEN_IMAGE_EDIT_2509_TEMPLATE_UUID"),
-            "qwen_image_edit_2511_rapid_aio": os.getenv("QWEN_IMAGE_EDIT_25011_RAPID_AIO_TEMPLATE_UUID"),
+            "qwen_image_edit_2511_rapid_aio": os.getenv("QWEN_IMAGE_EDIT_2511_RAPID_AIO_TEMPLATE_UUID"),
             "flux_kontext_dev": os.getenv("FLUX_KONTEXT_DEV_TEMPLATE_UUID"),
             "qwen_image": os.getenv("QWEN_IMAGE_TEMPLATE_UUID"),
             "qwen_image_edit_int4": os.getenv("QWEN_IMAGE_EDIT_INT4_TEMPLATE_UUID"),
@@ -373,7 +487,15 @@ class ConfigManager:
             "dreamid": os.getenv("DREAMID_TEMPLATE_UUID"),
             "hunyan15_480p_t2v_distilled": os.getenv("HUNYUAN_480P_T2V_TEMPLATE_UUID"),
             "hunyan15_480p_i2v_step_distilled": os.getenv("HUNYUAN_480P_I2V_TEMPLATE_UUID"),
+            "ltx2_3_t2v": os.getenv("LTX2_3_DIFFUSERS_MULTI_TEMPLATE_UUID"),
+            "ltx2_3_i2v_distilled": os.getenv("LTX2_3_DIFFUSERS_MULTI_TEMPLATE_UUID"),
+            "ltx2_3_flf2v": os.getenv("LTX2_3_DIFFUSERS_MULTI_TEMPLATE_UUID"),
             "glm_ocr": os.getenv("GLM_OCR_TEMPLATE_UUID"),
+            "minimax_h3": os.getenv("MINIMAX_H3_COMFY_TEMPLATE_UUID"),
+            "ltx25_int8": os.getenv("LTX25_INT8_COMFY_TEMPLATE_UUID"),
+            "ltx25_int8_t2v": os.getenv("LTX25_INT8_COMFY_TEMPLATE_UUID"),
+            "ltx25_int8_i2v": os.getenv("LTX25_INT8_COMFY_TEMPLATE_UUID"),
+            "ltx25_int8_flf2v": os.getenv("LTX25_INT8_COMFY_TEMPLATE_UUID"),
             "aurasrv2": os.getenv("AURASRV2_TEMPLATE_UUID"),
             "realesrgan": os.getenv("REALESRGAN_TEMPLATE_UUID"),
             "swin2sr": os.getenv("SWIN2SR_TEMPLATE_UUID"),
@@ -410,7 +532,15 @@ class ConfigManager:
             "dreamid": 70,
             "hunyan15_480p_t2v_distilled": 100,
             "hunyan15_480p_i2v_step_distilled": 100,
+            "ltx2_3_t2v": 200,
+            "ltx2_3_i2v_distilled": 200,
+            "ltx2_3_flf2v": 200,
             "glm_ocr": 30,
+            "minimax_h3": 250,
+            "ltx25_int8": 120,
+            "ltx25_int8_t2v": 120,
+            "ltx25_int8_i2v": 120,
+            "ltx25_int8_flf2v": 120,
             "aurasrv2": 30,
             "realesrgan": 30,
             "swin2sr": 30,
@@ -475,6 +605,27 @@ class ConfigManager:
         logger.info(f"Debug: {self._config.debug}")
         logger.info(f"Public URL: {self._config.public_url or '(not set)'}")
         logger.info(f"Pod Strategy: {self._config.pod.strategy.value}")
+        logger.info(f"Scheduler Mode: {self._config.scheduler.mode.value}")
+        logger.info(f"Scheduler Shadow Mode: {self._config.scheduler.shadow_mode}")
+        logger.info(
+            f"Dynamic ETA: enabled={self._config.scheduler.dynamic_eta_enabled}, "
+            f"observe_only={self._config.scheduler.dynamic_eta_observe_only}, "
+            f"min_samples={self._config.scheduler.dynamic_eta_min_samples}, "
+            f"alpha={self._config.scheduler.dynamic_eta_alpha:.2f}"
+        )
+        logger.info(
+            f"Soft Governor: enabled={self._config.scheduler.soft_governor_enabled}, "
+            f"window={self._config.scheduler.soft_governor_ops_window_seconds}s, "
+            f"threshold={self._config.scheduler.soft_governor_ops_threshold}, "
+            f"extra_safety={self._config.scheduler.soft_governor_extra_safety_seconds}s, "
+            f"extra_drain={self._config.scheduler.soft_governor_extra_drain_guard_seconds}s"
+        )
+        logger.info(
+            f"Pending Model Grace: enabled={self._config.scheduler.pending_model_grace_enabled}, "
+            f"max_wait={self._config.scheduler.pending_model_max_wait_seconds}s, "
+            f"poll={self._config.scheduler.pending_model_poll_interval_ms}ms, "
+            f"hint_timeout={self._config.scheduler.pending_model_hint_timeout_seconds}s"
+        )
         logger.info(f"Max Individual Pods: {self._config.pod.max_individual_pods}")
         logger.info(f"Worker Registration Timeout: {self._config.worker.registration_timeout}s")
         logger.info(
@@ -483,6 +634,10 @@ class ConfigManager:
         )
         logger.info(f"Job Timeout: {self._config.job.timeout_minutes} minutes")
         logger.info(f"Job Max Retries: {self._config.job.max_retries}")
+        logger.info(
+            f"Queue Fairness: enabled={self._config.job.queue_fairness_enabled}, "
+            f"max_consecutive={self._config.job.queue_fairness_max_consecutive_per_model}"
+        )
         logger.info(f"R2 Configured: {bool(self._config.r2.endpoint)}")
         logger.info(f"Firebase Configured: {bool(self._config.firebase.credentials_path)}")
         logger.info(f"API Keys Count: {len(self._config.security.api_keys)}")

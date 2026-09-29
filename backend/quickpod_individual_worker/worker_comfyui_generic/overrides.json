@@ -1,0 +1,24 @@
+{
+  "resolve_conflicts": {
+    "WanVideoModelLoader": "https://github.com/kijai/ComfyUI-WanVideoWrapper.git"
+  },
+  "missing_nodes": {
+    "Any Switch (rgthree)": "https://github.com/rgthree/rgthree-comfy.git",
+    "Bookmark (rgthree)": "https://github.com/rgthree/rgthree-comfy.git",
+    "Display Int (rgthree)": "https://github.com/rgthree/rgthree-comfy.git",
+    "Fast Groups Bypasser (rgthree)": "https://github.com/rgthree/rgthree-comfy.git",
+    "Fast Groups Muter (rgthree)": "https://github.com/rgthree/rgthree-comfy.git",
+    "Label (rgthree)": "https://github.com/rgthree/rgthree-comfy.git",
+    "Mute / Bypass Relay (rgthree)": "https://github.com/rgthree/rgthree-comfy.git",
+    "Mute / Bypass Repeater (rgthree)": "https://github.com/rgthree/rgthree-comfy.git",
+    "Power Lora Loader (rgthree)": "https://github.com/rgthree/rgthree-comfy.git",
+    "MMAudioFeatureUtilsLoader": "https://github.com/kijai/ComfyUI-MMAudio.git",
+    "MMAudioModelLoader": "https://github.com/kijai/ComfyUI-MMAudio.git",
+    "MMAudioSampler": "https://github.com/kijai/ComfyUI-MMAudio.git",
+    "DF_Int_to_Float": "https://github.com/Derfuu/Derfuu_ComfyUI_ModdedNodes.git",
+    "JWFloatToInteger": "https://github.com/jamesWalker55/comfyui-various.git",
+    "MarkdownNote": "https://github.com/pythongosssss/ComfyUI-Custom-Scripts.git",
+    "NovaSR": "https://github.com/Saganaki22/ComfyUI-NovaSR.git"
+  },
+  "extra_repos": []
+}

@@ -68,10 +68,9 @@ def write_rest(f):
     f.write("COPY src /app/worker/src\n\n")
 
     # Install core runtime deps (minimal)
-    f.write("RUN apt-get update && apt-get install -y --no-install-recommends git \\\n")
+    f.write("RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client \\\n")
     f.write("    && pip install --no-cache-dir 'diffusers==0.36.0' \\\n")
     f.write("    && pip install --no-cache-dir kernels \\\n")
-    f.write("    && apt-get purge -y git \\\n")
     f.write("    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*\n\n")
 
     # Environment variables

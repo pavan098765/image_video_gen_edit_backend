@@ -1,0 +1,139 @@
+[
+  {
+    "model": "qwen_image_edit_2511_rapid_aio",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/qwen_image_edit_2511_rapid_aio.zip",
+    "entry_relpath": "qwen_image_edit_2511_rapid_aio_inference.py",
+    "callable_name": "run_inference_qwen_image_edit_2511_rapid_aio",
+    "prewarm_fn": "get_pipeline",
+    "unload_fn": "unload_models"
+  },
+  {
+    "model": "flux_klein",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/flux_klein.zip",
+    "entry_relpath": "flux_klein_inference.py",
+    "callable_name": "run_inference_flux_klein",
+    "prewarm_fn": "get_pipeline",
+    "unload_fn": "unload_models"
+  },
+  {
+    "model": "z_image_turbo",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/z_image_turbo.zip",
+    "entry_relpath": "z_image_turbo.py",
+    "callable_name": "run_inference_z_image_turbo",
+    "prewarm_fn": "get_pipeline",
+    "unload_fn": "unload_models"
+  },
+  {
+    "model": "sdxl_t2i",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/sdxl_t2i.zip",
+    "entry_relpath": "sdxl_T2I_inference.py",
+    "callable_name": "run_inference_sdxl_t2i",
+    "prewarm_fn": "get_pipeline",
+    "unload_fn": "unload_models"
+  },
+  {
+    "model": "diffusers_outpaint",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/diffusers_outpaint.zip",
+    "entry_relpath": "diffuser_outpaint_inference.py",
+    "callable_name": "run_inference_sdxl_outpaint",
+    "prewarm_fn": "get_sdxl_outpaint_pipeline",
+    "unload_fn": "unload_sdxl_outpaint"
+  },
+  {
+    "model": "aurasrv2",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/aurasrv2.zip",
+    "entry_relpath": "aurasrv2_upscaler.py",
+    "callable_name": "run_inference_aurasr_upscale",
+    "unload_fn": "unload_aura_sr",
+    "no_prompt": true
+  },
+  {
+    "model": "swin2sr",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/swin2sr.zip",
+    "entry_relpath": "swin2sr_upscaler.py",
+    "callable_name": "run_inference_swin2sr",
+    "unload_fn": "unload_swin2sr_models",
+    "no_prompt": true
+  },
+  {
+    "model": "face_enhancer",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/face_enhancer.zip",
+    "entry_relpath": "inference_face_enhancer.py",
+    "callable_name": "run_inference_face_enhancer",
+    "unload_fn": "unload_models",
+    "no_prompt": true
+  },
+  {
+    "model": "video_upscaler",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/video_upscaler.zip",
+    "entry_relpath": "inference.py",
+    "callable_name": "run_inference_video_upscaler",
+    "unload_fn": "unload_models"
+  },
+  {
+    "model": "basic_utils",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/basic_utils.zip",
+    "entry_relpath": "_omni_entry.py",
+    "callable_name": "run_inference"
+  },
+  {
+    "model": "wan_22_fp8_lightx2v_t2v",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/wan_22_fp8_lightx2v_t2v.zip",
+    "entry_relpath": "inference.py",
+    "callable_name": "run_inference_wan_22_t2v"
+  },
+  {
+    "model": "wan_22_fp8_lightx2v_i2v",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/wan_22_fp8_lightx2v_i2v.zip",
+    "entry_relpath": "inference.py",
+    "callable_name": "run_inference_wan_22_i2v"
+  },
+  {
+    "model": "hunyan15_480p_t2v_distilled",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/hunyan15_480p_t2v_distilled.zip",
+    "entry_relpath": "hunyan15_video_inference.py",
+    "callable_name": "run_inference_hunyan15_t2v"
+  },
+  {
+    "model": "hunyan15_480p_i2v_step_distilled",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/hunyan15_480p_i2v_step_distilled.zip",
+    "entry_relpath": "_omni_entry.py",
+    "callable_name": "run_inference"
+  },
+  {
+    "model": "glm_ocr",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/glm_ocr.zip",
+    "entry_relpath": "glm_ocr_inference.py",
+    "callable_name": "run_inference_glm_ocr",
+    "prewarm_fn": "preload_pipeline",
+    "unload_fn": "unload_pipeline"
+  },
+  {
+    "model": "ltx2_3_t2v",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/ltx2_3_multi.zip",
+    "entry_relpath": "ltx2_3_inference.py",
+    "callable_name": "run_inference_ltx2_3_t2v",
+    "unload_fn": "unload_pipelines"
+  },
+  {
+    "model": "ltx2_3_i2v_distilled",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/ltx2_3_multi.zip",
+    "entry_relpath": "ltx2_3_inference.py",
+    "callable_name": "run_inference_ltx2_3_i2v_distilled",
+    "unload_fn": "unload_pipelines"
+  },
+  {
+    "model": "ltx2_3_flf2v",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/ltx2_3_multi.zip",
+    "entry_relpath": "ltx2_3_inference.py",
+    "callable_name": "run_inference_ltx2_3_flf2v",
+    "unload_fn": "unload_pipelines"
+  },
+  {
+    "model": "ltx2_3_iv2v_distilled",
+    "archive_url": "https://<YOUR_R2_PUBLIC_BUCKET>.r2.dev/ltx2_3_multi.zip",
+    "entry_relpath": "ltx2_3_inference.py",
+    "callable_name": "run_inference_ltx2_3_iv2v_distilled",
+    "unload_fn": "unload_pipelines"
+  }
+]

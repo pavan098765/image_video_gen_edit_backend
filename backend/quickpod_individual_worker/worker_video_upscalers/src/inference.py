@@ -37,6 +37,16 @@ if torch.cuda.is_available():
 # Configuration
 MODELS_DIR = os.environ.get("MODELS_DIR", "/app/models")
 
+
+def _realesrgan_video_ckpt_name(upscale_factor: Any) -> str:
+    """rockapaper/realesrgan baked weights (x2plus / x4plus)."""
+    try:
+        u = int(upscale_factor)
+    except (TypeError, ValueError):
+        u = 4
+    return "RealESRGAN_x2plus.pth" if u <= 2 else "RealESRGAN_x4plus.pth"
+
+
 # Default parameters
 DEFAULT_MAX_FPS = 60
 DEFAULT_MAX_UPSCALE = 4
@@ -70,6 +80,15 @@ def load_video_frames(video_path: str):
     
     cap.release()
     return frames, fps, width, height
+
+
+def unload_models():
+    """Free any cached models and reclaim GPU memory."""
+    import gc as _gc
+    _gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def run_inference_video_upscaler(
@@ -108,7 +127,26 @@ def run_inference_video_upscaler(
     input_video = params.get("input_video")
     if not input_video:
         raise ValueError("input_video parameter is required")
-    
+
+    # Accept presigned http(s) URL OR a local path. Controller ships URLs; workers must
+    # download to a temp file before the rest of the pipeline (which assumes a local path).
+    if isinstance(input_video, str) and (
+        input_video.startswith("http://") or input_video.startswith("https://")
+    ):
+        import tempfile
+        import requests
+        url = input_video
+        fd, tmp_path = tempfile.mkstemp(prefix=f"upsc_{job_id}_", suffix=".mp4")
+        os.close(fd)
+        print(f"[{job_id}] Downloading input video {url} -> {tmp_path}")
+        with requests.get(url, stream=True, timeout=300) as resp:
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1 << 20):
+                    if chunk:
+                        fh.write(chunk)
+        input_video = tmp_path
+
     if not os.path.exists(input_video):
         raise FileNotFoundError(f"Input video not found: {input_video}")
     
@@ -162,7 +200,11 @@ def run_inference_video_upscaler(
                 print(f"⚠️  RIFE code not available, interpolation disabled")
         
         if enable_upscaling:
-            realesrgan_model_file = os.path.join(MODELS_DIR, "realesrgan", f"RealESRGAN_x{upscale_factor}.pth")
+            realesrgan_model_file = os.path.join(
+                MODELS_DIR,
+                "realesrgan",
+                _realesrgan_video_ckpt_name(upscale_factor),
+            )
             if os.path.exists(realesrgan_model_file):
                 try:
                     upscale_model = load_sd_upscale(realesrgan_model_file, device)

@@ -1,60 +1,42 @@
 # prompt_enhancement.py
 """
-Prompt Enhancement Service
-
-Provides AI-powered prompt enhancement for image/video generation.
-Uses OpenAI GPT-4 or Claude to improve user prompts.
+Prompt Enhancement Service — NVIDIA integrate API via ``requests`` (``nvidia_chat_client``), no OpenAI SDK.
 
 Configuration via environment variables:
 - PROMPT_ENHANCEMENT_ENABLED: "true" to enable (default: "false")
-- OPENAI_API_KEY: OpenAI API key for GPT-4
-- ANTHROPIC_API_KEY: Anthropic API key for Claude (fallback)
-- PROMPT_ENHANCEMENT_MODEL: Model to use (default: "gpt-4o-mini")
-
-The service is designed to be non-blocking and gracefully fallback
-to the original prompt if enhancement fails.
+- NVIDIA_API_KEY or NVIDIA_LLM_API: Bearer nvapi-... (required when enabled)
+- PROMPT_ENHANCEMENT_NVIDIA_MODELS / NVIDIA_TEXT_MODELS: optional (default nvidia/nemotron-nano-12b-v2-vl)
+- PROMPT_ENHANCEMENT_TIMEOUT: HTTP timeout seconds (default: "120")
+- NVIDIA_MAX_TOKENS, NVIDIA_TEMPERATURE, NVIDIA_STREAM: shared Nemotron payload (see nvidia_chat_client)
 """
 
-import os
 import logging
-import asyncio
+import os
 from typing import Optional, Tuple
-from functools import lru_cache
 
-import httpx
+from nvidia_chat_client import (
+    build_messages_chat_with_media,
+    default_max_tokens,
+    default_temperature,
+    get_nvidia_api_key,
+    get_system_prompt_for_media_extensions,
+    nvidia_chat_completion_try_models,
+    nvidia_models_for_enhancement,
+)
 
 logger = logging.getLogger("prompt_enhancement")
 
 
-# =============================================================================
-# Configuration
-# =============================================================================
-
 def is_enhancement_enabled() -> bool:
-    """Check if prompt enhancement is enabled."""
     return os.getenv("PROMPT_ENHANCEMENT_ENABLED", "false").lower() == "true"
 
 
-@lru_cache(maxsize=1)
-def get_openai_api_key() -> Optional[str]:
-    """Get OpenAI API key from environment."""
-    return os.getenv("OPENAI_API_KEY")
+def get_enhancement_timeout() -> float:
+    try:
+        return float(os.getenv("PROMPT_ENHANCEMENT_TIMEOUT", "120"))
+    except ValueError:
+        return 120.0
 
-
-@lru_cache(maxsize=1)
-def get_anthropic_api_key() -> Optional[str]:
-    """Get Anthropic API key from environment."""
-    return os.getenv("ANTHROPIC_API_KEY")
-
-
-def get_enhancement_model() -> str:
-    """Get the model to use for enhancement."""
-    return os.getenv("PROMPT_ENHANCEMENT_MODEL", "gpt-4o-mini")
-
-
-# =============================================================================
-# System Prompts
-# =============================================================================
 
 IMAGE_ENHANCEMENT_SYSTEM_PROMPT = """You are an expert prompt engineer for AI image generation models like Stable Diffusion, DALL-E, and Midjourney.
 
@@ -103,12 +85,6 @@ Guidelines:
 
 Respond with ONLY the enhanced prompt, no explanations or prefixes."""
 
-
-# =============================================================================
-# Model Detection
-# =============================================================================
-
-# Models that are video generators
 VIDEO_MODELS = {
     "fastwan_22_5b",
     "fastwan_21_1b",
@@ -116,7 +92,6 @@ VIDEO_MODELS = {
     "animatediff",
 }
 
-# Models that are image editors
 EDIT_MODELS = {
     "qwen_image_edit_2509",
     "flux_kontext_dev",
@@ -126,249 +101,87 @@ EDIT_MODELS = {
 
 
 def get_system_prompt_for_model(model: str) -> str:
-    """Get the appropriate system prompt based on model type."""
     model_lower = model.lower()
-    
+
     if any(v in model_lower for v in VIDEO_MODELS):
         return VIDEO_ENHANCEMENT_SYSTEM_PROMPT
-    elif any(e in model_lower for e in EDIT_MODELS):
+    if any(e in model_lower for e in EDIT_MODELS):
         return EDIT_ENHANCEMENT_SYSTEM_PROMPT
-    else:
-        return IMAGE_ENHANCEMENT_SYSTEM_PROMPT
+    return IMAGE_ENHANCEMENT_SYSTEM_PROMPT
 
 
-# =============================================================================
-# OpenAI Enhancement
-# =============================================================================
-
-async def enhance_with_openai(
+async def enhance_with_nvidia(
     prompt: str,
     model: str,
     api_key: str,
-    timeout: float = 10.0,
+    timeout: float,
 ) -> Tuple[bool, str]:
-    """
-    Enhance prompt using OpenAI API.
-    
-    Args:
-        prompt: Original user prompt
-        model: The generation model (to determine system prompt)
-        api_key: OpenAI API key
-        timeout: Request timeout in seconds
-    
-    Returns:
-        Tuple of (success, enhanced_prompt_or_error)
-    """
-    enhancement_model = get_enhancement_model()
-    system_prompt = get_system_prompt_for_model(model)
-    
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": enhancement_model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": 500,
-                    "temperature": 0.7,
-                },
-            )
-            
-            if response.status_code != 200:
-                error_msg = response.text
-                logger.error(f"OpenAI API error: {response.status_code} - {error_msg}")
-                return False, f"OpenAI API error: {response.status_code}"
-            
-            data = response.json()
-            enhanced = data["choices"][0]["message"]["content"].strip()
-            
-            # Validate enhanced prompt is reasonable
-            if len(enhanced) < 5:
-                logger.warning("Enhanced prompt too short, using original")
-                return False, "Enhanced prompt too short"
-            
-            if len(enhanced) > 2000:
-                # Truncate if too long
-                enhanced = enhanced[:2000]
-            
-            logger.info(f"Prompt enhanced: {len(prompt)} -> {len(enhanced)} chars")
-            return True, enhanced
-            
-    except httpx.TimeoutException:
-        logger.warning("OpenAI API timeout")
-        return False, "Enhancement timeout"
-    except Exception as e:
-        logger.error(f"OpenAI enhancement error: {e}")
-        return False, str(e)
+    instruction = get_system_prompt_for_model(model)
+    combined_query = f"{instruction}\n\nUser prompt to enhance:\n{prompt}"
+    messages = build_messages_chat_with_media(
+        system_prompt=get_system_prompt_for_media_extensions([]),
+        query=combined_query,
+        media_files=[],
+    )
 
+    models = nvidia_models_for_enhancement()
+    ok, text = await nvidia_chat_completion_try_models(
+        messages=messages,
+        models=models,
+        api_key=api_key,
+        timeout=timeout,
+        max_tokens=default_max_tokens(),
+        temperature=default_temperature(),
+        min_chars=5,
+        log_prefix="prompt_enhance",
+        stream=None,
+    )
 
-# =============================================================================
-# Anthropic Enhancement (Fallback)
-# =============================================================================
+    if not ok:
+        return False, text
 
-async def enhance_with_anthropic(
-    prompt: str,
-    model: str,
-    api_key: str,
-    timeout: float = 10.0,
-) -> Tuple[bool, str]:
-    """
-    Enhance prompt using Anthropic Claude API (fallback).
-    
-    Args:
-        prompt: Original user prompt
-        model: The generation model (to determine system prompt)
-        api_key: Anthropic API key
-        timeout: Request timeout in seconds
-    
-    Returns:
-        Tuple of (success, enhanced_prompt_or_error)
-    """
-    system_prompt = get_system_prompt_for_model(model)
-    
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "claude-3-haiku-20240307",
-                    "max_tokens": 500,
-                    "system": system_prompt,
-                    "messages": [
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-            )
-            
-            if response.status_code != 200:
-                error_msg = response.text
-                logger.error(f"Anthropic API error: {response.status_code} - {error_msg}")
-                return False, f"Anthropic API error: {response.status_code}"
-            
-            data = response.json()
-            enhanced = data["content"][0]["text"].strip()
-            
-            # Validate enhanced prompt is reasonable
-            if len(enhanced) < 5:
-                logger.warning("Enhanced prompt too short, using original")
-                return False, "Enhanced prompt too short"
-            
-            if len(enhanced) > 2000:
-                enhanced = enhanced[:2000]
-            
-            logger.info(f"Prompt enhanced (Claude): {len(prompt)} -> {len(enhanced)} chars")
-            return True, enhanced
-            
-    except httpx.TimeoutException:
-        logger.warning("Anthropic API timeout")
-        return False, "Enhancement timeout"
-    except Exception as e:
-        logger.error(f"Anthropic enhancement error: {e}")
-        return False, str(e)
+    if len(text) > 2000:
+        text = text[:2000]
 
+    logger.info(f"Prompt enhanced: {len(prompt)} -> {len(text)} chars")
+    return True, text
 
-# =============================================================================
-# Main Enhancement Function
-# =============================================================================
 
 async def enhance_prompt(
     prompt: str,
     model: str,
     timeout: float = 10.0,
 ) -> Tuple[bool, str, Optional[str]]:
-    """
-    Enhance a user prompt using AI.
-    
-    This is the main entry point for prompt enhancement.
-    It tries OpenAI first, then falls back to Anthropic if available.
-    If enhancement is disabled or fails, returns the original prompt.
-    
-    Args:
-        prompt: Original user prompt
-        model: The generation model being used
-        timeout: Total timeout for enhancement attempts
-    
-    Returns:
-        Tuple of (was_enhanced, final_prompt, original_prompt_if_enhanced)
-        - was_enhanced: True if prompt was successfully enhanced
-        - final_prompt: The enhanced prompt or original if failed
-        - original_prompt_if_enhanced: Original prompt if enhanced, None otherwise
-    """
-    # Skip if disabled
     if not is_enhancement_enabled():
         logger.debug("Prompt enhancement disabled")
         return False, prompt, None
-    
-    # Skip if prompt is empty or too short
+
     if not prompt or len(prompt.strip()) < 3:
         logger.debug("Prompt too short for enhancement")
         return False, prompt, None
-    
+
     original_prompt = prompt
-    
-    # Try OpenAI first
-    openai_key = get_openai_api_key()
-    if openai_key:
-        success, result = await enhance_with_openai(prompt, model, openai_key, timeout)
-        if success:
-            return True, result, original_prompt
-        logger.warning(f"OpenAI enhancement failed: {result}")
-    
-    # Fallback to Anthropic
-    anthropic_key = get_anthropic_api_key()
-    if anthropic_key:
-        success, result = await enhance_with_anthropic(prompt, model, anthropic_key, timeout)
-        if success:
-            return True, result, original_prompt
-        logger.warning(f"Anthropic enhancement failed: {result}")
-    
-    # All methods failed or no API keys configured
-    if not openai_key and not anthropic_key:
-        logger.warning("No API keys configured for prompt enhancement")
-    
+    api_key = get_nvidia_api_key()
+    if not api_key:
+        logger.warning("NVIDIA_API_KEY / NVIDIA_LLM_API not set; prompt enhancement unavailable")
+        return False, prompt, None
+
+    t = timeout if timeout > 0 else get_enhancement_timeout()
+    success, result = await enhance_with_nvidia(prompt, model, api_key, t)
+    if success:
+        return True, result, original_prompt
+
+    logger.warning(f"NVIDIA enhancement failed: {result}")
     return False, prompt, None
 
 
-# =============================================================================
-# Utility Functions
-# =============================================================================
-
 def should_enhance_for_model(model: str, mode: Optional[str] = None) -> bool:
-    """
-    Check if prompt enhancement is appropriate for the given model/mode.
-    
-    Some models/modes don't benefit from prompt enhancement:
-    - Background removal (no prompt needed)
-    - Object removal/inpainting (prompt is about what to remove)
-    - Upscaling (no prompt needed)
-    
-    Args:
-        model: Model identifier
-        mode: Operation mode (e.g., "bg_remove", "lama_inpaint")
-    
-    Returns:
-        True if enhancement is appropriate
-    """
-    # Models that don't use prompts
     no_prompt_models = {"basic_utils", "real_esrgan", "upscaler"}
     if model.lower() in no_prompt_models:
         return False
-    
-    # Modes that don't benefit from enhancement
+
     no_enhancement_modes = {"bg_remove", "lama_inpaint", "upscale"}
     if mode and mode.lower() in no_enhancement_modes:
         return False
-    
+
     return True

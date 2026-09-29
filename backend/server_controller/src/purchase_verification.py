@@ -116,11 +116,17 @@ def get_credits_for_product(product_id: str) -> int:
     """
     Get the credit amount for a product ID.
     Returns 0 if product is not a credit pack.
+
+    Packs with base credits greater than 500 receive a +10% bonus (rounded).
     
     CRITICAL: This is the authoritative source for credit amounts.
     Never use client-provided credit amounts.
     """
-    return PRODUCT_CREDITS_MAP.get(product_id, 0)
+    base = PRODUCT_CREDITS_MAP.get(product_id, 0)
+    if base <= 500:
+        return base
+    bonus = int(round(base * 0.10))
+    return base + bonus
 
 
 def is_consumable_product(product_id: str) -> bool:

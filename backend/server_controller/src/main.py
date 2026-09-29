@@ -45,7 +45,9 @@ from routes import (
 )
 from pod_manager import PodManager
 from job_manager import JobManager, job_recovery_task
+from scheduler_strategy import build_scheduler_strategy
 from security import ip_ban_manager
+from studio_routes import studio_router
 
 # Initialize logging
 setup_logging()
@@ -66,6 +68,7 @@ class AppState:
         self.s3_client = None
         self.background_tasks: list = []
         self.shutdown_event = asyncio.Event()
+        self._ttl_destroy_inflight: set = set()
     
     async def initialize(self):
         """Initialize all application components"""
@@ -90,6 +93,27 @@ class AppState:
         logger.info("Initializing R2 storage...")
         self.s3_client = config_manager.get_s3_client()
         
+        # Crypto mode banner: both sides must agree. Mismatched modes fail on the first
+        # register/heartbeat call, so emit the current mode loudly on boot.
+        try:
+            from worker_transport_crypto import (
+                crypto_enabled as _wt_crypto_enabled,
+                transport_crypto_explicitly_on as _wt_explicit_on,
+                get_fernet as _wt_get_fernet,
+            )
+            _wt_env = os.getenv("WORKER_TRANSPORT_CRYPTO", "").strip()
+            _wt_has_key = _wt_get_fernet() is not None
+            logger.info(
+                "WORKER_TRANSPORT_CRYPTO=%r explicit_on=%s fernet_key_available=%s payload_encryption=%s "
+                "(controller and workers MUST match; set WORKER_TRANSPORT_CRYPTO=1 on both sides)",
+                _wt_env,
+                _wt_explicit_on(),
+                _wt_has_key,
+                _wt_crypto_enabled(),
+            )
+        except Exception as _crypto_log_err:
+            logger.warning("Could not log worker transport crypto mode: %s", _crypto_log_err)
+
         # Initialize Pod Manager
         logger.info("Initializing Pod Manager...")
         self.pod_manager = PodManager(
@@ -98,13 +122,54 @@ class AppState:
             warm_pod_uuid=self.config.quickpod.warm_pod_uuid if self.config.pod.strategy.value == "warm_and_individual" else None,
         )
         await self.pod_manager.initialize()
+
+        # Shared-bake drift check: controller FLEET_OMNI_SHARED_BAKE_MODELS must mirror
+        # worker_multi_common/src/omni_config.py OMNI_SHARED_BAKED_MODELS. Worker advertises
+        # them via register_worker + heartbeat; if the two diverge, the scheduler routes to
+        # pods that are missing baked weights (or conservatively skips pods that have them).
+        _WORKER_SHARED_BAKE_MIRROR = frozenset(
+            {
+                "basic_utils",
+                "aurasrv2",
+                "swin2sr",
+                "video_upscaler",
+                "face_enhancer",
+                "glm_ocr",
+            }
+        )
+        _ctrl_set = set(PodManager.FLEET_OMNI_SHARED_BAKE_MODELS)
+        _worker_set = set(_WORKER_SHARED_BAKE_MIRROR)
+        if _ctrl_set != _worker_set:
+            missing_in_ctrl = sorted(_worker_set - _ctrl_set)
+            extra_in_ctrl = sorted(_ctrl_set - _worker_set)
+            logger.warning(
+                "SHARED_BAKE_DRIFT FLEET_OMNI_SHARED_BAKE_MODELS=%s != worker OMNI_SHARED_BAKED_MODELS=%s "
+                "(missing in controller: %s; extra in controller: %s) — "
+                "sync backend/server_controller/src/pod_manager.py with "
+                "backend/quickpod_individual_worker/worker_multi_common/src/omni_config.py",
+                sorted(_ctrl_set),
+                sorted(_worker_set),
+                missing_in_ctrl,
+                extra_in_ctrl,
+            )
+        else:
+            logger.info(
+                "Shared-bake parity OK (controller FLEET_OMNI_SHARED_BAKE_MODELS == worker OMNI_SHARED_BAKED_MODELS): %s",
+                sorted(_ctrl_set),
+            )
         
         # Initialize Job Manager
         logger.info("Initializing Job Manager...")
         db_manager = get_db_manager()
+        scheduler_router = build_scheduler_strategy(
+            pod_manager=self.pod_manager,
+            scheduler_mode=self.config.scheduler.mode.value,
+            shadow_mode=self.config.scheduler.shadow_mode,
+        )
         self.job_manager = JobManager(
             session_factory=db_manager.session_factory,
             pod_manager=self.pod_manager,
+            scheduler_router=scheduler_router,
             max_retries=self.config.job.max_retries,
             job_timeout_minutes=self.config.job.timeout_minutes,
             running_job_timeout_minutes=self.config.job.running_timeout_minutes,
@@ -137,15 +202,6 @@ class AppState:
     async def start_background_tasks(self):
         """Start all background tasks"""
         logger.info("Starting background tasks...")
-        
-        # Job recovery task
-        if self.config.job.auto_recover:
-            task = asyncio.create_task(
-                job_recovery_task(self.job_manager, interval=30),
-                name="job_recovery"
-            )
-            self.background_tasks.append(task)
-            logger.info("Started job recovery task")
         
         # Idle worker reaper
         task = asyncio.create_task(
@@ -214,6 +270,18 @@ class AppState:
         )
         self.background_tasks.append(task)
         logger.info("Started stray pod cleanup task")
+
+        # Fixed-fleet TTL enforcer (hard pod cutoff + drain marker)
+        if (
+            self.pod_manager
+            and self.config.scheduler.mode.value == "fixed_fleet_windowed"
+        ):
+            task = asyncio.create_task(
+                self._fixed_fleet_ttl_enforcer_task(),
+                name="fixed_fleet_ttl_enforcer",
+            )
+            self.background_tasks.append(task)
+            logger.info("Started fixed fleet TTL enforcer task")
         
         # R2 input media reaper (cleanup orphaned input-media objects)
         task = asyncio.create_task(
@@ -230,6 +298,13 @@ class AppState:
         )
         self.background_tasks.append(task)
         logger.info("Started DB cleanup task")
+
+        task = asyncio.create_task(
+            self._kie_recordinfo_sweeper_task(),
+            name="kie_recordinfo_sweeper",
+        )
+        self.background_tasks.append(task)
+        logger.info("Started Kie recordInfo fallback sweeper")
         
         logger.info(f"Started {len(self.background_tasks)} background tasks")
     
@@ -270,6 +345,46 @@ class AppState:
     # -------------------------------------------------------------------------
     # Background Tasks
     # -------------------------------------------------------------------------
+
+    async def _kie_recordinfo_sweeper_task(self):
+        """Once-per-task fallback if Kie never POSTs callBackUrl."""
+        from datetime import timedelta
+        from db import SessionLocal, KieTask, utc_naive_now
+        from routes import _apply_kie_job_result
+        import kie_client
+
+        await asyncio.sleep(60)
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(90)
+                db = SessionLocal()
+                try:
+                    cutoff = utc_naive_now() - timedelta(minutes=8)
+                    stale = (
+                        db.query(KieTask)
+                        .filter(
+                            KieTask.callback_received == False,  # noqa: E712
+                            KieTask.created_at < cutoff,
+                        )
+                        .limit(20)
+                        .all()
+                    )
+                    for rec in stale:
+                        try:
+                            payload = kie_client.record_info(rec.task_id)
+                        except Exception:
+                            logger.exception("Kie recordInfo failed for %s", rec.task_id)
+                            continue
+                        rec.callback_received = True
+                        rec.updated_at = utc_naive_now()
+                        db.commit()
+                        await _apply_kie_job_result(rec.job_id, payload)
+                finally:
+                    db.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Kie recordInfo sweeper error")
     
     async def _idle_worker_reaper_task(self):
         """Reap idle workers"""
@@ -280,6 +395,7 @@ class AppState:
         heartbeat_stale_secs = self.config.worker.heartbeat_stale_seconds
         idle_cfg = self.config.worker
         sweep_interval = 30
+        fixed_fleet_mode = self.config.scheduler.mode.value == "fixed_fleet_windowed"
         
         logger.info(
             f"Idle worker reaper: stale>{heartbeat_stale_secs}s, "
@@ -302,6 +418,26 @@ class AppState:
                     
                     for w in workers:
                         try:
+                            if (w.model or "").strip().lower() == "studio_engine":
+                                cached_hb = get_cached_last_heartbeat(w.worker_id)
+                                effective_hb = cached_hb or w.last_heartbeat
+                                if effective_hb and effective_hb >= stale_cutoff:
+                                    continue
+                                logger.warning(
+                                    f"Studio engine worker {w.worker_id} orphan heartbeat; "
+                                    "deleting Vultr instance (not QuickPod)"
+                                )
+                                from vultr_pool import pool as vultr_pool
+
+                                vid = None
+                                if isinstance(w.info, dict):
+                                    vid = w.info.get("vultr_id")
+                                vid = vid or w.container_id
+                                if vid:
+                                    vultr_pool.destroy_instance(vid)
+                                w.status = "offline"
+                                db.commit()
+                                continue
                             # ------------------------------------------------------------------
                             # CRITICAL: Handle workers stuck in "starting" state FIRST.
                             # Do NOT treat "starting" as stale just because DB heartbeat is missing.
@@ -335,6 +471,30 @@ class AppState:
                             
                             # If cache shows recent heartbeat, worker is NOT stale even if DB lags
                             if not effective_hb or effective_hb < stale_cutoff:
+                                stale_age = (now - effective_hb).total_seconds() if effective_hb else 9999
+                                max_stale_with_jobs = heartbeat_stale_secs * 3
+
+                                active_running = db.query(Job).filter(
+                                    Job.worker_id == w.worker_id,
+                                    Job.status.in_([
+                                        JobState.RUNNING.value,
+                                        JobState.DISPATCHING.value
+                                    ])
+                                ).count()
+                                if active_running > 0 and stale_age < max_stale_with_jobs:
+                                    logger.warning(
+                                        f"Worker {w.worker_id} heartbeat stale ({stale_age:.0f}s) but has "
+                                        f"{active_running} active RUNNING/DISPATCHING job(s). "
+                                        f"Skipping destroy (max grace: {max_stale_with_jobs}s)."
+                                    )
+                                    continue
+                                elif active_running > 0:
+                                    logger.error(
+                                        f"Worker {w.worker_id} heartbeat stale for {stale_age:.0f}s "
+                                        f"(>{max_stale_with_jobs}s grace) with {active_running} active job(s). "
+                                        f"Worker likely dead, proceeding with pod destruction."
+                                    )
+
                                 logger.warning(
                                     f"Worker {w.worker_id} stale, destroying pod {w.container_id}"
                                 )
@@ -411,7 +571,7 @@ class AppState:
                                             )
                                             continue
                                 
-                                # Do not destroy if there are PENDING jobs for this model (e.g. next bulk batch)
+                                # Do not destroy if there are PENDING or orphaned QUEUED jobs for this model
                                 if w.model:
                                     pending_for_model = db.query(Job).filter(
                                         Job.model == w.model,
@@ -423,21 +583,69 @@ class AppState:
                                             f"PENDING job(s), skipping idle destroy"
                                         )
                                         continue
+
+                                    orphaned_queued = db.query(Job).filter(
+                                        Job.model == w.model,
+                                        Job.status == JobState.QUEUED.value,
+                                        Job.worker_id.is_(None),
+                                    ).count()
+                                    if orphaned_queued > 0:
+                                        logger.warning(
+                                            f"Worker {w.worker_id} model {w.model} has {orphaned_queued} "
+                                            f"orphaned QUEUED job(s) (worker_id=None). "
+                                            f"Skipping idle destroy; triggering dispatch."
+                                        )
+                                        orphaned_jobs = db.query(Job).filter(
+                                            Job.model == w.model,
+                                            Job.status == JobState.QUEUED.value,
+                                            Job.worker_id.is_(None),
+                                        ).all()
+                                        for oj in orphaned_jobs:
+                                            op = oj.params if isinstance(oj.params, dict) else {}
+                                            if op.get("on_device") is True:
+                                                continue
+                                            try:
+                                                import importlib
+                                                routes = importlib.import_module("routes")
+                                                dispatch_fn = getattr(routes, "_dispatch_job_background", None)
+                                                if dispatch_fn:
+                                                    asyncio.create_task(dispatch_fn(oj.job_id, oj.model, None))
+                                            except Exception as e:
+                                                logger.warning(f"Failed to dispatch orphaned job {oj.job_id}: {e}")
+                                        continue
                                 
                                 # Idle timeout: pod completed all assigned jobs, no new jobs came to it.
                                 # Destroy only if idle for configured timeout (errors handled separately).
+                                from gpu_providers.ttl import (
+                                    idle_timeout_seconds_for_worker,
+                                    provider_of_worker,
+                                )
+                                if fixed_fleet_mode and provider_of_worker(w) in ("", "quickpod"):
+                                    logger.debug(
+                                        f"Fixed fleet mode: skipping idle-time destroy for worker {w.worker_id}"
+                                    )
+                                    continue
+
                                 last_job = w.last_job_finished_at or w.created_at or w.last_active
                                 idle_for = (now - last_job).total_seconds() if last_job else 0
                                 worker_age = (now - w.created_at).total_seconds() if w.created_at else 0
+
+                                timeout_secs = idle_timeout_seconds_for_worker(
+                                    w, idle_cfg.idle_timeout_seconds
+                                )
+                                min_age = (
+                                    0
+                                    if timeout_secs == 0
+                                    else idle_cfg.idle_min_age_seconds
+                                )
                                 
-                                if worker_age < idle_cfg.idle_min_age_seconds:
+                                if worker_age < min_age:
                                     logger.debug(
                                         f"Worker {w.worker_id} is only {worker_age:.1f}s old, "
-                                        f"min_age={idle_cfg.idle_min_age_seconds}s, skipping idle check"
+                                        f"min_age={min_age}s, skipping idle check"
                                     )
                                     continue
                                 
-                                timeout_secs = idle_cfg.idle_timeout_seconds
                                 if idle_for > timeout_secs:
                                     logger.info(
                                         f"Worker {w.worker_id} idle for {idle_for:.1f}s "
@@ -500,6 +708,81 @@ class AppState:
                 break
             except Exception:
                 logger.exception("Idle worker reaper error")
+
+    async def _fixed_fleet_ttl_enforcer_task(self):
+        """
+        Enforce fixed-fleet pod lifecycle:
+        - mark pods as drain mode near TTL
+        - hard-destroy pods at/after TTL
+        """
+        from datetime import datetime
+
+        sweep_interval = 1
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(sweep_interval)
+                if not self.pod_manager:
+                    continue
+
+                now = datetime.utcnow()
+                to_destroy = []
+                ttl_seconds = self.pod_manager.pod_max_lifetime_seconds
+                drain_guard = self.pod_manager.pod_drain_guard_seconds
+
+                async with self.pod_manager._lock:
+                    for pod_uuid, pi in self.pod_manager.individual_pods.items():
+                        if pi.meta.get("is_cache_refresh_pod"):
+                            continue
+                        age_seconds = (now - pi.created_at).total_seconds()
+                        remaining_seconds = ttl_seconds - age_seconds
+
+                        if remaining_seconds <= drain_guard and not pi.meta.get("drain_mode"):
+                            pi.meta["drain_mode"] = True
+                            pi.meta["drain_since"] = now.isoformat()
+                            logger.info(
+                                "Fixed fleet drain mode: pod=%s machine=%s age=%.1fs remaining=%.1fs",
+                                pod_uuid,
+                                pi.machine_id,
+                                age_seconds,
+                                remaining_seconds,
+                            )
+
+                        if age_seconds >= ttl_seconds:
+                            to_destroy.append((pod_uuid, age_seconds))
+
+                # Deterministic ordering: oldest pods first, then UUID.
+                to_destroy.sort(key=lambda x: (-x[1], x[0]))
+                for pod_uuid, age_seconds in to_destroy:
+                    if pod_uuid in self._ttl_destroy_inflight:
+                        continue
+                    self._ttl_destroy_inflight.add(pod_uuid)
+                    try:
+                        logger.warning(
+                            "Fixed fleet hard TTL cutoff: destroying pod=%s age=%.1fs (ttl=%ss)",
+                            pod_uuid,
+                            age_seconds,
+                            ttl_seconds,
+                        )
+                        if hasattr(self.pod_manager, "fixed_fleet_metrics"):
+                            self.pod_manager.fixed_fleet_metrics["ttl_cutoff_destroyed"] = (
+                                self.pod_manager.fixed_fleet_metrics.get("ttl_cutoff_destroyed", 0) + 1
+                            )
+                        await self.pod_manager.destroy_individual_pod(
+                            pod_uuid,
+                            reason=f"Fixed fleet hard TTL cutoff ({age_seconds:.0f}s)",
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Fixed fleet TTL destroy failed for pod=%s err=%s",
+                            pod_uuid,
+                            e,
+                        )
+                    finally:
+                        self._ttl_destroy_inflight.discard(pod_uuid)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Fixed fleet TTL enforcer error")
     
     async def _pod_cleanup_task(self):
         """Clean up terminated/offline pods"""
@@ -565,7 +848,6 @@ class AppState:
         
         CRITICAL: Does NOT destroy pods that have active jobs!
         """
-        from quickpod_api import QuickPodManager
         from db import SessionLocal, Worker, Job
         from job_manager import JobState
         
@@ -582,14 +864,10 @@ class AppState:
                     continue
                 
                 try:
-                    # Fetch all pods from QuickPod
-                    # Create a fresh session for each cleanup run to avoid session issues
-                    from quickpod_api import QuickPodManager
-                    qp = QuickPodManager(
-                        self.pod_manager.email,
-                        self.pod_manager.password,
-                    )
-                    await asyncio.to_thread(qp.login)
+                    # Fetch all pods from QuickPod.
+                    # Reuse the shared manager so we don't force-login every sweep.
+                    # QuickPodManager.get_my_pods() already refreshes auth only when needed.
+                    qp = self.pod_manager.global_qp
                     pods = await asyncio.to_thread(qp.get_my_pods)
                     
                     if pods is None:
@@ -883,11 +1161,16 @@ class AppState:
         Without this task, QUEUED jobs would sit indefinitely waiting
         for the 30-minute timeout, even when workers are available.
         """
-        from db import SessionLocal, Job, Worker
-        from models import JobState
+        from db import SessionLocal, Job, Worker, utc_naive_now
+        from datetime import timedelta
+        from job_manager import JobState
         from routes import _dispatch_job_background
         
         dispatch_interval = 5  # Check every 5 seconds
+        fairness_enabled = bool(self.config.job.queue_fairness_enabled)
+        fairness_max_consecutive = max(
+            1, int(self.config.job.queue_fairness_max_consecutive_per_model)
+        )
         
         # Track recently dispatched jobs to avoid re-dispatching too quickly
         # Maps job_id -> timestamp when dispatch was triggered
@@ -906,9 +1189,6 @@ class AppState:
                     continue
                 
                 # Clean up old entries from recently_dispatched
-                from utils import utc_naive_now
-                from datetime import timedelta
-                
                 now = utc_naive_now()
                 cutoff = now - timedelta(seconds=dispatch_cooldown * 2)
                 recently_dispatched = {
@@ -940,6 +1220,11 @@ class AppState:
                     cooldown_threshold = now - timedelta(seconds=dispatch_cooldown)
                     eligible_jobs = []
                     for job in queued_jobs:
+                        jp = job.params if isinstance(job.params, dict) else {}
+                        if jp.get("on_device") is True:
+                            continue
+                        if (job.model or "").strip().lower() in {"studio", "studio_engine"}:
+                            continue
                         last_dispatch = recently_dispatched.get(job.job_id)
                         if last_dispatch is None or last_dispatch < cooldown_threshold:
                             eligible_jobs.append(job)
@@ -952,36 +1237,81 @@ class AppState:
                     
                     # Group jobs by model for efficient dispatch
                     jobs_by_model: dict = {}
+                    model_order: list = []
                     for job in eligible_jobs:
                         if job.model not in jobs_by_model:
                             jobs_by_model[job.model] = []
+                            model_order.append(job.model)
                         jobs_by_model[job.model].append(job)
-                    
-                    # Check for available workers for each model
-                    for model, jobs in jobs_by_model.items():
-                        # Always attempt dispatch for eligible QUEUED jobs.
-                        # _dispatch_job_background handles finding/creating pods.
-                        for job in jobs:
-                            logger.info(
-                                f"[DISPATCHER] Triggering dispatch for QUEUED job {job.job_id} "
-                                f"(model={model}, queued_since={job.updated_at})"
-                            )
-                            
-                            # Mark as recently dispatched
-                            recently_dispatched[job.job_id] = now
-                            
-                            # Get job mode from params
-                            job_mode = None
-                            if job.params and isinstance(job.params, dict):
-                                job_mode = job.params.get("mode")
-                            
-                            # Dispatch in background
-                            asyncio.create_task(
-                                _dispatch_job_background(job.job_id, model, job_mode)
-                            )
-                            
-                            # Small delay between dispatches to avoid thundering herd
-                            await asyncio.sleep(0.5)
+
+                    # Build fair dispatch sequence (bounded consecutive per model).
+                    dispatch_sequence = []
+                    if fairness_enabled:
+                        cursor = 0
+                        last_model = None
+                        consecutive_for_last = 0
+
+                        while True:
+                            active_models = [m for m in model_order if jobs_by_model.get(m)]
+                            if not active_models:
+                                break
+
+                            selected_model = None
+                            for offset in range(len(model_order)):
+                                candidate = model_order[(cursor + offset) % len(model_order)]
+                                if not jobs_by_model.get(candidate):
+                                    continue
+                                if (
+                                    candidate == last_model
+                                    and consecutive_for_last >= fairness_max_consecutive
+                                ):
+                                    continue
+                                selected_model = candidate
+                                cursor = (cursor + offset + 1) % len(model_order)
+                                break
+
+                            if selected_model is None:
+                                # All non-empty models were blocked by consecutive cap.
+                                # Reset streak to preserve progress deterministically.
+                                last_model = None
+                                consecutive_for_last = 0
+                                continue
+
+                            dispatch_sequence.append((selected_model, jobs_by_model[selected_model].pop(0)))
+                            if selected_model == last_model:
+                                consecutive_for_last += 1
+                            else:
+                                last_model = selected_model
+                                consecutive_for_last = 1
+                    else:
+                        for model in model_order:
+                            for job in jobs_by_model.get(model, []):
+                                dispatch_sequence.append((model, job))
+
+                    for model, job in dispatch_sequence:
+                        logger.info(
+                            f"[DISPATCHER] Triggering dispatch for QUEUED job {job.job_id} "
+                            f"(model={model}, queued_since={job.updated_at}, fairness={fairness_enabled})"
+                        )
+                        if fairness_enabled and self.pod_manager and hasattr(self.pod_manager, "fixed_fleet_metrics"):
+                            metrics = self.pod_manager.fixed_fleet_metrics
+                            metrics["fairness_dispatch_total"] = int(metrics.get("fairness_dispatch_total", 0)) + 1
+
+                        # Mark as recently dispatched
+                        recently_dispatched[job.job_id] = now
+
+                        # Get job mode from params
+                        job_mode = None
+                        if job.params and isinstance(job.params, dict):
+                            job_mode = job.params.get("mode")
+
+                        # Dispatch in background
+                        asyncio.create_task(
+                            _dispatch_job_background(job.job_id, model, job_mode)
+                        )
+
+                        # Small delay between dispatches to avoid thundering herd
+                        await asyncio.sleep(0.5)
                 finally:
                     db.close()
                     
@@ -1040,6 +1370,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_router)
     app.include_router(auth_router)
     app.include_router(ads_router)
+    app.include_router(studio_router)
     
     return app
 
