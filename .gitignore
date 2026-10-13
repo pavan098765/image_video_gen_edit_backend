@@ -88,3 +88,11 @@ backend/server_controller/src/controller_export.xlsx
 *.xlsx
 # HF Space reference clone (nested .git) next to I2V multi worker; remove inner .git to track files
 backend/quickpod_individual_worker/worker_wan_22_fp8_lightx2v_i2v_multi/wan2-2-fp8da-aoti-preview2/.git/
+
+# Local dumps / Civitai packs / bench archives (GitHub rejects files >100MB)
+/*.zip
+work_space/*.zip
+work_space/**/*.zip
+**/src/_archive/
+*.gguf
+*.safetensors
