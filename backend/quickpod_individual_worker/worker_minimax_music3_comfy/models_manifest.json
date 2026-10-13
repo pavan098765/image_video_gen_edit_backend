@@ -1,0 +1,19 @@
+{
+  "files": [
+    {
+      "hf_repo": "Comfy-Org/MiniMax-Music-3",
+      "hf_path": "diffusion_models/minimax_music3_dit_int8_convrot.safetensors",
+      "dest": "diffusion_models/minimax_music3_dit_int8_convrot.safetensors"
+    },
+    {
+      "hf_repo": "Comfy-Org/MiniMax-Music-3",
+      "hf_path": "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+      "dest": "text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors"
+    },
+    {
+      "hf_repo": "Comfy-Org/MiniMax-Music-3",
+      "hf_path": "vae/minimax_music3_dav.safetensors",
+      "dest": "vae/minimax_music3_dav.safetensors"
+    }
+  ]
+}

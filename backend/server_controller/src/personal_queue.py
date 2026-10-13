@@ -40,6 +40,10 @@ VIDEO_MODELS = (
     "flashvsr_video_upscaler",
 )
 
+AUDIO_MODELS = (
+    "minimax_music3",
+)
+
 IMAGE_MODELS = (
     "sdxl_t2i",
     "sdxl_i2i",
@@ -47,6 +51,7 @@ IMAGE_MODELS = (
     "sd15",
     "sd35",
     "qwen_image",
+    "qwen_image_21_turbo",
     "qwen_image_edit",
     "qwen_image_edit_2509",
     "qwen_image_edit_2511_rapid_aio",
@@ -67,6 +72,9 @@ LEFTOVER_MODELS = [
 ] + [
     {"id": mid, "kind": "image", "label": mid}
     for mid in IMAGE_MODELS
+] + [
+    {"id": mid, "kind": "audio", "label": mid}
+    for mid in AUDIO_MODELS
 ]
 
 
@@ -85,8 +93,17 @@ def has_leftover_work(db: Session, models: Optional[Sequence[str]] = None) -> bo
     return q.first() is not None
 
 
+def is_audio_model(model: str) -> bool:
+    key = (model or "").strip().lower()
+    if key in AUDIO_MODELS:
+        return True
+    return "music" in key
+
+
 def is_video_model(model: str) -> bool:
     key = (model or "").strip().lower()
+    if is_audio_model(key):
+        return False
     if key in VIDEO_MODELS:
         return True
     return any(
@@ -96,6 +113,8 @@ def is_video_model(model: str) -> bool:
 
 
 def result_extension(model: str) -> str:
+    if is_audio_model(model):
+        return ".mp3"
     return ".mp4" if is_video_model(model) else ".png"
 
 

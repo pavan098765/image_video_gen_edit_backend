@@ -3997,11 +3997,18 @@ async def submit_job(
             "hunyan15_480p_i2v_step_distilled", "hunyan15_480p_t2v_distilled",
             "ltx2_3_t2v", "ltx2_3_i2v_distilled", "ltx2_3_flf2v",
             "ltx2_3_iv2v_distilled",
+            "minimax_h3",
+            "ltx25_int8", "ltx25_int8_t2v", "ltx25_int8_i2v", "ltx25_int8_flf2v",
         }
         TEXT_OUTPUT_MODELS = {"glm_ocr"}
-        is_video_model = model.lower() in VIDEO_MODELS or "video" in model.lower()
-        is_text_output_model = model.lower() in TEXT_OUTPUT_MODELS
-        if is_video_model:
+        AUDIO_OUTPUT_MODELS = {"minimax_music3"}
+        model_l = model.lower()
+        is_video_model = model_l in VIDEO_MODELS or "video" in model_l
+        is_text_output_model = model_l in TEXT_OUTPUT_MODELS
+        is_audio_output_model = model_l in AUDIO_OUTPUT_MODELS or "music" in model_l
+        if is_audio_output_model:
+            output_extension = ".mp3"
+        elif is_video_model:
             output_extension = ".mp4"
         elif is_text_output_model:
             output_extension = ".txt"

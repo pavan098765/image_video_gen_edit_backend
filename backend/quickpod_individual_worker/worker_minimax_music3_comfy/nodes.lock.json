@@ -1,0 +1,9 @@
+{
+  "comfyui": {
+    "repo": "https://github.com/Comfy-Org/ComfyUI",
+    "ref": "v0.37.0"
+  },
+  "custom_nodes": [],
+  "local_nodes": [],
+  "note": "MiniMax Music 3 is native in ComfyUI v0.33.1+ (UNETLoader, MiniMaxMusic3TextEncode, EmptyMiniMaxMusic3LatentAudio, VAEDecodeAudioTiled)."
+}

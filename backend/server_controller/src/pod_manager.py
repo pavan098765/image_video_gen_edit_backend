@@ -773,6 +773,12 @@ class PodManager:
             "ltx25_int8_i2v",
             "ltx25_int8_flf2v",
         ],
+        "qwen_image_21_turbo_comfy": [
+            "qwen_image_21_turbo",
+        ],
+        "minimax_music3_comfy": [
+            "minimax_music3",
+        ],
     }
 
     # Same ids as worker omni_config.OMNI_SHARED_BAKED_MODELS (fixed-fleet template pick).
@@ -1058,6 +1064,8 @@ class PodManager:
             "ltx25_int8_t2v": os.getenv("LTX25_INT8_COMFY_TEMPLATE_UUID"),
             "ltx25_int8_i2v": os.getenv("LTX25_INT8_COMFY_TEMPLATE_UUID"),
             "ltx25_int8_flf2v": os.getenv("LTX25_INT8_COMFY_TEMPLATE_UUID"),
+            "qwen_image_21_turbo": os.getenv("QWEN_IMAGE_21_TURBO_COMFY_TEMPLATE_UUID"),
+            "minimax_music3": os.getenv("MINIMAX_MUSIC3_COMFY_TEMPLATE_UUID"),
 
             "aurasrv2": os.getenv("AURASRV2_TEMPLATE_UUID"),
             "realesrgan": os.getenv("REALESRGAN_TEMPLATE_UUID"),
@@ -1114,6 +1122,8 @@ class PodManager:
             "ltx25_int8_t2v": 120,
             "ltx25_int8_i2v": 120,
             "ltx25_int8_flf2v": 120,
+            "qwen_image_21_turbo": 80,
+            "minimax_music3": 80,
             "aurasrv2": 30,
             "realesrgan": 30,
             "swin2sr": 30,

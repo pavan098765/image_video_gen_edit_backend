@@ -1,7 +1,8 @@
-name: Build MiniMax H3 and LTX-2.5 images
+name: Build ComfyUI worker images
 
 # Manual only. These builds take 45–120+ minutes and need Docker Hub login
 # to pull pavanalur3/deps-base-new:py311-cu128 and push quickpod_worker tags.
+# Weights are NOT baked in. See .github/workflows/README-COMFY-BUILDS.md
 on:
   workflow_dispatch:
     inputs:
@@ -9,20 +10,34 @@ on:
         description: Which image to build and push
         type: choice
         required: true
-        default: minimax_h3_comfy
+        default: all
         options:
+          - all
           - minimax_h3_comfy
           - ltx25_int8_comfy
-          - both
+          - qwen_image_21_turbo_comfy
+          - minimax_music3_comfy
 
 env:
   REGISTRY_IMAGE: pavanalur3/quickpod_worker
 
 jobs:
-  minimax:
-    if: inputs.worker == 'minimax_h3_comfy' || inputs.worker == 'both'
+  build:
+    if: inputs.worker == 'all' || inputs.worker == matrix.worker
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - worker: minimax_h3_comfy
+            context: backend/quickpod_individual_worker/worker_minimax_h3_comfy
+          - worker: ltx25_int8_comfy
+            context: backend/quickpod_individual_worker/worker_ltx25_int8_comfy
+          - worker: qwen_image_21_turbo_comfy
+            context: backend/quickpod_individual_worker/worker_qwen_image_21_turbo_comfy
+          - worker: minimax_music3_comfy
+            context: backend/quickpod_individual_worker/worker_minimax_music3_comfy
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
@@ -44,53 +59,15 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push MiniMax H3
+      - name: Build and push ${{ matrix.worker }}
         uses: docker/build-push-action@v6
         with:
-          context: backend/quickpod_individual_worker/worker_minimax_h3_comfy
-          file: backend/quickpod_individual_worker/worker_minimax_h3_comfy/Dockerfile
+          context: ${{ matrix.context }}
+          file: ${{ matrix.context }}/Dockerfile
           platforms: linux/amd64
           push: true
           provenance: false
           sbom: false
           tags: |
-            ${{ env.REGISTRY_IMAGE }}:minimax_h3_comfy
-            ${{ env.REGISTRY_IMAGE }}:minimax_h3_comfy-${{ github.sha }}
-
-  ltx25:
-    if: inputs.worker == 'ltx25_int8_comfy' || inputs.worker == 'both'
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: false
-          docker-images: true
-
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push LTX-2.5
-        uses: docker/build-push-action@v6
-        with:
-          context: backend/quickpod_individual_worker/worker_ltx25_int8_comfy
-          file: backend/quickpod_individual_worker/worker_ltx25_int8_comfy/Dockerfile
-          platforms: linux/amd64
-          push: true
-          provenance: false
-          sbom: false
-          tags: |
-            ${{ env.REGISTRY_IMAGE }}:ltx25_int8_comfy
-            ${{ env.REGISTRY_IMAGE }}:ltx25_int8_comfy-${{ github.sha }}
+            ${{ env.REGISTRY_IMAGE }}:${{ matrix.worker }}
+            ${{ env.REGISTRY_IMAGE }}:${{ matrix.worker }}-${{ github.sha }}

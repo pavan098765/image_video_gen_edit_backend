@@ -64,6 +64,19 @@ docker build -t pavanalur3/quickpod_worker:ltx25_int8_comfy .
 docker push pavanalur3/quickpod_worker:ltx25_int8_comfy
 ```
 
+## Qwen Image 2.1 Turbo + MiniMax Music 3
+
+Same self-contained pattern. **Build these on GitHub Actions**, not on the Windows laptop and not on Quickpod DIND. See `.github/workflows/README-COMFY-BUILDS.md`.
+
+```bash
+# GitHub Actions → Build ComfyUI worker images → worker=all
+# Tags:
+#   pavanalur3/quickpod_worker:qwen_image_21_turbo_comfy
+#   pavanalur3/quickpod_worker:minimax_music3_comfy
+```
+
+Qwen uses molbal/ComfyUI-GGUF + AtomicChat Q8_0 UNET GGUF (CLIP/VAE stay Comfy-Org). Music 3 is native ComfyUI v0.37.0 with the official `audio_minimax_music_3.json` graph and int8 convrot DiT.
+
 ## `worker_multi_common`
 
 This is **not** a separate deployable worker; it is shared Python code copied into each image. It must be present in the build context (commit it in git so CI/rsync includes it).

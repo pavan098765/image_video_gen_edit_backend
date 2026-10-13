@@ -1050,6 +1050,50 @@
         ],
         "eta_seconds_default": 180
     },
+    "qwen_image_21_turbo": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 40,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "Qwen Image 2.1 Turbo 8-step. AtomicChat Q8_0 GGUF UNET + Comfy-Org CLIP/VAE. 16GB class.",
+        "group_id": "qwen_image_21_turbo_comfy",
+        "supported_models": [
+            "qwen_image_21_turbo"
+        ],
+        "eta_seconds_default": 90
+    },
+    "minimax_music3": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {
+            "default": 40,
+            "4090": 80,
+            "5090": 100,
+            "3090": 40
+        },
+        "allowed_gpu_names": [
+            "5090",
+            "4090",
+            "3090"
+        ],
+        "min_gpu_count": 1,
+        "comment": "MiniMax Music 3 ComfyUI (int8 convrot DiT, tiled audio VAE). 16GB class; longer songs prefer 24GB.",
+        "group_id": "minimax_music3_comfy",
+        "supported_models": [
+            "minimax_music3"
+        ],
+        "eta_seconds_default": 180
+    },
     "default": {
         "preferred_variant": null,
         "fallback_variants": []
