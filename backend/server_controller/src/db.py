@@ -21,6 +21,7 @@ from sqlalchemy import (
     Integer,
     String,
     DateTime,
+    Date,
     JSON,
     Text,
     Boolean,
@@ -236,6 +237,7 @@ class Job(Base):
             "error_log": self.error_log,
             # Timing metrics
             "total_time_seconds": self.total_time_seconds,
+
             "processing_time_seconds": self.processing_time_seconds,
             "queue_time_seconds": self.queue_time_seconds,
             "dispatch_time_seconds": self.dispatch_time_seconds,
@@ -245,6 +247,94 @@ class Job(Base):
             "processing_cost_usd": self.processing_cost_usd,  # Processing cost only
             "pod_overhead_share_usd": self.pod_overhead_share_usd,  # Overhead portion
             "gpu_hourly_rate": self.gpu_hourly_rate,
+        }
+
+
+# =============================================================================
+# Kie task lookup (callback / recordInfo fallback)
+# =============================================================================
+
+class KieTask(Base):
+    __tablename__ = "kie_tasks"
+
+    task_id = Column(String(128), primary_key=True)
+    job_id = Column(String(128), index=True, nullable=False)
+    model = Column(String(64), nullable=True)
+    callback_received = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+
+    __table_args__ = (Index("ix_kie_task_job", "job_id"),)
+
+
+class PersonalQueueItem(Base):
+    """Admin leftover-pod work. Not a client Job row; does not lock credits."""
+
+    __tablename__ = "personal_queue_items"
+
+    id = Column(String(128), primary_key=True)
+    prompt = Column(Text, nullable=True)
+    params = Column(MutableDict.as_mutable(JSON), default=dict, nullable=True)
+    model = Column(String(64), default="minimax_h3", nullable=False)
+    status = Column(String(32), default="queued", index=True)
+    sort_order = Column(Integer, default=0, nullable=False)
+    worker_id = Column(String(128), nullable=True)
+    result_r2_key = Column(String(512), nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utc_naive_now)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+    completed_at = Column(DateTime, nullable=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "prompt": self.prompt,
+            "params": self.params or {},
+            "model": self.model,
+            "status": self.status,
+            "sort_order": self.sort_order,
+            "worker_id": self.worker_id,
+            "result_r2_key": self.result_r2_key,
+            "error": self.error,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+
+# =============================================================================
+# Model ETA Stats (dynamic scheduler learning)
+# =============================================================================
+
+class ModelEtaStat(Base):
+    """
+    Learned ETA statistics per model for fixed-fleet admission.
+
+    Uses EWMA so estimates evolve with real traffic while remaining stable.
+    """
+    __tablename__ = "model_eta_stats"
+
+    model = Column(String(64), primary_key=True)
+    ewma_eta_seconds = Column(Float, nullable=False, default=0.0)
+    sample_count = Column(Integer, nullable=False, default=0)
+    last_sample_seconds = Column(Float, nullable=True)
+    min_observed_seconds = Column(Float, nullable=True)
+    max_observed_seconds = Column(Float, nullable=True)
+    source = Column(String(32), nullable=False, default="job_complete")
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, nullable=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "model": self.model,
+            "ewma_eta_seconds": float(self.ewma_eta_seconds or 0.0),
+            "sample_count": int(self.sample_count or 0),
+            "last_sample_seconds": self.last_sample_seconds,
+            "min_observed_seconds": self.min_observed_seconds,
+            "max_observed_seconds": self.max_observed_seconds,
+            "source": self.source,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
 
@@ -397,6 +487,9 @@ class User(Base):
     
     # Daily spinner tracking
     last_daily_spin_time = Column(DateTime, nullable=True)
+
+    # Daily login credits (UTC calendar day; one grant per day, no catch-up)
+    daily_credits_last_grant_utc = Column(Date, nullable=True)
     
     # Rewarded ad progress (for "X ads = 1 credit" feature)
     pending_ad_watches = Column(Integer, default=0, nullable=False)
@@ -473,6 +566,7 @@ class CreditTransaction(Base):
     
     delta = Column(Integer, nullable=False)  # Positive = add, negative = deduct
     reason = Column(String(256), nullable=False)
+    credit_metadata = Column("metadata", JSON, nullable=True)
     
     job_id = Column(String(128), nullable=True)
     created_at = Column(DateTime, default=utc_naive_now, nullable=False)
@@ -490,6 +584,7 @@ class CreditTransaction(Base):
             "user_id": self.user_id,
             "delta": self.delta,
             "reason": self.reason,
+            "metadata": self.credit_metadata,
             "job_id": self.job_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
@@ -1154,6 +1249,74 @@ def create_audit_log(
     )
     session.add(log)
     return log
+
+
+def update_model_eta_stat(
+    session: Session,
+    model: str,
+    sample_seconds: float,
+    alpha: float = 0.2,
+    min_seconds: float = 10.0,
+    max_seconds: float = 1200.0,
+) -> Optional[ModelEtaStat]:
+    """
+    Upsert EWMA ETA sample for a model.
+    """
+    try:
+        model_norm = (model or "").strip().lower()
+        if not model_norm:
+            return None
+
+        sample = float(sample_seconds)
+        if sample <= 0:
+            return None
+        sample = max(float(min_seconds), min(float(max_seconds), sample))
+
+        alpha_val = float(alpha)
+        if alpha_val <= 0 or alpha_val > 1:
+            alpha_val = 0.2
+
+        row = session.query(ModelEtaStat).filter(ModelEtaStat.model == model_norm).first()
+        now = utc_naive_now()
+        if row is None:
+            row = ModelEtaStat(
+                model=model_norm,
+                ewma_eta_seconds=float(sample),
+                sample_count=1,
+                last_sample_seconds=float(sample),
+                min_observed_seconds=float(sample),
+                max_observed_seconds=float(sample),
+                source="job_complete",
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            return row
+
+        prev = float(row.ewma_eta_seconds or 0.0)
+        if prev <= 0:
+            new_ewma = float(sample)
+        else:
+            new_ewma = (alpha_val * float(sample)) + ((1.0 - alpha_val) * prev)
+
+        row.ewma_eta_seconds = float(new_ewma)
+        row.sample_count = int(row.sample_count or 0) + 1
+        row.last_sample_seconds = float(sample)
+        row.min_observed_seconds = (
+            float(sample)
+            if row.min_observed_seconds is None
+            else min(float(row.min_observed_seconds), float(sample))
+        )
+        row.max_observed_seconds = (
+            float(sample)
+            if row.max_observed_seconds is None
+            else max(float(row.max_observed_seconds), float(sample))
+        )
+        row.source = "job_complete"
+        row.updated_at = now
+        return row
+    except Exception:
+        return None
 
 
 def get_or_create_ip_ban(

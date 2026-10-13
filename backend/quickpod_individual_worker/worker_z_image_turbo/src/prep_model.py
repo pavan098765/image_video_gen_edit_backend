@@ -45,13 +45,17 @@ else:
     print(f"✓ Z-Image Turbo repo already exists at {Z_IMAGE_TURBO_DIR}")
 
 # ------------------------
-# 2. Download transformer file from Nunchaku
+# 2. Download transformer files from Nunchaku (fp4 + int4 for VRAM selection at runtime)
 # ------------------------
 rank = 128
-filename = f"svdq-fp4_r{rank}-z-image-turbo.safetensors"
-target_path = os.path.join(NUNCHAKU_DIR, filename)
-
-if not os.path.exists(target_path):
+for filename in (
+    f"svdq-fp4_r{rank}-z-image-turbo.safetensors",
+    f"svdq-int4_r{rank}-z-image-turbo.safetensors",
+):
+    target_path = os.path.join(NUNCHAKU_DIR, filename)
+    if os.path.exists(target_path):
+        print(f"✓ Z-Image Turbo transformer already exists at {target_path}")
+        continue
     try:
         print(f"⬇️ Downloading {filename} from {NUNCHAKU_REPO}")
         downloaded_path = hf_hub_download(
@@ -64,8 +68,6 @@ if not os.path.exists(target_path):
     except Exception as e:
         print(f"❌ Failed to download Z-Image Turbo transformer: {e}")
         traceback.print_exc()
-else:
-    print(f"✓ Z-Image Turbo transformer already exists at {target_path}")
 
 # ------------------------
 # 3. Download Real-ESRGAN models (2x, 4x) from rockapaper/realesrgan

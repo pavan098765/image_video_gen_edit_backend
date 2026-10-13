@@ -1,0 +1,651 @@
+{
+  "workflows": [
+    "/worker_comfyui_generic/workflow/WAN2.2 T2V-I2V-T2I-S2V K3NK v2.5.4 SVI.json"
+  ],
+  "comfyui_dir": "/worker_comfyui_generic/comfyui",
+  "unique_node_types": 117,
+  "workflow_registry_rows": 521,
+  "note": "ComfyUI-Manager extension-node-map keys are node class names (workflow 'type'), not graph numeric 'id'. When the UI saves properties.cnr_id / properties.aux_id, those are preferred cm-cli install names (see cm_cli_try_names_per_pack). Types missing from the map may be auto-mapped via unlisted_node_hints.json and built-in rules (rgthree suffix, MMAudio); see unlisted_auto_resolved.",
+  "unlisted_auto_resolved": [],
+  "unlisted_skipped_core_or_uuid": [
+    {
+      "node_type": "340f324c-f8b3-46e1-a35b-4561ecd7027c",
+      "reason": "uuid_like_subgraph_or_stale_widget"
+    },
+    {
+      "node_type": "Note",
+      "reason": "assumed_comfyui_core"
+    },
+    {
+      "node_type": "PrimitiveNode",
+      "reason": "assumed_comfyui_core"
+    },
+    {
+      "node_type": "Reroute",
+      "reason": "assumed_comfyui_core"
+    },
+    {
+      "node_type": "a7d2f0d7-ff69-400d-aa64-ca94fcff6246",
+      "reason": "uuid_like_subgraph_or_stale_widget"
+    },
+    {
+      "node_type": "c7b2a9fc-a78e-4638-ab98-6ee92ecc3067",
+      "reason": "uuid_like_subgraph_or_stale_widget"
+    }
+  ],
+  "tie_breaks": [
+    {
+      "kind": "tie_break",
+      "node_type": "BasicScheduler",
+      "chosen_url": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper",
+      "candidates": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper,https://github.com/mrhan1993/ComfyUI-Fooocus"
+    },
+    {
+      "kind": "tie_break",
+      "node_type": "CLIPTextEncode",
+      "chosen_url": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper",
+      "candidates": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper,https://github.com/mrhan1993/ComfyUI-Fooocus"
+    },
+    {
+      "kind": "tie_break",
+      "node_type": "CLIPVisionLoader",
+      "chosen_url": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper",
+      "candidates": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper,https://github.com/mrhan1993/ComfyUI-Fooocus"
+    },
+    {
+      "kind": "tie_break",
+      "node_type": "GetImageSizeAndCount",
+      "chosen_url": "https://github.com/aining2022/ComfyUI_Swwan",
+      "candidates": "https://github.com/aining2022/ComfyUI_Swwan,https://github.com/kijai/ComfyUI-KJNodes"
+    },
+    {
+      "kind": "tie_break",
+      "node_type": "ImageScaleBy",
+      "chosen_url": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper",
+      "candidates": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper,https://github.com/mrhan1993/ComfyUI-Fooocus"
+    },
+    {
+      "kind": "tie_break",
+      "node_type": "ImageSharpen",
+      "chosen_url": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper",
+      "candidates": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper,https://github.com/mrhan1993/ComfyUI-Fooocus,https://github.com/zn123/ComfyUI-image-processor-zn123"
+    },
+    {
+      "kind": "tie_break",
+      "node_type": "LoadImage",
+      "chosen_url": "https://github.com/audioscavenger/ComfyUI-Thumbnails",
+      "candidates": "https://github.com/audioscavenger/ComfyUI-Thumbnails,https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper,https://github.com/mrhan1993/ComfyUI-Fooocus"
+    },
+    {
+      "kind": "tie_break",
+      "node_type": "PreviewAudio",
+      "chosen_url": "https://github.com/AIGODLIKE/ComfyUI-CUP",
+      "candidates": "https://github.com/AIGODLIKE/ComfyUI-CUP,https://github.com/Yuan-ManX/ComfyUI-SoundHub"
+    },
+    {
+      "kind": "tie_break",
+      "node_type": "PreviewImage",
+      "chosen_url": "https://github.com/NewLouwa/ComfyUI-Model_preset_Pilot",
+      "candidates": "https://github.com/NewLouwa/ComfyUI-Model_preset_Pilot,https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper,https://github.com/mrhan1993/ComfyUI-Fooocus"
+    },
+    {
+      "kind": "tie_break",
+      "node_type": "SaveImage",
+      "chosen_url": "https://github.com/brucew4yn3rp/ComfyUI_SelectiveMetadata",
+      "candidates": "https://github.com/brucew4yn3rp/ComfyUI_SelectiveMetadata,https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper,https://github.com/martin-rizzo/ComfyUI-ZImagePowerNodes,https://github.com/mrhan1993/ComfyUI-Fooocus"
+    },
+    {
+      "kind": "tie_break",
+      "node_type": "SaveLatent",
+      "chosen_url": "https://github.com/hugobb/FastGAN-ComfyUI-Node",
+      "candidates": "https://github.com/hugobb/FastGAN-ComfyUI-Node,https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper,https://github.com/mrhan1993/ComfyUI-Fooocus"
+    },
+    {
+      "kind": "tie_break",
+      "node_type": "UpscaleModelLoader",
+      "chosen_url": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper",
+      "candidates": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper,https://github.com/mrhan1993/ComfyUI-Fooocus,https://github.com/piscesbody/ComfyUI-Upscale-CUDAspeed"
+    }
+  ],
+  "node_types_not_in_extension_map": [
+    "340f324c-f8b3-46e1-a35b-4561ecd7027c",
+    "Any Switch (rgthree)",
+    "Bookmark (rgthree)",
+    "DF_Int_to_Float",
+    "Display Int (rgthree)",
+    "Fast Groups Bypasser (rgthree)",
+    "Fast Groups Muter (rgthree)",
+    "JWFloatToInteger",
+    "Label (rgthree)",
+    "MMAudioFeatureUtilsLoader",
+    "MMAudioModelLoader",
+    "MMAudioSampler",
+    "MarkdownNote",
+    "Mute / Bypass Relay (rgthree)",
+    "Mute / Bypass Repeater (rgthree)",
+    "Note",
+    "NovaSR",
+    "Power Lora Loader (rgthree)",
+    "PrimitiveNode",
+    "Reroute",
+    "a7d2f0d7-ff69-400d-aa64-ca94fcff6246",
+    "c7b2a9fc-a78e-4638-ab98-6ee92ecc3067"
+  ],
+  "non_git_urls_skipped": [],
+  "cm_cli_try_names_per_pack": {
+    "ComfyMath": [
+      "ComfyMath"
+    ],
+    "ComfyUI-Addoor": [
+      "ComfyUI-Addoor"
+    ],
+    "ComfyUI-CUP": [
+      "comfy-core",
+      "ComfyUI-CUP"
+    ],
+    "ComfyUI-Custom-Scripts": [
+      "comfyui-custom-scripts",
+      "ComfyUI-Custom-Scripts"
+    ],
+    "ComfyUI-Easy-Use": [
+      "comfyui-easy-use",
+      "yolain/ComfyUI-Easy-Use",
+      "ComfyUI-Easy-Use"
+    ],
+    "ComfyUI-Florence2": [
+      "comfyui-florence2",
+      "kijai/ComfyUI-Florence2",
+      "ComfyUI-Florence2"
+    ],
+    "ComfyUI-Fooocus-Inpaint-Wrapper": [
+      "comfy-core",
+      "ComfyUI-Fooocus-Inpaint-Wrapper"
+    ],
+    "ComfyUI-FramePackWrapper_PlusOne": [
+      "comfyui-framepackwrapper_plusone",
+      "kijai/ComfyUI-FramePackWrapper",
+      "ComfyUI-FramePackWrapper",
+      "ComfyUI-FramePackWrapper_PlusOne"
+    ],
+    "ComfyUI-Impact-Pack": [
+      "comfyui-impact-pack",
+      "ComfyUI-Impact-Pack"
+    ],
+    "ComfyUI-Inspire-Pack": [
+      "comfyui-inspire-pack",
+      "ComfyUI-Inspire-Pack"
+    ],
+    "ComfyUI-K3NKImageGrab": [
+      "ComfyUI-K3NKImageGrab"
+    ],
+    "ComfyUI-KJNodes": [
+      "comfyui-kjnodes",
+      "ComfyUI-KJNodes"
+    ],
+    "ComfyUI-MMAudio": [
+      "comfyui-mmaudio",
+      "kijai/ComfyUI-MMAudio",
+      "ComfyUI-MMAudio"
+    ],
+    "ComfyUI-MelBandRoFormer": [
+      "ComfyUI-MelBandRoFormer"
+    ],
+    "ComfyUI-Model_preset_Pilot": [
+      "comfy-core",
+      "ComfyUI-Model_preset_Pilot"
+    ],
+    "ComfyUI-NovaSR": [
+      "ComfyUI-NovaSR"
+    ],
+    "ComfyUI-Thumbnails": [
+      "comfy-core",
+      "ComfyUI-Thumbnails"
+    ],
+    "ComfyUI-VideoHelperSuite": [
+      "comfyui-videohelpersuite",
+      "Kosinkadink/ComfyUI-VideoHelperSuite",
+      "ComfyUI-VideoHelperSuite"
+    ],
+    "ComfyUI-WanVideoWrapper": [
+      "ComfyUI-WanVideoWrapper",
+      "kijai/ComfyUI-WanVideoWrapper"
+    ],
+    "ComfyUI-mxToolkit": [
+      "comfyui-mxtoolkit",
+      "ComfyUI-mxToolkit"
+    ],
+    "ComfyUI-pause": [
+      "wywywywy-pause",
+      "ComfyUI-pause"
+    ],
+    "ComfyUI-post-processing-nodes": [
+      "comfyui-art-venture",
+      "sipherxyz/comfyui-art-venture",
+      "ComfyUI-post-processing-nodes"
+    ],
+    "ComfyUI_Comfyroll_CustomNodes": [
+      "ComfyUI_Comfyroll_CustomNodes"
+    ],
+    "ComfyUI_Fill-Nodes": [
+      "comfyui_fill-nodes",
+      "ComfyUI_Fill-Nodes"
+    ],
+    "ComfyUI_FizzNodes": [
+      "comfy-core",
+      "ComfyUI_FizzNodes"
+    ],
+    "ComfyUI_SelectiveMetadata": [
+      "comfy-core",
+      "ComfyUI_SelectiveMetadata"
+    ],
+    "ComfyUI_Swwan": [
+      "comfyui-kjnodes",
+      "kijai/ComfyUI-KJNodes",
+      "ComfyUI-KJNodes",
+      "rgthree-comfy",
+      "ComfyUI_Swwan"
+    ],
+    "ComfyUI_essentials": [
+      "comfyui_essentials",
+      "ComfyUI_essentials"
+    ],
+    "ComfyUI_tinyterraNodes": [
+      "comfyui_tinyterranodes",
+      "ComfyUI_tinyterraNodes"
+    ],
+    "Comfyui-ergouzi-Nodes": [
+      "Comfyui-ergouzi-Nodes"
+    ],
+    "Derfuu_ComfyUI_ModdedNodes": [
+      "derfuu_comfyui_moddednodes",
+      "Derfuu_ComfyUI_ModdedNodes"
+    ],
+    "FastGAN-ComfyUI-Node": [
+      "comfy-core",
+      "FastGAN-ComfyUI-Node"
+    ],
+    "RES4LYF": [
+      "RES4LYF"
+    ],
+    "comfyui-extended": [
+      "comfy-core",
+      "comfyui-extended"
+    ],
+    "comfyui-various": [
+      "comfyui-various"
+    ],
+    "comfyui-vrgamedevgirl": [
+      "vrgamegirl19/comfyui-vrgamedevgirl",
+      "comfyui-vrgamedevgirl"
+    ],
+    "efficiency-nodes-comfyui": [
+      "efficiency-nodes-comfyui",
+      "jags111/efficiency-nodes-comfyui"
+    ],
+    "rgthree-comfy": [
+      "rgthree-comfy"
+    ],
+    "wlsh_nodes": [
+      "wlsh_nodes"
+    ]
+  },
+  "packs": [
+    {
+      "pack": "ComfyMath",
+      "git_url": "https://github.com/evanspearman/ComfyMath",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyMath",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-Addoor",
+      "git_url": "https://github.com/Eagle-CN/ComfyUI-Addoor",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-Addoor",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-CUP",
+      "git_url": "https://github.com/AIGODLIKE/ComfyUI-CUP",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-CUP",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-Custom-Scripts",
+      "git_url": "https://github.com/pythongosssss/ComfyUI-Custom-Scripts",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-Custom-Scripts",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-Easy-Use",
+      "git_url": "https://github.com/yolain/ComfyUI-Easy-Use",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-Easy-Use",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-Florence2",
+      "git_url": "https://github.com/kijai/ComfyUI-Florence2",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-Florence2",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-Fooocus-Inpaint-Wrapper",
+      "git_url": "https://github.com/iacoposk8/ComfyUI-Fooocus-Inpaint-Wrapper",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-Fooocus-Inpaint-Wrapper",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-FramePackWrapper_PlusOne",
+      "git_url": "https://github.com/xhiroga/ComfyUI-FramePackWrapper_PlusOne",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-FramePackWrapper_PlusOne",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-Impact-Pack",
+      "git_url": "https://github.com/ltdrdata/ComfyUI-Impact-Pack",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-Impact-Pack",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-Inspire-Pack",
+      "git_url": "https://github.com/ltdrdata/ComfyUI-Inspire-Pack",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-Inspire-Pack",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-K3NKImageGrab",
+      "git_url": "https://github.com/K3NK3/ComfyUI-K3NKImageGrab",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-K3NKImageGrab",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-KJNodes",
+      "git_url": "https://github.com/kijai/ComfyUI-KJNodes",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-KJNodes",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-MMAudio",
+      "git_url": "https://github.com/kijai/ComfyUI-MMAudio.git",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-MMAudio",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-MelBandRoFormer",
+      "git_url": "https://github.com/kijai/ComfyUI-MelBandRoFormer",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-MelBandRoFormer",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-Model_preset_Pilot",
+      "git_url": "https://github.com/NewLouwa/ComfyUI-Model_preset_Pilot",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-Model_preset_Pilot",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-NovaSR",
+      "git_url": "https://github.com/Saganaki22/ComfyUI-NovaSR.git",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-NovaSR",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-Thumbnails",
+      "git_url": "https://github.com/audioscavenger/ComfyUI-Thumbnails",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-Thumbnails",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-VideoHelperSuite",
+      "git_url": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-VideoHelperSuite",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-WanVideoWrapper",
+      "git_url": "https://github.com/kijai/ComfyUI-WanVideoWrapper",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-WanVideoWrapper",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-mxToolkit",
+      "git_url": "https://github.com/Smirnov75/ComfyUI-mxToolkit",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-mxToolkit",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-pause",
+      "git_url": "https://github.com/wywywywy/ComfyUI-pause",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-pause",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI-post-processing-nodes",
+      "git_url": "https://github.com/EllangoK/ComfyUI-post-processing-nodes",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI-post-processing-nodes",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI_Comfyroll_CustomNodes",
+      "git_url": "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI_Comfyroll_CustomNodes",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI_Fill-Nodes",
+      "git_url": "https://github.com/filliptm/ComfyUI_Fill-Nodes",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI_Fill-Nodes",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI_FizzNodes",
+      "git_url": "https://github.com/FizzleDorf/ComfyUI_FizzNodes",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI_FizzNodes",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI_SelectiveMetadata",
+      "git_url": "https://github.com/brucew4yn3rp/ComfyUI_SelectiveMetadata",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI_SelectiveMetadata",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI_Swwan",
+      "git_url": "https://github.com/aining2022/ComfyUI_Swwan",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI_Swwan",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI_essentials",
+      "git_url": "https://github.com/cubiq/ComfyUI_essentials",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI_essentials",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "ComfyUI_tinyterraNodes",
+      "git_url": "https://github.com/TinyTerra/ComfyUI_tinyterraNodes",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "ComfyUI_tinyterraNodes",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "Comfyui-ergouzi-Nodes",
+      "git_url": "https://github.com/11dogzi/Comfyui-ergouzi-Nodes",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "Comfyui-ergouzi-Nodes",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "Derfuu_ComfyUI_ModdedNodes",
+      "git_url": "https://github.com/Derfuu/Derfuu_ComfyUI_ModdedNodes.git",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "Derfuu_ComfyUI_ModdedNodes",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "FastGAN-ComfyUI-Node",
+      "git_url": "https://github.com/hugobb/FastGAN-ComfyUI-Node",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "FastGAN-ComfyUI-Node",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "RES4LYF",
+      "git_url": "https://github.com/ClownsharkBatwing/RES4LYF",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "RES4LYF",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "comfyui-extended",
+      "git_url": "https://github.com/rookiepsi/comfyui-extended",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "comfyui-extended",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "comfyui-various",
+      "git_url": "https://github.com/jamesWalker55/comfyui-various.git",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "comfyui-various",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "comfyui-vrgamedevgirl",
+      "git_url": "https://github.com/vrgamegirl19/comfyui-vrgamedevgirl",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "comfyui-vrgamedevgirl",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "efficiency-nodes-comfyui",
+      "git_url": "https://github.com/jags111/efficiency-nodes-comfyui",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "efficiency-nodes-comfyui",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "rgthree-comfy",
+      "git_url": "https://github.com/rgthree/rgthree-comfy.git",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "rgthree-comfy",
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "pack": "wlsh_nodes",
+      "git_url": "https://github.com/wallish77/wlsh_nodes",
+      "status": "ok",
+      "method": "cm_cli_batch",
+      "cm_cli_name_used": "wlsh_nodes",
+      "warnings": [],
+      "errors": []
+    }
+  ],
+  "counts": {
+    "ok": 39,
+    "warning": 0,
+    "failed": 0,
+    "unknown": 0
+  }
+}

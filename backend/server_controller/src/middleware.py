@@ -16,6 +16,7 @@ import re
 import time
 import asyncio
 import logging
+import ipaddress
 from typing import Set, Dict, List, Optional, Callable
 
 from fastapi import Request, Response
@@ -102,6 +103,7 @@ INJECTION_PATTERNS: List[bytes] = [
 # Allowed path prefixes
 ALLOWED_PATHS: List[str] = [
     "/health",
+    "/sales",
     "/submit",
     "/job_complete",
     "/job_status",
@@ -113,11 +115,23 @@ ALLOWED_PATHS: List[str] = [
     "/ads",   # Ad network SSV callbacks (AdMob, etc.)
     "/get_video_upload_url",   # R2 presigned video upload
     "/get_media_upload_urls",  # R2 presigned media upload (images/videos)
+    "/describe_asset_for_prompt",  # VLM caption from R2 key (Firebase auth)
     "/batch_status",           # Batch/variation status polling
+    "/kie",
+    "/admin",
+    "/personal",
 ]
 
 # Worker paths (exempt from some checks)
-WORKER_PATHS: List[str] = ["/register_worker", "/heartbeat", "/job_started", "/job_complete"]
+WORKER_PATHS: List[str] = [
+    "/register_worker",
+    "/heartbeat",
+    "/job_started",
+    "/job_complete",
+    "/personal/pull",
+    "/personal/complete",
+    "/personal/pause",
+]
 
 # Trusted API paths (require auth - Bearer token or fingerprint)
 TRUSTED_API_PATHS: List[str] = [
@@ -126,14 +140,19 @@ TRUSTED_API_PATHS: List[str] = [
     "/batch_status",
     "/get_video_upload_url",
     "/get_media_upload_urls",
+    "/describe_asset_for_prompt",
     "/auth",  # Firebase auth endpoints require Bearer token
+    "/admin",
 ]
 
 # Public paths (no auth needed)
 PUBLIC_PATHS: List[str] = [
     "/download", 
     "/health",
+    "/sales",
     "/ads/admob/ssv",  # AdMob SSV callback (called by Google, no auth)
+    "/kie/callback",
+    "/personal/ui",
 ]
 
 
@@ -143,16 +162,36 @@ PUBLIC_PATHS: List[str] = [
 
 def get_client_ip(request: Request) -> str:
     """Extract client IP from request, handling proxies"""
+    # Cloudflare original client IP (if present)
+    cf_ip = request.headers.get("cf-connecting-ip", "")
+    if cf_ip:
+        candidate = cf_ip.strip()
+        try:
+            ipaddress.ip_address(candidate)
+            return candidate
+        except Exception:
+            pass
+
     # Check X-Forwarded-For header
     forwarded = request.headers.get("x-forwarded-for", "")
     if forwarded:
         # Take the first (leftmost) IP as the original client
-        return forwarded.split(",")[0].strip()
+        candidate = forwarded.split(",")[0].strip()
+        try:
+            ipaddress.ip_address(candidate)
+            return candidate
+        except Exception:
+            pass
     
     # Check X-Real-IP header
     real_ip = request.headers.get("x-real-ip", "")
     if real_ip:
-        return real_ip.strip()
+        candidate = real_ip.strip()
+        try:
+            ipaddress.ip_address(candidate)
+            return candidate
+        except Exception:
+            pass
     
     # Fall back to direct connection
     return request.client.host if request.client else "unknown"

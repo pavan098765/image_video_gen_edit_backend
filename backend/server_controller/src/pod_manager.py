@@ -40,6 +40,24 @@ from exceptions import (
 logger = logging.getLogger("pod_manager")
 
 
+def parse_fixed_fleet_gpu_tiers(raw: str) -> Dict[str, int]:
+    """
+    Parse FIXED_FLEET_GPU_TIERS: pipe-separated preference groups, comma-separated
+    machine IDs per group. First group is tried before the second, etc.
+    Returns machine_id -> tier index (lower is better).
+    """
+    result: Dict[str, int] = {}
+    raw = (raw or "").strip()
+    if not raw:
+        return result
+    for tier_idx, group in enumerate(raw.split("|")):
+        for part in group.split(","):
+            mid = part.strip()
+            if mid:
+                result[mid] = tier_idx
+    return result
+
+
 def normalize_pod_uuid(pod_uuid: Optional[str]) -> Optional[str]:
     """Normalize pod UUID by removing hyphens for comparison."""
     if not pod_uuid:
@@ -261,6 +279,8 @@ class PodLifecycleManager:
         pod_uuid: str,
         graceful: bool = False,
         reason: Optional[str] = None,
+        gpu_provider: Optional[str] = None,
+        provider_meta: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """
         Destroy a pod.
@@ -273,6 +293,27 @@ class PodLifecycleManager:
         Returns:
             True if destroyed successfully
         """
+        provider = (gpu_provider or "quickpod").strip().lower()
+        if provider and provider not in ("quickpod",):
+            logger.info(
+                "Destroying %s pod %s: %s",
+                provider,
+                pod_uuid,
+                reason or "no reason given",
+            )
+            try:
+                from gpu_providers import destroy_external
+
+                ok = await asyncio.to_thread(
+                    destroy_external, provider, pod_uuid, provider_meta or {}
+                )
+            except Exception as e:
+                logger.error("Failed to destroy %s pod %s: %s", provider, pod_uuid, e)
+                ok = False
+            async with self._lock:
+                self._recently_destroyed[pod_uuid] = time.time()
+            return ok
+
         # CRITICAL: Ensure UUID is in hyphenated format for QuickPod API
         original_uuid = pod_uuid
         pod_uuid = format_pod_uuid_with_hyphens(pod_uuid) or pod_uuid
@@ -692,6 +733,68 @@ class PodManager:
         "realesrgan_face": "realesrgan",
         "realesrgan_denoise": "realesrgan",
     }
+
+    # Full static grouped-model configuration (Phase remediation baseline).
+    STATIC_GROUP_DEFINITIONS: Dict[str, List[str]] = {
+        "image_aio_4x_utils": [
+            "qwen_image_edit_2511_rapid_aio",
+            "z_image_turbo",
+            "flux_klein",
+            "sdxl_t2i",
+            "diffusers_outpaint",
+            "basic_utils",
+            "aurasrv2",
+            "video_upscaler",
+            "swin2sr",
+            "face_enhancer",
+            "glm_ocr",
+        ],
+        "wan_lightx2v": [
+            "wan_22_fp8_lightx2v_i2v",
+            "wan_22_fp8_lightx2v_t2v",
+        ],
+        "hunyuan_480p": [
+            "hunyan15_480p_t2v_distilled",
+            "hunyan15_480p_i2v_step_distilled",
+        ],
+        "ltx2_3_diffusers": [
+            "ltx2_3_t2v",
+            "ltx2_3_i2v_distilled",
+            "ltx2_3_flf2v",
+            "ltx2_3_iv2v_distilled",
+            "ltx2_3_cinereal",
+        ],
+        "minimax_h3_comfy": [
+            "minimax_h3",
+        ],
+        "ltx25_int8_comfy": [
+            "ltx25_int8",
+            "ltx25_int8_t2v",
+            "ltx25_int8_i2v",
+            "ltx25_int8_flf2v",
+        ],
+        "qwen_image_21_turbo_comfy": [
+            "qwen_image_21_turbo",
+        ],
+        "minimax_music3_comfy": [
+            "minimax_music3",
+        ],
+    }
+
+    # Same ids as worker omni_config.OMNI_SHARED_BAKED_MODELS (fixed-fleet template pick).
+    # Must stay in sync with
+    # backend/quickpod_individual_worker/worker_multi_common/src/omni_config.py
+    # (OMNI_SHARED_BAKED_MODELS). A startup drift check in main.py logs a warning on mismatch.
+    FLEET_OMNI_SHARED_BAKE_MODELS: frozenset = frozenset(
+        {
+            "basic_utils",
+            "aurasrv2",
+            "swin2sr",
+            "video_upscaler",
+            "face_enhancer",
+            "glm_ocr",
+        }
+    )
     
     @classmethod
     def resolve_model_alias(cls, model: str) -> str:
@@ -760,10 +863,60 @@ class PodManager:
         self.max_individual_pods = int(os.getenv("MAX_INDIVIDUAL_PODS", "50"))
         self.pod_startup_timeout = int(os.getenv("POD_STARTUP_TIMEOUT", "120"))
         self.worker_registration_timeout = int(os.getenv("WORKER_REGISTRATION_TIMEOUT", "180"))
+        self.scheduler_mode = os.getenv("SCHEDULER_MODE", "legacy_dynamic_fleet").strip().lower()
+        self.fixed_fleet_enabled = self.scheduler_mode == "fixed_fleet_windowed"
+        self.fixed_fleet_max_pods = int(os.getenv("FIXED_FLEET_MAX_PODS", "8"))
+        machine_ids_raw = os.getenv("FIXED_FLEET_MACHINE_IDS", "")
+        self.fixed_fleet_machine_ids: Set[str] = set(
+            x.strip() for x in machine_ids_raw.split(",") if x.strip()
+        )
+        self.fixed_fleet_gpu_tier_rank: Dict[str, int] = parse_fixed_fleet_gpu_tiers(
+            os.getenv("FIXED_FLEET_GPU_TIERS", "")
+        )
+        if self.fixed_fleet_machine_ids and self.fixed_fleet_gpu_tier_rank:
+            max_tier = max(self.fixed_fleet_gpu_tier_rank.values(), default=-1)
+            orphan_tier = max_tier + 1
+            for mid in self.fixed_fleet_machine_ids:
+                if mid not in self.fixed_fleet_gpu_tier_rank:
+                    self.fixed_fleet_gpu_tier_rank[mid] = orphan_tier
+                    logger.warning(
+                        "FIXED_FLEET_MACHINE_IDS id %s not listed in FIXED_FLEET_GPU_TIERS; "
+                        "using lowest-preference tier index %s",
+                        mid,
+                        orphan_tier,
+                    )
+        strict_raw = os.getenv("FIXED_FLEET_STRICT_MACHINES", "false").lower().strip()
+        self.fixed_fleet_strict_machines = strict_raw in ("1", "true", "yes", "on")
+        self.pod_max_lifetime_seconds = int(os.getenv("POD_MAX_LIFETIME_SECONDS", "840"))
+        self.pod_drain_guard_seconds = int(os.getenv("POD_DRAIN_GUARD_SECONDS", "90"))
+        self._fixed_fleet_machine_claims: Set[str] = set()
+        self.fixed_fleet_metrics: Dict[str, int] = {
+            "slot_claim_denied": 0,
+            "drain_guard_reject": 0,
+            "rejected_by_ttl": 0,
+            "ttl_cutoff_destroyed": 0,
+            "admission_existing_feasible": 0,
+            "admission_created_new_pod": 0,
+            "admission_fallback_legacy": 0,
+            "admission_pending_wait_started": 0,
+            "admission_pending_wait_success": 0,
+            "admission_pending_wait_timeout": 0,
+            "admission_pending_wait_error": 0,
+            "admission_pending_wait_total_ms": 0,
+            "fairness_dispatch_total": 0,
+            "pod_create_total": 0,
+            "pod_destroy_total": 0,
+        }
+        self._pod_create_events: deque = deque()
+        self._pod_destroy_events: deque = deque()
+
+        # Fixed-fleet windowed scheduler: larger disk + omni/multi QuickPod templates
+        self.fleet_pod_disk_gb = max(1, int(os.getenv("FLEET_POD_DISK_GB", "500")))
         
         # Templates
         self.template_uuids = self._load_template_uuids()
         self.template_disk_sizes = self._load_disk_sizes()
+        self._fleet_multi_template_uuids = self._load_fleet_multi_template_uuids()
         self.model_requirements = self._load_model_requirements()
         
         # Autoscaler state
@@ -778,7 +931,84 @@ class PodManager:
             f"PodManager initialized: strategy={self.strategy.value}, "
             f"warm_pod={warm_pod_uuid}"
         )
+        if self.fixed_fleet_enabled:
+            n_fleet_templates = sum(
+                1 for v in self._fleet_multi_template_uuids.values() if (v or "").strip()
+            )
+            logger.info(
+                "Fixed fleet mode enabled: max_pods=%s (hard slot cap), primary_machine_ids=%s, "
+                "strict_machines_only=%s, gpu_tier_groups=%s, offer_fallback=%s, pod_ttl=%ss, "
+                "drain_guard=%ss, fleet_disk_gb=%s, fleet_multi_template_models=%s",
+                self.fixed_fleet_max_pods,
+                sorted(list(self.fixed_fleet_machine_ids)),
+                self.fixed_fleet_strict_machines,
+                len(self.fixed_fleet_gpu_tier_rank) if self.fixed_fleet_gpu_tier_rank else 0,
+                "disabled" if self.fixed_fleet_strict_machines else "non_allowlisted_when_cap_allows",
+                self.pod_max_lifetime_seconds,
+                self.pod_drain_guard_seconds,
+                self.fleet_pod_disk_gb,
+                n_fleet_templates,
+            )
     
+    @staticmethod
+    def _env_uuid(*names: str) -> Optional[str]:
+        """First non-empty env value among ``names`` (strip whitespace)."""
+        for n in names:
+            raw = os.getenv(n)
+            if raw is None:
+                continue
+            s = str(raw).strip()
+            if s:
+                return s
+        return None
+
+    def _load_fleet_multi_template_uuids(self) -> Dict[str, Optional[str]]:
+        """
+        Map base model id -> QuickPod template UUID for omni/multi images.
+        Used only when SCHEDULER_MODE=fixed_fleet_windowed (see ``fixed_fleet_enabled``).
+        Env names mirror ``config.env`` MULTI_TEMPLATE entries.
+        Qwen omni: ``QWEN_IMAGE_EDIT_2511_RAPID_AIO_MULTI_TEMPLATE_UUID`` preferred;
+        ``QWEN_IMAGE_EDIT_25011_RAPID_AIO_MULTI_TEMPLATE_UUID`` also accepted.
+        """
+        return {
+            "qwen_image_edit_2511_rapid_aio": self._env_uuid(
+                "QWEN_IMAGE_EDIT_2511_RAPID_AIO_MULTI_TEMPLATE_UUID",
+                "QWEN_IMAGE_EDIT_25011_RAPID_AIO_MULTI_TEMPLATE_UUID",
+            ),
+            "flux_klein": self._env_uuid("FLUX_KLEIN_MULTI_TEMPLATE_UUID"),
+            "z_image_turbo": self._env_uuid("Z_IMAGE_TURBO_MULTI_TEMPLATE_UUID"),
+            "sdxl_t2i": self._env_uuid("SDXL_MULTI_TEMPLATE_UUID"),
+            "diffusers_outpaint": self._env_uuid("DIFFUSERS_OUTPAINT_MULTI_TEMPLATE_UUID"),
+            "basic_utils": self._env_uuid("BASIC_UTILS_MULTI_TEMPLATE_UUID"),
+            "aurasrv2": self._env_uuid("AURASRV2_MULTI_TEMPLATE_UUID"),
+            "video_upscaler": self._env_uuid("VIDEO_UPSCALER_MULTI_TEMPLATE_UUID"),
+            "swin2sr": self._env_uuid("SWIN2SR_MULTI_TEMPLATE_UUID"),
+            "face_enhancer": self._env_uuid("FACE_ENHANCER_MULTI_TEMPLATE_UUID"),
+            "glm_ocr": self._env_uuid("GLM_OCR_MULTI_TEMPLATE_UUID"),
+            "wan_22_fp8_lightx2v_i2v": self._env_uuid(
+                "WAN_22_14B_I2V_LIGHTX2V_MULTI",
+                "WAN_22_14B_I2V_LIGHTX2V_MULTI_TEMPLATE_UUID",
+            ),
+            "wan_22_fp8_lightx2v_t2v": self._env_uuid(
+                "WAN_22_14B_T2V_LIGHTX2V_MULTI",
+                "WAN_22_14B_T2V_LIGHTX2V_MULTI_TEMPLATE_UUID",
+            ),
+            "hunyan15_480p_t2v_distilled": self._env_uuid(
+                "HUNYUAN_480P_T2V_MULTI_TEMPLATE_UUID",
+            ),
+            "hunyan15_480p_i2v_step_distilled": self._env_uuid(
+                "HUNYUAN_480P_I2V_MULTI_TEMPLATE_UUID",
+            ),
+            "ltx2_3_t2v": self._env_uuid("LTX2_3_DIFFUSERS_MULTI_TEMPLATE_UUID"),
+            "ltx2_3_i2v_distilled": self._env_uuid(
+                "LTX2_3_DIFFUSERS_MULTI_TEMPLATE_UUID"
+            ),
+            "ltx2_3_flf2v": self._env_uuid("LTX2_3_DIFFUSERS_MULTI_TEMPLATE_UUID"),
+            "ltx2_3_iv2v_distilled": self._env_uuid(
+                "LTX2_3_DIFFUSERS_MULTI_TEMPLATE_UUID"
+            ),
+        }
+
     def _load_template_uuids(self) -> Dict[str, Optional[str]]:
         """Load template UUIDs from environment"""
         return {
@@ -796,7 +1026,7 @@ class PodManager:
 
             "qwen_image_edit_2509": os.getenv("QWEN_IMAGE_EDIT_2509_TEMPLATE_UUID"),
             "qwen_image_edit_2509_int4": os.getenv("QWEN_IMAGE_EDIT_2509_INT4_TEMPLATE_UUID"),
-            "qwen_image_edit_2511_rapid_aio": os.getenv("QWEN_IMAGE_EDIT_25011_RAPID_AIO_TEMPLATE_UUID"),
+            "qwen_image_edit_2511_rapid_aio": os.getenv("QWEN_IMAGE_EDIT_2511_RAPID_AIO_TEMPLATE_UUID"),
 
             "qwen_image": os.getenv("QWEN_IMAGE_TEMPLATE_UUID"),
             "qwen_image_int4": os.getenv("QWEN_IMAGE_INT4_TEMPLATE_UUID"),
@@ -819,11 +1049,23 @@ class PodManager:
             "flashvsr_video_upscaler": os.getenv("FLASHVSR_VIDEO_UPSCALER_TEMPLATE_UUID"),
 
             "ltx2_video": os.getenv("LTX2_VIDEO_TEMPLATE_UUID"),
+            "ltx2_3_t2v": os.getenv("LTX2_3_DIFFUSERS_MULTI_TEMPLATE_UUID"),
+            "ltx2_3_i2v_distilled": os.getenv("LTX2_3_DIFFUSERS_MULTI_TEMPLATE_UUID"),
+            "ltx2_3_flf2v": os.getenv("LTX2_3_DIFFUSERS_MULTI_TEMPLATE_UUID"),
+            "ltx2_3_iv2v_distilled": os.getenv("LTX2_3_DIFFUSERS_MULTI_TEMPLATE_UUID"),
+            "ltx2_3_cinereal": os.getenv("LTX2_3_DIFFUSERS_MULTI_TEMPLATE_UUID"),
 
             "dreamid": os.getenv("DREAMID_TEMPLATE_UUID"),
             "hunyan15_480p_t2v_distilled": os.getenv("HUNYUAN_480P_T2V_TEMPLATE_UUID"),
             "hunyan15_480p_i2v_step_distilled": os.getenv("HUNYUAN_480P_I2V_TEMPLATE_UUID"),
             "glm_ocr": os.getenv("GLM_OCR_TEMPLATE_UUID"),
+            "minimax_h3": os.getenv("MINIMAX_H3_COMFY_TEMPLATE_UUID"),
+            "ltx25_int8": os.getenv("LTX25_INT8_COMFY_TEMPLATE_UUID"),
+            "ltx25_int8_t2v": os.getenv("LTX25_INT8_COMFY_TEMPLATE_UUID"),
+            "ltx25_int8_i2v": os.getenv("LTX25_INT8_COMFY_TEMPLATE_UUID"),
+            "ltx25_int8_flf2v": os.getenv("LTX25_INT8_COMFY_TEMPLATE_UUID"),
+            "qwen_image_21_turbo": os.getenv("QWEN_IMAGE_21_TURBO_COMFY_TEMPLATE_UUID"),
+            "minimax_music3": os.getenv("MINIMAX_MUSIC3_COMFY_TEMPLATE_UUID"),
 
             "aurasrv2": os.getenv("AURASRV2_TEMPLATE_UUID"),
             "realesrgan": os.getenv("REALESRGAN_TEMPLATE_UUID"),
@@ -866,10 +1108,22 @@ class PodManager:
             "video_upscaler": 40,  # RIFE + Real-ESRGAN models ~10GB + workspace
             "flashvsr_video_upscaler": 50,  # FlashVSR-Pro models ~7GB + workspace
             "ltx2_video": 85,  # FP4 model ~20GB + Gemma ~2GB + workspace
+            "ltx2_3_t2v": 200,
+            "ltx2_3_i2v_distilled": 200,
+            "ltx2_3_flf2v": 200,
+            "ltx2_3_iv2v_distilled": 200,
+            "ltx2_3_cinereal": 200,
             "dreamid": 60,
             "hunyan15_480p_t2v_distilled": 50,
             "hunyan15_480p_i2v_step_distilled": 50,
             "glm_ocr": 40,
+            "minimax_h3": 250,
+            "ltx25_int8": 120,
+            "ltx25_int8_t2v": 120,
+            "ltx25_int8_i2v": 120,
+            "ltx25_int8_flf2v": 120,
+            "qwen_image_21_turbo": 80,
+            "minimax_music3": 80,
             "aurasrv2": 30,
             "realesrgan": 30,
             "swin2sr": 30,
@@ -883,11 +1137,137 @@ class PodManager:
         try:
             with open(path, "r") as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                logger.warning("model_requirements.json root is not an object; using empty config")
+                return {}
+            data = self._enrich_and_validate_model_requirements(data)
             logger.info(f"Loaded model requirements for {len(data)} models")
             return data
         except Exception as e:
             logger.warning(f"Failed to load model_requirements.json: {e}")
             return {}
+
+    def _build_static_group_defaults(self, model_names: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Build full static defaults for group_id/supported_models/eta."""
+        defaults: Dict[str, Dict[str, Any]] = {}
+        model_set = {m.strip().lower() for m in model_names if isinstance(m, str)}
+        base_eta = int(os.getenv("SCHEDULER_DEFAULT_MODEL_ETA_SECONDS", "180"))
+
+        eta_overrides = {
+            "qwen_image_edit": 85,
+            "qwen_image": 75,
+            "qwen_image_edit_2509": 85,
+            "qwen_image_edit_2511_rapid_aio": 70,
+            "z_image_turbo": 55,
+            "flux_klein": 65,
+            "sdxl_t2i": 70,
+            "sdxl_i2i": 70,
+            "sdxl_inpaint": 80,
+            "diffusers_outpaint": 95,
+            "wan_22_fp8_lightx2v_i2v": 170,
+            "wan_22_fp8_lightx2v_t2v": 155,
+            "video_upscaler": 220,
+            "aurasrv2": 60,
+            "realesrgan": 70,
+            "realesrgan_anime": 70,
+            "realesrgan_face": 75,
+            "realesrgan_denoise": 75,
+            "swin2sr": 80,
+            "dreamid": 145,
+            "hunyan15_480p_t2v_distilled": 210,
+            "hunyan15_480p_i2v_step_distilled": 220,
+            "glm_ocr": 45,
+            "face_enhancer": 65,
+            "ltx2_video": 180,
+            "ltx2_3_t2v": 200,
+            "ltx2_3_i2v_distilled": 220,
+            "ltx2_3_flf2v": 200,
+            "ltx2_3_iv2v_distilled": 220,
+            "basic_utils": 40,
+        }
+
+        assigned_models: Set[str] = set()
+        for group_id, members in self.STATIC_GROUP_DEFINITIONS.items():
+            normalized_members = [
+                m.strip().lower() for m in members if isinstance(m, str) and m.strip().lower() in model_set
+            ]
+            if not normalized_members:
+                continue
+            for model in normalized_members:
+                defaults[model] = {
+                    "group_id": group_id,
+                    "supported_models": list(normalized_members),
+                    "eta_seconds_default": int(eta_overrides.get(model, base_eta)),
+                }
+                assigned_models.add(model)
+
+        # Any model not explicitly grouped becomes a self-group.
+        for model in sorted(model_set):
+            if model in assigned_models:
+                continue
+            defaults[model] = {
+                "group_id": f"solo_{model}",
+                "supported_models": [model],
+                "eta_seconds_default": int(eta_overrides.get(model, base_eta)),
+            }
+        return defaults
+
+    def _enrich_and_validate_model_requirements(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Ensure every model has valid group_id/supported_models/eta_seconds_default.
+        Missing/invalid values are backfilled from static defaults.
+        """
+        normalized_keys = {k.strip().lower(): k for k in data.keys() if isinstance(k, str)}
+        defaults = self._build_static_group_defaults(list(normalized_keys.keys()))
+
+        for norm_model, original_key in normalized_keys.items():
+            req = data.get(original_key)
+            if not isinstance(req, dict):
+                req = {}
+                data[original_key] = req
+
+            default_cfg = defaults.get(norm_model, {})
+
+            group_id = req.get("group_id")
+            if not isinstance(group_id, str) or not group_id.strip():
+                req["group_id"] = default_cfg.get("group_id", f"solo_{norm_model}")
+            else:
+                req["group_id"] = group_id.strip()
+
+            supported = req.get("supported_models")
+            normalized_supported: List[str] = []
+            if isinstance(supported, list):
+                for item in supported:
+                    if isinstance(item, str) and item.strip():
+                        item_norm = item.strip().lower()
+                        if item_norm not in normalized_supported:
+                            normalized_supported.append(item_norm)
+            if not normalized_supported:
+                normalized_supported = list(default_cfg.get("supported_models", [norm_model]))
+            if norm_model not in normalized_supported:
+                normalized_supported.append(norm_model)
+            gid_key = req.get("group_id")
+            if isinstance(gid_key, str) and gid_key.strip() in self.STATIC_GROUP_DEFINITIONS:
+                grp_members = {
+                    m.strip().lower()
+                    for m in self.STATIC_GROUP_DEFINITIONS[gid_key.strip()]
+                    if isinstance(m, str) and m.strip()
+                }
+                normalized_supported = sorted(set(normalized_supported) | grp_members)
+            req["supported_models"] = normalized_supported
+
+            eta = req.get("eta_seconds_default")
+            try:
+                eta_int = int(eta)
+            except Exception:
+                eta_int = 0
+            if eta_int <= 0:
+                eta_int = int(default_cfg.get("eta_seconds_default", 180))
+            req["eta_seconds_default"] = eta_int
+
+            data[original_key] = req
+
+        return data
     
     # -------------------------------------------------------------------------
     # Locking Helpers
@@ -1019,10 +1399,45 @@ class PodManager:
         logger.info(f"Variant plan for {model}: {[(v, gpus) for v, gpus in plan]}")
         return plan
     
+    def _resolve_any_omni_fleet_template(self) -> str:
+        """First non-empty fleet multi template UUID from FLEET_OMNI_TEMPLATE_PRIORITY order."""
+        raw = os.getenv("FLEET_OMNI_TEMPLATE_PRIORITY", "").strip()
+        if raw:
+            keys = [k.strip().lower() for k in raw.split(",") if k.strip()]
+        else:
+            keys = [
+                "flux_klein",
+                "z_image_turbo",
+                "qwen_image_edit_2511_rapid_aio",
+                "sdxl_t2i",
+                "diffusers_outpaint",
+                "wan_22_fp8_lightx2v_t2v",
+                "wan_22_fp8_lightx2v_i2v",
+                "hunyan15_480p_t2v_distilled",
+                "hunyan15_480p_i2v_step_distilled",
+            ]
+        for k in keys:
+            u = (self._fleet_multi_template_uuids.get(k) or "").strip()
+            if u:
+                return u
+        return ""
+
     def get_template_for_variant(self, model: str, variant: Optional[str]) -> Optional[str]:
         """Get template UUID for a model/variant combination"""
         # Resolve model alias to base model for lookups
         base_model = self.resolve_model_alias(model)
+        if self.fixed_fleet_enabled:
+            fleet_t = (self._fleet_multi_template_uuids.get(base_model) or "").strip()
+            if base_model in self.FLEET_OMNI_SHARED_BAKE_MODELS:
+                any_t = self._resolve_any_omni_fleet_template()
+                if any_t:
+                    return any_t
+                if fleet_t:
+                    return fleet_t
+                return None
+            if fleet_t:
+                return fleet_t
+
         req = self.model_requirements.get(base_model, {})
         
         if variant and "variant_template_key" in req:
@@ -1034,6 +1449,9 @@ class PodManager:
     
     def get_disk_size_for_variant(self, model: str, variant: Optional[str]) -> int:
         """Get disk size for a model/variant combination"""
+        if self.fixed_fleet_enabled:
+            return self.fleet_pod_disk_gb
+
         # Resolve model alias to base model for lookups
         base_model = self.resolve_model_alias(model)
         req = self.model_requirements.get(base_model, {})
@@ -1055,7 +1473,7 @@ class PodManager:
         """Blacklist a machine"""
         duration = duration or self.blacklist.cooldown
         logger.warning(
-            f"🚫 BLACKLISTING machine {machine_id} for {duration}s due to failure"
+            f"[BLACKLIST] machine {machine_id} for {duration}s due to failure"
         )
         await self.blacklist.blacklist(machine_id, duration)
         await self.machine_cache.update_machine_success(machine_id, success=False)
@@ -1077,6 +1495,171 @@ class PodManager:
         if self.is_machine_bad(str(machine_id)):
             await self.blacklist.unblacklist(str(machine_id))
             logger.info(f"Machine {machine_id} removed from blacklist after successful pod startup")
+
+    def _fixed_fleet_total_slots(self) -> int:
+        """
+        Hard cap on concurrent non-cache-refresh individual pods in fixed-fleet mode.
+        Always FIXED_FLEET_MAX_PODS (not len(allowlist)): every rented machine counts
+        toward the same cap (QuickPod offers do not expose reliable GPU identity).
+        """
+        return max(1, self.fixed_fleet_max_pods)
+
+    def _machine_success_rate(self, machine_id: str) -> float:
+        """Rolling success rate from machine_cache (0.0 if unknown)."""
+        meta = self.machine_cache.get_machine_metadata(str(machine_id))
+        sr = meta.get("success_rate")
+        if sr is None:
+            return 0.0
+        try:
+            return float(sr)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _fixed_fleet_machine_tier(self, machine_id: str) -> int:
+        """Lower tier index = higher preference (from FIXED_FLEET_GPU_TIERS)."""
+        if not self.fixed_fleet_gpu_tier_rank:
+            return 0
+        return int(self.fixed_fleet_gpu_tier_rank.get(str(machine_id), 10**6))
+
+    async def _fixed_fleet_claim_machine_for_creation(self, machine_id: str) -> bool:
+        """
+        Reserve a machine slot for pod creation in fixed-fleet mode.
+        Prevents races from creating >1 pod per machine or exceeding slot count.
+
+        When FIXED_FLEET_STRICT_MACHINES is true, pod creation only targets
+        FIXED_FLEET_MACHINE_IDS; otherwise non-allowlisted offers may be used if
+        allowlisted machines are exhausted (still under FIXED_FLEET_MAX_PODS).
+        """
+        if not self.fixed_fleet_enabled:
+            return True
+
+        machine_id = str(machine_id)
+        async with self._lock:
+            active_pods = [
+                p for p in self.individual_pods.values()
+                if not p.meta.get("is_cache_refresh_pod")
+            ]
+            active_machine_ids = set(str(p.machine_id) for p in active_pods if p.machine_id)
+            total_slots = self._fixed_fleet_total_slots()
+
+            if machine_id in active_machine_ids:
+                logger.info(
+                    "Fixed fleet: machine %s already has active pod, skipping",
+                    machine_id,
+                )
+                self.fixed_fleet_metrics["slot_claim_denied"] += 1
+                return False
+            if machine_id in self._fixed_fleet_machine_claims:
+                logger.info(
+                    "Fixed fleet: machine %s already claimed by in-flight creation, skipping",
+                    machine_id,
+                )
+                self.fixed_fleet_metrics["slot_claim_denied"] += 1
+                return False
+            if (len(active_pods) + len(self._fixed_fleet_machine_claims)) >= total_slots:
+                logger.info(
+                    "Fixed fleet: all slots occupied (active=%s claims=%s total=%s), skipping machine=%s",
+                    len(active_pods),
+                    len(self._fixed_fleet_machine_claims),
+                    total_slots,
+                    machine_id,
+                )
+                self.fixed_fleet_metrics["slot_claim_denied"] += 1
+                return False
+
+            self._fixed_fleet_machine_claims.add(machine_id)
+            return True
+
+    async def _fixed_fleet_release_machine_claim(self, machine_id: str):
+        """Release in-flight machine claim."""
+        if not self.fixed_fleet_enabled:
+            return
+        machine_id = str(machine_id)
+        async with self._lock:
+            self._fixed_fleet_machine_claims.discard(machine_id)
+
+    def _prune_pod_operation_events(self, now: datetime):
+        """Prune old create/destroy timestamps used for rolling metrics."""
+        max_window = max(
+            int(os.getenv("SCHEDULER_SOFT_GOVERNOR_OPS_WINDOW_SECONDS", "3600")),
+            int(os.getenv("SCHEDULER_POD_OPS_24H_SECONDS", "86400")),
+        )
+        cutoff = now - timedelta(seconds=max(60, max_window))
+        while self._pod_create_events and self._pod_create_events[0] < cutoff:
+            self._pod_create_events.popleft()
+        while self._pod_destroy_events and self._pod_destroy_events[0] < cutoff:
+            self._pod_destroy_events.popleft()
+
+    async def _record_pod_operation_event(self, op_type: str):
+        """Track pod create/destroy operations for rolling risk controls."""
+        now = datetime.utcnow()
+        async with self._lock:
+            self._prune_pod_operation_events(now)
+            if op_type == "create":
+                self._pod_create_events.append(now)
+                self.fixed_fleet_metrics["pod_create_total"] = int(
+                    self.fixed_fleet_metrics.get("pod_create_total", 0)
+                ) + 1
+            elif op_type == "destroy":
+                self._pod_destroy_events.append(now)
+                self.fixed_fleet_metrics["pod_destroy_total"] = int(
+                    self.fixed_fleet_metrics.get("pod_destroy_total", 0)
+                ) + 1
+
+    async def get_pod_operation_metrics(self) -> Dict[str, int]:
+        """Return rolling pod create/destroy counters."""
+        now = datetime.utcnow()
+        one_hour_cutoff = now - timedelta(hours=1)
+        one_day_cutoff = now - timedelta(hours=24)
+        async with self._lock:
+            self._prune_pod_operation_events(now)
+            creates_1h = sum(1 for ts in self._pod_create_events if ts >= one_hour_cutoff)
+            destroys_1h = sum(1 for ts in self._pod_destroy_events if ts >= one_hour_cutoff)
+            creates_24h = sum(1 for ts in self._pod_create_events if ts >= one_day_cutoff)
+            destroys_24h = sum(1 for ts in self._pod_destroy_events if ts >= one_day_cutoff)
+            return {
+                "pod_creates_1h": int(creates_1h),
+                "pod_destroys_1h": int(destroys_1h),
+                "pod_ops_rolling_1h": int(creates_1h + destroys_1h),
+                "pod_creates_24h": int(creates_24h),
+                "pod_destroys_24h": int(destroys_24h),
+                "pod_ops_rolling_24h": int(creates_24h + destroys_24h),
+            }
+
+    async def get_soft_governor_state(self) -> Dict[str, Any]:
+        """
+        Return admission soft-governor state based on rolling pod op counts.
+        """
+        enabled = os.getenv("SCHEDULER_SOFT_GOVERNOR_ENABLED", "false").lower() == "true"
+        window_seconds = max(
+            60, int(os.getenv("SCHEDULER_SOFT_GOVERNOR_OPS_WINDOW_SECONDS", "3600"))
+        )
+        threshold = max(1, int(os.getenv("SCHEDULER_SOFT_GOVERNOR_OPS_THRESHOLD", "80")))
+        extra_safety = max(
+            0, int(os.getenv("SCHEDULER_SOFT_GOVERNOR_EXTRA_SAFETY_SECONDS", "30"))
+        )
+        extra_drain_guard = max(
+            0, int(os.getenv("SCHEDULER_SOFT_GOVERNOR_EXTRA_DRAIN_GUARD_SECONDS", "30"))
+        )
+        now = datetime.utcnow()
+        cutoff = now - timedelta(seconds=window_seconds)
+        async with self._lock:
+            self._prune_pod_operation_events(now)
+            creates_window = sum(1 for ts in self._pod_create_events if ts >= cutoff)
+            destroys_window = sum(1 for ts in self._pod_destroy_events if ts >= cutoff)
+            ops_window = int(creates_window + destroys_window)
+            active = bool(enabled and ops_window >= threshold)
+            return {
+                "enabled": bool(enabled),
+                "active": active,
+                "window_seconds": int(window_seconds),
+                "threshold": int(threshold),
+                "ops_in_window": int(ops_window),
+                "pod_creates_in_window": int(creates_window),
+                "pod_destroys_in_window": int(destroys_window),
+                "extra_safety_seconds": int(extra_safety if active else 0),
+                "extra_drain_guard_seconds": int(extra_drain_guard if active else 0),
+            }
     
     # -------------------------------------------------------------------------
     # Pod Slot Management
@@ -1093,6 +1676,21 @@ class PodManager:
             pi = self.individual_pods.get(pod_uuid)
             if not pi:
                 return False
+
+            if self.fixed_fleet_enabled:
+                age_seconds = (datetime.utcnow() - pi.created_at).total_seconds()
+                remaining_seconds = self.pod_max_lifetime_seconds - age_seconds
+                if remaining_seconds <= self.pod_drain_guard_seconds:
+                    logger.info(
+                        "Fixed fleet drain: refusing new job=%s on pod=%s remaining=%.1fs (guard=%ss)",
+                        job_id,
+                        pod_uuid,
+                        remaining_seconds,
+                        self.pod_drain_guard_seconds,
+                    )
+                    self.fixed_fleet_metrics["drain_guard_reject"] += 1
+                    self.fixed_fleet_metrics["rejected_by_ttl"] += 1
+                    return False
             
             # Per-model concurrency cap: heavy models can set max_jobs_per_pod in model_requirements.json
             model_limit = self.model_requirements.get(pi.model, {}).get(
@@ -1218,6 +1816,10 @@ class PodManager:
         
         Returns worker_id on success.
         """
+        if (model or "").strip().lower() in {"studio", "studio_engine"}:
+            raise ValueError(
+                "Studio jobs are pulled by studio_engine on Vultr, not dispatched to QuickPod"
+            )
         if self.strategy == PodStrategyType.WARM_AND_INDIVIDUAL:
             return await self._dispatch_warm_and_individual(job_id, model, mode)
         else:
@@ -2101,6 +2703,9 @@ class PodManager:
             # Use base model for cache lookup (aliases share the same cache entry)
             base_model = self.resolve_model_alias(model)
             cached = self.machine_cache.get_cached_machines_for_model(base_model)
+            cache_score_by_mid: Dict[str, float] = {
+                str(m): float(s) for m, s in cached
+            }
             for mid, score in cached:
                 mid_str = str(mid)
                 # Skip blacklisted machines
@@ -2108,6 +2713,34 @@ class PodManager:
                     logger.debug(f"Skipping blacklisted machine {mid_str} from cache")
                     continue
                 candidates.append((mid_str, f"cached (score={score})"))
+
+            if (
+                self.fixed_fleet_enabled
+                and self.fixed_fleet_strict_machines
+                and self.fixed_fleet_machine_ids
+            ):
+                _n0 = len(candidates)
+                candidates = [
+                    c for c in candidates if c[0] in self.fixed_fleet_machine_ids
+                ]
+                if _n0 != len(candidates):
+                    logger.info(
+                        "Fixed fleet strict: cache candidates filtered %s -> %s",
+                        _n0,
+                        len(candidates),
+                    )
+
+            if self.fixed_fleet_enabled and self.fixed_fleet_machine_ids and candidates:
+
+                def _fleet_candidate_sort_key(item: Tuple[str, str]):
+                    mid = item[0]
+                    nonfleet = 0 if mid in self.fixed_fleet_machine_ids else 1
+                    tier = self._fixed_fleet_machine_tier(mid)
+                    sr = self._machine_success_rate(mid)
+                    score = cache_score_by_mid.get(mid, 0.0)
+                    return (nonfleet, tier, -sr, -score)
+
+                candidates.sort(key=_fleet_candidate_sort_key)
             
             if model != base_model:
                 logger.info(
@@ -2239,26 +2872,47 @@ class PodManager:
                         if not has_allowed_geolocation(o): continue
                         
                         eligible_offers_for_gpu.append(o)
+
+                    if (
+                        self.fixed_fleet_enabled
+                        and self.fixed_fleet_strict_machines
+                        and self.fixed_fleet_machine_ids
+                    ):
+                        eligible_offers_for_gpu = [
+                            o
+                            for o in eligible_offers_for_gpu
+                            if extract_machine_id(o) in self.fixed_fleet_machine_ids
+                        ]
                     
                     if not eligible_offers_for_gpu:
                         logger.info(f"No eligible machines found for GPU tier '{target_gpu}'")
                         continue
                         
-                    # --- 2. Sort the eligible machines: CACHED first, then CHEAPEST ---
-                    # We know all these machines are the correct GPU tier and are available to rent.
-                    # We sort them such that if a machine ID is in `candidates` (our cache list), it goes first.
-                    # Among cached machines, preserve their original order (which is based on cache score).
+                    # --- 2. Sort eligible machines ---
+                    # Default: cached (by score) then cheapest.
+                    # Fixed fleet + allowlist: allowlisted machines first, ordered by GPU tier
+                    # (FIXED_FLEET_GPU_TIERS), then machine_cache success_rate, then cache score,
+                    # then price. Non-allowlisted offers follow when strict mode is off.
                     cached_mids = [c[0] for c in candidates]
-                    
-                    def sort_key(o):
+                    fleet_ids = self.fixed_fleet_machine_ids
+
+                    def offer_sort_key(o):
                         mid = extract_machine_id(o)
+                        price = extract_price(o)
                         is_cached = mid in cached_mids
                         cache_idx = cached_mids.index(mid) if is_cached else 999999
-                        price = extract_price(o)
-                        # Tuple comparison: (0 if cached else 1, cache index, price)
-                        return (0 if is_cached else 1, cache_idx, price)
-                        
-                    eligible_offers_for_gpu.sort(key=sort_key)
+                        tier = self._fixed_fleet_machine_tier(mid)
+                        sr = self._machine_success_rate(mid)
+                        if self.fixed_fleet_enabled and fleet_ids:
+                            if mid in fleet_ids:
+                                sub = 0 if is_cached else 1
+                                return (0, tier, -sr, sub, cache_idx, price)
+                            if is_cached:
+                                return (1, -sr, cache_idx, price, 0)
+                            return (2, price, 0, mid)
+                        return (0 if is_cached else 1, cache_idx, price, 0)
+
+                    eligible_offers_for_gpu.sort(key=offer_sort_key)
                     
                     logger.info(
                         f"Found {len(eligible_offers_for_gpu)} eligible machines for GPU '{target_gpu}' "
@@ -2278,9 +2932,18 @@ class PodManager:
                         hourly_cost = extract_price(offer)
                         gpu_type = offer.get("gpu_type", offer.get("offer_name", "Unknown"))
                         is_cached = machine_id_str in cached_mids
-                        
+                        if self.fixed_fleet_enabled and fleet_ids:
+                            if machine_id_str in fleet_ids:
+                                tier_lbl = "PRIMARY"
+                            elif is_cached:
+                                tier_lbl = "SECONDARY_CACHE"
+                            else:
+                                tier_lbl = "COLD_OFFER"
+                        else:
+                            tier_lbl = "CACHED" if is_cached else "UNCACHED"
+
                         logger.info(
-                            f"Trying {'CACHED' if is_cached else 'UNCACHED'} machine {machine_id_str} "
+                            f"Trying {tier_lbl} machine {machine_id_str} "
                             f"for variant {variant} (GPU: {target_gpu}, price=${hourly_cost:.3f}/hr)"
                         )
                         
@@ -2309,170 +2972,182 @@ class PodManager:
                     f"Trying next variant..."
                 )
             
-            # Global fallback - only reached if ALL variants exhausted ALL their GPU tier machines
-            logger.warning(
-                "All variants exhausted all available machines in their GPU tiers. "
-                "Trying global fallback (searching all available machines across all GPU types)..."
+            # Global fallback - only if not strict fixed fleet (strict = allowlisted IDs only)
+            skip_global_fallback = (
+                self.fixed_fleet_enabled
+                and self.fixed_fleet_strict_machines
+                and bool(self.fixed_fleet_machine_ids)
             )
-            
-            # Get current ACTIVE blacklisted machines (excludes expired)
-            blacklisted = self.blacklist.get_active_blacklist()
-            logger.info(f"Global fallback with ACTIVE blacklist: {blacklisted}")
-            
-            # Try each variant with its specific GPU requirements
-            for variant, allowed_gpus in variant_plan:
-                logger.info(
-                    f"Global fallback: trying variant={variant} with GPUs={allowed_gpus}"
+            if skip_global_fallback:
+                logger.warning(
+                    "All variants exhausted allowlisted fixed-fleet machines for this model "
+                    "(or no matching GPU-tier offer on those machines). "
+                    "FIXED_FLEET_STRICT_MACHINES=true: skipping global fallback."
                 )
-                
-                # First, try with all allowed GPUs together
-                variant_pod_created = False
-                try:
-                    # Resolve model alias for requirements lookup
-                    base_model = self.resolve_model_alias(model)
-                    req = self.model_requirements.get(base_model, {})
-                    min_tflops = req.get("min_tflops", 0)
-                    
-                    # Get offer with full details including pricing
-                    offer_info = await asyncio.to_thread(
-                        self.global_qp.get_best_offer_with_details,
-                        None,  # no preferred machine
-                        min_tflops,
-                        allowed_gpus,  # Use variant-specific GPUs!
-                        1,  # min_gpu_count
-                        blacklisted,  # Pass blacklist to get_best_offer
+            else:
+                logger.warning(
+                    "All variants exhausted all available machines in their GPU tiers. "
+                    "Trying global fallback (searching all available machines across all GPU types)..."
+                )
+
+                # Get current ACTIVE blacklisted machines (excludes expired)
+                blacklisted = self.blacklist.get_active_blacklist()
+                logger.info(f"Global fallback with ACTIVE blacklist: {blacklisted}")
+
+                # Try each variant with its specific GPU requirements
+                for variant, allowed_gpus in variant_plan:
+                    logger.info(
+                        f"Global fallback: trying variant={variant} with GPUs={allowed_gpus}"
                     )
-                    
-                    if offer_info and offer_info.machine_id:
-                        # Double-check: Verify the machine is not blacklisted
-                        if not self.is_machine_bad(str(offer_info.machine_id)):
-                            # Get template and disk size for this variant
-                            template_uuid = self.get_template_for_variant(model, variant)
-                            disk_size = self.get_disk_size_for_variant(model, variant)
-                            
-                            if not template_uuid:
-                                template_uuid = self.template_uuids.get(base_model) or self.template_uuids.get("default")
-                            
-                            if template_uuid:
-                                logger.info(
-                                    f"Global fallback: creating pod with variant={variant}, "
-                                    f"machine={offer_info.machine_id}, template={template_uuid}, "
-                                    f"hourly_cost=${offer_info.hourly_cost:.3f}"
-                                )
-                                pod_uuid = await self._try_create_pod_on_machine(
-                                    str(offer_info.machine_id),
-                                    model,
-                                    mode,
-                                    variant,
-                                    offer_info.offer_id,
-                                    template_uuid,
-                                    disk_size,
-                                    hourly_cost=offer_info.hourly_cost,
-                                    gpu_type=offer_info.gpu_type,
-                                )
-                                
-                                if pod_uuid:
-                                    variant_pod_created = True
-                                    # Update machine cache with newly found machine
-                                    await self.machine_cache.mark_image_cached(
-                                        str(offer_info.machine_id), base_model
-                                    )
-                                    logger.info(
-                                        f"Added machine {offer_info.machine_id} to cache for model {base_model}"
-                                    )
-                                    
-                                    # Record fallback event for autoscaler
-                                    await self._record_fallback_event(model, str(offer_info.machine_id))
-                                    return pod_uuid
-                        else:
-                            logger.warning(
-                                f"Global fallback returned blacklisted machine {offer_info.machine_id}, "
-                                f"trying individual GPU types..."
-                            )
-                    
-                    # If variant-level search failed, try each GPU type individually
-                    if not variant_pod_created:
-                        logger.info(
-                            f"Global fallback: variant-level search failed for {variant}, "
-                            f"trying individual GPU types: {allowed_gpus}"
+
+                    # First, try with all allowed GPUs together
+                    variant_pod_created = False
+                    try:
+                        # Resolve model alias for requirements lookup
+                        base_model = self.resolve_model_alias(model)
+                        req = self.model_requirements.get(base_model, {})
+                        min_tflops = req.get("min_tflops", 0)
+
+                        # Get offer with full details including pricing
+                        offer_info = await asyncio.to_thread(
+                            self.global_qp.get_best_offer_with_details,
+                            None,  # no preferred machine
+                            min_tflops,
+                            allowed_gpus,  # Use variant-specific GPUs!
+                            1,  # min_gpu_count
+                            blacklisted,  # Pass blacklist to get_best_offer
                         )
-                        
-                        for gpu_type in allowed_gpus:
-                            try:
-                                logger.info(
-                                    f"Global fallback: trying individual GPU type {gpu_type} "
-                                    f"for variant={variant}"
-                                )
-                                
-                                # Try with single GPU type
-                                offer_info = await asyncio.to_thread(
-                                    self.global_qp.get_best_offer_with_details,
-                                    None,  # no preferred machine
-                                    min_tflops,
-                                    [gpu_type],  # Try single GPU type
-                                    1,  # min_gpu_count
-                                    blacklisted,  # Pass blacklist
-                                )
-                                
-                                if offer_info and offer_info.machine_id:
-                                    # Double-check: Verify the machine is not blacklisted
-                                    if self.is_machine_bad(str(offer_info.machine_id)):
-                                        logger.debug(
-                                            f"Skipping blacklisted machine {offer_info.machine_id} "
-                                            f"for GPU type {gpu_type}"
+
+                        if offer_info and offer_info.machine_id:
+                            # Double-check: Verify the machine is not blacklisted
+                            if not self.is_machine_bad(str(offer_info.machine_id)):
+                                # Get template and disk size for this variant
+                                template_uuid = self.get_template_for_variant(model, variant)
+                                disk_size = self.get_disk_size_for_variant(model, variant)
+
+                                if not template_uuid:
+                                    template_uuid = self.template_uuids.get(base_model) or self.template_uuids.get("default")
+
+                                if template_uuid:
+                                    logger.info(
+                                        f"Global fallback: creating pod with variant={variant}, "
+                                        f"machine={offer_info.machine_id}, template={template_uuid}, "
+                                        f"hourly_cost=${offer_info.hourly_cost:.3f}"
+                                    )
+                                    pod_uuid = await self._try_create_pod_on_machine(
+                                        str(offer_info.machine_id),
+                                        model,
+                                        mode,
+                                        variant,
+                                        offer_info.offer_id,
+                                        template_uuid,
+                                        disk_size,
+                                        hourly_cost=offer_info.hourly_cost,
+                                        gpu_type=offer_info.gpu_type,
+                                    )
+
+                                    if pod_uuid:
+                                        variant_pod_created = True
+                                        # Update machine cache with newly found machine
+                                        await self.machine_cache.mark_image_cached(
+                                            str(offer_info.machine_id), base_model
                                         )
-                                        continue
-                                    
-                                    # Get template and disk size for this variant
-                                    template_uuid = self.get_template_for_variant(model, variant)
-                                    disk_size = self.get_disk_size_for_variant(model, variant)
-                                    
-                                    if not template_uuid:
-                                        template_uuid = self.template_uuids.get(base_model) or self.template_uuids.get("default")
-                                    
-                                    if template_uuid:
                                         logger.info(
-                                            f"Global fallback: creating pod with variant={variant}, "
-                                            f"GPU={gpu_type}, machine={offer_info.machine_id}, "
-                                            f"template={template_uuid}, hourly_cost=${offer_info.hourly_cost:.3f}"
+                                            f"Added machine {offer_info.machine_id} to cache for model {base_model}"
                                         )
-                                        pod_uuid = await self._try_create_pod_on_machine(
-                                            str(offer_info.machine_id),
-                                            model,
-                                            mode,
-                                            variant,
-                                            offer_info.offer_id,
-                                            template_uuid,
-                                            disk_size,
-                                            hourly_cost=offer_info.hourly_cost,
-                                            gpu_type=offer_info.gpu_type,
-                                        )
-                                        
-                                        if pod_uuid:
-                                            # Update machine cache with newly found machine
-                                            await self.machine_cache.mark_image_cached(
-                                                str(offer_info.machine_id), base_model
-                                            )
-                                            logger.info(
-                                                f"Added machine {offer_info.machine_id} to cache for model {base_model} "
-                                                f"(found via GPU type {gpu_type})"
-                                            )
-                                            
-                                            # Record fallback event for autoscaler
-                                            await self._record_fallback_event(model, str(offer_info.machine_id))
-                                            return pod_uuid
-                                
-                            except Exception as e:
+
+                                        # Record fallback event for autoscaler
+                                        await self._record_fallback_event(model, str(offer_info.machine_id))
+                                        return pod_uuid
+                            else:
                                 logger.warning(
-                                    f"Global fallback failed for GPU type {gpu_type} "
-                                    f"in variant {variant}: {e}"
+                                    f"Global fallback returned blacklisted machine {offer_info.machine_id}, "
+                                    f"trying individual GPU types..."
                                 )
-                                continue
-                            
-                except Exception as e:
-                    logger.warning(f"Global fallback failed for variant={variant}: {e}")
-                    continue
-            
+
+                        # If variant-level search failed, try each GPU type individually
+                        if not variant_pod_created:
+                            logger.info(
+                                f"Global fallback: variant-level search failed for {variant}, "
+                                f"trying individual GPU types: {allowed_gpus}"
+                            )
+
+                            for gpu_type in allowed_gpus:
+                                try:
+                                    logger.info(
+                                        f"Global fallback: trying individual GPU type {gpu_type} "
+                                        f"for variant={variant}"
+                                    )
+
+                                    # Try with single GPU type
+                                    offer_info = await asyncio.to_thread(
+                                        self.global_qp.get_best_offer_with_details,
+                                        None,  # no preferred machine
+                                        min_tflops,
+                                        [gpu_type],  # Try single GPU type
+                                        1,  # min_gpu_count
+                                        blacklisted,  # Pass blacklist
+                                    )
+
+                                    if offer_info and offer_info.machine_id:
+                                        # Double-check: Verify the machine is not blacklisted
+                                        if self.is_machine_bad(str(offer_info.machine_id)):
+                                            logger.debug(
+                                                f"Skipping blacklisted machine {offer_info.machine_id} "
+                                                f"for GPU type {gpu_type}"
+                                            )
+                                            continue
+
+                                        # Get template and disk size for this variant
+                                        template_uuid = self.get_template_for_variant(model, variant)
+                                        disk_size = self.get_disk_size_for_variant(model, variant)
+
+                                        if not template_uuid:
+                                            template_uuid = self.template_uuids.get(base_model) or self.template_uuids.get("default")
+
+                                        if template_uuid:
+                                            logger.info(
+                                                f"Global fallback: creating pod with variant={variant}, "
+                                                f"GPU={gpu_type}, machine={offer_info.machine_id}, "
+                                                f"template={template_uuid}, hourly_cost=${offer_info.hourly_cost:.3f}"
+                                            )
+                                            pod_uuid = await self._try_create_pod_on_machine(
+                                                str(offer_info.machine_id),
+                                                model,
+                                                mode,
+                                                variant,
+                                                offer_info.offer_id,
+                                                template_uuid,
+                                                disk_size,
+                                                hourly_cost=offer_info.hourly_cost,
+                                                gpu_type=offer_info.gpu_type,
+                                            )
+
+                                            if pod_uuid:
+                                                # Update machine cache with newly found machine
+                                                await self.machine_cache.mark_image_cached(
+                                                    str(offer_info.machine_id), base_model
+                                                )
+                                                logger.info(
+                                                    f"Added machine {offer_info.machine_id} to cache for model {base_model} "
+                                                    f"(found via GPU type {gpu_type})"
+                                                )
+
+                                                # Record fallback event for autoscaler
+                                                await self._record_fallback_event(model, str(offer_info.machine_id))
+                                                return pod_uuid
+
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Global fallback failed for GPU type {gpu_type} "
+                                        f"in variant {variant}: {e}"
+                                    )
+                                    continue
+
+                    except Exception as e:
+                        logger.warning(f"Global fallback failed for variant={variant}: {e}")
+                        continue
+
             logger.error(
                 f"Global fallback: no available machines for model {model}. "
                 f"All machines exhausted or blacklisted."
@@ -2486,6 +3161,15 @@ class PodManager:
             ]
             if blacklisted_machines:
                 logger.warning(f"Currently blacklisted machines: {blacklisted_machines}")
+
+            if self._should_try_external_providers():
+                logger.warning(
+                    "Quickpod exhausted for model %s; searching RunPod/Vast/Salad",
+                    model,
+                )
+                external_uuid = await self._create_external_provider_pod(model, mode)
+                if external_uuid:
+                    return external_uuid
             
             # Set backoff period on failure to prevent rapid retry storms
             async with self._lock:
@@ -2519,99 +3203,108 @@ class PodManager:
             f"machine={machine_id}, template={template_uuid}, "
             f"hourly_cost=${hourly_cost:.3f}"
         )
-        
-        # Final safety check: never create pod on blacklisted machine
-        if self.is_machine_bad(machine_id):
-            logger.warning(
-                f"Refusing to create pod on blacklisted machine {machine_id} "
-                f"for model {model}"
-            )
+
+        claimed_for_creation = await self._fixed_fleet_claim_machine_for_creation(machine_id)
+        if not claimed_for_creation:
             return None
-        
+
         try:
-            pod_uuid = await self.lifecycle.create_pod(
-                offer_id=offer_id,
-                template_uuid=template_uuid,
-                disk_size=disk_size,
-                model=model,
-                mode=mode,
-                variant=variant,
-                machine_id=machine_id,
-            )
-        except QuickPodFatalError as e:
-            # Don't blacklist machine for API errors
-            logger.error(f"QuickPod fatal error on {machine_id}: {e}")
-            return None
-        except Exception as e:
-            logger.warning(f"Pod creation failed on {machine_id}: {e}")
-            await self.mark_machine_bad(machine_id)
-            return None
-        
-        if not pod_uuid:
-            await self.mark_machine_bad(machine_id)
-            return None
-        
-        # Register pod locally with cost tracking info
-        await self._register_pod_locally(
-            pod_uuid, model, mode, machine_id, variant,
-            hourly_cost=hourly_cost,
-            gpu_type=gpu_type,
-            offer_id=offer_id,
-        )
-        
-        # Wait for pod to be ready
-        start = time.time()
-        while time.time() - start < self.pod_startup_timeout:
+            base_model_cache = self.resolve_model_alias(model)
+
+            # Final safety check: never create pod on blacklisted machine
+            if self.is_machine_bad(machine_id):
+                logger.warning(
+                    f"Refusing to create pod on blacklisted machine {machine_id} "
+                    f"for model {model}"
+                )
+                return None
+
             try:
-                if await self.check_pod_ready(pod_uuid):
-                    async with self._lock:
-                        if pod_uuid in self.individual_pods:
-                            self.individual_pods[pod_uuid].status = PodStatus.READY
-                    
-                    # Mark image as cached
-                    await self.machine_cache.mark_image_cached(machine_id, model)
-                    await self.mark_machine_good(machine_id)
-                    
-                    logger.info(f"Pod {pod_uuid} ready on {machine_id}")
-                    return pod_uuid
+                pod_uuid = await self.lifecycle.create_pod(
+                    offer_id=offer_id,
+                    template_uuid=template_uuid,
+                    disk_size=disk_size,
+                    model=model,
+                    mode=mode,
+                    variant=variant,
+                    machine_id=machine_id,
+                )
+            except QuickPodFatalError as e:
+                # Don't blacklist machine for API errors
+                logger.error(f"QuickPod fatal error on {machine_id}: {e}")
+                return None
             except Exception as e:
-                logger.debug(f"Pod readiness check error: {e}")
-            
-            await asyncio.sleep(2)
-        
-        # Timeout - check if worker registered anyway (race condition protection)
-        # CRITICAL: Worker must be in "ready" state, not just registered!
-        # Workers in "starting" state are still loading models
-        if await self._check_worker_registered_for_pod(pod_uuid, require_ready=True):
-            logger.info(
-                f"Pod {pod_uuid} timed out but worker is READY - keeping alive"
+                logger.warning(f"Pod creation failed on {machine_id}: {e}")
+                await self.mark_machine_bad(machine_id)
+                return None
+
+            if not pod_uuid:
+                await self.mark_machine_bad(machine_id)
+                return None
+
+            # Register pod locally with cost tracking info
+            await self._register_pod_locally(
+                pod_uuid, model, mode, machine_id, variant,
+                hourly_cost=hourly_cost,
+                gpu_type=gpu_type,
+                offer_id=offer_id,
             )
-            async with self._lock:
-                if pod_uuid in self.individual_pods:
-                    self.individual_pods[pod_uuid].status = PodStatus.READY
-            await self.machine_cache.mark_image_cached(machine_id, model)
-            return pod_uuid
-        
-        # Check if worker registered but still starting - give it more time
-        if await self._check_worker_registered_for_pod(pod_uuid, require_ready=False):
-            logger.warning(
-                f"Pod {pod_uuid} timed out but worker registered in 'starting' state. "
-                f"Keeping alive - models may still be loading. "
-                f"Worker will transition to 'ready' when models are loaded."
-            )
-            # Keep pod alive but mark as STARTING (not READY)
-            async with self._lock:
-                if pod_uuid in self.individual_pods:
-                    self.individual_pods[pod_uuid].status = PodStatus.STARTING
-            await self.machine_cache.mark_image_cached(machine_id, model)
-            return pod_uuid
-        
-        # Truly timed out - worker never registered at all, destroy and blacklist
-        logger.error(f"Pod {pod_uuid} startup timeout (no worker registration), destroying")
-        await self.destroy_individual_pod(pod_uuid, reason="Startup timeout - no worker registration")
-        await self.mark_machine_bad(machine_id)
-        
-        return None
+
+            # Wait for pod to be ready
+            start = time.time()
+            while time.time() - start < self.pod_startup_timeout:
+                try:
+                    if await self.check_pod_ready(pod_uuid):
+                        async with self._lock:
+                            if pod_uuid in self.individual_pods:
+                                self.individual_pods[pod_uuid].status = PodStatus.READY
+
+                        # Mark image as cached (base model so aliases share machine_cache)
+                        await self.machine_cache.mark_image_cached(machine_id, base_model_cache)
+                        await self.mark_machine_good(machine_id)
+
+                        logger.info(f"Pod {pod_uuid} ready on {machine_id}")
+                        return pod_uuid
+                except Exception as e:
+                    logger.debug(f"Pod readiness check error: {e}")
+
+                await asyncio.sleep(2)
+
+            # Timeout - check if worker registered anyway (race condition protection)
+            # CRITICAL: Worker must be in "ready" state, not just registered!
+            # Workers in "starting" state are still loading models
+            if await self._check_worker_registered_for_pod(pod_uuid, require_ready=True):
+                logger.info(
+                    f"Pod {pod_uuid} timed out but worker is READY - keeping alive"
+                )
+                async with self._lock:
+                    if pod_uuid in self.individual_pods:
+                        self.individual_pods[pod_uuid].status = PodStatus.READY
+                await self.machine_cache.mark_image_cached(machine_id, base_model_cache)
+                return pod_uuid
+
+            # Check if worker registered but still starting - give it more time
+            if await self._check_worker_registered_for_pod(pod_uuid, require_ready=False):
+                logger.warning(
+                    f"Pod {pod_uuid} timed out but worker registered in 'starting' state. "
+                    f"Keeping alive - models may still be loading. "
+                    f"Worker will transition to 'ready' when models are loaded."
+                )
+                # Keep pod alive but mark as STARTING (not READY)
+                async with self._lock:
+                    if pod_uuid in self.individual_pods:
+                        self.individual_pods[pod_uuid].status = PodStatus.STARTING
+                await self.machine_cache.mark_image_cached(machine_id, base_model_cache)
+                return pod_uuid
+
+            # Truly timed out - worker never registered at all, destroy and blacklist
+            logger.error(f"Pod {pod_uuid} startup timeout (no worker registration), destroying")
+            await self.destroy_individual_pod(pod_uuid, reason="Startup timeout - no worker registration")
+            await self.mark_machine_bad(machine_id)
+
+            return None
+        finally:
+            await self._fixed_fleet_release_machine_claim(machine_id)
     
     async def _register_pod_locally(
         self,
@@ -2624,9 +3317,18 @@ class PodManager:
         gpu_type: str = "",
         offer_id: int = 0,
         is_cache_refresh_pod: bool = False,
+        gpu_provider: str = "quickpod",
+        public_url: Optional[str] = None,
+        extra_meta: Optional[Dict[str, Any]] = None,
     ):
         """Register a pod in local tracking with cost info"""
-        meta: Dict[str, Any] = {"variant": variant}
+        provider = (gpu_provider or "quickpod").strip().lower() or "quickpod"
+        meta: Dict[str, Any] = {"variant": variant, "gpu_provider": provider}
+        if public_url:
+            meta["public_url"] = public_url
+        if extra_meta:
+            meta.update(extra_meta)
+            meta["gpu_provider"] = provider
         if is_cache_refresh_pod:
             meta["is_cache_refresh_pod"] = True
         async with self._lock:
@@ -2644,14 +3346,17 @@ class PodManager:
                 gpu_type=gpu_type,
                 offer_id=offer_id,
             )
-            
-            self.individual_pod_managers[pod_uuid] = QuickPodManager(
-                self.email,
-                self.password,
-                pod_uuid,
-            )
+
+            if provider in ("", "quickpod"):
+                self.individual_pod_managers[pod_uuid] = QuickPodManager(
+                    self.email,
+                    self.password,
+                    pod_uuid,
+                )
             
             self._pod_locks[pod_uuid] = asyncio.Lock()
+        if not is_cache_refresh_pod:
+            await self._record_pod_operation_event("create")
     
     async def _check_worker_registered_for_pod(self, pod_uuid: str, require_ready: bool = False) -> bool:
         """
@@ -2703,6 +3408,200 @@ class PodManager:
                 )
             
             return worker is not None
+
+    def _should_try_external_providers(self) -> bool:
+        if os.getenv("GPU_PROVIDERS_ENABLED", "true").strip().lower() in ("0", "false", "off", "no"):
+            return False
+        try:
+            from gpu_providers import any_external_configured
+
+            return any_external_configured()
+        except Exception:
+            return False
+
+    async def _apply_public_url(self, pod_uuid: str, url: str) -> None:
+        if not url:
+            return
+        async with self._lock:
+            pi = self.individual_pods.get(pod_uuid)
+            if pi:
+                pi.meta["public_url"] = url
+        from db import SessionLocal, Worker
+
+        with SessionLocal() as db:
+            worker = db.query(Worker).filter(Worker.container_id == pod_uuid).first()
+            if worker:
+                worker.endpoint = url
+                info = dict(worker.info or {})
+                if pi:
+                    info["gpu_provider"] = (pi.meta or {}).get("gpu_provider") or info.get("gpu_provider")
+                worker.info = info
+                db.commit()
+
+    async def _create_external_provider_pod(
+        self,
+        model: str,
+        mode: Optional[str] = None,
+    ) -> Optional[str]:
+        """Create a worker on RunPod, Vast, or Salad after Quickpod has no machines."""
+        from gpu_providers import create_on_providers, refresh_public_url
+        from gpu_providers.spec import build_worker_spec
+
+        variant_plan = self.get_variant_plan(model)
+        for variant, allowed_gpus in variant_plan:
+            template_uuid = self.get_template_for_variant(model, variant)
+            disk_size = self.get_disk_size_for_variant(model, variant)
+            spec = build_worker_spec(model, variant, template_uuid, disk_size, allowed_gpus)
+            if not spec:
+                logger.warning(
+                    "No Docker image in templates.json for model=%s variant=%s",
+                    model,
+                    variant,
+                )
+                continue
+            created = await asyncio.to_thread(create_on_providers, spec)
+            if not created:
+                continue
+            extra_meta = dict(created.meta or {})
+            extra_meta["public_url"] = created.public_url
+            extra_meta["gpu_provider"] = created.provider
+            await self._register_pod_locally(
+                created.pod_id,
+                model,
+                mode,
+                created.machine_id,
+                variant,
+                hourly_cost=created.hourly_cost,
+                gpu_type=created.gpu_type,
+                offer_id=0,
+                gpu_provider=created.provider,
+                public_url=created.public_url,
+                extra_meta=extra_meta,
+            )
+            start = time.time()
+            while time.time() - start < self.pod_startup_timeout:
+                async with self._lock:
+                    pi = self.individual_pods.get(created.pod_id)
+                    meta = dict(pi.meta or {}) if pi else {}
+                if not meta.get("public_url"):
+                    url = await asyncio.to_thread(
+                        refresh_public_url, created.provider, meta
+                    )
+                    if url:
+                        await self._apply_public_url(created.pod_id, url)
+                try:
+                    if await self.check_pod_ready(created.pod_id):
+                        async with self._lock:
+                            if created.pod_id in self.individual_pods:
+                                self.individual_pods[created.pod_id].status = PodStatus.READY
+                        logger.info(
+                            "External %s pod %s ready for model=%s",
+                            created.provider,
+                            created.pod_id,
+                            model,
+                        )
+                        return created.pod_id
+                except Exception as e:
+                    logger.debug("External pod ready check: %s", e)
+                await asyncio.sleep(2)
+
+            if await self._check_worker_registered_for_pod(created.pod_id, require_ready=True):
+                async with self._lock:
+                    if created.pod_id in self.individual_pods:
+                        self.individual_pods[created.pod_id].status = PodStatus.READY
+                return created.pod_id
+            if await self._check_worker_registered_for_pod(created.pod_id, require_ready=False):
+                logger.warning(
+                    "External %s pod %s registered but still starting; keeping alive",
+                    created.provider,
+                    created.pod_id,
+                )
+                async with self._lock:
+                    if created.pod_id in self.individual_pods:
+                        self.individual_pods[created.pod_id].status = PodStatus.STARTING
+                return created.pod_id
+
+            logger.error(
+                "External %s pod %s startup timeout, destroying",
+                created.provider,
+                created.pod_id,
+            )
+            await self.destroy_individual_pod(
+                created.pod_id,
+                reason="Startup timeout - no worker registration",
+            )
+        return None
+
+    async def maybe_release_external_pod_after_job(
+        self,
+        pod_uuid: str,
+        worker_id: Optional[str] = None,
+    ) -> None:
+        """Destroy RunPod/Vast/Salad pods after a job unless personal leftover exists."""
+        if not pod_uuid:
+            return
+        provider = "quickpod"
+        async with self._lock:
+            pi = self.individual_pods.get(pod_uuid)
+            if not pi:
+                for tracked, info in self.individual_pods.items():
+                    if normalize_pod_uuid(tracked) == normalize_pod_uuid(pod_uuid):
+                        pod_uuid = tracked
+                        pi = info
+                        break
+            if pi:
+                provider = str((pi.meta or {}).get("gpu_provider") or "quickpod")
+        if provider in ("", "quickpod"):
+            return
+
+        from db import SessionLocal, Worker, Job
+        from job_manager import JobState
+        from gpu_providers.ttl import should_keep_external_after_job
+
+        db = SessionLocal()
+        keep = False
+        try:
+            worker = None
+            if worker_id:
+                worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+            if not worker:
+                worker = db.query(Worker).filter(Worker.container_id == pod_uuid).first()
+            if worker:
+                busy = (
+                    db.query(Job)
+                    .filter(
+                        Job.worker_id == worker.worker_id,
+                        Job.status.in_(
+                            [
+                                JobState.QUEUED.value,
+                                JobState.RUNNING.value,
+                                JobState.DISPATCHING.value,
+                            ]
+                        ),
+                    )
+                    .count()
+                )
+                if busy > 0:
+                    return
+                keep = should_keep_external_after_job(worker)
+            if keep:
+                logger.info(
+                    "Keeping %s pod %s for personal leftover (15 min TTL)",
+                    provider,
+                    pod_uuid,
+                )
+                return
+            logger.info(
+                "Closing %s pod %s after job (no personal leftover)",
+                provider,
+                pod_uuid,
+            )
+        finally:
+            db.close()
+        await self.destroy_individual_pod(
+            pod_uuid,
+            reason="External provider job done, no personal leftover",
+        )
     
     # -------------------------------------------------------------------------
     # Pod Destruction
@@ -2760,6 +3659,9 @@ class PodManager:
         pod_created_at: Optional[datetime] = None
         pod_hourly_cost: float = 0.0
         pod_gpu_type: str = ""
+        is_cache_refresh_pod = False
+        gpu_provider = "quickpod"
+        provider_meta: Dict[str, Any] = {}
         async with self._lock:
             pi = self.individual_pods.get(pod_uuid)
             if pi:
@@ -2767,6 +3669,9 @@ class PodManager:
                 pod_created_at = pi.created_at
                 pod_hourly_cost = pi.hourly_cost
                 pod_gpu_type = pi.gpu_type
+                is_cache_refresh_pod = bool(pi.meta.get("is_cache_refresh_pod"))
+                gpu_provider = str((pi.meta or {}).get("gpu_provider") or "quickpod")
+                provider_meta = dict(pi.meta or {})
         
         # CRITICAL: Recover any running jobs BEFORE destroying the pod
         # This prevents jobs from being lost when a pod dies
@@ -2789,12 +3694,22 @@ class PodManager:
                     jobs_to_recover = db.query(Job).filter(
                         Job.worker_id == worker.worker_id,
                         Job.status.in_([JobState.QUEUED.value, JobState.RUNNING.value, JobState.DISPATCHING.value]),
-                    ).all()
+                    ).order_by(Job.created_at.asc()).all()
                     
                     max_retries_default = int(os.getenv("JOB_MAX_RETRIES", "3"))
                     recovered_count = 0
                     failed_count = 0
                     for job in jobs_to_recover:
+                        # RACE FIX: Re-read job from DB before modifying. job_complete may have
+                        # just committed COMPLETED for this job; do not overwrite with QUEUED/FAILED.
+                        db.refresh(job)
+                        if job.status in (JobState.COMPLETED.value, JobState.FAILED.value):
+                            logger.info(
+                                f"Job {job.job_id} already in terminal state '{job.status}', "
+                                f"skipping recovery (job_complete likely committed concurrently)"
+                            )
+                            continue
+
                         old_status = job.status
                         retry_count = job.retry_count or 0
                         max_retries = getattr(job, "max_retries", None) or max_retries_default
@@ -2865,6 +3780,8 @@ class PodManager:
                     
                     # Mark worker as offline
                     worker.status = "offline"
+                    if isinstance(worker.info, dict) and worker.info.get("gpu_provider"):
+                        gpu_provider = str(worker.info.get("gpu_provider") or gpu_provider)
                     db.commit()
                     
         except Exception as e:
@@ -2888,7 +3805,12 @@ class PodManager:
                 pi.status = PodStatus.STOPPING
         
         # Destroy via lifecycle manager (API call) BEFORE removing from tracking
-        success = await self.lifecycle.destroy_pod(pod_uuid, reason=reason)
+        success = await self.lifecycle.destroy_pod(
+            pod_uuid,
+            reason=reason,
+            gpu_provider=gpu_provider,
+            provider_meta=provider_meta,
+        )
         
         if not success:
             logger.error(
@@ -2900,6 +3822,8 @@ class PodManager:
         async with self._lock:
             self.individual_pods.pop(pod_uuid, None)
             self.individual_pod_managers.pop(pod_uuid, None)
+        if success and not is_cache_refresh_pod:
+            await self._record_pod_operation_event("destroy")
         
         logger.info(f"Pod {pod_uuid} removed from tracking (destroy success={success})")
         
@@ -2962,7 +3886,7 @@ class PodManager:
         # If pod died due to infrastructure/network issues, blacklist the machine to avoid immediate reuse.
         # (Do NOT blacklist for normal idle scale-down.)
         # Do NOT blacklist for "stuck running" / "running for" so recovered jobs can be re-dispatched to a new pod.
-        if machine_id and reason:
+        if machine_id and reason and (gpu_provider in ("", "quickpod")):
             reason_l = reason.lower()
             if (
                 "stale heartbeat" in reason_l
@@ -3121,6 +4045,26 @@ class PodManager:
         registration_timeout_sec = refresh_registration_min * 60
 
         pairs = self.machine_cache.list_all_cached_pairs()
+        fleet_allow = self.fixed_fleet_machine_ids
+        if fleet_allow:
+            before = len(pairs)
+            pairs = [
+                (mid, model)
+                for mid, model in pairs
+                if str(mid).strip() in fleet_allow
+            ]
+            logger.info(
+                "Cache refresh: FIXED_FLEET_MACHINE_IDS allowlist (%s ids) — "
+                "%s -> %s (machine, model) pairs",
+                len(fleet_allow),
+                before,
+                len(pairs),
+            )
+            if not pairs and before:
+                logger.warning(
+                    "Cache refresh: no (machine, model) pairs left after fleet allowlist filter; "
+                    "machine_cache may only list non-fleet machines"
+                )
         pairs = pairs[:max_items]
         logger.info(f"Cache refresh: processing {len(pairs)} (machine, model) pairs (max {max_items})")
 
@@ -3213,4 +4157,85 @@ class PodManager:
 
         await self.machine_cache.save()
         logger.info("Cache refresh: completed")
+
+    async def get_fixed_fleet_snapshot(self) -> Dict[str, Any]:
+        """Runtime snapshot for observability/debugging."""
+        from datetime import datetime
+
+        now = datetime.utcnow()
+        op_metrics = await self.get_pod_operation_metrics()
+        soft_governor_state = await self.get_soft_governor_state()
+        async with self._lock:
+            pods = []
+            for pod_uuid, pi in self.individual_pods.items():
+                if pi.meta.get("is_cache_refresh_pod"):
+                    continue
+                age_seconds = max(0, int((now - pi.created_at).total_seconds()))
+                remaining_seconds = max(0, int(self.pod_max_lifetime_seconds - age_seconds))
+                pods.append(
+                    {
+                        "pod_uuid": pod_uuid,
+                        "model": pi.model,
+                        "machine_id": pi.machine_id,
+                        "status": str(getattr(pi.status, "value", pi.status)),
+                        "queue_size": int(pi.queue_size),
+                        "age_seconds": age_seconds,
+                        "remaining_seconds": remaining_seconds,
+                        "drain_mode": bool(pi.meta.get("drain_mode")),
+                    }
+                )
+            pods.sort(key=lambda x: x["remaining_seconds"])
+            metrics_snapshot = dict(self.fixed_fleet_metrics)
+            pending_success = int(metrics_snapshot.get("admission_pending_wait_success", 0))
+            pending_timeout = int(metrics_snapshot.get("admission_pending_wait_timeout", 0))
+            pending_outcomes = max(1, pending_success + pending_timeout)
+            pending_total_ms = int(metrics_snapshot.get("admission_pending_wait_total_ms", 0))
+            metrics_snapshot["admission_pending_wait_avg_ms"] = int(
+                pending_total_ms / pending_outcomes
+            )
+
+            return {
+                "enabled": bool(self.fixed_fleet_enabled),
+                "scheduler_mode": self.scheduler_mode,
+                "max_pods": self.fixed_fleet_max_pods,
+                "allowlisted_machine_ids": sorted(list(self.fixed_fleet_machine_ids)),
+                "strict_machines_only": bool(self.fixed_fleet_strict_machines),
+                "gpu_tier_by_machine_id": dict(
+                    sorted(self.fixed_fleet_gpu_tier_rank.items(), key=lambda kv: (kv[1], kv[0]))
+                ),
+                "ttl_seconds": self.pod_max_lifetime_seconds,
+                "drain_guard_seconds": self.pod_drain_guard_seconds,
+                "active_pods": pods,
+                "active_pod_count": len(pods),
+                "inflight_machine_claims": sorted(list(self._fixed_fleet_machine_claims)),
+                "metrics": metrics_snapshot,
+                "pod_operation_metrics": op_metrics,
+                "soft_governor": soft_governor_state,
+                "claim_logic": {
+                    "one_active_pod_per_machine": True,
+                    "slot_cap": (
+                        self._fixed_fleet_total_slots() if self.fixed_fleet_enabled else None
+                    ),
+                    "slot_cap_source": (
+                        "FIXED_FLEET_MAX_PODS" if self.fixed_fleet_enabled else "not_fixed_fleet"
+                    ),
+                    "primary_machine_preference": bool(
+                        self.fixed_fleet_enabled and self.fixed_fleet_machine_ids
+                    ),
+                    "offer_fallback_when_primary_busy": bool(
+                        self.fixed_fleet_enabled and not self.fixed_fleet_strict_machines
+                    ),
+                    "secondary_cache_ordering": (
+                        "tier_then_success_rate_then_cache_then_price"
+                        if self.fixed_fleet_enabled and self.fixed_fleet_gpu_tier_rank
+                        else (
+                            "primary_allowlist_then_machine_cache_secondary_then_cold"
+                            if self.fixed_fleet_enabled
+                            else None
+                        )
+                    ),
+                    "fleet_omni_shared_bake_models": sorted(self.FLEET_OMNI_SHARED_BAKE_MODELS),
+                    "fleet_omni_template_priority_env": "FLEET_OMNI_TEMPLATE_PRIORITY",
+                },
+            }
 

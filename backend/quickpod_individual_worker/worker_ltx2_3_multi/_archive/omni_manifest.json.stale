@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "comment": "Overlay for worker_ltx2_3_multi; runtime merges with worker_multi_common/omni_manifest.json. Stage-2 LoRA is hf_hub_download only (supplement_hub_files), for T2V/FLF2V latent upsampler jobs.",
+  "download_specs": [
+    {
+      "model": "ltx2_3_t2v",
+      "multi_snapshot": true,
+      "local_dir": "/app/models/ltx2_3",
+      "download_priority": 10,
+      "supplement_dest_dir": "/app/models/ltx2_3/stage2_lora",
+      "supplement_hub_files": [
+        {
+          "repo_id": "Lightricks/LTX-2.3",
+          "filename": "ltx-2.3-22b-distilled-lora-384.safetensors"
+        }
+      ],
+      "snapshots": [
+        {
+          "repo_id": "rockapaper/LTX-2.3-Diffusers_tenc_uint4_sdnq_r64_s16",
+          "target_dir": "/app/models/ltx2_3/full"
+        },
+        {
+          "repo_id": "rockapaper/LTX-2.3-Distilled-Diffusers_tenc_uint4_sdnq_r64_s16",
+          "target_dir": "/app/models/ltx2_3/distilled"
+        },
+        {
+          "repo_id": "dg845/LTX-2.3-Spatial-Upsampler-Diffusers",
+          "target_dir": "/app/models/ltx2_3/spatial_upsampler"
+        }
+      ]
+    }
+  ],
+  "supported_models_add": [],
+  "supported_models_remove": [],
+  "model_eta_seconds": {
+    "ltx2_3_t2v": 200,
+    "ltx2_3_i2v_distilled": 220,
+    "ltx2_3_flf2v": 200
+  },
+  "model_categories": {
+    "image": [],
+    "video": [
+      "ltx2_3_t2v",
+      "ltx2_3_i2v_distilled",
+      "ltx2_3_flf2v"
+    ]
+  }
+}

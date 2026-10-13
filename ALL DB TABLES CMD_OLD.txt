@@ -1,0 +1,237 @@
+CREATE TABLE users (
+    id TEXT PRIMARY KEY,
+    firebase_uid TEXT NOT NULL UNIQUE,
+    email TEXT,
+
+    created_at DATETIME NOT NULL,
+    last_seen DATETIME NOT NULL,
+
+    total_credits INTEGER NOT NULL DEFAULT 0,
+    bonus_granted INTEGER NOT NULL DEFAULT 0,
+
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE UNIQUE INDEX ix_users_firebase_uid
+ON users(firebase_uid);
+
+
+CREATE TABLE credit_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+
+    delta INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+
+    job_id TEXT,
+    created_at DATETIME NOT NULL,
+
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE INDEX ix_credit_user_time
+ON credit_transactions(user_id, created_at);
+
+
+-- Drop existing table
+DROP TABLE IF EXISTS jobs;
+
+-- Create new table with correct schema
+CREATE TABLE jobs (
+    job_id TEXT PRIMARY KEY,
+    model TEXT,
+    prompt TEXT,
+    params JSON,
+    
+    status TEXT DEFAULT 'pending',
+    worker_id TEXT,
+    
+    created_at DATETIME,
+    updated_at DATETIME,
+    completed_at DATETIME,
+    timeout_at DATETIME,
+    started_at DATETIME,
+    queued_at DATETIME,
+    dispatched_at DATETIME,
+    
+    total_time_seconds REAL,
+    processing_time_seconds REAL,
+    queue_time_seconds REAL,
+    dispatch_time_seconds REAL,
+    
+    retry_count INTEGER DEFAULT 0,
+    max_retries INTEGER DEFAULT 3,
+    
+    result_r2_key TEXT,
+    output_key TEXT,
+    output_url TEXT,
+    
+    error TEXT,
+    error_log JSON,
+    
+    fcm_token TEXT,
+    notification_sent INTEGER DEFAULT 0
+);
+
+-- Create indexes
+CREATE INDEX ix_job_model_status ON jobs(model, status);
+CREATE INDEX ix_job_worker ON jobs(worker_id);
+CREATE INDEX ix_job_created ON jobs(created_at);
+CREATE INDEX ix_job_updated ON jobs(updated_at);
+CREATE INDEX ix_job_timeout ON jobs(timeout_at);
+CREATE INDEX ix_job_status ON jobs(status);
+
+
+CREATE TABLE workers (
+    worker_id TEXT PRIMARY KEY,
+    container_id TEXT,
+    endpoint TEXT,
+    model TEXT,
+    is_warm_pod INTEGER DEFAULT 0,
+    status TEXT,
+    health_status TEXT,
+
+    last_heartbeat DATETIME,
+    last_active DATETIME,
+    last_job_finished_at DATETIME,
+    created_at DATETIME,
+    updated_at DATETIME,
+
+    info JSON,
+    resource_metrics JSON,
+    resource_limits JSON,
+
+    error_count INTEGER DEFAULT 0,
+    queue_size INTEGER DEFAULT 0,
+    total_jobs_processed INTEGER DEFAULT 0,
+    job_id_counts JSON,
+    machine_id TEXT
+);
+
+CREATE INDEX ix_worker_model_status ON workers(model, status);
+CREATE INDEX ix_worker_container ON workers(container_id);
+CREATE INDEX ix_worker_heartbeat ON workers(last_heartbeat);
+CREATE INDEX ix_worker_active ON workers(last_active);
+CREATE INDEX ix_worker_health ON workers(health_status);
+CREATE INDEX ix_worker_warm_model ON workers(is_warm_pod, model);
+
+
+CREATE TABLE devices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_uuid TEXT,
+    fingerprint_hash TEXT NOT NULL,
+
+    created_at DATETIME NOT NULL,
+    last_seen DATETIME NOT NULL,
+
+    request_count INTEGER NOT NULL DEFAULT 0,
+    banned INTEGER NOT NULL DEFAULT 0,
+    ban_reason TEXT,
+
+    meta JSON
+);
+
+
+CREATE INDEX ix_device_lookup
+ON devices(device_uuid, fingerprint_hash);
+
+CREATE INDEX ix_device_banned
+ON devices(banned);
+
+CREATE INDEX ix_device_last_seen
+ON devices(last_seen);
+
+
+CREATE TABLE audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    event_type TEXT NOT NULL,
+    severity TEXT DEFAULT 'info',
+
+    actor TEXT,
+    actor_ip TEXT,
+    target TEXT,
+    target_type TEXT,
+
+    message TEXT,
+    details JSON,
+
+    timestamp DATETIME NOT NULL
+);
+
+
+CREATE INDEX ix_audit_event_time
+ON audit_logs(event_type, timestamp);
+
+CREATE INDEX ix_audit_actor_time
+ON audit_logs(actor, timestamp);
+
+CREATE INDEX ix_audit_target_time
+ON audit_logs(target, timestamp);
+
+
+CREATE TABLE ip_bans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip TEXT NOT NULL UNIQUE,
+    reason TEXT,
+    permanent INTEGER DEFAULT 0,
+    expires_at DATETIME,
+    created_at DATETIME NOT NULL,
+    created_by TEXT
+);
+
+CREATE INDEX ix_ipban_expires
+ON ip_bans(expires_at);
+
+
+CREATE TABLE subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    user_id TEXT NOT NULL,
+
+    provider TEXT NOT NULL,          
+    plan_id TEXT NOT NULL,           
+    status TEXT NOT NULL,            
+
+    started_at DATETIME NOT NULL,
+    expires_at DATETIME,
+    renewed_at DATETIME,
+
+    provider_ref TEXT,               
+    last_event TEXT,                 
+
+    created_at DATETIME NOT NULL,
+
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE INDEX ix_subscriptions_user
+ON subscriptions(user_id);
+
+CREATE INDEX ix_subscriptions_status
+ON subscriptions(status);
+
+
+CREATE TABLE ad_rewards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    user_id TEXT NOT NULL,
+    ad_provider TEXT NOT NULL,        
+    reward_type TEXT NOT NULL,        
+    reward_amount INTEGER NOT NULL,   
+
+    ad_event_id TEXT,                 
+    verified INTEGER NOT NULL DEFAULT 0,
+
+    created_at DATETIME NOT NULL,
+
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE UNIQUE INDEX ix_ad_reward_unique
+ON ad_rewards(ad_provider, ad_event_id);
+
+Credit actually added here:
+INSERT INTO credit_transactions (
+    user_id, delta, reason
+) VALUES (?, ?, 'ad_reward');

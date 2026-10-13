@@ -9,7 +9,7 @@ import base64
 import gc
 import time
 from io import BytesIO
-from typing import Dict, Any
+from typing import Any, Dict, List, Optional, Union
 from PIL import Image
 import httpx
 import torch
@@ -131,6 +131,52 @@ def _load_image_from_base64(img_b64: str) -> Image.Image:
         raise ValueError(f"Failed to decode base64 image: {e}")
 
 
+def _load_image_from_init_string(s: str) -> Image.Image:
+    """
+    Load from presigned HTTP(S) URL (R2), data URL, or raw base64 — matches controller dispatch.
+    """
+    s = (s or "").strip()
+    if not s:
+        raise ValueError("empty init_image string")
+    if s.startswith(("http://", "https://")):
+        with httpx.Client(timeout=120.0, follow_redirects=True) as client:
+            resp = client.get(s)
+            resp.raise_for_status()
+        return Image.open(BytesIO(resp.content)).convert("RGB")
+    if s.startswith("data:image"):
+        comma = s.find(",")
+        if comma < 0:
+            raise ValueError("invalid data:image URL")
+        b64 = s[comma + 1 :].strip()
+        return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+    return _load_image_from_base64(s)
+
+
+def _normalize_flux_init_images(
+    raw: Any,
+) -> Optional[List[Image.Image]]:
+    """Return list of RGB PIL images, or None for T2I."""
+    if raw is None:
+        return None
+    if isinstance(raw, Image.Image):
+        return [raw.convert("RGB")]
+    if isinstance(raw, str):
+        return [_load_image_from_init_string(raw)]
+    if isinstance(raw, (list, tuple)):
+        out: List[Image.Image] = []
+        for item in raw:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                out.append(_load_image_from_init_string(item))
+            elif isinstance(item, Image.Image):
+                out.append(item.convert("RGB"))
+            else:
+                raise ValueError(f"Unsupported init_image list element: {type(item)}")
+        return out or None
+    raise ValueError(f"Unsupported init_image type: {type(raw)}")
+
+
 def _get_dynamic_size(img: Image.Image, max_dim: int = 1024) -> tuple[int, int]:
     """Return width/height close to input, within max_dim, multiple-of-64, preserving aspect ratio."""
     w, h = img.size
@@ -174,7 +220,7 @@ def run_inference_flux_klein(job_id: str, prompt: str, params: Dict[str, Any]) -
         prompt: text description for image generation/editing
         params:
             - output_dir (str)
-            - init_image (str): base64-encoded image for I2I/editing mode (optional)
+            - init_image: single base64 / data URL / presigned URL, or list of those (multi-ref bulk)
             - width (int): output width for T2I mode (default: 1024)
             - height (int): output height for T2I mode (default: 1024)
             - num_inference_steps (int): default 4
@@ -189,16 +235,26 @@ def run_inference_flux_klein(job_id: str, prompt: str, params: Dict[str, Any]) -
     output_dir = params.get("output_dir", "./outputs")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Check if init_image is provided (I2I/editing mode)
-    init_image_b64 = params.get("init_image")
-    is_i2i_mode = init_image_b64 is not None
-    
+    # I2I/editing: init_image from controller is URL(s) or base64 (single or list for multi-ref bulk)
+    init_list = _normalize_flux_init_images(params.get("init_image"))
+    is_i2i_mode = bool(init_list)
+
     if is_i2i_mode:
-        # I2I/Editing mode: load image and use dynamic sizing
-        print("📸 I2I/Editing mode: init_image provided")
-        init_image = _load_image_from_base64(init_image_b64)
-        width, height = _get_dynamic_size(init_image, max_dim=1024)
-        print(f"   Input image size: {init_image.size[0]}x{init_image.size[1]}")
+        assert init_list is not None
+        print(
+            f"📸 I2I/Editing mode: {len(init_list)} reference image(s)"
+        )
+        width, height = _get_dynamic_size(init_list[0], max_dim=1024)
+        resized: List[Image.Image] = []
+        for img in init_list:
+            if img.size == (width, height):
+                resized.append(img)
+            else:
+                resized.append(img.resize((width, height), Image.LANCZOS))
+        pipeline_image: Union[Image.Image, List[Image.Image]] = (
+            resized[0] if len(resized) == 1 else resized
+        )
+        print(f"   Primary input size: {init_list[0].size[0]}x{init_list[0].size[1]}")
         print(f"   Output size: {width}x{height} (adjusted to multiple of 64)")
     else:
         # T2I mode: use provided dimensions or defaults
@@ -208,7 +264,7 @@ def run_inference_flux_klein(job_id: str, prompt: str, params: Dict[str, Any]) -
         # Ensure dimensions are multiples of 64
         width = max(64, (width // 64) * 64)
         height = max(64, (height // 64) * 64)
-        init_image = None
+        pipeline_image = None
 
     steps = int(params.get("num_inference_steps", 4))
     cfg = float(params.get("guidance_scale", 1.0))
@@ -253,7 +309,7 @@ def run_inference_flux_klein(job_id: str, prompt: str, params: Dict[str, Any]) -
             
             # Add image parameter for I2I/editing mode
             if is_i2i_mode:
-                pipeline_kwargs["image"] = init_image
+                pipeline_kwargs["image"] = pipeline_image
             
             output = pipeline(**pipeline_kwargs).images[0]
     finally:

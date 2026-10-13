@@ -28,6 +28,7 @@ from exceptions import (
     JobTimeoutError,
     JobMaxRetriesError,
 )
+from scheduler_strategy import SchedulerRouter
 
 logger = logging.getLogger("job_manager")
 
@@ -47,16 +48,27 @@ class JobState(str, Enum):
               FAILED ← TIMEOUT ← FAILED
                 ↓
             RECOVERED (retry) → QUEUED
+
+    Studio-only: RUNNING → REVIEWING → RUNNING → COMPLETED
+    GPU jobs must never enter REVIEWING.
     """
     PENDING = "pending"
     QUEUED = "queued"
     DISPATCHING = "dispatching"
     RUNNING = "running"
+    REVIEWING = "reviewing"
     COMPLETED = "completed"
     FAILED = "failed"
     TIMEOUT = "timeout"
     RECOVERED = "recovered"
     CANCELLED = "cancelled"
+
+
+STUDIO_MODELS = {"studio", "studio_engine"}
+
+
+def is_studio_model(model: Optional[str]) -> bool:
+    return (model or "").strip().lower() in STUDIO_MODELS
 
 
 # Valid state transitions
@@ -78,6 +90,12 @@ ALLOWED_TRANSITIONS: Dict[JobState, List[JobState]] = {
         JobState.COMPLETED,
         JobState.FAILED,
         JobState.TIMEOUT,
+        JobState.REVIEWING,  # Studio scene review; GPU jobs rejected in transition_to
+    ],
+    JobState.REVIEWING: [
+        JobState.RUNNING,
+        JobState.CANCELLED,
+        JobState.QUEUED,  # Resume after VM destroy
     ],
     JobState.COMPLETED: [],  # Terminal state
     JobState.FAILED: [JobState.RECOVERED, JobState.QUEUED],  # Can retry
@@ -106,22 +124,24 @@ class JobManager:
         self,
         session_factory,
         pod_manager=None,
+        scheduler_router: Optional[SchedulerRouter] = None,
         max_retries: int = None,
         job_timeout_minutes: int = None,
         running_job_timeout_minutes: int = None,
     ):
         self.session_factory = session_factory
         self.pod_manager = pod_manager
+        self.scheduler_router = scheduler_router
         
         # Configuration
         self.max_retries = max_retries or int(os.getenv("JOB_MAX_RETRIES", "3"))
         self.job_timeout = timedelta(
-            minutes=job_timeout_minutes or int(os.getenv("JOB_TIMEOUT_MINUTES", "30"))
+            minutes=job_timeout_minutes or int(os.getenv("JOB_TIMEOUT_MINUTES", "60"))
         )
         # CRITICAL: Shorter timeout for RUNNING jobs to catch stuck workers quickly
         # Default 5 minutes - if a job is RUNNING for > 5 min without completion, it's stuck
         self.running_job_timeout = timedelta(
-            minutes=running_job_timeout_minutes or int(os.getenv("JOB_RUNNING_TIMEOUT_MINUTES", "5"))
+            minutes=running_job_timeout_minutes or int(os.getenv("JOB_RUNNING_TIMEOUT_MINUTES", "10"))
         )
         self.auto_recover = os.getenv("JOB_AUTO_RECOVER", "false").lower() == "true"
     
@@ -213,6 +233,17 @@ class JobManager:
         if job.error_log is None:
             job.error_log = []
         job.error_log.append(entry)
+
+    def _is_on_device_job(self, job: Job) -> bool:
+        """
+        Detect client-side on-device jobs.
+        These jobs are completed by client callbacks, not worker dispatch/recovery.
+        """
+        try:
+            params = job.params if isinstance(job.params, dict) else {}
+            return bool(params.get("on_device") is True)
+        except Exception:
+            return False
     
     # -------------------------------------------------------------------------
     # State Transitions
@@ -263,6 +294,13 @@ class JobManager:
                     db.refresh(job)
                 return job
             
+            if new_state == JobState.REVIEWING and not is_studio_model(job.model):
+                raise JobStateError(
+                    job_id=job_id,
+                    current_state=current_state.value,
+                    target_state=new_state.value,
+                )
+
             # Validate transition
             try:
                 self._validate_transition(current_state, new_state, force)
@@ -558,6 +596,13 @@ class JobManager:
                     f"Job {job_id} already in terminal state {current_state.value}"
                 )
                 return job
+
+            # REVIEWING is not a failure. Do not refund or change state.
+            if current_state == JobState.REVIEWING:
+                logger.info(
+                    f"Refusing to fail studio job {job_id} while REVIEWING (no credit refund)"
+                )
+                return job
             
             self._validate_transition(current_state, JobState.FAILED)
             
@@ -581,10 +626,11 @@ class JobManager:
             
             db.commit()
             
-            # CREDIT REFUND: Refund locked credits when job fails
-            # This happens AFTER the commit to avoid rollback issues
-            # refund_credits_for_job uses its own session for atomicity
-            if job.credits_locked > 0 and job.credits_refunded < job.credits_locked:
+            # CREDIT REFUND: Refund locked credits when job fails.
+            # REVIEWING is not a failure — do not refund while the user is reviewing.
+            if current_state == JobState.REVIEWING:
+                logger.info(f"Skipping credit refund for reviewing studio job {job_id}")
+            elif job.credits_locked > 0 and job.credits_refunded < job.credits_locked:
                 try:
                     from credit_service import refund_credits_for_job
                     # Pass None for db - function uses its own session
@@ -622,16 +668,30 @@ class JobManager:
         Returns:
             Worker ID assigned
         """
-        if not self.pod_manager:
+        if is_studio_model(model):
+            raise JobDispatchError(
+                job_id,
+                reason="Studio jobs are pulled by studio_engine on Vultr, not dispatched to QuickPod",
+            )
+
+        if not self.pod_manager and not self.scheduler_router:
             raise JobDispatchError(job_id, reason="No pod manager configured")
         
         with self.session_factory() as db:
             job = db.query(Job).filter(Job.job_id == job_id).first()
             if not job:
                 raise JobNotFoundError(job_id)
+            if is_studio_model(job.model):
+                raise JobDispatchError(
+                    job_id,
+                    reason="Studio jobs are pulled by studio_engine on Vultr, not dispatched to QuickPod",
+                )
             
-            # Dispatch via pod manager
-            worker_id = await self.pod_manager.dispatch_job(job_id, model, mode)
+            # Dispatch via scheduler strategy when configured; fallback to direct pod manager.
+            if self.scheduler_router:
+                worker_id = await self.scheduler_router.assign_job(job_id, model, mode)
+            else:
+                worker_id = await self.pod_manager.dispatch_job(job_id, model, mode)
             
             # Update job
             job.worker_id = worker_id
@@ -686,6 +746,16 @@ class JobManager:
             )
             
             for job in running_stuck_jobs:
+                if is_studio_model(job.model):
+                    logger.debug(
+                        f"Skipping stuck RUNNING check for studio job {job.job_id}"
+                    )
+                    continue
+                if self._is_on_device_job(job):
+                    logger.debug(
+                        f"Skipping stuck RUNNING check for on-device job {job.job_id}"
+                    )
+                    continue
                 # Get worker and container info for pod destruction
                 container_id = None
                 machine_id = None
@@ -796,6 +866,25 @@ class JobManager:
             
             for job in stuck_jobs:
                 try:
+                    if is_studio_model(job.model):
+                        logger.debug(
+                            f"Skipping stuck timeout for studio job {job.job_id}"
+                        )
+                        continue
+                    if self._is_on_device_job(job):
+                        logger.debug(
+                            f"Skipping stuck timeout check for on-device job {job.job_id}"
+                        )
+                        continue
+                    # RACE FIX: Re-read job before modifying. job_complete may have just
+                    # committed COMPLETED; do not overwrite with TIMEOUT.
+                    db.refresh(job)
+                    if job.status in (JobState.COMPLETED.value, JobState.FAILED.value):
+                        logger.debug(
+                            f"Job {job.job_id} already terminal ({job.status}), skipping stuck timeout"
+                        )
+                        continue
+
                     logger.warning(
                         f"Job {job.job_id} stuck in {job.status}, "
                         f"last update: {job.updated_at}"
@@ -830,7 +919,7 @@ class JobManager:
                                     send_fcm_notification(
                                         job.fcm_token,
                                         "Job Timeout",
-                                        f"Your {job.model} job timed out after {self.job_timeout.total_seconds() / 60:.0f} minutes",
+                                        f"Your job timed out after {self.job_timeout.total_seconds() / 60:.0f} minutes",
                                         {
                                             "job_id": job.job_id,
                                             "status": "timeout",
@@ -930,14 +1019,21 @@ class JobManager:
             if not job:
                 logger.warning(f"Job {job_id} not found for fallback timeout")
                 return
-            
+
+            # RACE FIX: Do not overwrite COMPLETED/FAILED (job_complete may have committed).
+            if job.status in (JobState.COMPLETED.value, JobState.FAILED.value):
+                logger.debug(
+                    f"Job {job_id} already terminal ({job.status}), skipping fallback timeout"
+                )
+                return
+
             # Skip if state already changed (e.g., pod destruction already handled it)
             if job.status != JobState.RUNNING.value:
                 logger.debug(
                     f"Job {job_id} state changed to {job.status}, skipping fallback timeout"
                 )
                 return
-            
+
             job.status = JobState.TIMEOUT.value
             job.updated_at = now
             
@@ -967,7 +1063,18 @@ class JobManager:
             job = db.query(Job).filter(Job.job_id == job_id).first()
             if not job:
                 raise JobNotFoundError(job_id)
-            
+
+            if self._is_on_device_job(job):
+                logger.debug(f"Skipping recover_job for on-device job {job_id}")
+                return
+
+            # RACE FIX: Do not overwrite terminal states (e.g. job_complete committed concurrently).
+            if job.status in (JobState.COMPLETED.value, JobState.FAILED.value):
+                logger.debug(
+                    f"Job {job_id} already terminal ({job.status}), skipping recover_job"
+                )
+                return
+
             current_retry = job.retry_count or 0
             
             # Check max retries

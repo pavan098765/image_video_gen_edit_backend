@@ -1,0 +1,227 @@
+docker pull pavanalur3/deps-base:py311-cu129
+
+cd /work_space/
+
+=====
+docker build -t pavanalur3/quickpod_worker:basic_utils .
+docker push pavanalur3/quickpod_worker:basic_utils
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:flux_kontext_dev . 
+docker push pavanalur3/quickpod_worker:flux_kontext_dev
+
+docker build -t pavanalur3/quickpod_worker:flux_kontext_dev_int4 .
+docker push pavanalur3/quickpod_worker:flux_kontext_dev_int4
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:qwen_image_edit_2509 .
+docker push pavanalur3/quickpod_worker:qwen_image_edit_2509
+
+docker build -t pavanalur3/quickpod_worker:qwen_image_edit_2509_int4 .
+docker push pavanalur3/quickpod_worker:qwen_image_edit_2509_int4
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:qwen_image_edit .
+docker push pavanalur3/quickpod_worker:qwen_image_edit
+
+docker build -t pavanalur3/quickpod_worker:qwen_image_edit_int4 .
+docker push pavanalur3/quickpod_worker:qwen_image_edit_int4
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:fastwan_21_1b .
+docker push pavanalur3/quickpod_worker:fastwan_21_1b
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:fastwan_22_5b .
+docker push pavanalur3/quickpod_worker:fastwan_22_5b
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:qwen_image .
+docker push pavanalur3/quickpod_worker:qwen_image
+
+docker build -t pavanalur3/quickpod_worker:qwen_image_int4 .
+docker push pavanalur3/quickpod_worker:qwen_image_int4
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:z_image_turbo .
+docker push pavanalur3/quickpod_worker:z_image_turbo
+
+docker build -t pavanalur3/quickpod_worker:z_image_turbo_int4 .
+docker push pavanalur3/quickpod_worker:z_image_turbo_int4
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:image_upscaler_aurasrv2 .
+docker push pavanalur3/quickpod_worker:image_upscaler_aurasrv2
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:image_upscaler_realesrgan .
+docker push pavanalur3/quickpod_worker:image_upscaler_realesrgan
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:image_upscaler_swin2sr .
+docker push pavanalur3/quickpod_worker:image_upscaler_swin2sr
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:stable_diffusion_xl_outpaint .
+docker push pavanalur3/quickpod_worker:stable_diffusion_xl_outpaint
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:stable_diffusion_xl .
+docker push pavanalur3/quickpod_worker:stable_diffusion_xl
+=====
+=====
+docker build -t pavanalur3/deps-base-extended:py311-cu129-int4 .
+docker push pavanalur3/deps-base-extended:py311-cu129-int4
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:ltx2_video .
+docker push pavanalur3/quickpod_worker:ltx2_video
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:hunyan15_480p_i2v_step_distilled .
+docker push pavanalur3/quickpod_worker:hunyan15_480p_i2v_step_distilled
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:hunyan15_480p_t2V_distilled .
+docker push pavanalur3/quickpod_worker:hunyan15_480p_t2V_distilled
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:hunyan15_720p_i2V_distilled .
+docker push pavanalur3/quickpod_worker:hunyan15_720p_i2V_distilled
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:hunyan15_720p_i2V_distilled_fp8 .
+docker push pavanalur3/quickpod_worker:hunyan15_720p_i2V_distilled_fp8
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:wan_21_fast .
+docker push pavanalur3/quickpod_worker:wan_21_fast
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:glm_ocr .
+docker push pavanalur3/quickpod_worker:glm_ocr
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:dreamid .
+docker push pavanalur3/quickpod_worker:dreamid
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:qwen_image_edit_2511_rapid_aio .
+docker push pavanalur3/quickpod_worker:qwen_image_edit_2511_rapid_aio
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:face_enhancer .
+docker push pavanalur3/quickpod_worker:face_enhancer
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:wan22_14b_rapid .
+docker push pavanalur3/quickpod_worker:wan22_14b_rapid
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:wan_22_14b_t2v_lightx2v .
+docker push pavanalur3/quickpod_worker:wan_22_14b_t2v_lightx2v
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:wan_22_14b_i2v_lightx2v .
+docker push pavanalur3/quickpod_worker:wan_22_14b_i2v_lightx2v
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:video_upscaler_realesrgan .
+docker push pavanalur3/quickpod_worker:video_upscaler_realesrgan
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:flux_klein .
+docker push pavanalur3/quickpod_worker:flux_klein
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:wan_22_14b_720p_i2v_turbo .
+docker push pavanalur3/quickpod_worker:wan_22_14b_720p_i2v_turbo
+=====
+=====
+docker build -t pavanalur3/quickpod_worker:wan_21_14b_720p_t2v_turbo .
+docker push pavanalur3/quickpod_worker:wan_21_14b_720p_t2v_turbo
+
+-----------------------------------MULTI-----------------------------------
+docker build -f worker_flux_klein_9b_multi/Dockerfile -t pavanalur3/quickpod_worker:flux_klein_9b_multi .
+docker push pavanalur3/quickpod_worker:flux_klein_9b_multi
+
+docker build -f worker_qwen_image_edit_2511_rapid_aio_multi/Dockerfile -t pavanalur3/quickpod_worker:qwen_image_edit_2511_rapid_aio_multi .
+docker push pavanalur3/quickpod_worker:qwen_image_edit_2511_rapid_aio_multi
+
+docker build -f worker_z_image_turbo_multi/Dockerfile -t pavanalur3/quickpod_worker:z_image_turbo_multi .
+docker push pavanalur3/quickpod_worker:z_image_turbo_multi
+
+docker build -f worker_stable_diffusion_xl_multi/Dockerfile -t pavanalur3/quickpod_worker:stable_diffusion_xl_multi .
+docker push pavanalur3/quickpod_worker:stable_diffusion_xl_multi
+
+docker build -f worker_wan_22_fp8_lightx2v_t2v_multi/Dockerfile -t pavanalur3/quickpod_worker:wan_22_fp8_lightx2v_t2v_multi .
+docker push pavanalur3/quickpod_worker:wan_22_fp8_lightx2v_t2v_multi
+
+docker build -f worker_wan_22_fp8_lightx2v_i2v_multi/Dockerfile -t pavanalur3/quickpod_worker:wan_22_fp8_lightx2v_i2v_multi .
+docker push pavanalur3/quickpod_worker:wan_22_fp8_lightx2v_i2v_multi
+
+docker build -f worker_hunyan15_480p_t2V_distilled_multi/Dockerfile -t pavanalur3/quickpod_worker:hunyan15_480p_t2V_distilled_multi .
+docker push pavanalur3/quickpod_worker:hunyan15_480p_t2V_distilled_multi
+
+docker build -f worker_hunyan15_480p_i2V_step_distilled_multi/Dockerfile -t pavanalur3/quickpod_worker:hunyan15_480p_i2V_step_distilled_multi .
+docker push pavanalur3/quickpod_worker:hunyan15_480p_i2V_step_distilled_multi
+
+=====
+MiniMax H3 ComfyUI (self-contained: ComfyUI + pinned nodes baked in; weights download on first pod start)
+cd /work_space/worker_minimax_h3_comfy
+docker build -t pavanalur3/quickpod_worker:minimax_h3_comfy .
+docker push pavanalur3/quickpod_worker:minimax_h3_comfy
+=====
+
+=====
+LTX-2.5 INT8 AllModes ComfyUI (self-contained: ComfyUI + KJNodes + SolAttn + ltx25_smart_controls; weights download on first pod start)
+cd /work_space/worker_ltx25_int8_comfy
+docker build -t pavanalur3/quickpod_worker:ltx25_int8_comfy .
+docker push pavanalur3/quickpod_worker:ltx25_int8_comfy
+=====
+
+
+OMNI_RUNTIME_MANIFEST_URL=https://pub-67f874d172874988b5754734cc4fcb7e.r2.dev/omni_manifest.json
+
+docker push pavanalur3/flashvsr-pro:latest
+
+test_job.sh test.JPG 2
+
+python3 test_job.py all test.jpg
+
+python3 prep_model.py --no-split --no-dockerfile --install-deps
+
+
+pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
+
+docker build -t pavanalur3/deps-base-new:py311-cu128 .
+docker push pavanalur3/deps-base-new:py311-cu128
+
+sudo apt update
+sudo apt install python3-pip python3-venv build-essential -y
+
+pip install huggingface_hub
+
+
+python3 prep_model.py --no-split --no-dockerfile --install-deps
+python3 prep_model.py --no-split --no-dockerfile --install-deps
+   bash test_local.sh
+
+
+worker_image_upscaler_realesrgan
+
+docker run --rm -p 8000:8000 pavanalur3/quickpod_worker:image_upscaler_realesrgan
+
+
+docker run --rm pavanalur3/deps-base-extended:py311-cu129 sh -c "pip show fastapi && pip show uvicorn && pip show stable-diffusion-cpp-python"
+
+
+-p 8000:8000 -e CONTROLLER_SHARED_SECRET="SECRETKEY" -e CONTROLLER_API_KEY="SECRETKEY" -e ENABLE_AUTOTEST=1 -e CONTROLLER_URL="https://genedit.mooo.com" -e HF_TOKEN="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"
+
+uvicorn src.app:app --host 0.0.0.0 --port 8000 --log-level debug --access-log | tee uvicorn.log; echo quickpodflux_kontext
+
+
+docker rmi fc0faadf977c cdb3f1841f39 28e001623e99 01c508bdc2c6
+
+
+root@08811e41af19:/work# docker run --rm --entrypoint sh pavanalur3/quickpod_worker:qwen_image_edit_2509   -c "tar -cf - src/app.py" > app.py                   root@08811e41af19:/work# docker run --rm --entrypoint sh pavanalur3/quickpod_worker:qwen_image_edit_2509   -c "tar -cf - src/qwen_image_edit_2509_inference.py" > qwen_image_edit_2509_inference.py

@@ -1,0 +1,33 @@
+{
+  "add_skip_keys": false,
+  "dequantize_fp32": false,
+  "dynamic_loss_threshold": 0.01,
+  "group_size": 0,
+  "is_integer": false,
+  "is_training": false,
+  "modules_dtype_dict": {},
+  "modules_quant_config": {},
+  "modules_to_not_convert": [
+    "correction_coefs",
+    "prediction_coefs",
+    "lm_head",
+    "embedding_projection"
+  ],
+  "non_blocking": false,
+  "quant_conv": false,
+  "quant_method": "sdnq",
+  "quantization_device": null,
+  "quantized_matmul_dtype": null,
+  "return_device": null,
+  "sdnq_version": "0.1.5",
+  "svd_rank": 64,
+  "svd_steps": 16,
+  "use_dynamic_quantization": false,
+  "use_grad_ckpt": true,
+  "use_quantized_matmul": false,
+  "use_quantized_matmul_conv": false,
+  "use_static_quantization": true,
+  "use_stochastic_rounding": false,
+  "use_svd": true,
+  "weights_dtype": "fp8"
+}

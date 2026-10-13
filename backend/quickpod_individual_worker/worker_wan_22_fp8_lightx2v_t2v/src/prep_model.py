@@ -192,4 +192,4 @@ except Exception as e:
 
 print(f"✅ Prep finished. WAN 2.2 T2V FastDM merged Lightning SDNQ FP8 model ready in {MODEL_LOCAL_DIR}")
 print(f"   Note: Lightning distillation is already fused into the model weights (no LoRA needed)")
-print(f"Set ENV MODEL_LOCAL_DIR={MODEL_LOCAL_DIR}")
+print(f"Set ENV WAN_T2V_LOCAL_DIR={MODEL_LOCAL_DIR}")

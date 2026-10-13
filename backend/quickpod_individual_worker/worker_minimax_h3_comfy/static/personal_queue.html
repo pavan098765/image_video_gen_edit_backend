@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Personal leftover-pod queue</title>
+  <style>
+    body { font-family: sans-serif; margin: 24px; max-width: 960px; background: #111; color: #eee; }
+    input, textarea, button, select { font: inherit; }
+    textarea, input[type=text], input[type=password], select { width: 100%; background: #1c1c1c; color: #eee; border: 1px solid #444; padding: 8px; }
+    button { margin: 4px 4px 4px 0; padding: 6px 12px; }
+    li { margin: 8px 0; padding: 8px; background: #1a1a1a; list-style: none; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .muted { color: #888; font-size: 13px; }
+    label { display: block; margin: 10px 0 4px; }
+  </style>
+</head>
+<body>
+  <h1>Personal leftover-pod queue</h1>
+  <p class="muted">Uses leftover TTL on idle image or video workers. Client jobs always preempt these. Pick the model that matches a leftover pod (MiniMax H3, LTX 2.5 INT8, LTX 2.3, SDXL, Qwen, etc.).</p>
+  <label>Controller URL <input id="base" type="text" placeholder="https://genedit.mooo.com" /></label>
+  <label>Bearer token <input id="token" type="password" /></label>
+  <button id="save">Save locally</button>
+  <button id="reload">Refresh</button>
+  <h2>Add</h2>
+  <textarea id="prompt" rows="4" placeholder="Prompt"></textarea>
+  <label>Model
+    <select id="model"></select>
+  </label>
+  <label>Params JSON (optional — first_frame_url, last_frame_url, duration, width, height, stage2_mode, …)
+    <textarea id="params" rows="4" placeholder='{"first_frame_url":"https://..."}'></textarea>
+  </label>
+  <div class="row">
+    <button id="add">Add to queue</button>
+  </div>
+  <h2>Queue</h2>
+  <ul id="list"></ul>
+  <script>
+    const baseEl = document.getElementById("base");
+    const tokenEl = document.getElementById("token");
+    const modelEl = document.getElementById("model");
+    baseEl.value = localStorage.getItem("pq_base") || "";
+    tokenEl.value = localStorage.getItem("pq_token") || "";
+    document.getElementById("save").onclick = () => {
+      localStorage.setItem("pq_base", baseEl.value.trim());
+      localStorage.setItem("pq_token", tokenEl.value);
+    };
+    async function api(path, opts = {}) {
+      const base = baseEl.value.replace(/\/$/, "");
+      const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+      if (tokenEl.value) headers["Authorization"] = "Bearer " + tokenEl.value;
+      const res = await fetch(base + path, Object.assign({ headers }, opts));
+      if (!res.ok) throw new Error(res.status + " " + await res.text());
+      if (res.status === 204) return {};
+      const text = await res.text();
+      return text ? JSON.parse(text) : {};
+    }
+    function fillModels(models) {
+      const prev = modelEl.value || localStorage.getItem("pq_model") || "";
+      modelEl.innerHTML = "";
+      (models || []).forEach((m) => {
+        const opt = document.createElement("option");
+        opt.value = m.id;
+        opt.textContent = (m.kind ? m.kind + " · " : "") + (m.label || m.id);
+        modelEl.appendChild(opt);
+      });
+      if (prev && [...modelEl.options].some((o) => o.value === prev)) modelEl.value = prev;
+    }
+    async function reload() {
+      const [data, catalog] = await Promise.all([
+        api("/admin/personal"),
+        api("/admin/personal/models").catch(() => ({ models: [] })),
+      ]);
+      fillModels(catalog.models || []);
+      const ul = document.getElementById("list");
+      ul.innerHTML = "";
+      (data.items || []).forEach((item) => {
+        const li = document.createElement("li");
+        li.innerHTML = "<strong>" + item.status + "</strong> [" + (item.model || "") + "] " +
+          (item.prompt || "").slice(0, 120) +
+          " <span class='muted'>" + item.id + "</span> ";
+        const del = document.createElement("button");
+        del.textContent = "Remove";
+        del.onclick = async () => {
+          await api("/admin/personal/" + item.id, { method: "DELETE" });
+          reload();
+        };
+        li.appendChild(del);
+        ul.appendChild(li);
+      });
+    }
+    document.getElementById("reload").onclick = () => reload().catch((e) => alert(e));
+    document.getElementById("add").onclick = async () => {
+      try {
+        let params = {};
+        const raw = document.getElementById("params").value.trim();
+        if (raw) params = JSON.parse(raw);
+        const model = modelEl.value;
+        localStorage.setItem("pq_model", model);
+        await api("/admin/personal", {
+          method: "POST",
+          body: JSON.stringify({
+            prompt: document.getElementById("prompt").value,
+            model,
+            params
+          })
+        });
+        document.getElementById("prompt").value = "";
+        await reload();
+      } catch (e) { alert(e); }
+    };
+    reload().catch((e) => console.warn(e));
+  </script>
+</body>
+</html>

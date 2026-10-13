@@ -12,13 +12,17 @@ Provides all API endpoints:
 import os
 import uuid
 import time
+import copy
 import hmac
 import hashlib
+import json
 import asyncio
 import mimetypes
 import logging
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse
+from pathlib import Path
+from datetime import datetime, timedelta, date, timezone
+from typing import Optional, Dict, Any, List, Tuple
 
 
 def normalize_pod_uuid(pod_uuid: Optional[str]) -> Optional[str]:
@@ -76,9 +80,9 @@ from fastapi import (
     Header,
     BackgroundTasks,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import cast, String as SQLString
+from sqlalchemy import cast, String as SQLString, text
 from botocore.exceptions import ClientError
 
 from db import (
@@ -93,8 +97,11 @@ from db import (
     RewardedAdEvent,
     AdFreePurchase,
     Purchase,
+    KieTask,
+    PersonalQueueItem,
     get_app_config_int,
     create_audit_log,
+    update_model_eta_stat,
     utc_naive_now,
 )
 from credit_service import (
@@ -107,9 +114,16 @@ from prompt_enhancement import (
     enhance_prompt,
     should_enhance_for_model,
 )
+from asset_prompt_vlm import (
+    describe_image_with_nvidia,
+    get_max_image_bytes,
+    is_asset_prompt_vlm_enabled,
+)
 from models import (
     SubmitRequest,
     SubmitResponse,
+    DescribeAssetForPromptRequest,
+    DescribeAssetForPromptResponse,
     RegisterWorkerRequest,
     HeartbeatRequest,
     JobStartedRequest,
@@ -127,7 +141,9 @@ from security import (
     validate_device_signature,
     register_or_update_device,
     ip_ban_manager,
+    sign_payload_bytes,
 )
+from worker_transport_crypto import decode_worker_request_body, encode_worker_request_body
 from exceptions import (
     JobNotFoundError,
     InvalidModelError,
@@ -139,6 +155,7 @@ from exceptions import (
 from job_manager import JobManager, JobState
 from pod_manager import MAX_JOBS_PER_POD
 from logging_config import get_audit_logger
+from external_api_router import ExternalApiRouter, ExternalExecutionResult
 
 logger = logging.getLogger("routes")
 audit_logger = get_audit_logger()
@@ -149,6 +166,73 @@ client_router = APIRouter(tags=["Client"])
 worker_router = APIRouter(tags=["Worker"])
 admin_router = APIRouter(prefix="/admin", tags=["Admin"])
 auth_router = APIRouter(prefix="/auth", tags=["Auth"])
+
+# Daily login credits: first 30 UTC calendar days from account creation (by date), then standard amount.
+_DAILY_CREDITS_PROMO_DAYS = 30
+_DAILY_CREDITS_PROMO_AMOUNT = 20
+_DAILY_CREDITS_STANDARD_AMOUNT = 5
+
+
+def _utc_today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def user_has_verified_credit_purchase(db: Session, user_id: str) -> bool:
+    row = (
+        db.query(Purchase)
+        .filter(
+            Purchase.user_id == user_id,
+            Purchase.purchase_state == "verified",
+            Purchase.credits_awarded > 0,
+        )
+        .first()
+    )
+    return row is not None
+
+
+def compute_ad_experience(user: User, has_purchased_credits: bool) -> str:
+    """Server-only tier: none | light | heavy."""
+    if user.is_ad_free or user.is_vip_active():
+        return "none"
+    if has_purchased_credits:
+        return "light"
+    return "heavy"
+
+
+def apply_daily_credits_if_eligible(db: Session, user: User) -> int:
+    """
+    Grant daily credits at most once per UTC calendar day. Returns credits granted (0 if skipped).
+    """
+    if not user.is_active:
+        return 0
+    today = _utc_today()
+    if user.daily_credits_last_grant_utc == today:
+        return 0
+    created = user.created_at
+    created_day = created.date() if created else today
+    age_days = (today - created_day).days
+    amount = (
+        _DAILY_CREDITS_PROMO_AMOUNT
+        if age_days < _DAILY_CREDITS_PROMO_DAYS
+        else _DAILY_CREDITS_STANDARD_AMOUNT
+    )
+    user.total_credits += amount
+    user.bonus_granted += amount
+    user.daily_credits_last_grant_utc = today
+    db.add(
+        CreditTransaction(
+            user_id=user.id,
+            delta=amount,
+            reason="daily_login_grant",
+            credit_metadata={
+                "utc_date": today.isoformat(),
+                "in_promo_window": age_days < _DAILY_CREDITS_PROMO_DAYS,
+                "amount": amount,
+            },
+            created_at=utc_naive_now(),
+        )
+    )
+    return amount
 
 
 # =============================================================================
@@ -164,6 +248,11 @@ _r2_endpoint = None
 _model_requirements = {}
 _image_prefix = ""
 _controller_url = ""
+_external_api_router = ExternalApiRouter()
+
+# Per-user daily limit for VLM auto-prompt (best-effort in-process counter).
+_asset_prompt_rate_lock = asyncio.Lock()
+_asset_prompt_rate: Dict[str, Tuple[date, int]] = {}
 
 
 def set_dependencies(
@@ -188,6 +277,10 @@ def set_dependencies(
     _model_requirements = model_requirements
     _image_prefix = image_prefix
     _controller_url = controller_url
+    try:
+        _external_api_router.reload()
+    except Exception as e:
+        logger.warning(f"Failed to reload external API config: {e}")
 
 
 def get_client_ip(request: Request) -> str:
@@ -318,24 +411,27 @@ async def require_any_auth(
     }
 
 
-async def require_worker_signature(
+async def require_worker_signed_payload(
     request: Request,
     x_signature: Optional[str] = Header(None),
-) -> bool:
+) -> Dict[str, Any]:
     """
-    Require valid HMAC signature from worker.
+    Require valid HMAC over the wire body, then decrypt if worker transport crypto is on.
     """
     if not x_signature:
         raise HTTPException(status_code=401, detail="Missing signature")
-    
+
     body = await request.body()
-    
+
     if not verify_signature(x_signature, body):
         ip = get_client_ip(request)
         audit_logger.auth_failure(ip, "worker", "Invalid signature")
         raise HTTPException(status_code=403, detail="Invalid signature")
-    
-    return True
+
+    try:
+        return decode_worker_request_body(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # =============================================================================
@@ -387,6 +483,9 @@ def validate_model(model: str) -> str:
     # Check if model is directly in requirements
     if model_lower in _model_requirements or model_lower == "default":
         return model_lower
+
+    if _external_api_router.get_model_config(model_lower):
+        return model_lower
     
     # Check if model is a known alias that maps to a valid base model
     base_model = PodManager.resolve_model_alias(model_lower)
@@ -395,6 +494,103 @@ def validate_model(model: str) -> str:
     
     available = list(_model_requirements.keys()) + list(PodManager.MODEL_ALIASES.keys())
     raise InvalidModelError(model, available)
+
+
+def _build_public_result_url(job: Job) -> Optional[str]:
+    """Build client-facing result URL for completed jobs."""
+    if job.output_url:
+        return job.output_url
+    if job.result_r2_key:
+        return (
+            f"{_controller_url}/download_url/{job.job_id}"
+            if _controller_url
+            else f"/download_url/{job.job_id}"
+        )
+    return None
+
+
+def _prepare_external_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert transient R2 key params to downloadable URLs and normalize image input key.
+    External providers consume direct URLs or data URIs.
+    """
+    out = dict(params or {})
+
+    # init_image_r2_keys (multi-reference) -> init_image as list of URLs
+    if "init_image_r2_keys" in out and "init_image" not in out:
+        keys = out.pop("init_image_r2_keys")
+        if isinstance(keys, list) and keys:
+            urls: List[str] = []
+            for r2_key in keys:
+                download_url = create_presigned_get_url(r2_key, expires_in=3600)
+                if download_url:
+                    urls.append(download_url)
+            if len(urls) == len(keys):
+                out["init_image"] = urls
+
+    # init_image_r2_key -> init_image
+    if "init_image_r2_key" in out and "init_image" not in out:
+        r2_key = out.pop("init_image_r2_key")
+        download_url = create_presigned_get_url(r2_key, expires_in=3600)
+        if download_url:
+            out["init_image"] = download_url
+
+    # Some tools use image key instead of init_image.
+    if "image" in out and "init_image" not in out:
+        out["init_image"] = out["image"]
+
+    # Strip internal metadata keys from params for provider payload mapping.
+    for k in list(out.keys()):
+        if str(k).startswith("_"):
+            out.pop(k, None)
+
+    return out
+
+
+def _store_external_result(job_id: str, model: str, result: ExternalExecutionResult) -> tuple:
+    """Copy provider output into R2. Returns (r2_key, download_url)."""
+    ext = "png"
+    content_type = result.result_content_type or "image/png"
+    body = result.result_bytes
+    if result.result_text is not None:
+        body = result.result_text.encode("utf-8")
+        ext = "txt"
+        content_type = "text/plain; charset=utf-8"
+    elif result.result_url:
+        import kie_client
+
+        try:
+            body = kie_client.fetch_result_bytes(result.result_url)
+        except Exception:
+            body = requests.get(result.result_url, timeout=120).content
+        path = urlparse(result.result_url).path.lower()
+        if path.endswith(".jpg") or path.endswith(".jpeg"):
+            ext = "jpg"
+            content_type = "image/jpeg"
+        elif path.endswith(".webp"):
+            ext = "webp"
+            content_type = "image/webp"
+        elif path.endswith(".txt"):
+            ext = "txt"
+            content_type = "text/plain"
+        elif path.endswith(".mp4"):
+            ext = "mp4"
+            content_type = "video/mp4"
+    if not body:
+        raise RuntimeError("Empty external result")
+    key = f"results/{model}/{job_id}.{ext}"
+    if _s3_client and _r2_bucket:
+        _s3_client.put_object(
+            Bucket=_r2_bucket,
+            Key=key,
+            Body=body,
+            ContentType=content_type,
+        )
+        url = create_presigned_get_url(key, expires_in=3600) or result.result_url
+        return key, url
+    if result.result_url:
+        return None, result.result_url
+    raise RuntimeError("R2 is not configured and no result URL is available")
 
 
 async def send_fcm_notification(token: str, title: str, body: str, data: Dict = None):
@@ -747,6 +943,38 @@ class UserResponse(BaseModel):
     ad_free_product_id: Optional[str] = None
     created_at: str
     last_seen: str
+    is_vip: bool = False
+    vip_expires_at: Optional[str] = None
+    ad_experience: str = "heavy"  # none | light | heavy
+    has_purchased_credits: bool = False
+    daily_credits_granted_this_sync: int = 0
+
+
+def _build_user_response(db: Session, user: User, daily_granted: int = 0) -> UserResponse:
+    has_purchased = user_has_verified_credit_purchase(db, user.id)
+    ad_exp = compute_ad_experience(user, has_purchased)
+    return UserResponse(
+        user_id=user.id,
+        firebase_uid=user.firebase_uid,
+        email=user.email,
+        total_credits=user.total_credits,
+        bonus_granted=user.bonus_granted,
+        signup_bonus_granted=user.signup_bonus_granted,
+        is_active=user.is_active,
+        is_ad_free=user.is_ad_free,
+        ad_free_purchased_at=user.ad_free_purchased_at.isoformat()
+        if user.ad_free_purchased_at
+        else None,
+        ad_free_product_id=user.ad_free_product_id,
+        created_at=user.created_at.isoformat() if user.created_at else "",
+        last_seen=user.last_seen.isoformat() if user.last_seen else "",
+        is_vip=user.is_vip_active(),
+        vip_expires_at=user.vip_expires_at.isoformat() if user.vip_expires_at else None,
+        ad_experience=ad_exp,
+        has_purchased_credits=has_purchased,
+        daily_credits_granted_this_sync=daily_granted,
+    )
+
 
 class CreditBalanceResponse(BaseModel):
     """Credit balance response"""
@@ -765,6 +993,18 @@ class AddCreditsRequest(BaseModel):
     """Request body for adding credits"""
     amount: int = Field(..., gt=0, description="Number of credits to add (must be positive)")
     reason: str = Field(..., description="Reason for addition (e.g., 'ad_reward', 'subscription_bonus')")
+
+
+class OnDeviceJobStartedRequest(BaseModel):
+    """Client reports that on-device processing has started."""
+    job_id: str = Field(..., min_length=1, max_length=128)
+
+
+class OnDeviceJobCompleteRequest(BaseModel):
+    """Client reports terminal state for an on-device processed job."""
+    job_id: str = Field(..., min_length=1, max_length=128)
+    success: bool = Field(default=True)
+    error: Optional[str] = Field(default=None, max_length=4000)
 
 
 @auth_router.post("/sync", response_model=UserResponse)
@@ -839,19 +1079,22 @@ async def sync_user(
             # Grant signup bonus if:
             # 1. Email is verified (from Firebase token - tamper-proof)
             # 2. Signup bonus hasn't been granted yet (prevents reinstall abuse)
-            signup_bonus_just_granted = False
             if email_verified and not user.signup_bonus_granted:
                 SIGNUP_BONUS = 50
                 user.total_credits += SIGNUP_BONUS
                 user.bonus_granted += SIGNUP_BONUS
                 user.signup_bonus_granted = True
-                signup_bonus_just_granted = True
                 
                 # Record signup bonus as credit transaction
                 signup_transaction = CreditTransaction(
                     user_id=user.id,
                     delta=SIGNUP_BONUS,
                     reason="signup_bonus_email_verified",
+                    credit_metadata={
+                        "event": "signup_bonus_email_verified",
+                        "bonus_credits": SIGNUP_BONUS,
+                        "email_verified": True,
+                    },
                     created_at=utc_naive_now(),
                 )
                 db.add(signup_transaction)
@@ -878,21 +1121,13 @@ async def sync_user(
             
             elif not email_verified and not user.signup_bonus_granted:
                 logger.debug(f"[AUTH] User {firebase_uid} - email not verified yet, no bonus granted")
-            
-            return UserResponse(
-                user_id=user.id,
-                firebase_uid=user.firebase_uid,
-                email=user.email,
-                total_credits=user.total_credits,
-                bonus_granted=user.bonus_granted,
-                signup_bonus_granted=user.signup_bonus_granted,
-                is_active=user.is_active,
-                is_ad_free=user.is_ad_free,
-                ad_free_purchased_at=user.ad_free_purchased_at.isoformat() if user.ad_free_purchased_at else None,
-                ad_free_product_id=user.ad_free_product_id,
-                created_at=user.created_at.isoformat() if user.created_at else "",
-                last_seen=user.last_seen.isoformat() if user.last_seen else "",
-            )
+
+            user.last_seen = utc_naive_now()
+            daily_granted = apply_daily_credits_if_eligible(db, user)
+            db.commit()
+            db.refresh(user)
+
+            return _build_user_response(db, user, daily_granted)
     except Exception as e:
         logger.exception(f"User sync failed for {firebase_uid}: {e}")
         raise HTTPException(
@@ -935,24 +1170,12 @@ async def get_current_user(
                 detail="User not found. Please sign in first."
             )
         
-        # Update last_seen
         user.last_seen = utc_naive_now()
+        daily_granted = apply_daily_credits_if_eligible(db, user)
         db.commit()
-        
-        return UserResponse(
-            user_id=user.id,
-            firebase_uid=user.firebase_uid,
-            email=user.email,
-            total_credits=user.total_credits,
-            bonus_granted=user.bonus_granted,
-            signup_bonus_granted=user.signup_bonus_granted,
-            is_active=user.is_active,
-            is_ad_free=user.is_ad_free,
-            ad_free_purchased_at=user.ad_free_purchased_at.isoformat() if user.ad_free_purchased_at else None,
-            ad_free_product_id=user.ad_free_product_id,
-            created_at=user.created_at.isoformat() if user.created_at else "",
-            last_seen=user.last_seen.isoformat() if user.last_seen else "",
-        )
+        db.refresh(user)
+
+        return _build_user_response(db, user, daily_granted)
 
 
 @auth_router.get("/credits", response_model=CreditBalanceResponse)
@@ -990,6 +1213,38 @@ async def get_credit_balance(
 # - Deducted during job submission via lock_credits_for_job()
 # - Refunded on job failure via refund_credits_for_job()
 # Client cannot directly manipulate credits.
+
+
+@auth_router.get("/credit-history")
+async def get_credit_history(
+    auth: Dict = Depends(require_firebase_auth),
+    limit: int = 50,
+    offset: int = 0,
+):
+    """
+    Paginated credit transaction history for authenticated user.
+    """
+    firebase_uid = auth.get("uid") or auth.get("firebase_uid")
+    if not firebase_uid:
+        raise HTTPException(400, "Firebase UID not found")
+
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+        if not user:
+            raise HTTPException(404, "User not found")
+
+        from db import CreditTransaction
+        q = db.query(CreditTransaction).filter(
+            CreditTransaction.user_id == user.id
+        ).order_by(CreditTransaction.created_at.desc())
+        total = q.count()
+        rows = q.offset(max(0, offset)).limit(min(200, max(1, limit))).all()
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "transactions": [r.to_dict() for r in rows],
+        }
 
 
 # =============================================================================
@@ -1174,6 +1429,11 @@ async def perform_daily_spin(
             user_id=user.id,
             delta=credits_won,
             reason="daily_spin",
+            credit_metadata={
+                "event": "daily_spin",
+                "credits_won": int(credits_won),
+                "device_id": payload.device_id,
+            },
             created_at=now,
         )
         db.add(transaction)
@@ -1978,6 +2238,14 @@ async def verify_gem_purchase(
             user_id=user.id,
             delta=credits_to_award,
             reason=f"iap_purchase:{request.product_id}",
+            credit_metadata={
+                "event": "iap_purchase",
+                "product_id": request.product_id,
+                "platform": platform,
+                "order_id": verified_order_id,
+                "is_test": bool(result.is_test_purchase),
+                "credits_awarded": int(credits_to_award),
+            },
             created_at=now,
         )
         db.add(credit_transaction)
@@ -2390,6 +2658,13 @@ async def admob_ssv_callback(
                     user_id=user.id,
                     delta=credits_to_grant,
                     reason="rewarded_ad",
+                    credit_metadata={
+                        "event": "rewarded_ad",
+                        "credits_awarded": int(credits_to_grant),
+                        "ad_provider": "admob",
+                        "ad_unit_id": ad_unit,
+                        "transaction_id": transaction_id,
+                    },
                     created_at=utc_naive_now(),
                 )
                 db.add(transaction)
@@ -2679,6 +2954,14 @@ async def adgem_postback(
             user_id=user.id,
             delta=credits_to_award,
             reason=f"adgem_offer:{offer_id or 'unknown'}",
+            credit_metadata={
+                "event": "adgem_offer",
+                "offer_id": offer_id,
+                "offer_name": offer_name,
+                "transaction_id": transaction_id,
+                "credits_awarded": int(credits_to_award),
+                "payout": payout_float,
+            },
             created_at=utc_naive_now(),
         )
         db.add(transaction)
@@ -2821,6 +3104,50 @@ def _log_timing_metrics(
 # =============================================================================
 
 
+def _normalize_etag_header_value(raw: str) -> str:
+    """Strip weak prefix and quotes for If-None-Match comparison."""
+    v = raw.strip()
+    if v.upper().startswith("W/"):
+        v = v[2:].strip()
+    if len(v) >= 2 and v.startswith('"') and v.endswith('"'):
+        v = v[1:-1]
+    return v
+
+
+@public_router.get("/sales/active")
+async def get_public_sale_status(request: Request):
+    """
+    Public endpoint: current sale window state for frontend pricing.
+    No auth required so the app can render sale banners immediately.
+
+    Supports conditional GET: If-None-Match + ETag → 304 when payload unchanged
+    (reduces serialization and bandwidth under polling).
+    """
+    from credit_service import build_public_sale_status_payload
+
+    payload = build_public_sale_status_payload()
+    body_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    etag_token = hashlib.sha256(body_bytes).hexdigest()
+    etag_header = f'"{etag_token}"'
+    cache_headers = {
+        "ETag": etag_header,
+        "Cache-Control": "private, max-age=0, must-revalidate",
+    }
+
+    inm = request.headers.get("if-none-match")
+    if inm:
+        # Multiple ETags possible; any match → 304
+        for part in inm.split(","):
+            if _normalize_etag_header_value(part) == etag_token:
+                return Response(status_code=304, headers=cache_headers)
+
+    return Response(
+        content=body_bytes,
+        media_type="application/json",
+        headers=cache_headers,
+    )
+
+
 @public_router.get("/health", response_model=HealthResponse)
 async def health_check():
     """
@@ -2831,13 +3158,16 @@ async def health_check():
     components = {}
     
     # Check database
+    db = None
     try:
         db = SessionLocal()
-        db.execute("SELECT 1")
-        db.close()
+        db.execute(text("SELECT 1"))
         components["database"] = "ok"
     except Exception:
         components["database"] = "error"
+    finally:
+        if db is not None:
+            db.close()
     
     # Check R2
     if _s3_client:
@@ -2882,6 +3212,115 @@ def _generate_signed_download_url(r2_key: str, expires_in_seconds: int = 86400) 
     return f"https://img-vid-gen-download.pavanalur3.workers.dev/d/{r2_key}?exp={expires}&sig={sig}"
 
 
+async def _apply_kie_job_result(job_id: str, payload: Dict[str, Any]) -> None:
+    import kie_client
+
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if not job:
+            logger.error("[KIE] job %s not found for callback", job_id)
+            return
+        if job.status in (JobState.COMPLETED.value, JobState.FAILED.value, JobState.CANCELLED.value):
+            logger.info("[KIE] job %s already terminal (%s)", job_id, job.status)
+            return
+        urls = kie_client.parse_result_urls(payload)
+        if kie_client.is_success_code(payload) and urls:
+            fake = ExternalExecutionResult(success=True, result_url=urls[0], raw=payload)
+            r2_key, output_url = _store_external_result(job_id, job.model, fake)
+            if _job_manager:
+                _job_manager.mark_completed(job_id, result_r2_key=r2_key, output_url=output_url)
+            else:
+                job.status = JobState.COMPLETED.value
+                job.result_r2_key = r2_key
+                job.output_url = output_url
+                job.completed_at = utc_naive_now()
+                job.updated_at = utc_naive_now()
+                db.commit()
+            job = db.query(Job).filter(Job.job_id == job_id).first()
+            meta = job.params if isinstance(job.params, dict) else {}
+            await _send_job_notification(
+                token=job.fcm_token,
+                job_id=job.job_id,
+                model=job.model,
+                success=True,
+                download_url=output_url,
+                batch_id=meta.get("_batch_id"),
+                variation_index=int(meta.get("_variation_index", 0) or 0),
+                total_variations=int(meta.get("_total_variations", 1) or 1),
+            )
+            clear_cached_job_params(job_id)
+            return
+        err = str(
+            payload.get("msg")
+            or payload.get("message")
+            or (payload.get("data") or {}).get("failMsg")
+            or "Kie task failed"
+        )
+        if _job_manager:
+            _job_manager.mark_failed(job_id, err, worker_id=None)
+        else:
+            job.status = JobState.FAILED.value
+            job.error = err
+            job.updated_at = utc_naive_now()
+            db.commit()
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        meta = job.params if isinstance(job.params, dict) else {}
+        await _send_job_notification(
+            token=job.fcm_token,
+            job_id=job.job_id,
+            model=job.model,
+            success=False,
+            batch_id=meta.get("_batch_id"),
+            variation_index=int(meta.get("_variation_index", 0) or 0),
+            total_variations=int(meta.get("_total_variations", 1) or 1),
+        )
+        clear_cached_job_params(job_id)
+    finally:
+        db.close()
+
+
+@public_router.post("/kie/callback")
+async def kie_callback(request: Request):
+    import kie_client
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    task_id = kie_client.extract_task_id(payload)
+    timestamp = request.headers.get("X-Webhook-Timestamp") or ""
+    signature = request.headers.get("X-Webhook-Signature") or ""
+    if not task_id or not kie_client.verify_webhook_signature(task_id, timestamp, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    db = SessionLocal()
+    try:
+        rec = db.query(KieTask).filter(KieTask.task_id == task_id).first()
+        if not rec:
+            logger.warning("[KIE] callback for unknown task %s", task_id)
+            return {"ok": True, "ignored": True}
+        if rec.callback_received:
+            return {"ok": True, "duplicate": True}
+        rec.callback_received = True
+        rec.updated_at = utc_naive_now()
+        job_id = rec.job_id
+        db.commit()
+    finally:
+        db.close()
+    await _apply_kie_job_result(job_id, payload)
+    return {"ok": True}
+
+
+@public_router.get("/personal/ui")
+async def personal_queue_ui():
+    path = Path(__file__).resolve().parent / "static" / "personal_queue.html"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="personal_queue.html missing")
+    return FileResponse(path, media_type="text/html")
+
+
 @public_router.get("/download_url/{job_id}")
 async def get_signed_download_url(job_id: str):
     db = SessionLocal()
@@ -2890,12 +3329,14 @@ async def get_signed_download_url(job_id: str):
         if not job or job.status != JobState.COMPLETED.value:
             raise HTTPException(status_code=404, detail="Result not ready")
 
+        # External API route: output_url may already be a direct downloadable URL.
+        if job.output_url:
+            return job.output_url
+
         r2_key = job.result_r2_key
-        
         signed_url = _generate_signed_download_url(r2_key)
         if not signed_url:
             raise HTTPException(status_code=500, detail="DOWNLOAD_SECRET not set")
-        
         return signed_url
     finally:
         db.close()
@@ -3012,6 +3453,203 @@ async def get_media_upload_urls(
     return {"uploads": uploads}
 
 
+def _is_describe_asset_r2_key_allowed(key: str) -> bool:
+    """Only keys created via /get_media_upload_urls (input-media prefix)."""
+    if not key or ".." in key or key.startswith("/"):
+        return False
+    prefix = f"{_image_prefix}/input-media/"
+    return key.startswith(prefix)
+
+
+def _mime_from_r2_key(key: str) -> str:
+    if "." not in key:
+        return "application/octet-stream"
+    ext = key.rsplit(".", 1)[-1].lower()
+    if ext in ("jpg", "jpeg"):
+        return "image/jpeg"
+    if ext == "png":
+        return "image/png"
+    if ext == "webp":
+        return "image/webp"
+    if ext == "bin":
+        return "application/octet-stream"
+    guessed, _ = mimetypes.guess_type(f"file.{ext}")
+    return guessed or "application/octet-stream"
+
+
+def _r2_head_object_meta_sync(key: str) -> dict:
+    """Return head_object response dict (includes ContentLength)."""
+    if not _s3_client or not _r2_bucket:
+        raise RuntimeError("R2 not configured")
+    return _s3_client.head_object(Bucket=_r2_bucket, Key=key)
+
+
+def _r2_get_object_bytes_sync(key: str, max_bytes: int) -> bytes:
+    if not _s3_client or not _r2_bucket:
+        raise RuntimeError("R2 not configured")
+    resp = _s3_client.get_object(Bucket=_r2_bucket, Key=key)
+    body = resp["Body"]
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        chunk = body.read(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError("OBJECT_TOO_LARGE")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _reserve_asset_prompt_daily_slot(user_id: str) -> None:
+    """Raises 429 if user exceeded daily cap (counts reserved attempts before VLM call)."""
+    try:
+        cap = int(os.getenv("ASSET_PROMPT_VLM_DAILY_LIMIT_PER_USER", "50"))
+    except ValueError:
+        cap = 50
+    if cap <= 0:
+        return
+    async with _asset_prompt_rate_lock:
+        today = _utc_today()
+        cur = _asset_prompt_rate.get(user_id)
+        if not cur or cur[0] != today:
+            cur = (today, 0)
+        n = cur[1]
+        if n >= cap:
+            raise HTTPException(
+                status_code=429,
+                detail="Daily limit reached for auto-prompt. Try again tomorrow.",
+            )
+        _asset_prompt_rate[user_id] = (today, n + 1)
+
+
+@client_router.post(
+    "/describe_asset_for_prompt",
+    response_model=DescribeAssetForPromptResponse,
+)
+async def describe_asset_for_prompt(
+    payload: DescribeAssetForPromptRequest,
+    auth: Dict = Depends(require_firebase_auth),
+):
+    """
+    Load image bytes from R2 and send Nemotron VL-style ``messages`` to NVIDIA (base64 data URL
+    in ``image_url``, system ``/think`` for images per NVIDIA samples).
+
+    R2-only: request body must contain ``input_r2_key`` under the app's ``input-media/`` prefix.
+    For video sources, the client should upload a single JPEG frame to R2 and pass that key
+    with ``media_type=image``.
+    """
+    if not is_asset_prompt_vlm_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Auto-prompt from asset is disabled on the server.",
+        )
+
+    key = (payload.input_r2_key or "").strip()
+    if not _is_describe_asset_r2_key_allowed(key):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or disallowed input_r2_key.",
+        )
+
+    uid = auth.get("user_id")
+    if uid is None:
+        raise HTTPException(status_code=401, detail="User id missing from auth")
+
+    await _reserve_asset_prompt_daily_slot(str(uid))
+
+    max_bytes = get_max_image_bytes()
+    try:
+        meta = await asyncio.to_thread(_r2_head_object_meta_sync, key)
+    except ClientError as e:
+        code = (e.response.get("Error") or {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            raise HTTPException(status_code=404, detail="Object not found in storage.") from e
+        logger.error(f"[DESCRIBE_ASSET] R2 head_object failed: {e}")
+        raise HTTPException(status_code=500, detail="Could not read object metadata from storage.") from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    size = int(meta.get("ContentLength") or 0)
+    if size > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail="Image is too large for auto-prompt. Use a smaller file.",
+        )
+
+    try:
+        raw = await asyncio.to_thread(_r2_get_object_bytes_sync, key, max_bytes)
+    except ClientError as e:
+        code = (e.response.get("Error") or {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            raise HTTPException(status_code=404, detail="Object not found in storage.") from e
+        logger.error(f"[DESCRIBE_ASSET] R2 get_object failed: {e}")
+        raise HTTPException(status_code=500, detail="Could not read object from storage.") from e
+    except ValueError as e:
+        if str(e) == "OBJECT_TOO_LARGE":
+            raise HTTPException(
+                status_code=413,
+                detail="Image is too large for auto-prompt. Use a smaller file.",
+            ) from e
+        raise HTTPException(status_code=500, detail="Could not read object.") from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    mime = (payload.content_type or "").strip() or _mime_from_r2_key(key)
+    if not mime.startswith("image/"):
+        mime = _mime_from_r2_key(key)
+
+    ok, text = await describe_image_with_nvidia(key, raw, mime)
+    if not ok:
+        logger.warning(
+            f"[DESCRIBE_ASSET] VLM failed user_id={uid!s} key_prefix={key[:48]!r} err={text[:200]!r}"
+        )
+        raise HTTPException(status_code=502, detail=text)
+
+    logger.info(
+        f"[DESCRIBE_ASSET] ok user_id={uid!s} key_prefix={key[:48]!r} prompt_len={len(text)}"
+    )
+    return DescribeAssetForPromptResponse(prompt=text)
+
+
+def _bulk_entries_include_multi_image_group(entries: Optional[List[Any]]) -> bool:
+    """True if any top-level bulk entry is a list (multi-reference task)."""
+    if not entries:
+        return False
+    return any(isinstance(e, list) for e in entries)
+
+
+def _flatten_bulk_r2_keys_for_cleanup(entries: List[Any], bulk_limit: int) -> List[str]:
+    """Collect every R2 object key from input_image_r2_keys (flat or nested per task)."""
+    flat: List[str] = []
+    for entry in (entries or [])[:bulk_limit]:
+        if isinstance(entry, str):
+            flat.append(entry)
+        elif isinstance(entry, list):
+            for k in entry:
+                if isinstance(k, str):
+                    flat.append(k)
+    return flat
+
+
+def _build_bulk_images_to_process_r2(entries: List[Any], bulk_limit: int) -> List[Any]:
+    """
+    Each item is either 'r2:<key>' (single) or ['r2:k1', 'r2:k2', ...] (multi-reference).
+    """
+    out: List[Any] = []
+    for entry in entries[:bulk_limit]:
+        if isinstance(entry, str):
+            out.append(f"r2:{entry}")
+        elif isinstance(entry, list):
+            out.append([f"r2:{k}" for k in entry])
+        else:
+            raise ValueError(
+                f"Invalid input_image_r2_keys entry type: {type(entry).__name__}"
+            )
+    return out
+
+
 @client_router.post("/submit", response_model=SubmitResponse)
 async def submit_job(
     request: Request,
@@ -3027,8 +3665,8 @@ async def submit_job(
     Supports:
     - enhance_prompt: If true, AI will enhance the prompt before processing
     - variations: Number of output variations to generate (1-4, creates multiple jobs)
-    - bulk_images: List of images to process with same prompt/settings (VIP feature)
-    - is_bulk: Flag indicating bulk edit request (requires VIP)
+    - input_image_r2_keys: Bulk tasks as R2 object keys (str or list[str] per task for multi-ref)
+    - is_bulk: Flag indicating bulk edit request (requires non-empty input_image_r2_keys)
     
     VIP Benefits:
     - Bulk edit: Process multiple images with same settings
@@ -3042,6 +3680,8 @@ async def submit_job(
     ip = get_client_ip(request)
     user_id = auth.get("user_id")
     is_vip = auth.get("is_vip", False)
+    # Backward-compatible access for older SubmitRequest schema versions.
+    on_device_flag = bool(getattr(payload, "on_device", False))
 
     # Save the client request as JSON (as received from client)
     try:
@@ -3083,20 +3723,28 @@ async def submit_job(
         )
 
     # ==========================================================================
-    # BULK EDIT: VIP Feature Check
+    # BULK EDIT: Tier-aware limits
     # ==========================================================================
-    # Bulk edit allows processing multiple images with the same prompt/settings
-    # Requires active VIP subscription
+    # Bulk edit allows processing multiple images with the same prompt/settings.
+    # Limits:
+    # - non-VIP: up to 5 bulk tasks
+    # - VIP: up to 15 bulk tasks
+    # A "task" is one top-level entry (string or list of refs for multi-image models).
     is_bulk_request = (
         payload.is_bulk
-        or (payload.bulk_images and len(payload.bulk_images) > 0)
         or (payload.input_image_r2_keys and len(payload.input_image_r2_keys) > 1)
+        or _bulk_entries_include_multi_image_group(payload.input_image_r2_keys)
     )
-    
-    if is_bulk_request and not is_vip:
+    bulk_limit = 15 if is_vip else 5
+    bulk_input_count = len(payload.input_image_r2_keys or [])
+
+    if is_bulk_request and bulk_input_count > bulk_limit:
         raise HTTPException(
-            status_code=403,
-            detail="Bulk edit requires VIP subscription. Please upgrade to VIP to use this feature."
+            status_code=400,
+            detail=(
+                f"Bulk edit limit exceeded: max {bulk_limit} image(s) allowed for "
+                f"{'VIP' if is_vip else 'non-VIP'} users."
+            ),
         )
     
     # Validate model
@@ -3105,24 +3753,28 @@ async def submit_job(
     except InvalidModelError as e:
         raise HTTPException(status_code=400, detail=str(e))
     
-    # Keep full params for dispatch to worker (including base64 images)
-    # Moved earlier for credit cost calculation with scale_factor
+    # Full params for dispatch (R2 keys only; embedded media rejected in SubmitRequest)
     full_params = dict(payload.params) if payload.params else {}
+
+    # Flutter UI id "ltx2_3_cinereal" → concrete LTX 2.3 worker model (must match worker registry)
+    if model == "ltx2_3_cinereal":
+        ff_keys = full_params.get("first_frame_image_r2_keys")
+        has_last = bool(full_params.get("last_frame_image_r2_key"))
+        multi_first = isinstance(ff_keys, list) and len(ff_keys) >= 2
+        if has_last or multi_first:
+            model = "ltx2_3_flf2v"
+        else:
+            model = "ltx2_3_i2v_distilled"
+        logger.info(
+            "[MODEL] Normalized ltx2_3_cinereal → %s (has_last=%s multi_first=%s)",
+            model,
+            has_last,
+            multi_first,
+        )
     
     # ==========================================================================
     # PARAM KEY NORMALIZATION
     # ==========================================================================
-    # Frontend may send "mask" but workers expect "mask_image"
-    # Normalize key names to match worker expectations
-    if "mask" in full_params and "mask_image" not in full_params:
-        full_params["mask_image"] = full_params.pop("mask")
-        logger.debug("[PARAMS] Mapped 'mask' → 'mask_image'")
-    
-    # Upscale capability uses input id "image"; face_enhancer and other upscalers expect "init_image"
-    if "image" in full_params and "init_image" not in full_params:
-        full_params["init_image"] = full_params.pop("image")
-        logger.debug("[PARAMS] Mapped 'image' → 'init_image' for upscale")
-    
     # Frontend may send "is_custom" (string) but workers expect "is_custom_mode" (boolean)
     if "is_custom" in full_params and "is_custom_mode" not in full_params:
         is_custom_val = full_params.pop("is_custom")
@@ -3150,9 +3802,8 @@ async def submit_job(
     # ==========================================================================
     # BUILD IMAGE LIST for processing
     # ==========================================================================
-    # Priority: R2 keys > base64 bulk_images > params.init_image > text-to-image
-    # When R2 keys are provided, images_to_process entries are R2 key strings
-    # (prefixed with "r2:") so downstream code can distinguish them from base64.
+    # R2 keys only: bulk uses input_image_r2_keys; single job uses params.init_image_r2_key
+    # or params.init_image_r2_keys (multi-ref, one job). Entries use "r2:<key>" for the job loop.
     images_to_process = []
     using_r2_images = False   # True when images come from presigned R2 uploads
     r2_input_keys = []        # Track all input R2 keys for cleanup after job completion
@@ -3160,9 +3811,21 @@ async def submit_job(
     if payload.input_image_r2_keys and len(payload.input_image_r2_keys) > 0:
         # R2 presigned upload path – images are already in R2
         using_r2_images = True
-        images_to_process = [f"r2:{k}" for k in payload.input_image_r2_keys[:10]]
-        r2_input_keys.extend(payload.input_image_r2_keys[:10])
-        logger.info(f"[R2_MEDIA] Processing {len(images_to_process)} images via R2 keys")
+        try:
+            images_to_process = _build_bulk_images_to_process_r2(
+                list(payload.input_image_r2_keys), bulk_limit
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        r2_input_keys.extend(
+            _flatten_bulk_r2_keys_for_cleanup(
+                list(payload.input_image_r2_keys), bulk_limit
+            )
+        )
+        logger.info(
+            f"[R2_MEDIA] Processing {len(images_to_process)} bulk task(s) via R2 keys "
+            f"(flat key count for cleanup={len(r2_input_keys)})"
+        )
         
         # If a single R2 mask key was provided (non-bulk), store it
         if payload.mask_image_r2_key:
@@ -3180,44 +3843,54 @@ async def submit_job(
             for i, cfg in enumerate(payload.bulk_outpaint_configs):
                 if cfg:
                     logger.debug(f"[R2_MEDIA] Outpaint config {i}: {cfg}")
-    
-    elif is_bulk_request and payload.bulk_images:
-        # Legacy base64 bulk path
-        images_to_process = payload.bulk_images[:10]  # Max 10 images
-        logger.info(f"[BULK] Processing {len(images_to_process)} images in bulk edit (base64)")
-        
-        # Log bulk configs for debugging
-        if payload.bulk_outpaint_configs:
-            logger.info(f"[BULK] Received {len(payload.bulk_outpaint_configs)} outpaint configs")
-            for i, cfg in enumerate(payload.bulk_outpaint_configs):
-                if cfg:
-                    logger.debug(f"[BULK] Outpaint config {i}: {cfg}")
-        if payload.bulk_masks:
-            mask_count = sum(1 for m in payload.bulk_masks if m)
-            logger.info(f"[BULK] Received {mask_count} non-null masks out of {len(payload.bulk_masks)}")
     else:
-        # Single image or text-to-image
-        # Check for single-image R2 key in params
-        single_r2_key = full_params.get("init_image_r2_key")
-        if single_r2_key:
+        # Single image, multi-ref single job, or text-to-image
+        multi_r2_keys = full_params.get("init_image_r2_keys")
+        if multi_r2_keys is not None:
+            if not isinstance(multi_r2_keys, list) or not multi_r2_keys:
+                raise HTTPException(
+                    status_code=400,
+                    detail="params.init_image_r2_keys must be a non-empty list of R2 object keys",
+                )
+            for j, k in enumerate(multi_r2_keys):
+                if not isinstance(k, str) or not k.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"params.init_image_r2_keys[{j}] must be a non-empty R2 object key string",
+                    )
             using_r2_images = True
-            images_to_process = [f"r2:{single_r2_key}"]
-            r2_input_keys.append(single_r2_key)
-            # Remove the transient key so it doesn't reach worker raw
-            full_params.pop("init_image_r2_key", None)
-            logger.info(f"[R2_MEDIA] Single image via R2 key")
-        else:
-            single_image = full_params.get("init_image")
-            if single_image:
-                images_to_process = [single_image]
+            r2_input_keys.extend(multi_r2_keys)
+            full_params.pop("init_image_r2_keys", None)
+            if len(multi_r2_keys) == 1:
+                images_to_process = [f"r2:{multi_r2_keys[0]}"]
             else:
-                images_to_process = [None]  # Text-to-image, no init_image
+                images_to_process = [[f"r2:{k}" for k in multi_r2_keys]]
+            logger.info(
+                f"[R2_MEDIA] Single job with {len(multi_r2_keys)} init_image R2 key(s)"
+            )
+        else:
+            single_r2_key = full_params.get("init_image_r2_key")
+            if single_r2_key:
+                if not isinstance(single_r2_key, str) or not single_r2_key.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="params.init_image_r2_key must be a non-empty R2 object key string",
+                    )
+                using_r2_images = True
+                images_to_process = [f"r2:{single_r2_key}"]
+                r2_input_keys.append(single_r2_key)
+                full_params.pop("init_image_r2_key", None)
+                logger.info("[R2_MEDIA] Single image via R2 key")
+            else:
+                images_to_process = [None]  # Text-to-image / no init image
     
-    # Handle input video R2 key (from payload-level field or from params)
+    # Handle input video R2 key (payload overrides params.input_video_r2_key)
     if payload.input_video_r2_key:
         full_params["input_video_r2_key"] = payload.input_video_r2_key
-        r2_input_keys.append(payload.input_video_r2_key)
-        logger.info(f"[R2_MEDIA] Input video via R2 key: {payload.input_video_r2_key}")
+    _ivk = full_params.get("input_video_r2_key")
+    if _ivk and isinstance(_ivk, str) and _ivk.strip() and _ivk not in r2_input_keys:
+        r2_input_keys.append(_ivk)
+        logger.info(f"[R2_MEDIA] Input video via R2 key: {_ivk}")
     
     num_images = len(images_to_process)
     
@@ -3226,19 +3899,29 @@ async def submit_job(
     # ==========================================================================
     # Validate video_duration for video upscalers (max 10 minutes)
     if model in ("video_upscaler", "flashvsr_video_upscaler") and "video_duration" in full_params:
-        try:
-            video_duration = float(full_params.get("video_duration", 0))
-            MAX_VIDEO_DURATION = 600  # 10 minutes in seconds
-            if video_duration > MAX_VIDEO_DURATION:
-                logger.warning(
-                    f"[VIDEO_UPSCALER] Video duration {video_duration}s exceeds max {MAX_VIDEO_DURATION}s, "
-                    f"capping to {MAX_VIDEO_DURATION}s"
-                )
-                full_params["video_duration"] = MAX_VIDEO_DURATION
-        except (ValueError, TypeError) as e:
-            logger.warning(f"[VIDEO_UPSCALER] Invalid video_duration: {full_params.get('video_duration')}, error: {e}")
-            # Remove invalid video_duration, will use default cost calculation
+        vd_raw = full_params.get("video_duration")
+        # Unresolved client/template placeholders (e.g. "{{video_duration}}") are not numeric
+        if isinstance(vd_raw, str) and ("{{" in vd_raw or "}}" in vd_raw):
+            logger.debug(
+                "[VIDEO_UPSCALER] Dropping unresolved video_duration placeholder: %r",
+                vd_raw,
+            )
             full_params.pop("video_duration", None)
+        else:
+            try:
+                video_duration = float(vd_raw or 0)
+                MAX_VIDEO_DURATION = 600  # 10 minutes in seconds
+                if video_duration > MAX_VIDEO_DURATION:
+                    logger.warning(
+                        f"[VIDEO_UPSCALER] Video duration {video_duration}s exceeds max {MAX_VIDEO_DURATION}s, "
+                        f"capping to {MAX_VIDEO_DURATION}s"
+                    )
+                    full_params["video_duration"] = MAX_VIDEO_DURATION
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"[VIDEO_UPSCALER] Invalid video_duration: {full_params.get('video_duration')}, error: {e}"
+                )
+                full_params.pop("video_duration", None)
     
     # ==========================================================================
     # CREDIT CALCULATION
@@ -3304,7 +3987,7 @@ async def submit_job(
         now = utc_naive_now()
         
         # Determine output extension based on model type
-        # Video models output .mp4, image models output .png
+        # Video models output .mp4, image models output .png, text-output models (e.g. OCR) output .txt
         VIDEO_MODELS = {
             "ltx2_video", "fastwan_21_1b", "fastwan_22_5b", "wan_22_14b_rapid",
             "wan_22_uint4_lightx2v_i2v", "wan_22_uint4_lightx2v_t2v",
@@ -3312,9 +3995,25 @@ async def submit_job(
             "wan21", "wan22",
             "video_upscaler", "flashvsr_video_upscaler",
             "hunyan15_480p_i2v_step_distilled", "hunyan15_480p_t2v_distilled",
+            "ltx2_3_t2v", "ltx2_3_i2v_distilled", "ltx2_3_flf2v",
+            "ltx2_3_iv2v_distilled",
+            "minimax_h3",
+            "ltx25_int8", "ltx25_int8_t2v", "ltx25_int8_i2v", "ltx25_int8_flf2v",
         }
-        is_video_model = model.lower() in VIDEO_MODELS or "video" in model.lower()
-        output_extension = ".mp4" if is_video_model else ".png"
+        TEXT_OUTPUT_MODELS = {"glm_ocr"}
+        AUDIO_OUTPUT_MODELS = {"minimax_music3"}
+        model_l = model.lower()
+        is_video_model = model_l in VIDEO_MODELS or "video" in model_l
+        is_text_output_model = model_l in TEXT_OUTPUT_MODELS
+        is_audio_output_model = model_l in AUDIO_OUTPUT_MODELS or "music" in model_l
+        if is_audio_output_model:
+            output_extension = ".mp3"
+        elif is_video_model:
+            output_extension = ".mp4"
+        elif is_text_output_model:
+            output_extension = ".txt"
+        else:
+            output_extension = ".png"
         
         # Loop through images (for bulk edit) and variations
         job_index = 0
@@ -3327,12 +4026,42 @@ async def submit_job(
                 # Build full params for this specific job (with specific image)
                 job_full_params = dict(full_params)
                 if image_data:
-                    if using_r2_images and isinstance(image_data, str) and image_data.startswith("r2:"):
-                        # Store R2 key – dispatch will convert to presigned GET URL
-                        job_full_params["init_image_r2_key"] = image_data[3:]  # strip "r2:" prefix
+                    if isinstance(image_data, list):
+                        if not using_r2_images:
+                            raise HTTPException(
+                                status_code=500,
+                                detail="Internal error: multi-reference image task without R2 keys",
+                            )
+                        keys: List[str] = []
+                        for item in image_data:
+                            if isinstance(item, str) and item.startswith("r2:"):
+                                keys.append(item[3:])
+                            else:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail="Invalid bulk R2 entry: expected r2:<key> strings",
+                                )
+                        if not keys:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Empty R2 key group in bulk request",
+                            )
                         job_full_params.pop("init_image", None)
+                        job_full_params.pop("init_image_r2_key", None)
+                        job_full_params.pop("init_image_r2_keys", None)
+                        if len(keys) == 1:
+                            job_full_params["init_image_r2_key"] = keys[0]
+                        else:
+                            job_full_params["init_image_r2_keys"] = keys
+                    elif isinstance(image_data, str) and image_data.startswith("r2:"):
+                        job_full_params["init_image_r2_key"] = image_data[3:]
+                        job_full_params.pop("init_image", None)
+                        job_full_params.pop("init_image_r2_keys", None)
                     else:
-                        job_full_params["init_image"] = image_data
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Invalid image input: use R2 upload + init_image_r2_key / input_image_r2_keys only.",
+                        )
                 
                 # Apply per-image outpaint config (for expand scene bulk edit)
                 if payload.bulk_outpaint_configs and image_idx < len(payload.bulk_outpaint_configs):
@@ -3438,30 +4167,26 @@ async def submit_job(
                     logger.error(f"[BULK] CRITICAL: Missing outpaint config for image {image_idx} in bulk outpaint request!")
                     logger.error(f"[BULK] bulk_outpaint_configs exists: {payload.bulk_outpaint_configs is not None}, len: {len(payload.bulk_outpaint_configs) if payload.bulk_outpaint_configs else 0}, image_idx: {image_idx}")
                 
-                # Apply per-image mask (for inpaint/erase bulk edit)
-                # Priority: R2 bulk mask keys > base64 bulk masks > single mask R2 key
-                if using_r2_images and payload.bulk_mask_r2_keys and image_idx < len(payload.bulk_mask_r2_keys):
+                # Apply per-image mask (R2 keys only)
+                if using_r2_images and payload.bulk_mask_r2_keys and image_idx < len(
+                    payload.bulk_mask_r2_keys
+                ):
                     mask_r2_key = payload.bulk_mask_r2_keys[image_idx]
                     if mask_r2_key:
                         job_full_params.pop("mask_image", None)
                         job_full_params.pop("mask", None)
                         job_full_params["mask_image_r2_key"] = mask_r2_key
                         logger.info(f"[R2_MEDIA] Applied mask R2 key for image {image_idx}")
-                elif using_r2_images and not is_bulk_request and payload.mask_image_r2_key:
-                    # Single-image mode with R2 mask
+                elif not is_bulk_request and (
+                    payload.mask_image_r2_key or job_full_params.get("mask_image_r2_key")
+                ):
+                    mask_r2_key = payload.mask_image_r2_key or job_full_params.get(
+                        "mask_image_r2_key"
+                    )
                     job_full_params.pop("mask_image", None)
                     job_full_params.pop("mask", None)
-                    job_full_params["mask_image_r2_key"] = payload.mask_image_r2_key
-                    logger.info(f"[R2_MEDIA] Applied single mask R2 key")
-                elif payload.bulk_masks and image_idx < len(payload.bulk_masks):
-                    mask_data = payload.bulk_masks[image_idx]
-                    if mask_data:
-                        # IMPORTANT: Remove any existing mask from base params first
-                        # This ensures per-image mask always takes precedence
-                        job_full_params.pop("mask_image", None)
-                        job_full_params.pop("mask", None)
-                        job_full_params["mask_image"] = mask_data
-                        logger.info(f"[BULK] Applied mask for image {image_idx} (mask size: {len(mask_data)} chars)")
+                    job_full_params["mask_image_r2_key"] = mask_r2_key
+                    logger.info("[R2_MEDIA] Applied single mask R2 key")
                 
                 # Final verification for outpaint bulk requests: ensure critical params are set
                 if is_bulk_request and model == "diffusers_outpaint":
@@ -3473,11 +4198,26 @@ async def submit_job(
                     if "expansion_factor" not in job_full_params:
                         logger.warning(f"[BULK] expansion_factor not in params for job {job_id}, worker will use default 1.25")
                 
-                # Store for later dispatch (includes full base64 image)
+                # Store for later dispatch (R2 keys; URLs applied at dispatch time)
                 job_full_params_map[job_id] = job_full_params
                 
-                # Prepare params for DB storage - strip base64 images to prevent DB bloat
+                # Prepare params for DB storage — strip any stray large/binary-looking fields
                 db_params = strip_base64_images_for_db(job_full_params)
+
+                # Store route selection metadata for observability/debugging.
+                try:
+                    route_params = _prepare_external_params(job_full_params)
+                    db_params["_route_backend"] = (
+                        "external"
+                        if _external_api_router.should_use_external(model, route_params)
+                        else "quickpod"
+                    )
+                except Exception:
+                    db_params["_route_backend"] = "quickpod"
+                # Persist for dispatchers/recovery: client runs inference locally; no worker/pod.
+                if on_device_flag:
+                    db_params["on_device"] = True
+                    db_params["_route_backend"] = "on_device"
                 
                 # Add batch metadata to params for tracking
                 if batch_id:
@@ -3498,6 +4238,9 @@ async def submit_job(
                 job_r2_keys = []
                 if job_full_params.get("init_image_r2_key"):
                     job_r2_keys.append(job_full_params["init_image_r2_key"])
+                _multi_init = job_full_params.get("init_image_r2_keys")
+                if _multi_init and isinstance(_multi_init, list):
+                    job_r2_keys.extend(_multi_init)
                 if job_full_params.get("mask_image_r2_key"):
                     job_r2_keys.append(job_full_params["mask_image_r2_key"])
                 if job_full_params.get("input_video_r2_key"):
@@ -3527,7 +4270,8 @@ async def submit_job(
                     status=JobState.QUEUED.value,
                     result_r2_key=result_key,
                     output_key=result_key,
-                    fcm_token=payload.fcm_token,  # All jobs get FCM so frontend is notified
+                    # On-device jobs are client-completed; avoid stale timeout push alerts.
+                    fcm_token=None if on_device_flag else payload.fcm_token,
                     user_id=user_id,
                     credits_locked=0,
                     credits_refunded=0,
@@ -3649,11 +4393,16 @@ async def submit_job(
         # Get the specific params for this job (for bulk edit, each job has different image)
         job_params = job_full_params_map.get(jid, full_params)
         
-        # Cache full params (including base64 images) for dispatch to worker
+        # Cache full params for dispatch (R2 keys → presigned GET URLs in _dispatch_to_worker)
         cache_job_params(jid, job_params)
     
-    # Dispatch job(s) to worker
-    if len(created_jobs) > 1 and _pod_manager:
+    # Dispatch job(s) to worker unless this is an on-device client workflow.
+    if on_device_flag:
+        logger.info(
+            f"[ON_DEVICE] Skipping worker dispatch for {len(created_jobs)} job(s) "
+            f"(model={model}, user_id={user_id})"
+        )
+    elif len(created_jobs) > 1 and _pod_manager:
         # MULTI-JOB (bulk edit OR variations): dispatch all to ONE worker in a single /run_bulk request
         all_job_ids = [j["job_id"] for j in created_jobs]
         background_tasks.add_task(
@@ -3681,9 +4430,13 @@ async def submit_job(
         else f"/download_url/{primary_job['job_id']}"
     )
     
-    # Generate upload URL for primary job
-    upload_url = create_presigned_put_url(primary_job["result_key"])
-    
+    # Presigned PUT for worker result upload; on-device jobs finish locally (no R2 upload).
+    upload_url = (
+        None
+        if on_device_flag
+        else create_presigned_put_url(primary_job["result_key"])
+    )
+
     # Return response with all job IDs for variations/bulk edit
     # Frontend should poll all job_ids when total_jobs > 1
     return SubmitResponse(
@@ -3705,6 +4458,287 @@ async def submit_job(
         # Credits
         credits_used=total_credits_locked,
     )
+
+
+@client_router.post("/on_device/job_started")
+async def on_device_job_started(
+    payload: OnDeviceJobStartedRequest,
+    auth: Dict = Depends(require_firebase_auth),
+):
+    """Mark an on-device job as started (client-reported lifecycle)."""
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid auth context")
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        job = (
+            db.query(Job)
+            .filter(Job.job_id == payload.job_id, Job.user_id == user.id)
+            .first()
+        )
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        if job.status in (
+            JobState.COMPLETED.value,
+            JobState.FAILED.value,
+            JobState.CANCELLED.value,
+            JobState.TIMEOUT.value,
+        ):
+            return {"ok": True, "status": job.status}
+
+        now = utc_naive_now()
+        if job.status == JobState.QUEUED.value:
+            job.status = JobState.RUNNING.value
+        if not job.started_at:
+            job.started_at = now
+        if not job.dispatched_at:
+            job.dispatched_at = now
+        job.updated_at = now
+        db.commit()
+        return {"ok": True, "status": job.status}
+    finally:
+        db.close()
+
+
+@client_router.post("/on_device/job_complete")
+async def on_device_job_complete(
+    payload: OnDeviceJobCompleteRequest,
+    auth: Dict = Depends(require_firebase_auth),
+):
+    """Mark an on-device job terminal state and handle refunds on failure."""
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid auth context")
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        job = (
+            db.query(Job)
+            .filter(Job.job_id == payload.job_id, Job.user_id == user.id)
+            .first()
+        )
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        if job.status in (
+            JobState.COMPLETED.value,
+            JobState.FAILED.value,
+            JobState.CANCELLED.value,
+            JobState.TIMEOUT.value,
+        ):
+            return {"ok": True, "status": job.status}
+
+        now = utc_naive_now()
+        if payload.success:
+            job.status = JobState.COMPLETED.value
+            job.error = None
+            # Prevent any future stale timeout push attempts for this client-finished job.
+            job.notification_sent = True
+            if not job.started_at:
+                job.started_at = now
+            if not job.dispatched_at:
+                job.dispatched_at = now
+            job.completed_at = now
+            job.timeout_at = None
+            job.updated_at = now
+            db.commit()
+            return {"ok": True, "status": JobState.COMPLETED.value}
+
+        # Failure path: mark failed and refund locked credits.
+        job.status = JobState.FAILED.value
+        job.error = payload.error or "On-device processing failed"
+        job.notification_sent = True
+        if not job.started_at:
+            job.started_at = now
+        if not job.dispatched_at:
+            job.dispatched_at = now
+        job.completed_at = now
+        job.timeout_at = None
+        job.updated_at = now
+        db.commit()
+
+        refund_ok, refund_msg, refund_amount = refund_credits_for_job(
+            None,
+            payload.job_id,
+            reason="on_device_failed",
+        )
+        if not refund_ok:
+            logger.warning(
+                f"[ON_DEVICE] Refund failed for {payload.job_id}: {refund_msg}"
+            )
+        return {
+            "ok": True,
+            "status": JobState.FAILED.value,
+            "refund_amount": refund_amount,
+        }
+    finally:
+        db.close()
+
+
+async def _dispatch_to_external_api(job_id: str, retry_count: int = 0) -> bool:
+    """
+    Execute a queued job through external API provider instead of QuickPod worker dispatch.
+    Keeps the same job lifecycle and notification semantics.
+    """
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if not job:
+            logger.error(f"[EXTERNAL_API] Job {job_id} not found")
+            return False
+
+        current_state = JobState(job.status)
+        if current_state in [
+            JobState.RUNNING,
+            JobState.COMPLETED,
+            JobState.FAILED,
+            JobState.TIMEOUT,
+            JobState.CANCELLED,
+        ]:
+            logger.info(
+                f"[EXTERNAL_API] Job {job_id} already in terminal/active state {current_state.value}"
+            )
+            return True
+
+        cached_params = get_cached_job_params(job_id)
+        source_params = cached_params if cached_params else (job.params or {})
+        source_params = _prepare_external_params(source_params)
+
+        if not _external_api_router.should_use_external(job.model, source_params):
+            return False
+
+        # State transitions mirror worker dispatch flow.
+        if _job_manager:
+            _job_manager.update_job_state(job_id, JobState.DISPATCHING)
+            _job_manager.update_job_state(job_id, JobState.RUNNING)
+        else:
+            now = utc_naive_now()
+            job.status = JobState.RUNNING.value
+            job.dispatched_at = now
+            job.started_at = now
+            job.updated_at = now
+            db.commit()
+
+        result = await asyncio.to_thread(
+            _external_api_router.execute, job.model, job.prompt or "", source_params
+        )
+
+        if result.pending and result.external_task_id:
+            from db import KieTask
+            existing = db.query(KieTask).filter(KieTask.task_id == result.external_task_id).first()
+            if not existing:
+                db.add(
+                    KieTask(
+                        task_id=result.external_task_id,
+                        job_id=job_id,
+                        model=job.model,
+                    )
+                )
+            job_row = db.query(Job).filter(Job.job_id == job_id).first()
+            if job_row:
+                params = dict(job_row.params or {})
+                params["_kie_task_id"] = result.external_task_id
+                job_row.params = params
+            db.commit()
+            logger.info(f"[KIE] Job {job_id} submitted task {result.external_task_id}")
+            return True
+
+        r2_key = None
+        output_url = result.result_url
+        if result.success and (result.result_url or result.result_text or result.result_bytes):
+            try:
+                r2_key, output_url = _store_external_result(job_id, job.model, result)
+            except Exception as store_err:
+                logger.exception(f"[EXTERNAL_API] Failed to store result for {job_id}: {store_err}")
+                result = ExternalExecutionResult(success=False, error=str(store_err))
+
+        if result.success and (output_url or r2_key):
+            if _job_manager:
+                _job_manager.mark_completed(
+                    job_id,
+                    result_r2_key=r2_key,
+                    output_url=output_url,
+                )
+            else:
+                completed_job = db.query(Job).filter(Job.job_id == job_id).first()
+                if completed_job:
+                    completed_job.status = JobState.COMPLETED.value
+                    completed_job.result_r2_key = r2_key
+                    completed_job.output_url = output_url
+                    completed_job.completed_at = utc_naive_now()
+                    completed_job.updated_at = utc_naive_now()
+                    db.commit()
+
+            # Refresh job for notification metadata.
+            job = db.query(Job).filter(Job.job_id == job_id).first()
+            meta = job.params if isinstance(job.params, dict) else {}
+            await _send_job_notification(
+                token=job.fcm_token,
+                job_id=job.job_id,
+                model=job.model,
+                success=True,
+                download_url=output_url,
+                batch_id=meta.get("_batch_id"),
+                variation_index=int(meta.get("_variation_index", 0) or 0),
+                total_variations=int(meta.get("_total_variations", 1) or 1),
+            )
+            clear_cached_job_params(job_id)
+            logger.info(f"[EXTERNAL_API] Job {job_id} completed via external provider")
+            return True
+
+        # External execution failed; retry a few times before failing job permanently.
+        max_retries = 2
+        if retry_count < max_retries:
+            delay_seconds = 2 * (retry_count + 1)
+            logger.warning(
+                f"[EXTERNAL_API] Job {job_id} failed (attempt {retry_count + 1}/{max_retries + 1}): "
+                f"{result.error}. Retrying in {delay_seconds}s"
+            )
+            await asyncio.sleep(delay_seconds)
+            asyncio.create_task(_dispatch_to_external_api(job_id, retry_count + 1))
+            return True
+
+        # Permanent failure path.
+        err = result.error or "External API execution failed"
+        if _job_manager:
+            _job_manager.mark_failed(job_id, err, worker_id=None)
+        else:
+            failed_job = db.query(Job).filter(Job.job_id == job_id).first()
+            if failed_job:
+                failed_job.status = JobState.FAILED.value
+                failed_job.error = err
+                failed_job.updated_at = utc_naive_now()
+                db.commit()
+
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        meta = job.params if isinstance(job.params, dict) else {}
+        await _send_job_notification(
+            token=job.fcm_token,
+            job_id=job.job_id,
+            model=job.model,
+            success=False,
+            batch_id=meta.get("_batch_id"),
+            variation_index=int(meta.get("_variation_index", 0) or 0),
+            total_variations=int(meta.get("_total_variations", 1) or 1),
+        )
+        clear_cached_job_params(job_id)
+        logger.error(f"[EXTERNAL_API] Job {job_id} failed permanently: {err}")
+        return True
+    except Exception as e:
+        logger.exception(f"[EXTERNAL_API] Unexpected dispatch failure for job {job_id}: {e}")
+        return False
+    finally:
+        db.close()
 
 
 async def _dispatch_job_background(
@@ -3755,6 +4789,21 @@ async def _dispatch_job_background(
                         f"skipping retry dispatch (retry_count={retry_count})"
                     )
                     return
+
+        # On-device jobs: credits only; client completes via /on_device/* — never assign workers.
+        job_params_early = job.params if isinstance(job.params, dict) else {}
+        if job_params_early.get("on_device") is True:
+            logger.info(
+                f"[ON_DEVICE] Skipping worker/external dispatch for job {job_id} ({job.model})"
+            )
+            return
+
+        # External API route: bypass pod/worker assignment.
+        cached_params = get_cached_job_params(job_id)
+        route_params = _prepare_external_params(cached_params if cached_params else (job.params or {}))
+        if _external_api_router.should_use_external(job.model, route_params):
+            logger.info(f"[EXTERNAL_API] Routing job {job_id} ({job.model}) through external provider")
+            return await _dispatch_to_external_api(job_id, retry_count=retry_count)
         
         # Track machines attempted
         machines_attempted = set()
@@ -3894,14 +4943,13 @@ async def _dispatch_job_background(
         return
     except Exception as e:
         logger.error(f"Background dispatch failed for {job_id}: {e}")
-        # Ensure job is reverted to QUEUED so recovery system can pick it up
         db = SessionLocal()
         try:
             job = db.query(Job).filter(Job.job_id == job_id).first()
             if job and job.status not in [
                 JobState.COMPLETED.value,
                 JobState.FAILED.value,
-                JobState.RUNNING.value,  # Don't revert if already running
+                JobState.RUNNING.value,
             ]:
                 job.status = JobState.QUEUED.value
                 job.worker_id = None
@@ -3916,10 +4964,23 @@ async def _dispatch_job_background(
                     }
                 )
                 db.commit()
-                logger.info(
-                    f"Job {job_id} reverted to QUEUED after dispatch error. "
-                    f"Will be picked up by recovery system."
-                )
+
+                max_retries = 5
+                if retry_count < max_retries:
+                    retry_delay = min(15 * (2 ** retry_count), 120)
+                    logger.info(
+                        f"Job {job_id} reverted to QUEUED after dispatch error. "
+                        f"Retrying in {retry_delay}s (attempt {retry_count + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(retry_delay)
+                    asyncio.create_task(
+                        _dispatch_job_background(job_id, model, mode, retry_count + 1)
+                    )
+                else:
+                    logger.error(
+                        f"Job {job_id} exhausted all dispatch retries ({max_retries}) "
+                        f"after generic error. Job remains in QUEUED."
+                    )
         finally:
             db.close()
 
@@ -3969,6 +5030,27 @@ async def _dispatch_bulk_jobs_background(
     """
     if not job_ids:
         return
+
+    # External providers for first wave do not support native bulk; fan out per job.
+    # This preserves user-visible bulk/variation behavior while avoiding QuickPod load.
+    db = SessionLocal()
+    try:
+        first_job = db.query(Job).filter(Job.job_id == job_ids[0]).first()
+        if first_job:
+            first_params = _prepare_external_params(
+                get_cached_job_params(first_job.job_id) or (first_job.params or {})
+            )
+            if _external_api_router.should_use_external(first_job.model, first_params):
+                logger.info(
+                    f"[EXTERNAL_API] Bulk fan-out for {len(job_ids)} jobs "
+                    f"(model={first_job.model})"
+                )
+                for jid in job_ids:
+                    asyncio.create_task(_dispatch_job_background(jid, model, mode, retry_count=0))
+                return
+    finally:
+        db.close()
+
     if not _job_manager or not _pod_manager:
         logger.warning(
             "[BULK_DISPATCH] job_manager or pod_manager not available, skipping bulk dispatch"
@@ -4191,7 +5273,17 @@ async def _recover_jobs_on_worker(
             # Skip the excluded job (if specified)
             if exclude_job_id and job.job_id == exclude_job_id:
                 continue
-            
+
+            # RACE FIX: Re-read job from DB before modifying. job_complete may have
+            # just committed COMPLETED for this job; do not overwrite with QUEUED.
+            db.refresh(job)
+            if job.status in (JobState.COMPLETED.value, JobState.FAILED.value):
+                logger.info(
+                    f"Job {job.job_id} already in terminal state '{job.status}', "
+                    f"skipping recovery in _recover_jobs_on_worker (job_complete likely committed concurrently)"
+                )
+                continue
+
             # Requeue the job
             old_status = job.status
             job.status = JobState.QUEUED.value
@@ -4362,8 +5454,7 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
         )
         
         # Build the run payload
-        # CRITICAL: Use cached params (with base64 images) if available
-        # DB params are sanitized (no large binary data)
+        # Prefer cached params (full R2 keys); DB params omit large blobs
         cached_params = get_cached_job_params(job.job_id)
         dispatch_params = cached_params if cached_params else (job.params or {})
         
@@ -4373,8 +5464,26 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
         # ---------------------------------------------------------------
         dispatch_params = dict(dispatch_params)  # Don't mutate cached params
         
+        # init_image_r2_keys (multi) → init_image as list of presigned GET URLs
+        if "init_image_r2_keys" in dispatch_params:
+            keys = dispatch_params.pop("init_image_r2_keys")
+            if not isinstance(keys, list) or not keys:
+                raise Exception("init_image_r2_keys must be a non-empty list")
+            urls: List[str] = []
+            for r2_key in keys:
+                download_url = create_presigned_get_url(r2_key, expires_in=3600)
+                if download_url:
+                    urls.append(download_url)
+                else:
+                    raise Exception(
+                        f"Failed to generate init_image download URL for R2 key: {r2_key}"
+                    )
+            dispatch_params["init_image"] = urls
+            logger.info(
+                f"[R2_MEDIA] Job {job_id}: {len(urls)} init_image R2 keys → download URLs"
+            )
         # init_image_r2_key → init_image (presigned GET URL)
-        if "init_image_r2_key" in dispatch_params:
+        elif "init_image_r2_key" in dispatch_params:
             r2_key = dispatch_params.pop("init_image_r2_key")
             download_url = create_presigned_get_url(r2_key, expires_in=3600)
             if download_url:
@@ -4392,6 +5501,61 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                 logger.info(f"[R2_MEDIA] Job {job_id}: mask_image R2 key → download URL")
             else:
                 raise Exception(f"Failed to generate mask_image download URL for R2 key: {r2_key}")
+
+        # first_frame_image_r2_key → first_frame_image (CineReal FLF2V / WAN two-frame UX)
+        if "first_frame_image_r2_key" in dispatch_params:
+            r2_key = dispatch_params.pop("first_frame_image_r2_key")
+            download_url = create_presigned_get_url(r2_key, expires_in=3600)
+            if download_url:
+                dispatch_params["first_frame_image"] = download_url
+                logger.info(f"[R2_MEDIA] Job {job_id}: first_frame_image R2 key → download URL")
+            else:
+                raise Exception(
+                    f"Failed to generate first_frame_image download URL for R2 key: {r2_key}"
+                )
+
+        # first_frame_image_r2_keys → two presigned URLs as init_image list (LTX FLF2V bulk mapping)
+        if "first_frame_image_r2_keys" in dispatch_params:
+            keys = dispatch_params.pop("first_frame_image_r2_keys")
+            if not isinstance(keys, list) or not keys:
+                raise Exception("first_frame_image_r2_keys must be a non-empty list")
+            urls_ff: List[str] = []
+            for r2_key in keys:
+                download_url = create_presigned_get_url(r2_key, expires_in=3600)
+                if download_url:
+                    urls_ff.append(download_url)
+                else:
+                    raise Exception(
+                        f"Failed to generate first_frame_image download URL for R2 key: {r2_key}"
+                    )
+            if "init_image" not in dispatch_params:
+                if len(urls_ff) == 2:
+                    dispatch_params["init_image"] = urls_ff
+                    logger.info(
+                        f"[R2_MEDIA] Job {job_id}: first_frame_image_r2_keys ({len(urls_ff)}) "
+                        f"→ init_image URL list for FLF2V"
+                    )
+                elif len(urls_ff) == 1:
+                    dispatch_params.setdefault("first_frame_image", urls_ff[0])
+                    logger.info(
+                        f"[R2_MEDIA] Job {job_id}: first_frame_image_r2_keys (1) → first_frame_image"
+                    )
+                else:
+                    raise Exception(
+                        f"first_frame_image_r2_keys: expected 1 or 2 keys, got {len(urls_ff)}"
+                    )
+
+        # last_frame_image_r2_key → last_frame_image
+        if "last_frame_image_r2_key" in dispatch_params:
+            r2_key = dispatch_params.pop("last_frame_image_r2_key")
+            download_url = create_presigned_get_url(r2_key, expires_in=3600)
+            if download_url:
+                dispatch_params["last_frame_image"] = download_url
+                logger.info(f"[R2_MEDIA] Job {job_id}: last_frame_image R2 key → download URL")
+            else:
+                raise Exception(
+                    f"Failed to generate last_frame_image download URL for R2 key: {r2_key}"
+                )
         
         # ref_image_r2_key → ref_image (presigned GET URL) — for dreamid
         if "ref_image_r2_key" in dispatch_params:
@@ -4437,6 +5601,8 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
         for internal_key in list(dispatch_params.keys()):
             if internal_key.startswith("_"):
                 dispatch_params.pop(internal_key)
+
+        _assert_dispatch_params_media_are_urls(dispatch_params, job_id)
         
         run_payload = {
             "job_id": job.job_id,
@@ -4482,8 +5648,9 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
         
         # Log if we're using cached vs DB params
         if cached_params:
-            has_images = any(k in cached_params for k in BASE64_IMAGE_FIELDS)
-            logger.debug(f"Job {job_id} using cached params (has_images={has_images})")
+            logger.debug(
+                f"Job {job_id} using cached params ({len(cached_params)} param keys)"
+            )
         
         # Get worker endpoint
         endpoint = worker.endpoint
@@ -4706,6 +5873,7 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
         # CRITICAL: Worker returns 409 if same job_id is already queued
         # So we must NOT retry if the worker received the request (even if we timed out)
         last_error = None
+        accepted_job_ids_from_worker: Optional[List[str]] = None
         max_attempts = 3
         worker_received_job = False  # Track if worker confirmed receipt
         
@@ -4720,7 +5888,15 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                     f"(timeout={timeout}s)"
                 )
                 
-                resp = requests.post(url, json=run_payload, timeout=timeout)
+                body_bytes = encode_worker_request_body(run_payload)
+                dispatch_headers = {"Content-Type": "application/json"}
+                try:
+                    dispatch_headers["X-Signature"] = sign_payload_bytes(body_bytes)
+                except ValueError:
+                    pass
+                resp = requests.post(
+                    url, data=body_bytes, headers=dispatch_headers, timeout=timeout
+                )
                 resp.raise_for_status()
                 
                 # Success!
@@ -5489,7 +6665,7 @@ async def _dispatch_bulk_to_worker(job_ids: List[str], worker_id: str) -> bool:
                 create_presigned_put_url(job.result_r2_key) if job.result_r2_key else None
             )
             
-            # Get cached params (with base64 images or R2 keys)
+            # Get cached params (R2 keys) or DB fallback
             cached_params = get_cached_job_params(jid)
             dispatch_params = dict(cached_params) if cached_params else dict(job.params or {})
             
@@ -5497,6 +6673,29 @@ async def _dispatch_bulk_to_worker(job_ids: List[str], worker_id: str) -> bool:
             # R2 MEDIA: Convert all *_r2_key fields to presigned download URLs
             # ---------------------------------------------------------------
             r2_convert_failed = False
+            if "init_image_r2_keys" in dispatch_params:
+                keys = dispatch_params.pop("init_image_r2_keys")
+                if isinstance(keys, list) and keys:
+                    urls: List[str] = []
+                    for r2_key in keys:
+                        download_url = create_presigned_get_url(r2_key, expires_in=3600)
+                        if download_url:
+                            urls.append(download_url)
+                        else:
+                            logger.error(
+                                f"[BULK_DISPATCH] Job {jid}: Failed download URL for init R2 key"
+                            )
+                            r2_convert_failed = True
+                            break
+                    if not r2_convert_failed and len(urls) == len(keys):
+                        dispatch_params["init_image"] = urls
+                        logger.info(
+                            f"[BULK_DISPATCH] Job {jid}: init_image_r2_keys → {len(urls)} URLs"
+                        )
+                    elif not r2_convert_failed:
+                        r2_convert_failed = True
+                else:
+                    r2_convert_failed = True
             for r2_field, target_field in [
                 ("init_image_r2_key", "init_image"),
                 ("mask_image_r2_key", "mask_image"),
@@ -5522,6 +6721,8 @@ async def _dispatch_bulk_to_worker(job_ids: List[str], worker_id: str) -> bool:
             for internal_key in list(dispatch_params.keys()):
                 if internal_key.startswith("_"):
                     dispatch_params.pop(internal_key)
+
+            _assert_dispatch_params_media_are_urls(dispatch_params, jid)
             
             run_payload = {
                 "job_id": job.job_id,
@@ -5585,12 +6786,26 @@ async def _dispatch_bulk_to_worker(job_ids: List[str], worker_id: str) -> bool:
                     f"(timeout={timeout}s)"
                 )
                 
-                resp = requests.post(url, json=bulk_request_body, timeout=timeout)
+                body_bytes = encode_worker_request_body(bulk_request_body)
+                bulk_headers = {"Content-Type": "application/json"}
+                try:
+                    bulk_headers["X-Signature"] = sign_payload_bytes(body_bytes)
+                except ValueError:
+                    pass
+                resp = requests.post(
+                    url, data=body_bytes, headers=bulk_headers, timeout=timeout
+                )
                 resp.raise_for_status()
                 
                 # Success!
                 last_error = None
                 resp_data = resp.json()
+                if isinstance(resp_data, dict):
+                    raw_ids = resp_data.get("job_ids")
+                    if isinstance(raw_ids, list):
+                        accepted_job_ids_from_worker = [
+                            str(x) for x in raw_ids if isinstance(x, str) and x
+                        ]
                 logger.info(
                     f"[BULK_DISPATCH] Worker accepted {len(bulk_payloads)} jobs: {resp_data}"
                 )
@@ -5656,7 +6871,51 @@ async def _dispatch_bulk_to_worker(job_ids: List[str], worker_id: str) -> bool:
             db.commit()
             return False
         
-        # SUCCESS: Mark all jobs as RUNNING
+        # SUCCESS: Mark accepted jobs as RUNNING.
+        # Worker may return a partial acceptance list (rare race/queue edge), so do not
+        # blindly mark all sent jobs as RUNNING.
+        accepted_job_ids = list(valid_job_ids)
+        if accepted_job_ids_from_worker is not None:
+            accepted_set = set(accepted_job_ids_from_worker)
+            accepted_job_ids = [jid for jid in valid_job_ids if jid in accepted_set]
+            if len(accepted_job_ids) != len(valid_job_ids):
+                logger.warning(
+                    "[BULK_DISPATCH] Partial worker acceptance: accepted=%s requested=%s worker=%s",
+                    len(accepted_job_ids),
+                    len(valid_job_ids),
+                    worker_id,
+                )
+                rejected = [jid for jid in valid_job_ids if jid not in accepted_set]
+                for jid in rejected:
+                    job = db.query(Job).filter(Job.job_id == jid).first()
+                    if job and job.status not in [
+                        JobState.RUNNING.value, JobState.COMPLETED.value, JobState.FAILED.value
+                    ]:
+                        job.status = JobState.QUEUED.value
+                        job.worker_id = None
+                        job.updated_at = utc_naive_now()
+                    if _pod_manager and pod_uuid:
+                        try:
+                            await _pod_manager.release_slot_on_pod(pod_uuid, jid)
+                        except Exception as e:
+                            logger.warning(
+                                f"[BULK_DISPATCH] Failed releasing slot for rejected job {jid}: {e}"
+                            )
+
+        if not accepted_job_ids:
+            logger.warning("[BULK_DISPATCH] Worker accepted 0 jobs in bulk response")
+            for jid in valid_job_ids:
+                job = db.query(Job).filter(Job.job_id == jid).first()
+                if job and job.status not in [
+                    JobState.RUNNING.value, JobState.COMPLETED.value, JobState.FAILED.value
+                ]:
+                    job.status = JobState.QUEUED.value
+                    job.worker_id = None
+                    job.updated_at = utc_naive_now()
+            db.commit()
+            return False
+
+        # SUCCESS: Mark accepted jobs as RUNNING
         # Verify pod is still valid first
         pod_still_valid = True
         if _pod_manager and pod_uuid:
@@ -5670,7 +6929,7 @@ async def _dispatch_bulk_to_worker(job_ids: List[str], worker_id: str) -> bool:
             )
             return False
         
-        for i, jid in enumerate(valid_job_ids):
+        for i, jid in enumerate(accepted_job_ids):
             try:
                 if _job_manager:
                     # Do NOT set started_at for any bulk job. Stuck detection uses started_at;
@@ -5706,7 +6965,7 @@ async def _dispatch_bulk_to_worker(job_ids: List[str], worker_id: str) -> bool:
         db.commit()
         
         logger.info(
-            f"[BULK_DISPATCH] All {len(valid_job_ids)} jobs marked as RUNNING on worker {worker_id}"
+            f"[BULK_DISPATCH] Marked {len(accepted_job_ids)}/{len(valid_job_ids)} jobs as RUNNING on worker {worker_id}"
         )
         return True
         
@@ -5715,6 +6974,63 @@ async def _dispatch_bulk_to_worker(job_ids: List[str], worker_id: str) -> bool:
         return False
     finally:
         db.close()
+
+
+def _get_model_eta_for_status(model: str) -> int:
+    """Best-effort ETA seconds for a model: dynamic EWMA first, then model_requirements default."""
+    try:
+        from db import SessionLocal as _SL, ModelEtaStat
+        model_norm = (model or "").strip().lower()
+        if model_norm:
+            with _SL() as _db:
+                row = _db.query(ModelEtaStat).filter(ModelEtaStat.model == model_norm).first()
+                if row and int(row.sample_count or 0) >= 3:
+                    return max(5, int(row.ewma_eta_seconds))
+    except Exception:
+        pass
+    try:
+        pm = _pod_manager
+        if pm and hasattr(pm, "model_requirements"):
+            req = pm.model_requirements.get(model) or pm.model_requirements.get((model or "").strip().lower()) or {}
+            default_eta = req.get("eta_seconds_default")
+            if default_eta:
+                return int(default_eta)
+    except Exception:
+        pass
+    return 60
+
+
+def _compute_model_inference_seconds_map(supported: Any) -> Dict[str, float]:
+    """
+    EWMA inference seconds per model (ModelEtaStat), for worker download tuning.
+    Only models with sample_count >= 3 and positive ewma are included.
+    """
+    out: Dict[str, float] = {}
+    try:
+        from db import SessionLocal, ModelEtaStat
+
+        models = supported or []
+        if not isinstance(models, (list, tuple)):
+            models = [models] if models else []
+        with SessionLocal() as db:
+            for m in models:
+                m_norm = str(m or "").strip().lower()
+                if not m_norm:
+                    continue
+                row = (
+                    db.query(ModelEtaStat)
+                    .filter(ModelEtaStat.model == m_norm)
+                    .first()
+                )
+                if (
+                    row
+                    and int(row.sample_count or 0) >= 3
+                    and float(row.ewma_eta_seconds or 0) > 0
+                ):
+                    out[m_norm] = round(float(row.ewma_eta_seconds), 1)
+    except Exception:
+        pass
+    return out
 
 
 @client_router.get("/job_status", response_model=JobStatusResponse)
@@ -5798,12 +7114,8 @@ async def get_job_status(
                 var_idx = sib_job.params.get("_variation_index", 0) if sib_job.params else 0
                 var_result_url = None
                 
-                if sib_job.status == JobState.COMPLETED.value and sib_job.result_r2_key:
-                    var_result_url = (
-                        f"{_controller_url}/download_url/{sib_job.job_id}"
-                        if _controller_url
-                        else f"/download_url/{sib_job.job_id}"
-                    )
+                if sib_job.status == JobState.COMPLETED.value:
+                    var_result_url = _build_public_result_url(sib_job)
                     completed_count += 1
                     if sib_job.completed_at:
                         if latest_completed_at is None or sib_job.completed_at > latest_completed_at:
@@ -5861,13 +7173,36 @@ async def get_job_status(
         else:
             # Single job - standard behavior
             total_variations = 1
-            if job.status == JobState.COMPLETED.value and job.result_r2_key:
-                result_url = (
-                    f"{_controller_url}/download_url/{job_id}"
-                    if _controller_url
-                    else f"/download_url/{job_id}"
-                )
+            if job.status == JobState.COMPLETED.value:
+                result_url = _build_public_result_url(job)
         
+        estimated_wait_seconds = None
+        queue_position = None
+        if aggregated_status in (JobState.QUEUED.value, JobState.RUNNING.value):
+            try:
+                model_name = job.model or ""
+                queued_ahead = db.query(Job).filter(
+                    Job.model == model_name,
+                    Job.status == JobState.QUEUED.value,
+                    Job.created_at < job.created_at,
+                ).count()
+                running_count = db.query(Job).filter(
+                    Job.model == model_name,
+                    Job.status == JobState.RUNNING.value,
+                ).count()
+                if aggregated_status == JobState.QUEUED.value:
+                    queue_position = queued_ahead + 1
+                else:
+                    queue_position = 0
+                eta_per_job = _get_model_eta_for_status(model_name)
+                pending_jobs = max(0, queued_ahead - max(0, running_count - 1))
+                if aggregated_status == JobState.RUNNING.value:
+                    estimated_wait_seconds = eta_per_job
+                else:
+                    estimated_wait_seconds = eta_per_job * (pending_jobs + 1)
+            except Exception:
+                pass
+
         return JobStatusResponse(
             job_id=job.job_id,
             status=JobStatus(aggregated_status),
@@ -5880,10 +7215,11 @@ async def get_job_status(
             result_url=result_url,
             error=aggregated_error,
             error_log=job.error_log,
-            # Variation fields
             variations=total_variations,
             variation_results=variation_results,
             all_completed=all_completed,
+            estimated_wait_seconds=estimated_wait_seconds,
+            queue_position=queue_position,
         )
     finally:
         db.close()
@@ -5932,12 +7268,8 @@ async def get_batch_status(
         
         for job in jobs:
             result_url = None
-            if job.status == JobState.COMPLETED.value and job.result_r2_key:
-                result_url = (
-                    f"{_controller_url}/download_url/{job.job_id}"
-                    if _controller_url
-                    else f"/download_url/{job.job_id}"
-                )
+            if job.status == JobState.COMPLETED.value:
+                result_url = _build_public_result_url(job)
             
             variation_idx = job.params.get("_variation_index", 0) if job.params else 0
             
@@ -5985,9 +7317,9 @@ async def get_batch_status(
 @worker_router.post("/register_worker")
 async def register_worker(
     request: Request,
-    payload: RegisterWorkerRequest,
-    _: bool = Depends(require_worker_signature),
+    payload_dict: Dict[str, Any] = Depends(require_worker_signed_payload),
 ):
+    payload = RegisterWorkerRequest.model_validate(payload_dict)
     """
     Worker registration endpoint.
     
@@ -6065,6 +7397,25 @@ async def register_worker(
             )
     else:
         pod_uuid = worker_pod_uuid
+
+    if _pod_manager and pod_uuid:
+        tracked = _pod_manager.individual_pods.get(pod_uuid)
+        if not tracked:
+            want = normalize_pod_uuid(pod_uuid)
+            for tracked_uuid, tracked_info in list(_pod_manager.individual_pods.items()):
+                if normalize_pod_uuid(tracked_uuid) == want:
+                    tracked = tracked_info
+                    pod_uuid = tracked_uuid
+                    break
+        if tracked:
+            public_url = (tracked.meta or {}).get("public_url")
+            if public_url:
+                payload.endpoint = public_url
+            gpu_prov = (tracked.meta or {}).get("gpu_provider")
+            if gpu_prov:
+                if not isinstance(payload.info, dict):
+                    payload.info = {}
+                payload.info["gpu_provider"] = gpu_prov
     
     # Normalize for storage (we'll store without hyphens for consistency)
     pod_uuid_for_storage = normalize_pod_uuid(pod_uuid)
@@ -6135,6 +7486,42 @@ async def register_worker(
     # Fallback to worker's reported model if no tracked pod model
     if not model:
         model = payload.models[0] if payload.models else "unknown"
+
+    # Build normalized runtime capability payload (Phase 2 hybrid capability source)
+    runtime_supported_models = []
+    for m in (payload.supported_models or payload.models or []):
+        if isinstance(m, str):
+            m_norm = m.strip().lower()
+            if m_norm and m_norm not in runtime_supported_models:
+                runtime_supported_models.append(m_norm)
+    if model and model != "unknown" and model not in runtime_supported_models:
+        runtime_supported_models.append(model)
+
+    runtime_eta_map = {}
+    if isinstance(payload.model_eta_seconds, dict):
+        for k, v in payload.model_eta_seconds.items():
+            if not isinstance(k, str):
+                continue
+            try:
+                eta_val = int(v)
+            except Exception:
+                continue
+            if eta_val <= 0:
+                continue
+            runtime_eta_map[k.strip().lower()] = eta_val
+
+    merged_worker_info = payload.info.copy() if isinstance(payload.info, dict) else {}
+    merged_worker_info["supported_models"] = runtime_supported_models
+    if runtime_eta_map:
+        merged_worker_info["model_eta_seconds"] = runtime_eta_map
+    merged_worker_info["capability_source"] = "worker_runtime"
+    merged_worker_info["capability_updated_at"] = utc_naive_now().isoformat()
+    if _pod_manager and pod_uuid in _pod_manager.individual_pods:
+        tracked_meta = _pod_manager.individual_pods[pod_uuid].meta or {}
+        if tracked_meta.get("gpu_provider"):
+            merged_worker_info["gpu_provider"] = tracked_meta["gpu_provider"]
+        if tracked_meta.get("public_url"):
+            merged_worker_info["public_url"] = tracked_meta["public_url"]
     
     # Upsert worker with comprehensive error handling
     # CRITICAL: Use try/except to prevent 500 errors on weak servers
@@ -6237,7 +7624,7 @@ async def register_worker(
                 last_heartbeat=now,
                 last_active=now,
                 created_at=now,
-                info=payload.info,
+                info=merged_worker_info,
                 is_warm_pod=is_warm,
                 # Cost tracking fields
                 gpu_hourly_rate=gpu_hourly_rate,
@@ -6253,7 +7640,7 @@ async def register_worker(
             worker.status = initial_status
             worker.last_heartbeat = now
             worker.last_active = now
-            worker.info = payload.info
+            worker.info = merged_worker_info
             if pod_uuid:
                 worker.is_warm_pod = is_warm
             # Update cost tracking fields if available
@@ -6415,10 +7802,14 @@ async def register_worker(
             pass
         # Return success anyway - worker can still operate
         # This prevents weak servers from rejecting valid workers
+        _mis = _compute_model_inference_seconds_map(
+            payload.supported_models or payload.models
+        )
         return {
             "status": "ok",
             "worker_id": payload.worker_id,
             "warning": "partial_registration",
+            "model_inference_seconds": _mis,
         }
     finally:
         db.close()
@@ -6432,8 +7823,15 @@ async def register_worker(
     logger.info(
         f"Worker {payload.worker_id} registered for model {model} (pod: {pod_uuid})"
     )
-    
-    return {"status": "ok", "worker_id": payload.worker_id}
+
+    _mis = _compute_model_inference_seconds_map(
+        payload.supported_models or payload.models
+    )
+    return {
+        "status": "ok",
+        "worker_id": payload.worker_id,
+        "model_inference_seconds": _mis,
+    }
 
 
 # In-memory heartbeat cache for fast responses (synced to DB periodically)
@@ -6448,38 +7846,7 @@ _job_params_cache: Dict[str, Dict[str, Any]] = {}
 _job_params_cache_lock = asyncio.Lock()
 
 
-def _normalize_base64_image(value: str) -> str:
-    """
-    Normalize base64 image string for workers:
-    1. Strip data URL prefix (e.g., 'data:image/png;base64,...')
-    2. Remove whitespace/newlines
-    3. Fix padding (base64 length must be divisible by 4)
-    
-    Workers expect clean, properly-padded base64 without the data URL prefix.
-    """
-    if not isinstance(value, str):
-        return value
-    
-    # Strip data URL prefix if present
-    if value.startswith('data:'):
-        # Format: data:image/png;base64,iVBORw0KGgo...
-        if ';base64,' in value:
-            value = value.split(';base64,', 1)[1]
-        elif ',' in value:
-            value = value.split(',', 1)[1]
-    
-    # Remove any whitespace or newlines
-    value = value.strip().replace('\n', '').replace('\r', '').replace(' ', '')
-    
-    # Fix padding if needed (base64 must be divisible by 4)
-    missing_padding = len(value) % 4
-    if missing_padding:
-        value += '=' * (4 - missing_padding)
-    
-    return value
-
-
-# Known fields that contain base64 image data
+# Known fields that may have held base64 historically; strip before DB persist
 BASE64_IMAGE_FIELDS = frozenset([
     "init_image", "image", "mask_image", "control_image", "source_image", 
     "images", "reference_image", "style_image", "face_image", "input_image",
@@ -6507,6 +7874,60 @@ def _is_base64_image_string(value: Any) -> bool:
     # Sample first 100 chars to avoid checking entire string
     sample = value[:100].replace('/', '').replace('+', '').replace('=', '')
     return sample.isalnum()
+
+
+_WORKER_MEDIA_PARAM_KEYS = (
+    "init_image",
+    "image",
+    "mask_image",
+    "input_video",
+    "ref_image",
+    "ref_video",
+    "first_frame_image",
+    "last_frame_image",
+    "condition_image",
+    "condition_video",
+)
+
+
+def _assert_dispatch_params_media_are_urls(
+    dispatch_params: Dict[str, Any], job_id: str
+) -> None:
+    """
+    Workers must receive only http(s) URLs for media (presigned R2 GET).
+    Rejects data: URIs, raw base64 blobs, and local paths mistaken for payloads.
+    """
+    for key in _WORKER_MEDIA_PARAM_KEYS:
+        val = dispatch_params.get(key)
+        if val is None:
+            continue
+        if isinstance(val, list):
+            for i, item in enumerate(val):
+                if not isinstance(item, str):
+                    raise Exception(
+                        f"Job {job_id}: {key}[{i}] must be a URL string after R2 resolution"
+                    )
+                s = item.strip()
+                if s.startswith("data:") or _is_base64_image_string(s):
+                    raise Exception(
+                        f"Job {job_id}: {key}[{i}] must be a presigned https URL, not embedded media"
+                    )
+                if not (s.startswith("http://") or s.startswith("https://")):
+                    raise Exception(
+                        f"Job {job_id}: {key}[{i}] must start with http:// or https://"
+                    )
+            continue
+        if not isinstance(val, str):
+            raise Exception(f"Job {job_id}: {key} must be a URL string or list of URLs")
+        s = val.strip()
+        if s.startswith("data:") or _is_base64_image_string(s):
+            raise Exception(
+                f"Job {job_id}: {key} must be a presigned https URL, not embedded media"
+            )
+        if not (s.startswith("http://") or s.startswith("https://")):
+            raise Exception(
+                f"Job {job_id}: {key} must start with http:// or https:// (presigned R2 GET)"
+            )
 
 
 def strip_base64_images_for_db(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -6551,23 +7972,8 @@ def strip_base64_images_for_db(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def cache_job_params(job_id: str, params: Dict[str, Any]):
-    """Cache full job params (including base64 images) for dispatch to worker"""
-    # Normalize base64 image fields - strip data URL prefix and fix padding
-    cleaned_params = dict(params)
-    
-    for field in BASE64_IMAGE_FIELDS:
-        if field in cleaned_params:
-            value = cleaned_params[field]
-            if isinstance(value, str):
-                cleaned_params[field] = _normalize_base64_image(value)
-            elif isinstance(value, list):
-                # Handle list of images
-                cleaned_params[field] = [
-                    _normalize_base64_image(v) if isinstance(v, str) else v
-                    for v in value
-                ]
-    
-    _job_params_cache[job_id] = cleaned_params
+    """Cache full job params for dispatch (R2 keys; server expands to presigned GET URLs)."""
+    _job_params_cache[job_id] = copy.deepcopy(params)
 
 
 def get_cached_job_params(job_id: str) -> Optional[Dict[str, Any]]:
@@ -6578,6 +7984,69 @@ def get_cached_job_params(job_id: str) -> Optional[Dict[str, Any]]:
 def clear_cached_job_params(job_id: str):
     """Clear cached job params after dispatch"""
     _job_params_cache.pop(job_id, None)
+
+
+def _learn_dynamic_eta_from_completed_job(
+    db: Session,
+    job: Job,
+    payload_metrics: Optional[Dict[str, Any]],
+):
+    """
+    Update dynamic per-model ETA using completed job runtime.
+
+    Source priority:
+    1) worker payload.metrics.processing_time_seconds
+    2) persisted job.processing_time_seconds
+    """
+    if os.getenv("SCHEDULER_DYNAMIC_ETA_ENABLED", "false").lower() != "true":
+        return
+    if not job or not isinstance(job.model, str):
+        return
+
+    sample_seconds: Optional[float] = None
+    if isinstance(payload_metrics, dict):
+        raw = payload_metrics.get("processing_time_seconds")
+        try:
+            if raw is not None:
+                sample_seconds = float(raw)
+        except Exception:
+            sample_seconds = None
+
+    if sample_seconds is None:
+        try:
+            if job.processing_time_seconds is not None:
+                sample_seconds = float(job.processing_time_seconds)
+        except Exception:
+            sample_seconds = None
+
+    if sample_seconds is None or sample_seconds <= 0:
+        return
+
+    min_seconds = max(1.0, float(os.getenv("SCHEDULER_DYNAMIC_ETA_MIN_SECONDS", "10")))
+    max_seconds = max(
+        min_seconds,
+        float(os.getenv("SCHEDULER_DYNAMIC_ETA_MAX_SECONDS", "1200")),
+    )
+    alpha = float(os.getenv("SCHEDULER_DYNAMIC_ETA_ALPHA", "0.2"))
+
+    row = update_model_eta_stat(
+        session=db,
+        model=job.model,
+        sample_seconds=sample_seconds,
+        alpha=alpha,
+        min_seconds=min_seconds,
+        max_seconds=max_seconds,
+    )
+    if row is None:
+        return
+    db.flush()
+    logger.info(
+        "dynamic_eta_learned model=%s sample=%.2fs ewma=%.2fs samples=%s",
+        job.model,
+        float(sample_seconds),
+        float(row.ewma_eta_seconds or 0.0),
+        int(row.sample_count or 0),
+    )
 
 
 def cleanup_input_r2_keys(job_id: str, r2_keys: List[str], batch_id: Optional[str] = None):
@@ -6677,9 +8146,9 @@ def get_cached_last_heartbeat(worker_id: str) -> Optional[datetime]:
 @worker_router.post("/heartbeat")
 async def worker_heartbeat(
     request: Request,
-    payload: HeartbeatRequest,
-    _: bool = Depends(require_worker_signature),
+    payload_dict: Dict[str, Any] = Depends(require_worker_signed_payload),
 ):
+    payload = HeartbeatRequest.model_validate(payload_dict)
     """
     Worker heartbeat endpoint.
     
@@ -6699,15 +8168,29 @@ async def worker_heartbeat(
             "last_heartbeat": now,
             "status": payload.status.value if payload.status else None,
             "metrics": payload.metrics,
+            "supported_models": payload.supported_models,
+            "model_eta_seconds": payload.model_eta_seconds,
             "needs_sync": True,  # Mark for DB sync
         }
     except Exception:
         # If cache update fails for any reason, just continue
         # Sync task will eventually catch up via DB reads
         pass
-    
-    # Return immediately - zero blocking operations
-    return {"status": "ok"}
+
+    queue_snapshot: Dict[str, int] = {}
+    try:
+        if _pod_manager and hasattr(_pod_manager, "pending_jobs"):
+            all_pending = _pod_manager.pending_jobs.get_all_pending()
+            queue_snapshot = {
+                str(model): len(job_ids)
+                for model, job_ids in all_pending.items()
+                if job_ids
+            }
+    except Exception:
+        pass
+
+    # Return immediately; queue_snapshot is in-memory only (no DB).
+    return {"status": "ok", "queue_snapshot": queue_snapshot}
 
 
 async def sync_heartbeat_cache_to_db():
@@ -6785,6 +8268,65 @@ async def sync_heartbeat_cache_to_db():
                             worker.status = heartbeat_status
                         if data["metrics"]:
                             worker.resource_metrics = data["metrics"]
+                        hb_supported = data.get("supported_models")
+                        hb_eta = data.get("model_eta_seconds")
+                        hb_download_state = None
+                        hb_metrics = data.get("metrics")
+                        if isinstance(hb_metrics, dict):
+                            raw_download_state = hb_metrics.get("download_state")
+                            if isinstance(raw_download_state, dict):
+                                compact_download_state = {}
+                                for m_key, m_state in raw_download_state.items():
+                                    if not isinstance(m_key, str):
+                                        continue
+                                    model_key = m_key.strip().lower()
+                                    if not model_key:
+                                        continue
+                                    if isinstance(m_state, dict):
+                                        compact = {}
+                                        status_val = m_state.get("status")
+                                        if isinstance(status_val, str) and status_val.strip():
+                                            compact["status"] = status_val.strip()
+                                        ready_in = m_state.get("ready_in_seconds")
+                                        if isinstance(ready_in, (int, float)) and ready_in >= 0:
+                                            compact["ready_in_seconds"] = int(ready_in)
+                                        eta_download = m_state.get("eta_seconds")
+                                        if isinstance(eta_download, (int, float)) and eta_download > 0:
+                                            compact["eta_seconds"] = int(eta_download)
+                                        if compact:
+                                            compact_download_state[model_key] = compact
+                                if compact_download_state:
+                                    hb_download_state = compact_download_state
+                        if hb_supported is not None or hb_eta is not None or hb_download_state is not None:
+                            info = worker.info if isinstance(worker.info, dict) else {}
+                            if hb_supported is not None:
+                                normalized_supported = []
+                                for m in hb_supported or []:
+                                    if isinstance(m, str):
+                                        m_norm = m.strip().lower()
+                                        if m_norm and m_norm not in normalized_supported:
+                                            normalized_supported.append(m_norm)
+                                if normalized_supported:
+                                    info["supported_models"] = normalized_supported
+                            if isinstance(hb_eta, dict):
+                                eta_map = {}
+                                for k, v in hb_eta.items():
+                                    if not isinstance(k, str):
+                                        continue
+                                    try:
+                                        eta_val = int(v)
+                                    except Exception:
+                                        continue
+                                    if eta_val <= 0:
+                                        continue
+                                    eta_map[k.strip().lower()] = eta_val
+                                if eta_map:
+                                    info["model_eta_seconds"] = eta_map
+                            if hb_download_state is not None:
+                                info["download_state"] = hb_download_state
+                            info["capability_source"] = "worker_runtime"
+                            info["capability_updated_at"] = data["last_heartbeat"].isoformat()
+                            worker.info = info
                 
                 db.commit()
                 logger.debug(f"Synced {len(to_sync)} worker heartbeats to DB")
@@ -6806,9 +8348,9 @@ async def sync_heartbeat_cache_to_db():
 @worker_router.post("/job_started")
 async def job_started(
     request: Request,
-    payload: JobStartedRequest,
-    _: bool = Depends(require_worker_signature),
+    payload_dict: Dict[str, Any] = Depends(require_worker_signed_payload),
 ):
+    payload = JobStartedRequest.model_validate(payload_dict)
     """
     Job started notification from worker.
     
@@ -6870,11 +8412,11 @@ async def job_started(
 
 @worker_router.post("/job_complete")
 async def job_complete(
-    request: Request,
-    payload: JobCompleteRequest,
     background_tasks: BackgroundTasks,
-    _: bool = Depends(require_worker_signature),
+    request: Request,
+    payload_dict: Dict[str, Any] = Depends(require_worker_signed_payload),
 ):
+    payload = JobCompleteRequest.model_validate(payload_dict)
     """
     Job completion notification from worker.
     
@@ -6925,6 +8467,16 @@ async def job_complete(
             worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
             if worker:
                 pod_uuid = worker.container_id
+            try:
+                existing = _heartbeat_cache.get(worker_id)
+                _heartbeat_cache[worker_id] = {
+                    "last_heartbeat": utc_naive_now(),
+                    "status": existing.get("status") if existing else None,
+                    "metrics": existing.get("metrics") if existing else None,
+                    "needs_sync": True,
+                }
+            except Exception:
+                pass
         
         if payload.failed:
             # Chain started_at to the next job the worker will process (even on failure)
@@ -7320,6 +8872,17 @@ async def job_complete(
                 background_tasks.add_task(
                     cleanup_input_r2_keys, job_id, input_r2_keys, batch_id_for_cleanup
                 )
+
+        if (
+            not payload.next_job_id
+            and pod_uuid
+            and _pod_manager
+        ):
+            background_tasks.add_task(
+                _pod_manager.maybe_release_external_pod_after_job,
+                pod_uuid,
+                worker_id,
+            )
         
         # Send FCM notification
         # CRITICAL: Only send notifications for jobs that are actually COMPLETED or FAILED
@@ -7328,6 +8891,18 @@ async def job_complete(
         
         # Refresh job to get the latest status from DB
         db.refresh(job)
+        if job.status == JobState.COMPLETED.value:
+            try:
+                _learn_dynamic_eta_from_completed_job(db, job, payload.metrics)
+                db.commit()
+            except Exception as e:
+                logger.warning(
+                    f"dynamic_eta update skipped for job {job_id} model={job.model}: {e}"
+                )
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
         
         fcm_token = job.fcm_token
         job_status = job.status
@@ -7771,6 +9346,149 @@ async def _requeue_jobs_after_pod_failure(job_ids: list, model: str):
 # =============================================================================
 
 
+@admin_router.get("/personal")
+async def admin_list_personal(auth: Dict = Depends(require_any_auth)):
+    import personal_queue
+
+    db = SessionLocal()
+    try:
+        items = personal_queue.list_items(db)
+        return {"items": [i.to_dict() for i in items]}
+    finally:
+        db.close()
+
+
+@admin_router.get("/personal/models")
+async def admin_personal_models(auth: Dict = Depends(require_any_auth)):
+    import personal_queue
+
+    return {"models": personal_queue.leftover_models()}
+
+
+@admin_router.post("/personal")
+async def admin_add_personal(request: Request, auth: Dict = Depends(require_any_auth)):
+    import personal_queue
+
+    body = await request.json()
+    model = (body.get("model") or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+    db = SessionLocal()
+    try:
+        item = personal_queue.add_item(
+            db,
+            prompt=body.get("prompt") or "",
+            params=body.get("params") or {},
+            model=model,
+        )
+        return item.to_dict()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        db.close()
+
+
+@admin_router.post("/personal/reorder")
+async def admin_reorder_personal(request: Request, auth: Dict = Depends(require_any_auth)):
+    import personal_queue
+
+    body = await request.json()
+    ids = body.get("ids") or []
+    db = SessionLocal()
+    try:
+        personal_queue.reorder(db, ids)
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+@admin_router.delete("/personal/{item_id}")
+async def admin_delete_personal(item_id: str, auth: Dict = Depends(require_any_auth)):
+    import personal_queue
+
+    db = SessionLocal()
+    try:
+        ok = personal_queue.delete_item(db, item_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Not found")
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+@worker_router.post("/personal/pull")
+async def worker_personal_pull(payload_dict: Dict[str, Any] = Depends(require_worker_signed_payload)):
+    import personal_queue
+
+    db = SessionLocal()
+    try:
+        item = personal_queue.pull_next(
+            db,
+            worker_id=payload_dict.get("worker_id"),
+            models=payload_dict.get("models"),
+            model=payload_dict.get("model"),
+        )
+        if not item:
+            return {"item": None}
+        ext = personal_queue.result_extension(item.model)
+        result_key = f"personal/{item.model}/{item.id}{ext}"
+        upload_url = create_presigned_put_url(result_key) or ""
+        data = item.to_dict()
+        data["job_id"] = f"personal-{item.id}"
+        data["upload_url"] = upload_url
+        data["result_key"] = result_key
+        return {"item": data}
+    finally:
+        db.close()
+
+
+@worker_router.post("/personal/complete")
+async def worker_personal_complete(
+    background_tasks: BackgroundTasks,
+    payload_dict: Dict[str, Any] = Depends(require_worker_signed_payload),
+):
+    import personal_queue
+
+    db = SessionLocal()
+    try:
+        status = payload_dict.get("status") or ("done" if payload_dict.get("result_r2_key") else "failed")
+        item = personal_queue.complete_item(
+            db,
+            payload_dict.get("item_id"),
+            status=status,
+            result_r2_key=payload_dict.get("result_r2_key"),
+            error=payload_dict.get("error"),
+        )
+        if not item:
+            raise HTTPException(status_code=404, detail="Not found")
+        worker_id = payload_dict.get("worker_id")
+        if worker_id and _pod_manager:
+            worker = db.query(Worker).filter(Worker.worker_id == worker_id).first()
+            if worker and worker.container_id:
+                background_tasks.add_task(
+                    _pod_manager.maybe_release_external_pod_after_job,
+                    worker.container_id,
+                    worker_id,
+                )
+        return item.to_dict()
+    finally:
+        db.close()
+
+
+@worker_router.post("/personal/pause")
+async def worker_personal_pause(payload_dict: Dict[str, Any] = Depends(require_worker_signed_payload)):
+    import personal_queue
+
+    db = SessionLocal()
+    try:
+        item = personal_queue.pause_item(db, payload_dict.get("item_id"))
+        if not item:
+            raise HTTPException(status_code=404, detail="Not found")
+        return item.to_dict()
+    finally:
+        db.close()
+
+
 @admin_router.get("/workers")
 async def list_workers(
     status: Optional[str] = None,
@@ -7986,5 +9704,142 @@ async def get_cost_by_model_endpoint(
         
         breakdown = get_cost_by_model(db, start, end)
         return {"models": breakdown}
+    finally:
+        db.close()
+
+
+@admin_router.get("/scheduler/status")
+async def get_scheduler_status(
+    auth: Dict = Depends(require_any_auth),
+):
+    """
+    Scheduler/fleet runtime status for rollout monitoring.
+    """
+    from config import get_config
+    cfg = get_config()
+
+    scheduler_mode = cfg.scheduler.mode.value if getattr(cfg, "scheduler", None) else "unknown"
+    shadow_mode = bool(getattr(getattr(cfg, "scheduler", None), "shadow_mode", False))
+    scheduler_flags = {
+        "dynamic_eta_enabled": bool(
+            getattr(getattr(cfg, "scheduler", None), "dynamic_eta_enabled", False)
+        ),
+        "dynamic_eta_observe_only": bool(
+            getattr(getattr(cfg, "scheduler", None), "dynamic_eta_observe_only", True)
+        ),
+        "dynamic_eta_min_samples": int(
+            getattr(getattr(cfg, "scheduler", None), "dynamic_eta_min_samples", 5)
+        ),
+        "dynamic_eta_alpha": float(
+            getattr(getattr(cfg, "scheduler", None), "dynamic_eta_alpha", 0.2)
+        ),
+        "dynamic_eta_allowed_groups": sorted(
+            list(getattr(getattr(cfg, "scheduler", None), "dynamic_eta_allowed_groups", set()) or set())
+        ),
+        "soft_governor_enabled": bool(
+            getattr(getattr(cfg, "scheduler", None), "soft_governor_enabled", False)
+        ),
+        "soft_governor_ops_window_seconds": int(
+            getattr(getattr(cfg, "scheduler", None), "soft_governor_ops_window_seconds", 3600)
+        ),
+        "soft_governor_ops_threshold": int(
+            getattr(getattr(cfg, "scheduler", None), "soft_governor_ops_threshold", 80)
+        ),
+        "pending_model_grace_enabled": bool(
+            getattr(getattr(cfg, "scheduler", None), "pending_model_grace_enabled", True)
+        ),
+        "pending_model_max_wait_seconds": int(
+            getattr(getattr(cfg, "scheduler", None), "pending_model_max_wait_seconds", 20)
+        ),
+        "pending_model_poll_interval_ms": int(
+            getattr(getattr(cfg, "scheduler", None), "pending_model_poll_interval_ms", 500)
+        ),
+        "pending_model_hint_timeout_seconds": int(
+            getattr(getattr(cfg, "scheduler", None), "pending_model_hint_timeout_seconds", 3)
+        ),
+    }
+
+    fleet_snapshot = None
+    if _pod_manager and hasattr(_pod_manager, "get_fixed_fleet_snapshot"):
+        try:
+            fleet_snapshot = await _pod_manager.get_fixed_fleet_snapshot()
+        except Exception as e:
+            fleet_snapshot = {"error": str(e)}
+
+    return {
+        "scheduler_mode": scheduler_mode,
+        "scheduler_shadow_mode": shadow_mode,
+        "scheduler_flags": scheduler_flags,
+        "fixed_fleet": fleet_snapshot,
+    }
+
+
+@admin_router.get("/sales/status")
+async def get_sales_status(
+    auth: Dict = Depends(require_any_auth),
+):
+    """
+    Current sale-window status for pricing validation.
+    """
+    from credit_service import get_active_sale_window_info
+    return get_active_sale_window_info()
+
+
+@admin_router.get("/sales/schedule_today")
+async def get_sales_schedule_today(
+    auth: Dict = Depends(require_any_auth),
+):
+    """
+    Today's deterministic discount schedule and active window info.
+    """
+    from credit_service import get_today_sale_schedule_info
+    return get_today_sale_schedule_info()
+
+
+@admin_router.get("/credit/metadata_status")
+async def get_credit_metadata_status(
+    limit: int = 50,
+    auth: Dict = Depends(require_any_auth),
+):
+    """
+    Quick audit for credit transaction metadata persistence health.
+    """
+    db = SessionLocal()
+    try:
+        limit = max(1, min(200, int(limit)))
+        rows = (
+            db.query(CreditTransaction)
+            .order_by(CreditTransaction.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        total = len(rows)
+        with_meta = 0
+        sale_tagged = 0
+        sample = []
+        for tx in rows:
+            has_meta = bool(getattr(tx, "credit_metadata", None))
+            if has_meta:
+                with_meta += 1
+                md = tx.credit_metadata if isinstance(tx.credit_metadata, dict) else {}
+                pricing = md.get("pricing", {}) if isinstance(md.get("pricing"), dict) else {}
+                if pricing.get("sale_active") is True:
+                    sale_tagged += 1
+            sample.append(
+                {
+                    "id": tx.id,
+                    "reason": tx.reason,
+                    "delta": tx.delta,
+                    "has_metadata": has_meta,
+                    "created_at": tx.created_at.isoformat() if tx.created_at else None,
+                }
+            )
+        return {
+            "checked": total,
+            "with_metadata": with_meta,
+            "without_metadata": total - with_meta,
+            "sale_tagged": sale_tagged,
+            "sample": sample[:20],
+        }
     finally:
         db.close()

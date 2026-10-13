@@ -1,0 +1,318 @@
+{
+  "created_at_utc": "2026-04-12T19:47:36.854663+00:00",
+  "script": "inference_sdnq_space_parity.py",
+  "base_params": {
+    "duration_seconds": 10.0,
+    "guidance_scale": 1.0,
+    "guidance_scale_2": 1.0,
+    "flow_shift": 3.0,
+    "video_quality": 9,
+    "frame_multiplier": 32,
+    "resize_mode": "area480",
+    "seed": 42
+  },
+  "schedulers": [
+    "DPMSolverMultistep",
+    "DPMSolverSinglestep",
+    "FlowMatchEulerDiscrete",
+    "UniPCMultistep"
+  ],
+  "step_counts": [
+    6
+  ],
+  "bench_cases": [
+    {
+      "image_id": "h1",
+      "image_file": "h1.jpeg",
+      "has_fallback_url": false,
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency."
+    },
+    {
+      "image_id": "h2",
+      "image_file": "h2.jpeg",
+      "has_fallback_url": false,
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency."
+    },
+    {
+      "image_id": "h3",
+      "image_file": "h3.jpeg",
+      "has_fallback_url": false,
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency."
+    },
+    {
+      "image_id": "h4",
+      "image_file": "h4.jpeg",
+      "has_fallback_url": false,
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency."
+    },
+    {
+      "image_id": "h5",
+      "image_file": "h5.jpeg",
+      "has_fallback_url": false,
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency."
+    }
+  ],
+  "runs": [
+    {
+      "image_id": "h1",
+      "image_file": "h1.jpeg",
+      "image_source": "/work_space/h1.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h1_DPMSolverMultistep_6steps",
+      "scheduler": "DPMSolverMultistep",
+      "num_inference_steps": 6,
+      "wall_seconds": 325.744,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h1_DPMSolverMultistep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h1",
+      "image_file": "h1.jpeg",
+      "image_source": "/work_space/h1.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h1_DPMSolverSinglestep_6steps",
+      "scheduler": "DPMSolverSinglestep",
+      "num_inference_steps": 6,
+      "wall_seconds": 316.631,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h1_DPMSolverSinglestep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h1",
+      "image_file": "h1.jpeg",
+      "image_source": "/work_space/h1.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h1_FlowMatchEulerDiscrete_6steps",
+      "scheduler": "FlowMatchEulerDiscrete",
+      "num_inference_steps": 6,
+      "wall_seconds": 323.513,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h1_FlowMatchEulerDiscrete_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h1",
+      "image_file": "h1.jpeg",
+      "image_source": "/work_space/h1.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h1_UniPCMultistep_6steps",
+      "scheduler": "UniPCMultistep",
+      "num_inference_steps": 6,
+      "wall_seconds": 356.167,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h1_UniPCMultistep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h2",
+      "image_file": "h2.jpeg",
+      "image_source": "/work_space/h2.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h2_DPMSolverMultistep_6steps",
+      "scheduler": "DPMSolverMultistep",
+      "num_inference_steps": 6,
+      "wall_seconds": 594.375,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h2_DPMSolverMultistep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h2",
+      "image_file": "h2.jpeg",
+      "image_source": "/work_space/h2.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h2_DPMSolverSinglestep_6steps",
+      "scheduler": "DPMSolverSinglestep",
+      "num_inference_steps": 6,
+      "wall_seconds": 1047.316,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h2_DPMSolverSinglestep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h2",
+      "image_file": "h2.jpeg",
+      "image_source": "/work_space/h2.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h2_FlowMatchEulerDiscrete_6steps",
+      "scheduler": "FlowMatchEulerDiscrete",
+      "num_inference_steps": 6,
+      "wall_seconds": 714.325,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h2_FlowMatchEulerDiscrete_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h2",
+      "image_file": "h2.jpeg",
+      "image_source": "/work_space/h2.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h2_UniPCMultistep_6steps",
+      "scheduler": "UniPCMultistep",
+      "num_inference_steps": 6,
+      "wall_seconds": 306.532,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h2_UniPCMultistep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h3",
+      "image_file": "h3.jpeg",
+      "image_source": "/work_space/h3.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h3_DPMSolverMultistep_6steps",
+      "scheduler": "DPMSolverMultistep",
+      "num_inference_steps": 6,
+      "wall_seconds": 251.983,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h3_DPMSolverMultistep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h3",
+      "image_file": "h3.jpeg",
+      "image_source": "/work_space/h3.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h3_DPMSolverSinglestep_6steps",
+      "scheduler": "DPMSolverSinglestep",
+      "num_inference_steps": 6,
+      "wall_seconds": 247.402,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h3_DPMSolverSinglestep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h3",
+      "image_file": "h3.jpeg",
+      "image_source": "/work_space/h3.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h3_FlowMatchEulerDiscrete_6steps",
+      "scheduler": "FlowMatchEulerDiscrete",
+      "num_inference_steps": 6,
+      "wall_seconds": 252.537,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h3_FlowMatchEulerDiscrete_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h3",
+      "image_file": "h3.jpeg",
+      "image_source": "/work_space/h3.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h3_UniPCMultistep_6steps",
+      "scheduler": "UniPCMultistep",
+      "num_inference_steps": 6,
+      "wall_seconds": 273.281,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h3_UniPCMultistep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h4",
+      "image_file": "h4.jpeg",
+      "image_source": "/work_space/h4.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h4_DPMSolverMultistep_6steps",
+      "scheduler": "DPMSolverMultistep",
+      "num_inference_steps": 6,
+      "wall_seconds": 263.055,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h4_DPMSolverMultistep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h4",
+      "image_file": "h4.jpeg",
+      "image_source": "/work_space/h4.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h4_DPMSolverSinglestep_6steps",
+      "scheduler": "DPMSolverSinglestep",
+      "num_inference_steps": 6,
+      "wall_seconds": 245.207,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h4_DPMSolverSinglestep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h4",
+      "image_file": "h4.jpeg",
+      "image_source": "/work_space/h4.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h4_FlowMatchEulerDiscrete_6steps",
+      "scheduler": "FlowMatchEulerDiscrete",
+      "num_inference_steps": 6,
+      "wall_seconds": 240.133,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h4_FlowMatchEulerDiscrete_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h4",
+      "image_file": "h4.jpeg",
+      "image_source": "/work_space/h4.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h4_UniPCMultistep_6steps",
+      "scheduler": "UniPCMultistep",
+      "num_inference_steps": 6,
+      "wall_seconds": 239.058,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h4_UniPCMultistep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h5",
+      "image_file": "h5.jpeg",
+      "image_source": "/work_space/h5.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h5_DPMSolverMultistep_6steps",
+      "scheduler": "DPMSolverMultistep",
+      "num_inference_steps": 6,
+      "wall_seconds": 240.652,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h5_DPMSolverMultistep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h5",
+      "image_file": "h5.jpeg",
+      "image_source": "/work_space/h5.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h5_DPMSolverSinglestep_6steps",
+      "scheduler": "DPMSolverSinglestep",
+      "num_inference_steps": 6,
+      "wall_seconds": 273.755,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h5_DPMSolverSinglestep_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h5",
+      "image_file": "h5.jpeg",
+      "image_source": "/work_space/h5.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h5_FlowMatchEulerDiscrete_6steps",
+      "scheduler": "FlowMatchEulerDiscrete",
+      "num_inference_steps": 6,
+      "wall_seconds": 269.213,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h5_FlowMatchEulerDiscrete_6steps.mp4",
+      "error": null
+    },
+    {
+      "image_id": "h5",
+      "image_file": "h5.jpeg",
+      "image_source": "/work_space/h5.jpeg",
+      "prompt": "Starting EXACTLY from the input image: the woman slowly removes her top and bra to become fully nude, exposing her large breasts and body. She then seductively and firmly squeezes her own breasts with both hands — pressing them tightly together, lifting them upward, creating deep cleavage, fingers digging into the soft flesh, thumbs teasing erect nipples, with realistic bouncing and jiggle.\n\n    FACE MUST NOT CHANGE AT ALL: Her face is 100% identical to the input image for every single frame — exact facial identity, exact same facial features, exact eyes, exact expression, exact head position and angle locked perfectly with zero change, zero drift, and zero morphing. The face in the video must look exactly like the face in the input image from start to finish.\n\n    Camera is completely static — no zoom, no push in, no camera movement of any kind. Exact same framing, exact same distance, and exact same perspective locked throughout the entire clip. Only clothes disappear and arms move from their starting position to actively press and squeeze the breasts. Photorealistic, cinematic lighting, natural skin texture and breast physics, smooth motion, high consistency.",
+      "job_id": "bench_h5_UniPCMultistep_6steps",
+      "scheduler": "UniPCMultistep",
+      "num_inference_steps": 6,
+      "wall_seconds": 253.984,
+      "success": true,
+      "output_path": "/workspace/wan_i2v_bench_h5_UniPCMultistep_6steps.mp4",
+      "error": null
+    }
+  ],
+  "run_count": 20
+}

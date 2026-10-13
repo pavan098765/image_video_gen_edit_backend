@@ -75,12 +75,9 @@ def write_rest(f):
         "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/"
         "flash_attn-2.7.3+cu12torch2.8cxx11abiFALSE-cp311-cp311-linux_x86_64.whl\n"
     )
-    # Install git (required for git+ dependencies in requirements.txt)
-    # Then install requirements, then remove git to keep image size down
-    f.write("# Install git for git+ dependencies, then install requirements\n")
+    f.write("# git kept installed (git+ deps, RIFE clone, etc.)\n")
     f.write("RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client \\\n")
     f.write("    && pip install --no-cache-dir -r /app/worker/src/requirements.txt \\\n")
-    f.write("    && apt-get purge -y git \\\n")
     f.write("    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*\n\n")
 
 

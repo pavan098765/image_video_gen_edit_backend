@@ -26,15 +26,17 @@ def download_swin2sr_all():
             continue
 
         print(f"⬇️ Downloading {repo_id} into {local_dir} ...")
-        snapshot_download(
-            repo_id=repo_id,
-            local_dir=local_dir,
-            local_dir_use_symlinks=False,
-            token="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",
-            resume_download=True,
-            ignore_patterns=["pytorch_model.bin"]
-
-        )
+        dl_kwargs = {
+            "repo_id": repo_id,
+            "local_dir": local_dir,
+            "local_dir_use_symlinks": False,
+            "resume_download": True,
+            "ignore_patterns": ["pytorch_model.bin"],
+        }
+        tok = os.getenv("HF_TOKEN", "").strip()
+        if tok:
+            dl_kwargs["token"] = tok
+        snapshot_download(**dl_kwargs)
         print(f"✅ {name} ready at {local_dir}")
 
 

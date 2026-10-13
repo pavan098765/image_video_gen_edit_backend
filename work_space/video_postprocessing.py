@@ -289,7 +289,16 @@ def upscale(upscale_model, tensor: torch.Tensor, inf_device, output_device="cpu"
 
 
 def frames_to_tensor(frames):
-    """Convert frames (numpy array, list of PIL, or list of numpy) to tensor format [f, c, h, w]."""
+    """Convert frames (numpy array, torch tensor, or PIL images) to tensor format [f, c, h, w] in [0, 1]."""
+    if isinstance(frames, torch.Tensor):
+        t = frames.float()
+        if t.dim() == 3:
+            t = t.unsqueeze(0)
+        if t.shape[1] != 3:
+            t = t.permute(0, 3, 1, 2)
+        if t.max() > 1.0:
+            t = t / 255.0
+        return t
     if isinstance(frames, np.ndarray):
         # Assume shape is [f, h, w, c] or [h, w, c]
         if len(frames.shape) == 3:
@@ -300,20 +309,19 @@ def frames_to_tensor(frames):
         if frames.dtype == np.uint8:
             frames = frames.astype(np.float32) / 255.0
         tensor = torch.from_numpy(frames).float()
-    elif isinstance(frames, list) and len(frames) > 0:
-        # List of PIL Images and/or numpy arrays (e.g. from stitch_clips with blend_at_join)
-        arrs = []
-        for f in frames:
-            a = np.asarray(f, dtype=np.float32)
-            if a.max() > 1.0:
-                a = a / 255.0
-            if len(a.shape) == 2:
-                a = np.stack([a] * 3, axis=-1)
-            elif a.shape[-1] == 4:
-                a = a[:, :, :3]
-            arrs.append(np.clip(a, 0, 1))
-        frames_np = np.stack(arrs, axis=0)  # [f, h, w, c]
-        tensor = torch.from_numpy(np.transpose(frames_np, (0, 3, 1, 2))).float()  # [f, c, h, w]
+    elif isinstance(frames, list) and len(frames) > 0 and isinstance(frames[0], Image.Image):
+        # Convert PIL images to tensor
+        tensor_frames = []
+        for img in frames:
+            img_array = np.array(img)
+            if len(img_array.shape) == 2:  # Grayscale
+                img_array = np.stack([img_array] * 3, axis=-1)
+            if img_array.shape[2] == 4:  # RGBA
+                img_array = img_array[:, :, :3]
+            img_array = img_array.astype(np.float32) / 255.0
+            img_tensor = torch.from_numpy(np.transpose(img_array, (2, 0, 1)))  # [c, h, w]
+            tensor_frames.append(img_tensor)
+        tensor = torch.stack(tensor_frames)  # [f, c, h, w]
     else:
         raise ValueError(f"Unsupported frame format: {type(frames)}")
     
@@ -380,38 +388,40 @@ def download_rife_model(models_dir):
 
 
 def download_realesrgan_model(models_dir, upscale_factor=4):
-    """Download Real-ESRGAN model locally.
-    
-    Args:
-        models_dir: Directory to save models
-        upscale_factor: Upscale factor (2, 4, or 8)
-    
-    Returns:
-        Path to downloaded model file or None if failed
+    """Download Real-ESRGAN model locally (rockapaper/realesrgan x2plus/x4plus).
+
+    Video postprocess uses the same weight files as omni image bake (not ai-forever names).
     """
-    if upscale_factor not in [2, 4, 8]:
+    try:
+        u = int(upscale_factor)
+    except (TypeError, ValueError):
+        u = 4
+    if u not in (2, 4, 8):
         print(f"⚠️  Invalid upscale factor {upscale_factor}, must be 2, 4, or 8. Using 4x.")
-        upscale_factor = 4
-    
+        u = 4
+
     realesrgan_dir = os.path.join(models_dir, "realesrgan")
     os.makedirs(realesrgan_dir, exist_ok=True)
-    
-    model_filename = f"RealESRGAN_x{upscale_factor}.pth"
+
+    repo_id = os.environ.get("REALESRGAN_HF_REPO", "rockapaper/realesrgan")
+    model_filename = (
+        "RealESRGAN_x2plus.pth" if u <= 2 else "RealESRGAN_x4plus.pth"
+    )
     model_file = os.path.join(realesrgan_dir, model_filename)
-    
+
     if os.path.exists(model_file):
         print(f"✓ Real-ESRGAN model already exists at {model_file}")
         return model_file
-    
-    print(f"⬇️ Downloading Real-ESRGAN {upscale_factor}x model to {realesrgan_dir}...")
-    
+
+    print(f"⬇️ Downloading {repo_id} / {model_filename} → {realesrgan_dir} …")
+
     try:
         hf_hub_download(
-            repo_id="ai-forever/Real-ESRGAN",
+            repo_id=repo_id,
             filename=model_filename,
             local_dir=realesrgan_dir,
         )
-        print(f"✓ Real-ESRGAN {upscale_factor}x model downloaded successfully")
+        print(f"✓ Real-ESRGAN ({model_filename}) downloaded successfully")
         return model_file
     except Exception as e:
         print(f"❌ Failed to download Real-ESRGAN model: {e}")
@@ -509,7 +519,7 @@ def calculate_rife_exp(original_fps, target_fps):
     return exp, actual_fps
 
 
-def apply_rife_interpolation(model, frames, device="cuda", original_fps=16, target_fps=None):
+def apply_rife_interpolation(model, frames, device="cuda", original_fps=16, target_fps=None, force_target_fps=True):
     """Apply RIFE frame interpolation to frames (numpy array).
     
     Args:
@@ -518,6 +528,8 @@ def apply_rife_interpolation(model, frames, device="cuda", original_fps=16, targ
         device: Device to run on
         original_fps: Original frame rate
         target_fps: Target frame rate (if None, doubles the FPS)
+        force_target_fps: If True, resample to exact target_fps when RIFE overshoots (e.g. 96->60).
+                         If False, keep RIFE output FPS (e.g. 96 when target was 60).
     
     Returns:
         Interpolated frames (numpy array [f, h, w, c]), actual_fps
@@ -565,6 +577,22 @@ def apply_rife_interpolation(model, frames, device="cuda", original_fps=16, targ
         pt_image = pt_image.clamp(0, 1)  # Ensure [0, 1] range
         image_np = VaeImageProcessor.pt_to_numpy(pt_image)  # [f, h, w, c]
         
+        # RIFE only does 2x/4x/8x; if we overshot target_fps and force_target_fps, resample to exact target
+        # Use temporal blending (not nearest-frame) to avoid judder and preserve smoothness
+        if force_target_fps and target_fps is not None and actual_fps > target_fps:
+            num_f = image_np.shape[0]
+            duration_sec = num_f / actual_fps
+            target_num_f = max(1, int(round(duration_sec * target_fps)))
+            out = np.empty((target_num_f,) + image_np.shape[1:], dtype=image_np.dtype)
+            for i in range(target_num_f):
+                src_idx = (i + 0.5) * actual_fps / target_fps
+                src_idx = min(src_idx, num_f - 1.001)
+                low = int(np.floor(src_idx))
+                high = min(low + 1, num_f - 1)
+                w = src_idx - low
+                out[i] = (1.0 - w) * image_np[low] + w * image_np[high]
+            image_np = out
+            actual_fps = target_fps
         return image_np, actual_fps
     except Exception as e:
         print(f"⚠️  RIFE interpolation failed: {e}")
@@ -621,548 +649,3 @@ def apply_realesrgan_upscaling(model, frames, device="cuda"):
         import traceback
         traceback.print_exc()
         return frames
-
-
-# ============================================================================
-# Function-based API for video post-processing
-# ============================================================================
-def upscale_and_interpolate(
-    input_video: str,
-    output_video: str = None,
-    enable_rife: bool = False,
-    rife_target_fps: int = None,
-    enable_upscale: bool = False,
-    upscale_factor: int = 2,
-    device: str = None,
-    models_dir: str = None,
-    interpolate_first: bool = False,
-    verbose: bool = True,
-) -> str:
-    """
-    Process video with RIFE frame interpolation and/or Real-ESRGAN upscaling.
-    
-    Args:
-        input_video: Path to input video file
-        output_video: Path to output video file (default: input_video with _processed suffix)
-        enable_rife: Enable RIFE frame interpolation
-        rife_target_fps: Target FPS for RIFE (None = double original FPS)
-        enable_upscale: Enable Real-ESRGAN upscaling
-        upscale_factor: Upscale factor: 2, 4, or 8 (default: 2)
-        device: Device to use: "cuda" or "cpu" (default: "cuda" if available, else "cpu")
-        models_dir: Directory for models (default: ./models relative to script)
-        interpolate_first: If True, interpolate first then upscale (may cause errors).
-                          If False, upscale first then interpolate (default, more stable)
-        verbose: Print progress messages (default: True)
-    
-    Returns:
-        Path to output video file
-    
-    Example:
-        # Upscale only
-        output = upscale_and_interpolate(
-            "input.mp4",
-            enable_upscale=True,
-            upscale_factor=2
-        )
-        
-        # RIFE interpolation only
-        output = upscale_and_interpolate(
-            "input.mp4",
-            enable_rife=True,
-            rife_target_fps=30
-        )
-        
-        # Both (upscale first, then interpolate)
-        output = upscale_and_interpolate(
-            "input.mp4",
-            enable_upscale=True,
-            enable_rife=True,
-            upscale_factor=2,
-            rife_target_fps=30
-        )
-    """
-    import cv2
-    from diffusers.utils import export_to_video
-    from PIL import Image
-    
-    # Set defaults
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    if models_dir is None:
-        models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-    
-    if output_video is None:
-        base_name = os.path.splitext(input_video)[0]
-        ext = os.path.splitext(input_video)[1]
-        output_video = f"{base_name}_processed{ext}"
-    
-    if verbose:
-        print("="*60)
-        print("Video Post-Processing")
-        print("="*60)
-        print(f"Input video: {input_video}")
-        print(f"Output video: {output_video}")
-        print(f"Device: {device}")
-        print(f"Models directory: {models_dir}")
-        print(f"\nOptions:")
-        print(f"  RIFE interpolation: {'✓' if enable_rife else '✗'}")
-        if enable_rife:
-            target_fps_str = f"{rife_target_fps}fps" if rife_target_fps else "double original FPS"
-            print(f"    Target FPS: {target_fps_str}")
-        print(f"  Real-ESRGAN upscaling: {'✓' if enable_upscale else '✗'}")
-        if enable_upscale:
-            print(f"    Upscale factor: {upscale_factor}x")
-        order_str = "Interpolate → Upscale" if interpolate_first else "Upscale → Interpolate"
-        print(f"  Processing order: {order_str}")
-        print("="*60)
-    
-    # Check input file exists
-    if not os.path.exists(input_video):
-        raise FileNotFoundError(f"Input video not found: {input_video}")
-    
-    # Load video frames
-    if verbose:
-        print(f"\n📹 Loading video: {input_video}")
-    cap = cv2.VideoCapture(input_video)
-    if not cap.isOpened():
-        raise ValueError(f"Could not open video file: {input_video}")
-    
-    original_fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    if verbose:
-        print(f"  Original resolution: {width}x{height}")
-        print(f"  Original FPS: {original_fps:.2f}")
-        print(f"  Total frames: {total_frames}")
-    
-    # Read all frames
-    frames = []
-    frame_count = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        # Convert BGR to RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(frame_rgb)
-        frame_count += 1
-        if verbose and frame_count % 10 == 0:
-            print(f"  Loaded {frame_count}/{total_frames} frames...", end='\r')
-    cap.release()
-    if verbose:
-        print(f"  ✓ Loaded {len(frames)} frames")
-    
-    # Convert to numpy array [f, h, w, c]
-    frames_np = np.array(frames, dtype=np.uint8)
-    
-    # Download and load models if needed
-    rife_model = None
-    upscale_model = None
-    
-    if enable_rife:
-        if not check_rife_code_available():
-            if verbose:
-                print("❌ RIFE code not available. Cannot enable RIFE interpolation.")
-            enable_rife = False
-        else:
-            rife_path = download_rife_model(models_dir)
-            if rife_path:
-                rife_model = load_rife_model(rife_path)
-                if not rife_model:
-                    if verbose:
-                        print("⚠️  RIFE model failed to load. Disabling RIFE interpolation.")
-                    enable_rife = False
-    
-    if enable_upscale:
-        realesrgan_path = download_realesrgan_model(models_dir, upscale_factor)
-        if realesrgan_path:
-            try:
-                upscale_model = load_sd_upscale(realesrgan_path, device)
-            except Exception as e:
-                if verbose:
-                    print(f"⚠️  Real-ESRGAN model failed to load: {str(e)[:100]}")
-                enable_upscale = False
-        else:
-            enable_upscale = False
-    
-    # Apply post-processing
-    final_fps = original_fps
-    final_output = frames_np
-    final_width = width
-    final_height = height
-    
-    if enable_rife or enable_upscale:
-        if verbose:
-            print(f"\n🎨 Applying post-processing...")
-        
-        if interpolate_first:
-            # Interpolate → Upscale
-            if verbose:
-                print(f"  📋 Processing order: Interpolate → Upscale")
-            
-            if enable_rife and rife_model:
-                if verbose:
-                    print(f"  🎬 Interpolating frames with RIFE...")
-                final_output, final_fps = apply_rife_interpolation(
-                    rife_model, final_output, device,
-                    original_fps=original_fps, target_fps=rife_target_fps
-                )
-                if verbose:
-                    print(f"  ✓ Frame interpolation completed (new FPS: {final_fps:.2f})")
-            
-            if enable_upscale and upscale_model:
-                if verbose:
-                    print(f"  🔍 Upscaling video with Real-ESRGAN ({upscale_factor}x)...")
-                final_output = apply_realesrgan_upscaling(upscale_model, final_output, device)
-                final_width = width * upscale_factor
-                final_height = height * upscale_factor
-                if verbose:
-                    print(f"  ✓ Upscaling completed (new resolution: {final_width}x{final_height})")
-        else:
-            # Upscale → Interpolate (default)
-            if verbose:
-                print(f"  📋 Processing order: Upscale → Interpolate")
-            
-            if enable_upscale and upscale_model:
-                if verbose:
-                    print(f"  🔍 Upscaling video with Real-ESRGAN ({upscale_factor}x)...")
-                final_output = apply_realesrgan_upscaling(upscale_model, final_output, device)
-                final_width = width * upscale_factor
-                final_height = height * upscale_factor
-                if verbose:
-                    print(f"  ✓ Upscaling completed (new resolution: {final_width}x{final_height})")
-            
-            if enable_rife and rife_model:
-                if verbose:
-                    print(f"  🎬 Interpolating frames with RIFE...")
-                final_output, final_fps = apply_rife_interpolation(
-                    rife_model, final_output, device,
-                    original_fps=original_fps, target_fps=rife_target_fps
-                )
-                if verbose:
-                    print(f"  ✓ Frame interpolation completed (new FPS: {final_fps:.2f})")
-    
-    # Export video
-    if verbose:
-        print(f"\n💾 Exporting video to {output_video}...")
-        print(f"  Resolution: {final_width}x{final_height}")
-        print(f"  FPS: {final_fps:.2f}")
-        print(f"  Frames: {len(final_output)}")
-    
-    # Convert numpy frames to PIL Images for export_to_video
-    pil_frames = [Image.fromarray(frame) for frame in final_output]
-    
-    export_to_video(pil_frames, output_video, fps=final_fps)
-    if verbose:
-        print(f"✓ Video exported successfully!")
-        print(f"  Output: {output_video}")
-        print("="*60)
-    
-    return output_video
-
-
-# ============================================================================
-# Command-line interface (optional wrapper)
-# ============================================================================
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(
-        description="Video post-processing: RIFE frame interpolation and Real-ESRGAN upscaling"
-    )
-    parser.add_argument(
-        "input_video",
-        type=str,
-        help="Path to input video file"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        type=str,
-        default=None,
-        help="Path to output video file (default: input_video with _processed suffix)"
-    )
-    parser.add_argument(
-        "--enable-rife",
-        action="store_true",
-        help="Enable RIFE frame interpolation"
-    )
-    parser.add_argument(
-        "--rife-target-fps",
-        type=int,
-        default=None,
-        help="Target FPS for RIFE (default: double original FPS)"
-    )
-    parser.add_argument(
-        "--enable-upscale",
-        action="store_true",
-        help="Enable Real-ESRGAN upscaling"
-    )
-    parser.add_argument(
-        "--upscale-factor",
-        type=int,
-        choices=[2, 4, 8],
-        default=2,
-        help="Upscale factor: 2, 4, or 8 (default: 2)"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to use (default: cuda if available, else cpu)"
-    )
-    parser.add_argument(
-        "--models-dir",
-        type=str,
-        default=None,
-        help="Directory for models (default: ./models)"
-    )
-    parser.add_argument(
-        "--order",
-        type=str,
-        choices=["upscale-first", "interpolate-first"],
-        default="upscale-first",
-        help="Processing order: 'upscale-first' (default, stable) or 'interpolate-first' (faster but may cause errors)"
-    )
-    
-    args = parser.parse_args()
-    
-    try:
-        output_path = upscale_and_interpolate(
-            input_video=args.input_video,
-            output_video=args.output,
-            enable_rife=args.enable_rife,
-            rife_target_fps=args.rife_target_fps,
-            enable_upscale=args.enable_upscale,
-            upscale_factor=args.upscale_factor,
-            device=args.device,
-            models_dir=args.models_dir,
-            interpolate_first=(args.order == "interpolate-first"),
-            verbose=True,
-        )
-        print(f"\n✅ Success! Output video: {output_path}")
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
-    import argparse
-    import cv2
-    from diffusers.utils import export_to_video
-    
-    parser = argparse.ArgumentParser(
-        description="Video post-processing: RIFE frame interpolation and Real-ESRGAN upscaling"
-    )
-    parser.add_argument(
-        "input_video",
-        type=str,
-        help="Path to input video file"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        type=str,
-        default=None,
-        help="Path to output video file (default: input_video with _processed suffix)"
-    )
-    parser.add_argument(
-        "--enable-rife",
-        action="store_true",
-        help="Enable RIFE frame interpolation"
-    )
-    parser.add_argument(
-        "--rife-target-fps",
-        type=int,
-        default=None,
-        help="Target FPS for RIFE (default: double original FPS)"
-    )
-    parser.add_argument(
-        "--enable-upscale",
-        action="store_true",
-        help="Enable Real-ESRGAN upscaling"
-    )
-    parser.add_argument(
-        "--upscale-factor",
-        type=int,
-        choices=[2, 4, 8],
-        default=2,
-        help="Upscale factor: 2, 4, or 8 (default: 2)"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to use (default: cuda if available, else cpu)"
-    )
-    parser.add_argument(
-        "--models-dir",
-        type=str,
-        default=None,
-        help="Directory for models (default: ./models)"
-    )
-    parser.add_argument(
-        "--order",
-        type=str,
-        choices=["upscale-first", "interpolate-first"],
-        default="upscale-first",
-        help="Processing order: 'upscale-first' (default, stable) or 'interpolate-first' (faster but may cause errors)"
-    )
-    
-    args = parser.parse_args()
-    
-    # Determine output path
-    if args.output is None:
-        base_name = os.path.splitext(args.input_video)[0]
-        ext = os.path.splitext(args.input_video)[1]
-        args.output = f"{base_name}_processed{ext}"
-    
-    # Set models directory
-    if args.models_dir is None:
-        args.models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-    
-    print("="*60)
-    print("Video Post-Processing Standalone Tool")
-    print("="*60)
-    print(f"Input video: {args.input_video}")
-    print(f"Output video: {args.output}")
-    print(f"Device: {args.device}")
-    print(f"Models directory: {args.models_dir}")
-    print(f"\nOptions:")
-    print(f"  RIFE interpolation: {'✓' if args.enable_rife else '✗'}")
-    if args.enable_rife:
-        target_fps_str = f"{args.rife_target_fps}fps" if args.rife_target_fps else "double original FPS"
-        print(f"    Target FPS: {target_fps_str}")
-    print(f"  Real-ESRGAN upscaling: {'✓' if args.enable_upscale else '✗'}")
-    if args.enable_upscale:
-        print(f"    Upscale factor: {args.upscale_factor}x")
-    print(f"  Processing order: {args.order}")
-    print("="*60)
-    
-    # Check input file exists
-    if not os.path.exists(args.input_video):
-        print(f"❌ Error: Input video not found: {args.input_video}")
-        exit(1)
-    
-    # Load video frames
-    print(f"\n📹 Loading video: {args.input_video}")
-    cap = cv2.VideoCapture(args.input_video)
-    if not cap.isOpened():
-        print(f"❌ Error: Could not open video file: {args.input_video}")
-        exit(1)
-    
-    original_fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    print(f"  Original resolution: {width}x{height}")
-    print(f"  Original FPS: {original_fps:.2f}")
-    print(f"  Total frames: {total_frames}")
-    
-    # Read all frames
-    frames = []
-    frame_count = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        # Convert BGR to RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(frame_rgb)
-        frame_count += 1
-        if frame_count % 10 == 0:
-            print(f"  Loaded {frame_count}/{total_frames} frames...", end='\r')
-    cap.release()
-    print(f"  ✓ Loaded {len(frames)} frames")
-    
-    # Convert to numpy array [f, h, w, c]
-    frames_np = np.array(frames, dtype=np.uint8)
-    
-    # Download and load models if needed
-    rife_model = None
-    upscale_model = None
-    
-    if args.enable_rife:
-        if not check_rife_code_available():
-            print("❌ RIFE code not available. Cannot enable RIFE interpolation.")
-            args.enable_rife = False
-        else:
-            rife_path = download_rife_model(args.models_dir)
-            if rife_path:
-                rife_model = load_rife_model(rife_path)
-                if not rife_model:
-                    print("⚠️  RIFE model failed to load. Disabling RIFE interpolation.")
-                    args.enable_rife = False
-    
-    if args.enable_upscale:
-        realesrgan_path = download_realesrgan_model(args.models_dir, args.upscale_factor)
-        if realesrgan_path:
-            try:
-                upscale_model = load_sd_upscale(realesrgan_path, args.device)
-            except Exception as e:
-                print(f"⚠️  Real-ESRGAN model failed to load: {str(e)[:100]}")
-                args.enable_upscale = False
-        else:
-            args.enable_upscale = False
-    
-    # Apply post-processing
-    final_fps = original_fps
-    final_output = frames_np
-    final_width = width
-    final_height = height
-    
-    if args.enable_rife or args.enable_upscale:
-        print(f"\n🎨 Applying post-processing...")
-        
-        if args.order == "interpolate-first":
-            # Interpolate → Upscale
-            print(f"  📋 Processing order: Interpolate → Upscale")
-            
-            if args.enable_rife and rife_model:
-                print(f"  🎬 Interpolating frames with RIFE...")
-                final_output, final_fps = apply_rife_interpolation(
-                    rife_model, final_output, args.device,
-                    original_fps=original_fps, target_fps=args.rife_target_fps
-                )
-                print(f"  ✓ Frame interpolation completed (new FPS: {final_fps:.2f})")
-            
-            if args.enable_upscale and upscale_model:
-                print(f"  🔍 Upscaling video with Real-ESRGAN ({args.upscale_factor}x)...")
-                final_output = apply_realesrgan_upscaling(upscale_model, final_output, args.device)
-                final_width = width * args.upscale_factor
-                final_height = height * args.upscale_factor
-                print(f"  ✓ Upscaling completed (new resolution: {final_width}x{final_height})")
-        else:
-            # Upscale → Interpolate (default)
-            print(f"  📋 Processing order: Upscale → Interpolate")
-            
-            if args.enable_upscale and upscale_model:
-                print(f"  🔍 Upscaling video with Real-ESRGAN ({args.upscale_factor}x)...")
-                final_output = apply_realesrgan_upscaling(upscale_model, final_output, args.device)
-                final_width = width * args.upscale_factor
-                final_height = height * args.upscale_factor
-                print(f"  ✓ Upscaling completed (new resolution: {final_width}x{final_height})")
-            
-            if args.enable_rife and rife_model:
-                print(f"  🎬 Interpolating frames with RIFE...")
-                final_output, final_fps = apply_rife_interpolation(
-                    rife_model, final_output, args.device,
-                    original_fps=original_fps, target_fps=args.rife_target_fps
-                )
-                print(f"  ✓ Frame interpolation completed (new FPS: {final_fps:.2f})")
-    
-    # Export video
-    print(f"\n💾 Exporting video to {args.output}...")
-    print(f"  Resolution: {final_width}x{final_height}")
-    print(f"  FPS: {final_fps:.2f}")
-    print(f"  Frames: {len(final_output)}")
-    
-    # Convert numpy frames to PIL Images for export_to_video
-    from PIL import Image
-    pil_frames = [Image.fromarray(frame) for frame in final_output]
-    
-    export_to_video(pil_frames, args.output, fps=final_fps)
-    print(f"✓ Video exported successfully!")
-    print(f"  Output: {args.output}")
-    print("="*60)

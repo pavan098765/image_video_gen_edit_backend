@@ -15,6 +15,7 @@ import random
 from io import BytesIO
 from typing import Dict, Any, List, Tuple, Optional
 from PIL import Image
+import httpx
 import torch
 import numpy as np
 
@@ -51,6 +52,16 @@ except ImportError:
 AIO_REPO_ID = "Pr0f3ssi0n4ln00b/Phr00t-Qwen-Rapid-AIO"
 DEFAULT_AIO_VERSION = "v19"
 QWEN_REPO = "Qwen/Qwen-Image-Edit-2511"
+
+
+def _qwen_omni_offline() -> bool:
+    """Omni Docker sets QWEN_2511_OFFLINE=1 — no Hub download for base/AIO/LoRA."""
+    return os.environ.get("QWEN_2511_OFFLINE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
 
 dtype = torch.bfloat16
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -213,6 +224,23 @@ ADAPTER_SPECS = {
     },
 }
 
+
+def _resolve_lora_spec_key(selected_lora: str) -> str:
+    """Resolve ADAPTER_SPECS dict key from either the public key or the internal adapter_name."""
+    if not selected_lora or selected_lora == NONE_LORA:
+        return selected_lora
+    if selected_lora in ADAPTER_SPECS:
+        return selected_lora
+    for key, spec in ADAPTER_SPECS.items():
+        if spec.get("type") == "package":
+            for part in spec.get("parts", []):
+                if part.get("adapter_name") == selected_lora:
+                    return key
+        elif spec.get("adapter_name") == selected_lora:
+            return key
+    return selected_lora
+
+
 # Track what is currently loaded in memory (adapter_name values)
 LOADED_ADAPTERS = set()
 
@@ -281,6 +309,11 @@ def get_pipeline(version: Optional[str] = None) -> QwenImageEditPlusPipeline:
             transformer_local_path,
             **load_kwargs
         )
+    elif _qwen_omni_offline():
+        raise RuntimeError(
+            f"QWEN_2511_OFFLINE: missing AIO transformer at {transformer_local_path}. "
+            "Bake Phr00t-Qwen-Rapid-AIO transformer into the image (see omni_prep_bake / prep_model)."
+        )
     else:
         sub = f"{aio_version}/transformer"
         print(f"  Downloading from {AIO_REPO_ID} / {sub}")
@@ -307,6 +340,11 @@ def get_pipeline(version: Optional[str] = None) -> QwenImageEditPlusPipeline:
         pipeline = QwenImageEditPlusPipeline.from_pretrained(
             qwen_local_path,
             **pipeline_load_kwargs
+        )
+    elif _qwen_omni_offline():
+        raise RuntimeError(
+            f"QWEN_2511_OFFLINE: missing Qwen base at {qwen_local_path}. "
+            "Bake Qwen/Qwen-Image-Edit-2511 into the image (see omni_prep_bake / prep_model)."
         )
     else:
         print(f"  Downloading from {QWEN_REPO}")
@@ -453,19 +491,54 @@ def _load_image_from_base64(img_b64: str) -> Image.Image:
     return Image.open(BytesIO(base64.b64decode(img_b64))).convert("RGB")
 
 
+def _load_image_from_init_string(s: str) -> Image.Image:
+    """Presigned URL (R2), file:// or local path, data URL, or raw base64 — matches server_controller bulk dispatch."""
+    from urllib.parse import urlparse
+    from urllib.request import url2pathname
+
+    s = (s or "").strip()
+    if not s:
+        raise ValueError("empty image string")
+    if s.startswith(("http://", "https://")):
+        with httpx.Client(timeout=120.0, follow_redirects=True) as client:
+            resp = client.get(s)
+            resp.raise_for_status()
+        return Image.open(BytesIO(resp.content)).convert("RGB")
+    if s.startswith("file:"):
+        local_path = url2pathname(urlparse(s).path)
+        if not os.path.isfile(local_path):
+            raise FileNotFoundError(f"file URL path not found: {local_path!r}")
+        return Image.open(local_path).convert("RGB")
+    expanded = os.path.expandvars(os.path.expanduser(s))
+    if os.path.isfile(expanded):
+        return Image.open(expanded).convert("RGB")
+    if s.startswith("data:image"):
+        comma = s.find(",")
+        if comma < 0:
+            raise ValueError("invalid data:image URL")
+        b64 = s[comma + 1 :].strip()
+        return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+    return _load_image_from_base64(s)
+
+
 def _ensure_image_list(maybe_one_or_many) -> List[Image.Image]:
-    """Accept single base64, list of base64s, or PIL.Image(s); return list of PIL.Images."""
+    """Single or list: base64, data URL, presigned URL, or PIL.Image(s)."""
     if maybe_one_or_many is None:
         return []
     if isinstance(maybe_one_or_many, Image.Image):
-        return [maybe_one_or_many]
+        return [maybe_one_or_many.convert("RGB")]
     if isinstance(maybe_one_or_many, (list, tuple)):
-        return [
-            (_load_image_from_base64(item) if isinstance(item, str) else item)
-            for item in maybe_one_or_many
-        ]
+        out: List[Image.Image] = []
+        for item in maybe_one_or_many:
+            if isinstance(item, str):
+                out.append(_load_image_from_init_string(item))
+            elif isinstance(item, Image.Image):
+                out.append(item.convert("RGB"))
+            else:
+                raise ValueError(f"Unsupported image list element: {type(item)}")
+        return out
     if isinstance(maybe_one_or_many, str):
-        return [_load_image_from_base64(maybe_one_or_many)]
+        return [_load_image_from_init_string(maybe_one_or_many)]
     raise ValueError("Unsupported image input type")
 
 
@@ -686,8 +759,19 @@ def _load_lora_weights_with_fallback(
             pipe.load_lora_weights(sd, adapter_name=adapter_name)
             return
         except Exception as local_error:
-            print(f"  ⚠️ Failed to load from local file: {local_error}, falling back to HuggingFace Hub")
-    
+            if _qwen_omni_offline():
+                raise RuntimeError(
+                    f"QWEN_2511_OFFLINE: LoRA load failed for {local_lora_path}: {local_error}"
+                ) from local_error
+            print(
+                f"  ⚠️ Failed to load from local file: {local_error}, falling back to HuggingFace Hub"
+            )
+    elif _qwen_omni_offline():
+        raise RuntimeError(
+            f"QWEN_2511_OFFLINE: missing LoRA weights at {local_lora_path} "
+            f"(repo={repo!r}, file={weight_name!r})"
+        )
+
     # Try HuggingFace Hub (will use cache if available)
     try:
         pipe.load_lora_weights(repo, weight_name=weight_name, adapter_name=adapter_name)
@@ -702,6 +786,10 @@ def _load_lora_weights_with_fallback(
         )
 
         # Download from HuggingFace Hub as last resort
+        if _qwen_omni_offline():
+            raise RuntimeError(
+                f"QWEN_2511_OFFLINE: cannot download LoRA {weight_name!r} from {repo!r}"
+            ) from e
         local_path = hf_hub_download(repo_id=repo, filename=weight_name)
         sd = safetensors_load_file(local_path)
 
@@ -727,9 +815,13 @@ def _load_lora_weights_with_fallback(
 def _ensure_loaded_and_get_active_adapters(
     pipe: QwenImageEditPlusPipeline, selected_lora: str
 ) -> Tuple[List[str], List[float]]:
+    selected_lora = _resolve_lora_spec_key(selected_lora)
     spec = ADAPTER_SPECS.get(selected_lora)
     if not spec:
-        raise ValueError(f"Configuration not found for: {selected_lora}")
+        raise ValueError(
+            f"Configuration not found for: {selected_lora!r}. "
+            f"Use an ADAPTER_SPECS key (e.g. 'Ultrarealistic-Portrait') or its adapter_name (e.g. 'URPortrait')."
+        )
 
     adapter_names = []
     adapter_weights = []
@@ -796,6 +888,17 @@ def _ensure_loaded_and_get_active_adapters(
     return adapter_names, adapter_weights
 
 
+def unload_models():
+    """Unload the Qwen pipeline and free GPU memory."""
+    global _pipeline
+    if _pipeline is not None:
+        del _pipeline
+        _pipeline = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 # -------------------------
 # Main inference function
 # -------------------------
@@ -842,6 +945,8 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
 
     global _active_adapter_config
     lora_adapter = params.get("lora_adapter", NONE_LORA)
+    if lora_adapter != NONE_LORA:
+        lora_adapter = _resolve_lora_spec_key(lora_adapter)
 
     if lora_adapter == NONE_LORA:
         desired_config = ((), ())
@@ -1037,24 +1142,43 @@ def run_inference_qwen_image_edit_2511_rapid_aio(job_id: str, prompt: str, param
 # CLI test mode
 # -------------------------
 if __name__ == "__main__":
-    import httpx
-    job_id = "localtest"
-    prompt = "Change her body orientation so she is facing the camera directly."
-    url = "https://pub-67f874d172874988b5754734cc4fcb7e.r2.dev/Snapinsta.app_262322643_4937545659591345_7487236998017046274_n_1080.jpg"
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _default_output_dir = os.path.join(_script_dir, "qwen_localtest_outputs")
+    output_dir = os.environ.get("QWEN_TEST_OUTPUT_DIR", _default_output_dir)
 
-    with httpx.Client(timeout=60) as c:
-        img_bytes = c.get(url).content
-    img_b64 = base64.b64encode(img_bytes).decode()
+    prompt = """
+    The woman is already completely nude and lying on her back with legs spread. A man is between her legs performing missionary sex. His erect penis is penetrating deep into her vagina, visible penetration with natural moisture sheen on the penis and surrounding skin. Her large breasts are fully exposed and bouncing naturally with the motion.
 
-    params = {
-        "init_image": img_b64,
-        "guidance_scale": 1.0,
-        "num_inference_steps": 4,
-        "lora_adapter": NONE_LORA,
-        "scale_image": True,
-        "scale_factor": 2,
-        "output_dir": "/app/worker/outputs",
-    }
+Maintain identical camera angle, framing, and perspective. Make sure to leave her facial features completely identical with no changes whatsoever. The rest of the image remains exactly the same, only showing the addition of the man and the penetration action. Preserve exact facial identity, exact eyes, exact expression, and exact head angle from the original image.
+   """
+    
+    
+    def _resolve_sidecar_image(filename: str) -> str:
+        for d in (_script_dir, os.getcwd()):
+            p = os.path.join(d, filename)
+            if os.path.isfile(p):
+                return os.path.abspath(p)
+        raise SystemExit(
+            f"Missing {filename}: not found next to this script ({_script_dir}) "
+            f"or cwd ({os.getcwd()})"
+        )
 
-    out = run_inference_qwen_image_edit_2511_rapid_aio(job_id, prompt, params)
-    print("✅ Final output path:", out)
+    for fname in ("d1.jpeg", "h1.jpeg", "h2.jpeg", "h3.jpeg", "h4.jpeg", "h5.jpeg"):
+        img_path = _resolve_sidecar_image(fname)
+        with open(img_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
+        job_id = f"localtest_{os.path.splitext(fname)[0]}"
+        print(f"📷 {fname} → {img_path} | job_id={job_id}")
+
+        params = {
+            "init_image": img_b64,
+            "guidance_scale": 1.0,
+            "num_inference_steps": 4,
+            "lora_adapter": "Multiple-Angles",
+            "scale_image": True,
+            "scale_factor": 2,
+            "output_dir": output_dir,
+        }
+
+        out = run_inference_qwen_image_edit_2511_rapid_aio(job_id, prompt, params)
+        print("✅ Final output path:", out)

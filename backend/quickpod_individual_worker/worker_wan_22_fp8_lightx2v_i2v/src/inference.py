@@ -1,42 +1,53 @@
 #!/usr/bin/env python3
 """
-Inference module for WAN 2.2 I2V 14B SDNQ FP8 FastDM merged Lightning worker.
-Uses FastDM merged Lightning model where Lightning distillation is already fused into the base model weights,
-then quantized. No LoRA loading needed.
-Based on wan_22_14b_fastdm_i2v_inference.py from work_space.
+WAN 2.2 I2V — SDNQ Space-behavior parity (V2). Single-pass generation, Space-aligned
+schedulers, dual CFG, optional last_image, duration→num_frames, export quality,
+frame_multiplier via existing video_postprocessing RIFE.
+
+Does not use torchao/AoTI. See inference_hub_space_torchao.py for Hub runtime parity.
 """
 
-from io import BytesIO
+from __future__ import annotations
+
+import copy
 import gc
-import math
+import inspect
+import json
 import os
 import random
 import time
-import torch
-import traceback
+from io import BytesIO
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Union
+
+import diffusers
 import httpx
 import numpy as np
-import diffusers
-from diffusers.utils import export_to_video, load_image
-from PIL import Image, ImageFilter
-from sdnq import (
-    SDNQConfig,
-)  # import sdnq to register it into diffusers and transformers
-from sdnq.common import use_torch_compile as triton_is_available
-from sdnq.loader import apply_sdnq_options_to_model
-from typing import Dict, Any, Optional, Union, List
+import torch
+from diffusers import (
+    DEISMultistepScheduler,
+    DPMSolverMultistepInverseScheduler,
+    DPMSolverMultistepScheduler,
+    DPMSolverSinglestepScheduler,
+    FlowMatchEulerDiscreteScheduler,
+    SASolverScheduler,
+    UniPCMultistepScheduler,
+)
+from diffusers.utils import export_to_video
+from huggingface_hub import snapshot_download
+from PIL import Image
+from sdnq import SDNQConfig  # noqa: F401 — register sdnq
 
-# Video post-processing imports
 try:
     from video_postprocessing import (
+        calculate_rife_exp,
+        check_rife_code_available,
+        download_realesrgan_model,
+        download_rife_model,
         load_rife_model,
         load_sd_upscale,
-        check_rife_code_available,
-        download_rife_model,
-        download_realesrgan_model,
-        tiled_scale,
-        calculate_rife_exp,
         make_inference,
+        tiled_scale,
     )
 
     POSTPROCESSING_AVAILABLE = True
@@ -46,66 +57,105 @@ except ImportError as e:
     tiled_scale = calculate_rife_exp = make_inference = None
     download_rife_model = download_realesrgan_model = None
 
-# V3 long-video constants (SVI-style clip chaining)
-NUM_OVERLAP_FRAME = 5
-BLEND_AT_JOIN_FRAMES = 3
-SEED_MULTIPLIER = 42
-CLIP_DURATION_SEC = 5  # Each clip is ~5 sec (81 frames @ 16fps)
-
-# Set PyTorch optimizations for speed
-torch.set_float32_matmul_precision(
-    "medium"
-)  # Faster matmul with slight precision trade-off
+torch.set_float32_matmul_precision("medium")
 if torch.cuda.is_available():
-    torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
-    torch.backends.cudnn.deterministic = (
-        False  # Allow non-deterministic algorithms for speed
-    )
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
 
-# Configuration
-# FastDM merged Lightning model: Lightning distillation is already fused into base model, then quantized
-MODEL_REPO = "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_Multiscene_SVI_sdnq_fp8_svd_r64"
-MODELS_DIR = os.environ.get("MODELS_DIR", "/app/models")
-MODEL_LOCAL_DIR = os.path.join(
-    MODELS_DIR, "wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_Multiscene_SVI_sdnq_fp8_svd_r64"
+_DEFAULT_HF_REPO = "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_Multiscene_SVI_sdnq_fp8_svd_r64"
+_DEFAULT_LOCAL_LEAF = (
+    "wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_Multiscene_SVI_sdnq_fp8_svd_r64"
 )
 
-# Pipeline cache
-PIPELINE_CACHE = {}
-PIPELINE_LOADED = False
+MODEL_REPO = os.getenv("HF_REPO_WAN_I2V", os.getenv("REPO_ID", _DEFAULT_HF_REPO))
+MODELS_DIR = os.environ.get("MODELS_DIR", "/app/models")
+MODEL_LOCAL_DIR = os.getenv(
+    "MODEL_LOCAL_DIR", os.path.join(MODELS_DIR, _DEFAULT_LOCAL_LEAF)
+)
 
-# Default inference parameters (Lightning-merged model works with 4-8 steps and guidance_scale=1.0)
+SCHEDULER_MAP = {
+    #"FlowMatchEulerDiscrete": FlowMatchEulerDiscreteScheduler,
+    "UniPCMultistep": UniPCMultistepScheduler,
+    # "DPMSolverMultistep": DPMSolverMultistepScheduler,
+    #"DPMSolverSinglestep": DPMSolverSinglestepScheduler,
+}
 
-# Default inference parameters
-DEFAULT_NEGATIVE_PROMPT = "色调艳丽, 过曝, 静态, 细节模糊不清, 字幕, 风格, 作品, 画作, 画面, 静止, 整体发灰, 最差质量, 低质量, JPEG压缩残留, 丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景, 三条腿, 背景人很多, 倒着走, 阴道变形, 乳房变形, 乳头畸形, 变形的皮肤, 大腿畸形，臀部畸, 面部畸形，眼睛畸形, 膝盖畸形，髋关节畸形"
+MIN_FRAMES_MODEL = 8
+MAX_FRAMES_MODEL = 160
+FIXED_FPS = 16
+MAX_DIM = 832
+MIN_DIM = 480
+SQUARE_DIM = 640
+MULTIPLE_OF = 16
+
+DEFAULT_NEGATIVE_PROMPT = "色调艳丽, 过曝, 静态, 细节模糊不清, 字幕, 风格, 作品, 画作, 画面, 静止, 整体发灰, 最差质量, 低质量, JPEG压缩残留, 丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合, 静止不动的画面, 杂乱的背景, 三条腿, 背景人很多, 倒着走"
 
 DEFAULT_FPS = 16
-DEFAULT_NUM_FRAMES = 81
-DEFAULT_NUM_INFERENCE_STEPS = 8
+DEFAULT_NUM_INFERENCE_STEPS = 4
 DEFAULT_GUIDANCE_SCALE = 1.0
+DEFAULT_GUIDANCE_SCALE_2 = 1.0
 
-# V3 long-video constants (SVI-style clip chaining)
-NUM_OVERLAP_FRAME = 5
-BLEND_AT_JOIN_FRAMES = 3
-SEED_MULTIPLIER = 42
-CLIP_DURATION_SEC = 5
-
-# Extended negative prompt (v3: fog/haze, face drift, color drift suppression)
-EXTENDED_NEGATIVE_PROMPT = (
-    DEFAULT_NEGATIVE_PROMPT + " "
-    "fog, haze, smoke, mist, steam, foggy, misty, smoky, atmospheric haze, "
-    "smoke effects, hazy background, particle effects, vapor, dust haze, "
-    "transition, fade in, fade out, dissolve, wipe, flash, "
-    "overexposed, blown out highlights, washed out, "
-    "soft focus, out of focus, blurry, defocus, "
-    "face morphing, identity change, different person, face swap, "
-    "character change, different face, changing face, face drift, face change, "
-    "color shift, color cast, tint change, hue shift, color grading change"
-)
+PIPELINE_CACHE: Dict[str, Any] = {}
+PIPELINE_LOADED = False
 
 
-def flush_memory():
-    """Free CPU and GPU memory without touching the loaded model."""
+def _auto_download_disabled() -> bool:
+    return os.getenv("WAN_I2V_DISABLE_AUTO_DOWNLOAD", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _wan_diffusers_dir_ready(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    if os.path.isfile(os.path.join(path, "model_index.json")):
+        return True
+    if os.path.isfile(os.path.join(path, "text_encoder", "config.json")):
+        return True
+    if os.path.isfile(os.path.join(path, "transformer", "config.json")):
+        return True
+    try:
+        return len(os.listdir(path)) > 0
+    except OSError:
+        return False
+
+
+def ensure_sdnq_wan_model_downloaded() -> None:
+    """Snapshot WAN I2V SDNQ repo into MODEL_LOCAL_DIR if missing or incomplete."""
+    if _auto_download_disabled():
+        if not _wan_diffusers_dir_ready(MODEL_LOCAL_DIR):
+            raise FileNotFoundError(
+                f"Model not present at {MODEL_LOCAL_DIR} and WAN_I2V_DISABLE_AUTO_DOWNLOAD is set"
+            )
+        return
+    if _wan_diffusers_dir_ready(MODEL_LOCAL_DIR):
+        return
+    os.makedirs(MODEL_LOCAL_DIR, exist_ok=True)
+    print(f"⬇️  [V2] Downloading {MODEL_REPO} → {MODEL_LOCAL_DIR} …", flush=True)
+    snapshot_download(
+        repo_id=MODEL_REPO,
+        local_dir=MODEL_LOCAL_DIR,
+        local_dir_use_symlinks=False,
+        resume_download=True,
+    )
+    if not _wan_diffusers_dir_ready(MODEL_LOCAL_DIR):
+        raise RuntimeError(
+            f"Download finished but {MODEL_LOCAL_DIR} still looks incomplete"
+        )
+    print(f"✓ [V2] WAN weights ready at {MODEL_LOCAL_DIR}", flush=True)
+
+
+def _realesrgan_video_ckpt_name(upscale_factor: Any) -> str:
+    try:
+        u = int(upscale_factor)
+    except (TypeError, ValueError):
+        u = 4
+    return "RealESRGAN_x2plus.pth" if u <= 2 else "RealESRGAN_x4plus.pth"
+
+
+def flush_memory() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -113,7 +163,6 @@ def flush_memory():
 
 
 def frames_to_uint8_pil(frames) -> list:
-    """Convert pipeline output to uint8 PIL. uint8 uses 4x less RAM than float32."""
     result = []
     for f in frames:
         if isinstance(f, Image.Image):
@@ -128,48 +177,9 @@ def frames_to_uint8_pil(frames) -> list:
     return result
 
 
-def get_handoff_frame(frames: list, width: int, height: int) -> Image.Image:
-    """Last frame + SHARPEN for next clip (avoids smoke/haze at transitions)."""
-    last = frames[-1]
-    if not isinstance(last, Image.Image):
-        arr = np.asarray(last, dtype=np.float32)
-        arr = (np.clip(arr if arr.max() <= 1.0 else arr / 255.0, 0, 1) * 255).astype(np.uint8)
-        last = Image.fromarray(arr)
-    if last.size != (width, height):
-        last = last.resize((width, height), Image.LANCZOS)
-    return last.filter(ImageFilter.SHARPEN)
-
-
-def blend_at_join(prev_tail: list, next_head: list, n: int) -> list:
-    """Cross-fade n frames from prev_tail into next_head."""
-    def to_f32(f):
-        a = np.asarray(f, dtype=np.float32)
-        return a / 255.0 if a.max() > 1.0 else a
-
-    before = np.stack([to_f32(f) for f in prev_tail])
-    after = np.stack([to_f32(f) for f in next_head])
-    blended = []
-    for i in range(n):
-        alpha = (i + 1) / (n + 1)
-        b = np.clip(before[i] * (1.0 - alpha) + after[i] * alpha, 0, 1)
-        blended.append(Image.fromarray((b * 255).astype(np.uint8)))
-    return blended
-
-
-def stitch_append(running: list, new_clip: list, overlap: int, blend_frames: int) -> list:
-    """Append one clip to running stitched result. Incremental stitch for memory efficiency."""
-    trimmed = new_clip[overlap:]
-    if blend_frames > 0 and len(running) >= blend_frames and len(trimmed) >= blend_frames:
-        prev_tail = running[-blend_frames:]
-        next_head = trimmed[:blend_frames]
-        blended = blend_at_join(prev_tail, next_head, blend_frames)
-        return running[:-blend_frames] + blended + trimmed[blend_frames:]
-    return running + trimmed
-
-
-def upscale_frames_streaming(upscale_model, frames: list, device: str,
-                              upscale_factor: int, batch_size: int = 50) -> list:
-    """Batched Real-ESRGAN upscaling, returning uint8 PIL list. Avoids OOM on long videos."""
+def upscale_frames_streaming(
+    upscale_model, frames: list, device: str, upscale_factor: int, batch_size: int = 50
+) -> list:
     if tiled_scale is None:
         raise ImportError("tiled_scale not available from video_postprocessing")
     from diffusers.image_processor import VaeImageProcessor
@@ -177,22 +187,28 @@ def upscale_frames_streaming(upscale_model, frames: list, device: str,
     result = []
     n = len(frames)
     upscale_model.to(device)
-
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
         batch = frames[start:end]
         if start % 40 == 0 or start == 0:
             print(f"   Upscaling frames {start+1}-{end}/{n}...", flush=True)
-
         arrs = []
         for f in batch:
-            a = np.asarray(f if isinstance(f, Image.Image) else Image.fromarray(f),
-                           dtype=np.float32) / 255.0
+            a = (
+                np.asarray(
+                    f if isinstance(f, Image.Image) else Image.fromarray(f),
+                    dtype=np.float32,
+                )
+                / 255.0
+            )
             arrs.append(a)
         batch_np = np.stack(arrs, axis=0)
-        batch_t = torch.from_numpy(np.transpose(batch_np, (0, 3, 1, 2))).to(torch.float16).to(device)
+        batch_t = (
+            torch.from_numpy(np.transpose(batch_np, (0, 3, 1, 2)))
+            .to(torch.float16)
+            .to(device)
+        )
         del batch_np, arrs
-
         upscaled_t = tiled_scale(
             samples=batch_t,
             function=lambda a: upscale_model(a),
@@ -204,38 +220,34 @@ def upscale_frames_streaming(upscale_model, frames: list, device: str,
             output_device="cpu",
         )
         del batch_t
-
         upscaled_t = upscaled_t.clamp(0, 1)
         batch_out = VaeImageProcessor.pt_to_numpy(upscaled_t)
         del upscaled_t
-
         for i in range(len(batch_out)):
             result.append(Image.fromarray((batch_out[i] * 255).astype(np.uint8)))
         del batch_out
-
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
     upscale_model.to("cpu")
     return result
 
 
-def rife_frames_streaming(rife_model, frames: list, device: str,
-                           original_fps: int, target_fps: int) -> tuple:
-    """Frame-by-frame RIFE interpolation, returning uint8 PIL list. Avoids OOM on long videos."""
+def rife_frames_streaming(
+    rife_model, frames: list, device: str, original_fps: int, target_fps: int
+) -> tuple:
     if calculate_rife_exp is None or make_inference is None:
         raise ImportError("calculate_rife_exp/make_inference not available")
-
     if target_fps <= original_fps:
         return frames, original_fps
-
     exp, actual_fps = calculate_rife_exp(original_fps, target_fps)
     if exp == 0:
         return frames, original_fps
-
     n = len(frames)
-    print(f"   RIFE exp={exp} ({original_fps}fps -> {actual_fps}fps), "
-          f"{n} frames -> {n * 2**exp} frames...", flush=True)
+    print(
+        f"   RIFE exp={exp} ({original_fps}fps -> {actual_fps}fps), "
+        f"{n} frames -> {n * 2**exp} frames...",
+        flush=True,
+    )
 
     def pil_to_gpu(f) -> torch.Tensor:
         arr = np.asarray(f, dtype=np.float32) / 255.0
@@ -252,7 +264,9 @@ def rife_frames_streaming(rife_model, frames: list, device: str,
             with torch.no_grad():
                 t0 = pil_to_gpu(frames[i])
                 t1 = pil_to_gpu(frames[i + 1])
-                midpoints = make_inference(rife_model, t0, t1, upscale_amount=1, n=2**exp - 1)
+                midpoints = make_inference(
+                    rife_model, t0, t1, upscale_amount=1, n=2**exp - 1
+                )
                 del t0, t1
                 for mid_t in midpoints:
                     result.append(tensor_to_pil(mid_t))
@@ -261,90 +275,115 @@ def rife_frames_streaming(rife_model, frames: list, device: str,
             if i % 20 == 0 and torch.cuda.is_available():
                 torch.cuda.empty_cache()
         if i % 50 == 0:
-            print(f"   RIFE pair {i+1}/{n}  ({len(result)} frames so far)...", flush=True)
-
+            print(
+                f"   RIFE pair {i+1}/{n}  ({len(result)} frames so far)...", flush=True
+            )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return result, actual_fps
 
 
-def load_pipeline():
-    """Load and cache the I2V pipeline."""
-    global PIPELINE_CACHE, PIPELINE_LOADED
+def resize_image_wan_space(image: Image.Image) -> Image.Image:
+    width, height = image.size
+    if width == height:
+        return image.resize((SQUARE_DIM, SQUARE_DIM), Image.LANCZOS)
+    aspect_ratio = width / height
+    max_ar = MAX_DIM / MIN_DIM
+    min_ar = MIN_DIM / MAX_DIM
+    image_to_resize = image
+    if aspect_ratio > max_ar:
+        target_w, target_h = MAX_DIM, MIN_DIM
+        crop_width = int(round(height * max_ar))
+        left = (width - crop_width) // 2
+        image_to_resize = image.crop((left, 0, left + crop_width, height))
+    elif aspect_ratio < min_ar:
+        target_w, target_h = MIN_DIM, MAX_DIM
+        crop_height = int(round(width / min_ar))
+        top = (height - crop_height) // 2
+        image_to_resize = image.crop((0, top, width, top + crop_height))
+    else:
+        if width > height:
+            target_w = MAX_DIM
+            target_h = int(round(target_w / aspect_ratio))
+        else:
+            target_h = MAX_DIM
+            target_w = int(round(target_h * aspect_ratio))
+    final_w = round(target_w / MULTIPLE_OF) * MULTIPLE_OF
+    final_h = round(target_h / MULTIPLE_OF) * MULTIPLE_OF
+    final_w = max(MIN_DIM, min(MAX_DIM, final_w))
+    final_h = max(MIN_DIM, min(MAX_DIM, final_h))
+    return image_to_resize.resize((final_w, final_h), Image.LANCZOS)
 
+
+def resize_and_crop_to_match(
+    target_image: Image.Image, reference_image: Image.Image
+) -> Image.Image:
+    ref_width, ref_height = reference_image.size
+    target_width, target_height = target_image.size
+    scale = max(ref_width / target_width, ref_height / target_height)
+    new_width, new_height = int(target_width * scale), int(target_height * scale)
+    resized = target_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    left, top = (new_width - ref_width) // 2, (new_height - ref_height) // 2
+    return resized.crop((left, top, left + ref_width, top + ref_height))
+
+
+def get_num_frames_from_duration(duration_seconds: float) -> int:
+    """Match HF Space: duration × 16 fps, clamped to model frame band."""
+    return 1 + int(
+        np.clip(
+            int(round(float(duration_seconds) * FIXED_FPS)),
+            MIN_FRAMES_MODEL,
+            MAX_FRAMES_MODEL,
+        )
+    )
+
+
+def _bool_param(p: Dict[str, Any], key: str, default: bool = False) -> bool:
+    v = p.get(key, default)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes")
+    return bool(v)
+
+
+def _apply_scheduler_for_run(
+    pipe, original_scheduler, scheduler_name: str, flow_shift: float
+) -> None:
+    """Rebuild scheduler from frozen original config (Space-style), then restore after run."""
+    scheduler_class = SCHEDULER_MAP.get(scheduler_name)
+    if scheduler_class is None:
+        print(f"⚠️  Unknown scheduler {scheduler_name!r}, keeping pipeline default")
+        return
+    config = copy.deepcopy(original_scheduler.config)
+    try:
+        if scheduler_class == FlowMatchEulerDiscreteScheduler:
+            config["shift"] = flow_shift
+        else:
+            config["flow_shift"] = flow_shift
+        pipe.scheduler = scheduler_class.from_config(config)
+    except Exception as e:
+        print(f"⚠️  Scheduler from_config failed ({scheduler_name}): {e}")
+
+
+def load_pipeline():
+    global PIPELINE_CACHE, PIPELINE_LOADED
     if PIPELINE_LOADED and MODEL_LOCAL_DIR in PIPELINE_CACHE:
         return PIPELINE_CACHE[MODEL_LOCAL_DIR]
 
     load_start_time = time.time()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    ensure_sdnq_wan_model_downloaded()
 
-    # Verify model directory exists and has required files
-    if not os.path.exists(MODEL_LOCAL_DIR):
-        raise FileNotFoundError(f"Model directory not found: {MODEL_LOCAL_DIR}")
-
-    # Check for text_encoder directory
-    text_encoder_dir = os.path.join(MODEL_LOCAL_DIR, "text_encoder")
-    if not os.path.exists(text_encoder_dir):
-        raise FileNotFoundError(
-            f"Text encoder directory not found: {text_encoder_dir}. Model may be incomplete."
-        )
-
-    # Check for text encoder config
-    text_encoder_config = os.path.join(text_encoder_dir, "config.json")
-    if not os.path.exists(text_encoder_config):
-        print(f"⚠️  Warning: Text encoder config not found at {text_encoder_config}")
-    else:
-        print(f"✓ Text encoder directory verified: {text_encoder_dir}")
-
-    # Check for text encoder model file and verify it's not suspiciously small
-    text_encoder_model = os.path.join(text_encoder_dir, "model.safetensors")
-    if os.path.exists(text_encoder_model):
-        model_size = os.path.getsize(text_encoder_model)
-        model_size_gb = model_size / (1024**3)
-        # Expected size is ~8.15GB, warn if significantly smaller (e.g., < 7.5GB)
-        if model_size_gb < 7.5:
-            print(f"⚠️  WARNING: Text encoder model file is suspiciously small!")
-            print(f"   Size: {model_size_gb:.2f} GB (expected ~8.15 GB)")
-            print(f"   This may indicate an incomplete merge or corrupted download.")
-            print(
-                f"   Check if merge.py ran correctly and all .part-* files were merged."
-            )
-        else:
-            print(f"✓ Text encoder model file size verified: {model_size_gb:.2f} GB")
-    else:
-        # Check for split parts
-        import glob
-
-        part_files = glob.glob(text_encoder_model + ".part-*")
-        if part_files:
-            print(
-                f"⚠️  WARNING: Text encoder model is still split into {len(part_files)} parts!"
-            )
-            print(f"   Merge.py should have merged these. Parts found:")
-            for part in sorted(part_files)[:5]:  # Show first 5
-                print(f"     - {os.path.basename(part)}")
-            if len(part_files) > 5:
-                print(f"     ... and {len(part_files) - 5} more")
-            raise FileNotFoundError(
-                f"Text encoder model not merged. Found {len(part_files)} part files. Run merge.py first."
-            )
-        else:
-            print(
-                f"⚠️  Warning: Text encoder model.safetensors not found at {text_encoder_model}"
-            )
-
-    print(f"📦 Loading pipeline from {MODEL_LOCAL_DIR}...")
-    print(f"   Loading SDNQ FP8+SVD quantized model (FastDM merged Lightning)...")
+    print(
+        f"📦 [V2] Loading SDNQ pipeline from {MODEL_LOCAL_DIR} (repo ref: {MODEL_REPO})..."
+    )
     pipe = diffusers.WanImageToVideoPipeline.from_pretrained(
         MODEL_LOCAL_DIR,
         torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,  # Load components on CPU first
-        local_files_only=True,  # Ensure we only use local files, prevent partial downloads
+        low_cpu_mem_usage=True,
+        local_files_only=True,
     )
-
-    # Fix SDNQ tied weights: shared.weight -> encoder.embed_tokens.weight
-    # SDNQ's load_sdnq_model handles this (loader.py:128-129), but
-    # diffusers' from_pretrained does not. Re-tie explicitly.
     if hasattr(pipe, "text_encoder"):
         te = pipe.text_encoder
         if (
@@ -352,313 +391,336 @@ def load_pipeline():
             and hasattr(te, "encoder")
             and hasattr(te.encoder, "embed_tokens")
         ):
-            shared_ptr = te.shared.weight.data_ptr()
-            embed_ptr = te.encoder.embed_tokens.weight.data_ptr()
-            if shared_ptr != embed_ptr:
+            if te.shared.weight.data_ptr() != te.encoder.embed_tokens.weight.data_ptr():
                 te.encoder.embed_tokens.weight = te.shared.weight
-                print("✓ Fixed: Re-tied shared.weight -> encoder.embed_tokens.weight")
-            else:
-                print("✓ Text encoder weights already tied correctly")
-        # Also call tie_weights() as a safety net
         if hasattr(te, "tie_weights"):
             te.tie_weights()
 
-    # Apply memory management (sequential CPU offload for better VRAM management)
-    # FP8 models (~20-28GB) use sequential CPU offload which is more aggressive
-    print("⚡ Applying memory and speed optimizations...")
     if device == "cuda":
         try:
-            pipe.enable_sequential_cpu_offload()
-            print("✓ Sequential CPU offload enabled (aggressive memory management)")
-        except Exception as e1:
-            print(f"   ⚠️  Sequential CPU offload failed: {e1}")
+            pipe.enable_model_cpu_offload()
+            print("✓ Model CPU offload enabled")
+        except Exception:
             try:
-                # Fallback to regular CPU offload
-                pipe.enable_model_cpu_offload()
-                print("✓ Model CPU offload enabled (fallback)")
-            except Exception as e2:
-                print(f"   ⚠️  CPU offload failed: {e2}")
-                # Last resort: move to device directly
+                pipe.enable_sequential_cpu_offload()
+                print("✓ Sequential CPU offload enabled")
+            except Exception:
                 pipe = pipe.to(device)
-                print(f"   ✓ Model moved to {device} directly")
     else:
         pipe = pipe.to(device)
-        print(f"✓ Model moved to {device}")
 
-    # Try Flash Attention first, fallback to XFormers
-    flash_attn_available = False
     try:
-        import flash_attn
-
-        flash_attn_available = True
-        print(
-            f"   ✓ Flash Attention detected (version: {getattr(flash_attn, '__version__', 'unknown')})"
-        )
+        import flash_attn  # noqa: F401
     except ImportError:
-        pass
-
-    if not flash_attn_available:
         try:
             pipe.enable_xformers_memory_efficient_attention()
-            print("   ✓ XFormers memory-efficient attention enabled")
         except Exception:
             pass
 
-    # Try to enable VAE tiling if available (reduces VRAM for VAE)
     try:
         if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
             pipe.vae.enable_tiling()
-            print("   ✓ VAE tiling enabled (reduces VRAM usage)")
     except Exception:
-        pass  # VAE tiling not available, skip silently
-
-    # Try to enable attention slicing if available (reduces VRAM for attention)
+        pass
     try:
         if hasattr(pipe, "enable_attention_slicing"):
             pipe.enable_attention_slicing(slice_size="max")
-            print("   ✓ Attention slicing enabled (reduces VRAM usage)")
     except Exception:
-        pass  # Attention slicing not available, skip silently
+        pass
 
-    load_time = time.time() - load_start_time
-    print(f"✓ I2V Pipeline loaded ({load_time:.1f}s)")
-
-    # Verify text encoder weights are correct after all loading
-    try:
-        if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
-            te = pipe.text_encoder
-            if (
-                hasattr(te, "shared")
-                and hasattr(te, "encoder")
-                and hasattr(te.encoder, "embed_tokens")
-            ):
-                shared_ptr = te.shared.weight.data_ptr()
-                embed_ptr = te.encoder.embed_tokens.weight.data_ptr()
-                if shared_ptr == embed_ptr:
-                    print(
-                        f"✓ Text encoder verified: shared.weight and embed_tokens.weight are tied (shape: {te.shared.weight.shape})"
-                    )
-                else:
-                    print(
-                        "⚠️  WARNING: Text encoder weights are NOT tied after full pipeline load!"
-                    )
-        else:
-            print("⚠️  WARNING: Text encoder not found in pipeline!")
-    except Exception as e:
-        print(f"⚠️  Warning: Could not verify text encoder: {str(e)[:100]}")
+    original_scheduler = copy.deepcopy(pipe.scheduler)
+    print(f"✓ [V2] Pipeline loaded ({time.time() - load_start_time:.1f}s)")
 
     PIPELINE_CACHE[MODEL_LOCAL_DIR] = {
         "pipe": pipe,
-        "flash_attn_available": flash_attn_available,
+        "original_scheduler": original_scheduler,
     }
     PIPELINE_LOADED = True
-
     return PIPELINE_CACHE[MODEL_LOCAL_DIR]
+
+
+def _build_pipe_call_kwargs(
+    pipe,
+    *,
+    image: Image.Image,
+    last_image: Optional[Image.Image],
+    prompt: str,
+    negative_prompt: str,
+    height: int,
+    width: int,
+    num_frames: int,
+    guidance_scale: float,
+    guidance_scale_2: float,
+    num_inference_steps: int,
+    generator: torch.Generator,
+) -> Dict[str, Any]:
+    sig = inspect.signature(pipe.__call__)
+    params = set(sig.parameters.keys())
+    kw: Dict[str, Any] = {
+        "image": image,
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "height": height,
+        "width": width,
+        "num_frames": num_frames,
+        "guidance_scale": guidance_scale,
+        "num_inference_steps": num_inference_steps,
+        "generator": generator,
+    }
+    if "guidance_scale_2" in params:
+        kw["guidance_scale_2"] = guidance_scale_2
+    if last_image is not None and "last_image" in params:
+        kw["last_image"] = last_image
+    return kw
+
+
+def _export_video(
+    frames: list, out_path: str, fps: int, video_quality: Optional[int]
+) -> None:
+    kwargs: Dict[str, Any] = {"fps": fps}
+    if video_quality is not None:
+        try:
+            sig = inspect.signature(export_to_video)
+            if "quality" in sig.parameters:
+                kwargs["quality"] = int(video_quality)
+            else:
+                print("⚠️  export_to_video has no quality= param; skipping quality")
+        except Exception as e:
+            print(f"⚠️  export_to_video quality check failed: {e}")
+    export_to_video(frames, out_path, **kwargs)
+
+
+def _resolve_image_arg(raw: Any, timeout: int = 120) -> Optional[Image.Image]:
+    """Accept Image.Image, URL str (http/https), or local path str; return PIL.Image or None."""
+    if raw is None:
+        return None
+    if isinstance(raw, Image.Image):
+        return raw.convert("RGB")
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        if s.startswith("http://") or s.startswith("https://"):
+            import requests
+            resp = requests.get(s, timeout=timeout)
+            resp.raise_for_status()
+            return Image.open(BytesIO(resp.content)).convert("RGB")
+        if os.path.exists(s):
+            return Image.open(s).convert("RGB")
+        raise ValueError("init_image must be a presigned http(s) URL or an existing local file path")
+    raise TypeError(f"unsupported image arg type: {type(raw).__name__}")
 
 
 def run_inference_wan_22_i2v(
     job_id: str,
     prompt_or_prompts: Union[str, List[str]],
     params: Dict[str, Any],
-    init_image: Optional[Image.Image] = None,
+    init_image: Optional[Union[Image.Image, str]] = None,
+    last_image: Optional[Union[Image.Image, str]] = None,
 ) -> str:
-    """
-    Run image-to-video inference. Supports single-clip and multi-clip (long video) modes.
-
-    Args:
-        job_id: Job identifier
-        prompt_or_prompts: Single prompt (str) or list of prompts (List[str]) for multi-clip
-        params: Inference parameters (duration, num_frames, steps, guidance_scale, seed, etc.)
-        init_image: Input PIL Image (required for I2V)
-
-    Returns:
-        Path to output video file
-    """
+    # Single-source entry: works for the primary in-process path (where init_image / last_image
+    # are already-resolved PIL images passed via kwargs by video_registry._wan_i2v) AND for the
+    # downloaded-plugin path (where the runtime calls run_inference_wan_22_i2v(job_id, prompt, params)
+    # with init_image inside params). Resolve URL / path strings into PIL images here either way.
+    p_in = dict(params or {})
+    if init_image is None:
+        init_image = p_in.pop("init_image", None) or p_in.pop("image", None)
+    else:
+        p_in.pop("init_image", None)
+        p_in.pop("image", None)
+    if last_image is None:
+        last_image = p_in.pop("last_image", None) or p_in.pop("last_frame_image", None)
+    else:
+        p_in.pop("last_image", None)
+        p_in.pop("last_frame_image", None)
+    init_image = _resolve_image_arg(init_image)
+    last_image = _resolve_image_arg(last_image)
+    params = p_in
     if init_image is None:
         raise ValueError("init_image is required for I2V inference")
 
-    # Normalize to list: single prompt -> [prompt], multi-clip -> list of prompts
     if isinstance(prompt_or_prompts, str):
-        prompts = [prompt_or_prompts]
+        prompt = prompt_or_prompts
     else:
-        prompts = list(prompt_or_prompts)
-    num_clips = len(prompts)
+        plist = list(prompt_or_prompts)
+        if len(plist) > 1:
+            print(
+                f"[{job_id}] [V2] Multiple prompts received; using first only (single-pass mode)."
+            )
+        prompt = plist[0] if plist else ""
 
-    # Pre-inference GPU cleanup
-    import gc
-
+    p = params or {}
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    # Load pipeline
-    pipeline_data = load_pipeline()
-    pipe = pipeline_data["pipe"]
+    pdata = load_pipeline()
+    pipe = pdata["pipe"]
+    original_scheduler = pdata["original_scheduler"]
 
-    # Clear CUDA cache before inference to maximize available VRAM
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        gc.collect()
+    gen_fps = int(p.get("fps", DEFAULT_FPS))
+    if "num_frames" in p and p.get("num_frames") is not None:
+        num_frames = int(p["num_frames"])
+    else:
+        dur = p.get("duration_seconds", p.get("duration"))
+        if dur is not None:
+            num_frames = get_num_frames_from_duration(float(dur))
+        else:
+            num_frames = 81
 
-    # Extract parameters
-    num_frames = int(params.get("num_frames", DEFAULT_NUM_FRAMES))
-    guidance_scale = float(params.get("guidance_scale", DEFAULT_GUIDANCE_SCALE))
-    num_inference_steps = int(
-        params.get("num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS)
-    )
-    seed = params.get("seed", None)
+    guidance_scale = float(p.get("guidance_scale", DEFAULT_GUIDANCE_SCALE))
+    guidance_scale_2 = float(p.get("guidance_scale_2", DEFAULT_GUIDANCE_SCALE_2))
+    num_inference_steps = int(p.get("num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS))
+    seed = p.get("seed", None)
     if seed is None:
         seed = random.randint(0, 1000)
     else:
         seed = int(seed)
 
-    negative_prompt = params.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
-    output_dir = params.get("output_dir", "/workspace")
+    negative_prompt = p.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
+    output_dir = p.get("output_dir", "/workspace")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Image processing
-    resize_image = params.get("resize_image", True)
+    resize_image_flag = p.get("resize_image", True)
+    resize_mode = str(p.get("resize_mode", "area480")).strip().lower()
 
-    # Calculate dimensions
     mod_value = pipe.vae_scale_factor_spatial * pipe.transformer.config.patch_size[1]
 
-    if resize_image:
-        max_area = 480 * 832
-        aspect_ratio = init_image.height / init_image.width
-        height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-        width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
-        image = init_image.resize((width, height))
-    else:
-        original_width = init_image.width
-        original_height = init_image.height
-        width = (original_width // mod_value) * mod_value
-        height = (original_height // mod_value) * mod_value
-
-        if width != original_width or height != original_height:
-            image = init_image.resize((width, height))
+    if resize_image_flag:
+        if resize_mode == "wan_space":
+            image = resize_image_wan_space(init_image)
         else:
-            image = init_image
-
-    # Post-processing options (coerce bools so "true"/"false" from JSON work)
-    def _bool_param(p: Dict[str, Any], key: str, default: bool = False) -> bool:
-        v = p.get(key, default)
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, str):
-            return v.strip().lower() in ("true", "1", "yes")
-        return bool(v)
-
-    enable_rife = _bool_param(params, "enable_rife", False)
-    rife_target_fps = int(params.get("rife_target_fps", 30))
-    force_target_fps = _bool_param(params, "force_target_fps", True)
-    enable_upscaling = _bool_param(params, "enable_upscaling", False) or _bool_param(
-        params, "enable_upscale", False
-    )
-    upscale_factor = int(params.get("upscale_factor", 2))
-    postprocess_interpolate_first = _bool_param(
-        params, "postprocess_interpolate_first", False
-    )
-
-    fps = int(params.get("fps", DEFAULT_FPS))
-
-    # Use extended negative prompt for multi-clip (v3: fog/haze, face drift suppression)
-    neg_prompt = EXTENDED_NEGATIVE_PROMPT if num_clips > 1 else negative_prompt
-    # Pad prompts if fewer than num_clips
-    while len(prompts) < num_clips:
-        prompts.append(prompts[-1])
-
-    generation_start_time = time.time()
-
-    if num_clips == 1:
-        # Single-clip path
-        print(
-            f"[{job_id}] Generating I2V: {width}x{height}, {num_frames}f @ {fps}fps, {num_inference_steps} steps"
+            max_area = 480 * 832
+            aspect_ratio = init_image.height / init_image.width
+            height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+            width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+            image = init_image.resize((width, height))
+    else:
+        ow, oh = init_image.width, init_image.height
+        width = (ow // mod_value) * mod_value
+        height = (oh // mod_value) * mod_value
+        image = (
+            init_image.resize((width, height))
+            if (width, height) != (ow, oh)
+            else init_image
         )
-        generator = torch.Generator(
-            device="cuda" if torch.cuda.is_available() else "cpu"
-        ).manual_seed(seed)
+
+    width, height = image.size
+
+    processed_last: Optional[Image.Image] = None
+    if last_image is not None:
+        if resize_image_flag:
+            if resize_mode == "wan_space":
+                li = resize_image_wan_space(last_image)
+            else:
+                max_area = 480 * 832
+                ar = last_image.height / last_image.width
+                h2 = round(np.sqrt(max_area * ar)) // mod_value * mod_value
+                w2 = round(np.sqrt(max_area / ar)) // mod_value * mod_value
+                li = last_image.resize((w2, h2))
+        else:
+            li = last_image
+        processed_last = resize_and_crop_to_match(li, image)
+
+    scheduler_name = str(
+        p.get("scheduler_name", p.get("scheduler", "UniPCMultistep"))
+    ).strip()
+    flow_shift = float(p.get("flow_shift", 3.0))
+    video_quality = p.get("video_quality", 6)
+    if video_quality is not None:
+        video_quality = int(video_quality)
+
+    fm_raw = p.get("frame_multiplier", None)
+    enable_rife = _bool_param(p, "enable_rife", False)
+    rife_target_fps = int(p.get("rife_target_fps", 30))
+    if fm_raw is not None:
+        fm = int(fm_raw)
+        if fm > 16:
+            enable_rife = True
+            rife_target_fps = fm
+        elif enable_rife and "rife_target_fps" not in p:
+            pass
+
+    enable_upscaling = _bool_param(p, "enable_upscaling", False) or _bool_param(
+        p, "enable_upscale", False
+    )
+    upscale_factor = int(p.get("upscale_factor", 2))
+    postprocess_interpolate_first = _bool_param(
+        p, "postprocess_interpolate_first", False
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    generator = torch.Generator(
+        device="cuda" if torch.cuda.is_available() else "cpu"
+    ).manual_seed(seed)
+
+    print(
+        f"[{job_id}] [V2] I2V single-pass: {width}x{height}, {num_frames}f @ {gen_fps}fps, "
+        f"steps={num_inference_steps}, sched={scheduler_name}, flow_shift={flow_shift}"
+    )
+
+    generation_start = time.time()
+    final_output: list
+    try:
+        _apply_scheduler_for_run(pipe, original_scheduler, scheduler_name, flow_shift)
+        call_kw = _build_pipe_call_kwargs(
+            pipe,
+            image=image,
+            last_image=processed_last,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            guidance_scale=guidance_scale,
+            guidance_scale_2=guidance_scale_2,
+            num_inference_steps=num_inference_steps,
+            generator=generator,
+        )
         with torch.inference_mode():
-            output = pipe(
-                image=image,
-                prompt=prompts[0],
-                negative_prompt=neg_prompt,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                guidance_scale=guidance_scale,
-                num_inference_steps=num_inference_steps,
-                generator=generator,
-            ).frames[0]
+            output = pipe(**call_kw).frames[0]
         final_output = frames_to_uint8_pil(output)
         del output
-        flush_memory()
-    else:
-        # Multi-clip path (v3 SVI-style autoregressive chaining)
-        total_frames_est = num_frames + (num_clips - 1) * (num_frames - NUM_OVERLAP_FRAME)
-        print(
-            f"[{job_id}] Generating long video: {num_clips} clips, ~{total_frames_est} frames, "
-            f"{width}x{height} @ {fps}fps"
-        )
-        stitched = []
-        current_start = image
-        for clip_idx in range(num_clips):
-            print(f"[{job_id}] CLIP {clip_idx + 1}/{num_clips}: {prompts[clip_idx][:80]}...")
-            clip_seed = clip_idx * SEED_MULTIPLIER
-            generator = torch.Generator(
-                device="cuda" if torch.cuda.is_available() else "cpu"
-            ).manual_seed(clip_seed)
-            with torch.inference_mode():
-                raw_frames = pipe(
-                    image=current_start,
-                    prompt=prompts[clip_idx],
-                    negative_prompt=neg_prompt,
-                    height=height,
-                    width=width,
-                    num_frames=num_frames,
-                    guidance_scale=guidance_scale,
-                    num_inference_steps=num_inference_steps,
-                    generator=generator,
-                ).frames[0]
-            frames = frames_to_uint8_pil(raw_frames)
-            del raw_frames
-            flush_memory()
-            if clip_idx == 0:
-                stitched = list(frames)
-            else:
-                stitched = stitch_append(
-                    stitched, frames, NUM_OVERLAP_FRAME, BLEND_AT_JOIN_FRAMES
-                )
-            if clip_idx < num_clips - 1:
-                current_start = get_handoff_frame(frames, width, height)
-            del frames
-            flush_memory()
-        final_output = stitched
+    finally:
+        pipe.scheduler = original_scheduler
 
-    generation_time = time.time() - generation_start_time
+    flush_memory()
+    generation_time = time.time() - generation_start
 
-    # Post-processing: streaming RIFE/upscale (avoids OOM on long videos)
     postprocess_time = 0.0
-    final_fps = fps
+    final_fps = gen_fps
     final_height = height
     final_width = width
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if POSTPROCESSING_AVAILABLE and (enable_rife or enable_upscaling):
         postprocess_start = time.time()
         rife_model = None
         upscale_model = None
-
         if enable_rife and check_rife_code_available():
-            rife_path = download_rife_model(MODELS_DIR) if download_rife_model else os.path.join(MODELS_DIR, "rife")
+            rife_path = None
+            if download_rife_model:
+                rife_path = download_rife_model(MODELS_DIR)
+            if not rife_path:
+                rife_path = os.path.join(MODELS_DIR, "rife")
             if rife_path and os.path.exists(rife_path) and os.listdir(rife_path):
                 rife_model = load_rife_model(rife_path)
             else:
-                print(f"⚠️  RIFE model not found, interpolation disabled")
-
+                print(
+                    "⚠️  RIFE weights missing after download attempt; interpolation disabled"
+                )
         if enable_upscaling:
-            realesrgan_path = download_realesrgan_model(MODELS_DIR, upscale_factor) if download_realesrgan_model else None
-            realesrgan_model_file = realesrgan_path or os.path.join(MODELS_DIR, "realesrgan", f"RealESRGAN_x{upscale_factor}.pth")
+            realesrgan_model_file = None
+            if download_realesrgan_model:
+                realesrgan_model_file = download_realesrgan_model(
+                    MODELS_DIR, upscale_factor
+                )
+            if not realesrgan_model_file:
+                realesrgan_model_file = os.path.join(
+                    MODELS_DIR,
+                    "realesrgan",
+                    _realesrgan_video_ckpt_name(upscale_factor),
+                )
             if os.path.exists(realesrgan_model_file):
                 try:
                     upscale_model = load_sd_upscale(realesrgan_model_file, device)
@@ -669,11 +731,11 @@ def run_inference_wan_22_i2v(
             if enable_rife and rife_model:
                 try:
                     final_output, final_fps = rife_frames_streaming(
-                        rife_model, final_output, device, fps, rife_target_fps
+                        rife_model, final_output, device, gen_fps, rife_target_fps
                     )
                     flush_memory()
                 except Exception as e:
-                    print(f"⚠️  RIFE interpolation failed: {str(e)[:100]}")
+                    print(f"⚠️  RIFE failed: {str(e)[:100]}")
             if enable_upscaling and upscale_model:
                 try:
                     final_output = upscale_frames_streaming(
@@ -683,7 +745,7 @@ def run_inference_wan_22_i2v(
                     final_width = width * upscale_factor
                     flush_memory()
                 except Exception as e:
-                    print(f"⚠️  Upscaling failed: {str(e)[:100]}")
+                    print(f"⚠️  Upscale failed: {str(e)[:100]}")
         else:
             if enable_upscaling and upscale_model:
                 try:
@@ -694,63 +756,278 @@ def run_inference_wan_22_i2v(
                     final_width = width * upscale_factor
                     flush_memory()
                 except Exception as e:
-                    print(f"⚠️  Upscaling failed: {str(e)[:100]}")
+                    print(f"⚠️  Upscale failed: {str(e)[:100]}")
             if enable_rife and rife_model:
                 try:
                     final_output, final_fps = rife_frames_streaming(
-                        rife_model, final_output, device, fps, rife_target_fps
+                        rife_model, final_output, device, gen_fps, rife_target_fps
                     )
                     flush_memory()
                 except Exception as e:
-                    print(f"⚠️  RIFE interpolation failed: {str(e)[:100]}")
-
+                    print(f"⚠️  RIFE failed: {str(e)[:100]}")
         postprocess_time = time.time() - postprocess_start
 
-    # Export video
     out_path = os.path.join(output_dir, f"wan_i2v_{job_id}.mp4")
-    export_start_time = time.time()
-    export_to_video(final_output, out_path, fps=final_fps)
-    export_time = time.time() - export_start_time
+    export_start = time.time()
+    _export_video(final_output, out_path, fps=final_fps, video_quality=video_quality)
+    export_time = time.time() - export_start
 
     total_time = generation_time + postprocess_time + export_time
     print(
-        f"[{job_id}] ✓ Complete: {total_time:.1f}s (gen: {generation_time:.1f}s, post: {postprocess_time:.1f}s, export: {export_time:.1f}s) | {final_width}x{final_height} @ {final_fps}fps"
+        f"[{job_id}] [V2] ✓ {total_time:.1f}s (gen {generation_time:.1f}s, post {postprocess_time:.1f}s, "
+        f"export {export_time:.1f}s) | {final_width}x{final_height} @ {final_fps}fps"
     )
-
-    # Post-inference GPU cleanup
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-
     return os.path.abspath(out_path)
 
 
 if __name__ == "__main__":
-    job_id = "test"
-    prompt = "animate this image with cinematic motion, smooth animation"
-    params = {
-        "num_frames": 81,
-        "guidance_scale": 1.0,
-        "num_inference_steps": 8,
-        "seed": 42,
-        "enable_rife": True,
-        "enable_upscaling": True,
-        "upscale_factor": 2,
-        "rife_target_fps": 30,
-        "resize_image": True,
-    }
-    # Toggle: Set to True to use local image, False to use remote image
-    USE_LOCAL_IMAGE = True
+    _prm_d1 = """
+    A fully nude beautiful woman with large breasts seductively presses and squeezes her own big breasts together with both hands, cupping them firmly from underneath and sides, pushing upward and inward to create deep cleavage, fingers gently kneading and fondling soft flesh, nipples erect and visible. Natural realistic breast jiggle and bounce physics with every squeeze, subtle body sway and hip shift, aroused seductive expression, half-lidded eyes, slight lip bite in pleasure. Smooth fluid hand and arm movements over 5 seconds, maintaining exact facial identity, exact head position, exact overall body pose and camera angle/framing from the input image. Photorealistic skin texture, detailed pores and sheen, cinematic soft lighting, high quality, sharp details, stable animation, smooth and fluid motion, consistent character identity, static camera with very subtle slow zoom in on upper body.
+    """
+    _prm_h1 = """
+Starting exactly from the first frame where the beautiful woman is fully clothed: she slowly and seductively removes her top and bra, fully exposing her large bare breasts with natural jiggle, then slides off her bottoms to become completely nude. Once fully nude, she leans forward and begins performing a sensual blowjob on a man's erect penis — she grasps the base with her manicured nails, wraps her lips tightly around the shaft, and performs smooth rhythmic bobbing and sucking motions with visible saliva sheen on her lips and the penis. Her large bare breasts sway and jiggle naturally with the head movements, detailed vagina and natural pubic hair visible in the nude pose.
 
-    if USE_LOCAL_IMAGE:
-        # Load image from local file "testimg.jpeg" in the same folder as this script
-        local_image_path = os.path.join(os.path.dirname(__file__), "testimg.jpeg")
-        input_img = Image.open(local_image_path).convert("RGB")
+The video must smoothly transition from the exact first frame (clothed) to the exact last frame (fully nude and actively giving blowjob). All motion happens naturally over the duration: undressing in the first 2-3 seconds, then continuous oral sex action until the end.
+
+FACE LOCK: Her face remains same throughout the entire clip with absolutely no change whatsoever — exact same facial identity, exact same facial features, eyes, expression, head angle, skin tone, and proportions perfectly locked from the first frame to the last frame with zero drift, zero morphing, and zero alterations.
+
+The camera stays completely static or with only very minimal subtle movement — exact same camera angle, exact same framing, exact same distance, and exact same perspective maintained from the first frame to the last frame. No zoom in, no push-in, no sudden changes in composition. Only the clothing is removed and the action (undressing + blowjob) occurs while preserving the original pose foundation and background.
+
+Photorealistic skin texture, natural breast physics and jiggle, realistic saliva and moisture details, cinematic soft lighting highlighting natural skin tones, smooth fluid motion, high consistency, sharp details.
+
+"""
+
+    _base_params: Dict[str, Any] = {
+        "duration_seconds": 10.0,
+        "guidance_scale": 1.0,
+        "guidance_scale_2": 1.0,
+        "flow_shift": 3.0,
+        "video_quality": 9,
+        "frame_multiplier": 32,
+        "resize_mode": "area480",
+        "seed": 42,
+    }
+
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Init + last-frame pairs in _script_dir: h1.jpeg + h1_last.jpeg, etc. Optional per-case last_fallback_url.
+    _bench_cases: List[Dict[str, Any]] = [
+        {
+            "image_id": "d1",
+            "image_file": "d1.jpeg",
+            "last_image_file": "d1_last.png",
+            "prompt": _prm_h1.strip(),
+            "fallback_url": None,
+        },
+        {
+            "image_id": "h1",
+            "image_file": "h1.jpeg",
+            "last_image_file": "h1_last.png",
+            "prompt": _prm_h1.strip(),
+            "fallback_url": None,
+        },
+        {
+            "image_id": "h2",
+            "image_file": "h2.jpeg",
+            "last_image_file": "h2_last.png",
+            "prompt": _prm_h1.strip(),
+            "fallback_url": None,
+        },
+        {
+            "image_id": "h3",
+            "image_file": "h3.jpeg",
+            "last_image_file": "h3_last.png",
+            "prompt": _prm_h1.strip(),
+            "fallback_url": None,
+        },
+        {
+            "image_id": "h4",
+            "image_file": "h4.jpeg",
+            "last_image_file": "h4_last.png",
+            "prompt": _prm_h1.strip(),
+            "fallback_url": None,
+        },
+        {
+            "image_id": "h5",
+            "image_file": "h5.jpeg",
+            "last_image_file": "h5_last.png",
+            "prompt": _prm_h1.strip(),
+            "fallback_url": None,
+        },
+    ]
+
+    def _load_case_image(case: Dict[str, Any]) -> tuple[Optional[Image.Image], str]:
+        path = os.path.join(_script_dir, case["image_file"])
+        if os.path.isfile(path):
+            return Image.open(path).convert("RGB"), path
+        url = case.get("fallback_url")
+        if url:
+            with httpx.Client(timeout=60) as _c:
+                raw = _c.get(url).content
+            return Image.open(BytesIO(raw)).convert("RGB"), url
+        return None, path
+
+    def _load_case_last_image(
+        case: Dict[str, Any],
+    ) -> tuple[Optional[Image.Image], Optional[str]]:
+        """Load last-frame PIL if last_image_file is set; optional last_fallback_url."""
+        last_file = case.get("last_image_file")
+        if not last_file:
+            return None, None
+        path = os.path.join(_script_dir, str(last_file))
+        if os.path.isfile(path):
+            return Image.open(path).convert("RGB"), path
+        url = case.get("last_fallback_url")
+        if url:
+            with httpx.Client(timeout=60) as _c:
+                raw = _c.get(url).content
+            return Image.open(BytesIO(raw)).convert("RGB"), str(url)
+        return None, path
+
+    # Tuple needs a trailing comma for one element: (6,) — bare (6) is int 6 and breaks "for x in _step_counts".
+    _step_counts = (6,)
+    if isinstance(_step_counts, int):
+        _step_counts = (_step_counts,)
     else:
-        url = "https://pub-67f874d172874988b5754734cc4fcb7e.r2.dev/Snapinsta.app_262322643_4937545659591345_7487236998017046274_n_1080.jpg"
-        with httpx.Client(timeout=60) as c:
-            img_bytes = c.get(url).content
-        input_img = Image.open(BytesIO(img_bytes)).convert("RGB")
-    out_path = run_inference_wan_22_i2v(job_id, prompt, params, input_img)
-    print(f"Output video saved to: {out_path}")
+        _step_counts = tuple(int(x) for x in _step_counts)
+
+    _schedulers = sorted(SCHEDULER_MAP.keys())
+    _bench_rows: List[Dict[str, Any]] = []
+
+    _n_images = len(_bench_cases)
+    _n_schedulers = len(_schedulers)
+    _n_step_variants = len(_step_counts)
+    _n_runs = _n_images * _n_schedulers * _n_step_variants
+    print(
+        f"[BENCH] {_n_images} images × {_n_schedulers} schedulers × {_n_step_variants} step counts "
+        f"= {_n_runs} runs (wall clock = full gen + post + export)"
+    )
+
+    for _case in _bench_cases:
+        _iid = str(_case["image_id"])
+        _img, _img_src = _load_case_image(_case)
+        if _img is None:
+            print(
+                f"[BENCH] SKIP image_id={_iid!r} (missing {_case['image_file']!r}, no fallback_url)"
+            )
+            continue
+        _last_img, _last_src = _load_case_last_image(_case)
+        if _case.get("last_image_file") and _last_img is None:
+            print(
+                f"[BENCH] WARN image_id={_iid!r} missing last {_case['last_image_file']!r} "
+                f"(no last_fallback_url); running I2V without last_image"
+            )
+        _prm = str(_case["prompt"])
+        print(
+            f"[BENCH] --- image_id={_iid} init={_img_src!r} "
+            f"last={_last_src if _last_img is not None else 'none (no last frame)'} ---"
+        )
+
+        for _steps in _step_counts:
+            for _sampler in _schedulers:
+                _jid = f"bench_{_iid}_{_sampler}_{_steps}steps"
+                _params = {
+                    **_base_params,
+                    "num_inference_steps": _steps,
+                    "scheduler": _sampler,
+                }
+                _t0 = time.time()
+                try:
+                    _out = run_inference_wan_22_i2v(
+                        _jid,
+                        _prm,
+                        _params,
+                        init_image=_img,
+                        last_image=_last_img,
+                    )
+                    _wall = time.time() - _t0
+                    print(
+                        f"[BENCH] OK  image={_iid} scheduler={_sampler!r} steps={_steps} "
+                        f"wall_s={_wall:.1f} out={_out}"
+                    )
+                    _bench_rows.append(
+                        {
+                            "image_id": _iid,
+                            "image_file": _case["image_file"],
+                            "image_source": _img_src,
+                            "last_image_file": _case.get("last_image_file"),
+                            "last_image_source": _last_src,
+                            "prompt": _prm,
+                            "job_id": _jid,
+                            "scheduler": _sampler,
+                            "num_inference_steps": _steps,
+                            "wall_seconds": round(_wall, 3),
+                            "success": True,
+                            "output_path": _out,
+                            "error": None,
+                        }
+                    )
+                except Exception as _e:
+                    _wall = time.time() - _t0
+                    print(
+                        f"[BENCH] FAIL image={_iid} scheduler={_sampler!r} steps={_steps} "
+                        f"wall_s={_wall:.1f} err={_e!r}"
+                    )
+                    _bench_rows.append(
+                        {
+                            "image_id": _iid,
+                            "image_file": _case["image_file"],
+                            "image_source": _img_src,
+                            "last_image_file": _case.get("last_image_file"),
+                            "last_image_source": _last_src,
+                            "prompt": _prm,
+                            "job_id": _jid,
+                            "scheduler": _sampler,
+                            "num_inference_steps": _steps,
+                            "wall_seconds": round(_wall, 3),
+                            "success": False,
+                            "output_path": None,
+                            "error": str(_e),
+                        }
+                    )
+
+    _ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    _json_path = os.path.join(_script_dir, f"wan_i2v_scheduler_bench_{_ts}.json")
+    _report: Dict[str, Any] = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "script": os.path.basename(__file__),
+        "base_params": _base_params,
+        "schedulers": _schedulers,
+        "step_counts": list(_step_counts),
+        "bench_cases": [
+            {
+                "image_id": c["image_id"],
+                "image_file": c["image_file"],
+                "last_image_file": c.get("last_image_file"),
+                "has_fallback_url": bool(c.get("fallback_url")),
+                "has_last_fallback_url": bool(c.get("last_fallback_url")),
+                "prompt": str(c["prompt"]),
+            }
+            for c in _bench_cases
+        ],
+        "runs": _bench_rows,
+        "run_count": len(_bench_rows),
+    }
+    with open(_json_path, "w", encoding="utf-8") as _jf:
+        json.dump(_report, _jf, indent=2, ensure_ascii=False)
+    print(f"\n[BENCH] Wrote JSON report: {_json_path}")
+
+    print("\n=== BENCHMARK SUMMARY (wall_s per run) ===")
+    if _bench_rows:
+        _w_img = max(len("image"), max(len(r["image_id"]) for r in _bench_rows))
+        _w_sampler = max(len("scheduler"), max(len(r["scheduler"]) for r in _bench_rows))
+        for r in _bench_rows:
+            _status = "ok" if r["success"] else "FAIL"
+            print(
+                f"  {_status:4}  image={r['image_id']:<{_w_img}}  steps={r['num_inference_steps']}  "
+                f"wall_s={r['wall_seconds']:8.1f}  scheduler={r['scheduler']:<{_w_sampler}}"
+            )
+            if not r["success"] and r.get("error"):
+                _err = r["error"]
+                print(f"         {_err[:200]}{'…' if len(_err) > 200 else ''}")
+    else:
+        print("  (no completed runs — check missing images / fallbacks)")

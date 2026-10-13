@@ -1,0 +1,19 @@
+{
+  "files": [
+    {
+      "hf_repo": "AtomicChat/Qwen-Image-2.1-Turbo-Uncensored-GGUF",
+      "hf_path": "Qwen-Image-2.1-Turbo-Abliterated-Uncensored-Q8_0.gguf",
+      "dest": "unet/Qwen-Image-2.1-Turbo-Abliterated-Uncensored-Q8_0.gguf"
+    },
+    {
+      "hf_repo": "Comfy-Org/Qwen-Image-2.1",
+      "hf_path": "text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+      "dest": "text_encoders/qwen3vl_8b_int8_convrot.safetensors"
+    },
+    {
+      "hf_repo": "Comfy-Org/Qwen-Image-2.1",
+      "hf_path": "vae/qwen_image_2.1_vae_bf16.safetensors",
+      "dest": "vae/qwen_image_2.1_vae_bf16.safetensors"
+    }
+  ]
+}

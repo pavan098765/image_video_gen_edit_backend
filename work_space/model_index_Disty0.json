@@ -1,0 +1,39 @@
+{
+  "_class_name": "WanImageToVideoPipeline",
+  "_diffusers_version": "0.35.2",
+  "_name_or_path": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+  "boundary_ratio": 0.9,
+  "expand_timesteps": false,
+  "image_encoder": [
+    null,
+    null
+  ],
+  "image_processor": [
+    null,
+    null
+  ],
+  "scheduler": [
+    "diffusers",
+    "UniPCMultistepScheduler"
+  ],
+  "text_encoder": [
+    "transformers",
+    "UMT5EncoderModel"
+  ],
+  "tokenizer": [
+    "transformers",
+    "T5TokenizerFast"
+  ],
+  "transformer": [
+    "diffusers",
+    "WanTransformer3DModel"
+  ],
+  "transformer_2": [
+    "diffusers",
+    "WanTransformer3DModel"
+  ],
+  "vae": [
+    "diffusers",
+    "AutoencoderKLWan"
+  ]
+}

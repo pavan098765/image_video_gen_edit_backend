@@ -36,24 +36,24 @@ else:
 REALESRGAN_DIR = os.path.join(MODELS_DIR, "realesrgan")
 os.makedirs(REALESRGAN_DIR, exist_ok=True)
 
-for upscale_factor in [2, 4]:
-    model_filename = f"RealESRGAN_x{upscale_factor}.pth"
+_repo = os.getenv("REALESRGAN_HF_REPO", "rockapaper/realesrgan")
+for model_filename in ("RealESRGAN_x2plus.pth", "RealESRGAN_x4plus.pth"):
     model_file = os.path.join(REALESRGAN_DIR, model_filename)
-    
     if not os.path.exists(model_file):
         try:
-            print(f"⬇️ Downloading Real-ESRGAN {upscale_factor}x model to {REALESRGAN_DIR}...")
+            print(f"⬇️ Downloading {_repo} / {model_filename} → {REALESRGAN_DIR} …")
             hf_hub_download(
-                repo_id="ai-forever/Real-ESRGAN",
+                repo_id=_repo,
                 filename=model_filename,
                 local_dir=REALESRGAN_DIR,
+                resume_download=True,
             )
-            print(f"✓ Real-ESRGAN {upscale_factor}x model downloaded successfully")
+            print(f"✓ Real-ESRGAN {model_filename} downloaded successfully")
         except Exception as e:
-            print(f"❌ Failed to download Real-ESRGAN {upscale_factor}x model: {e}")
+            print(f"❌ Failed to download Real-ESRGAN {model_filename}: {e}")
             traceback.print_exc()
     else:
-        print(f"✓ Real-ESRGAN {upscale_factor}x model already exists at {model_file}")
+        print(f"✓ Real-ESRGAN already exists at {model_file}")
 
 # ------------------------
 # 3. Download RIFE code (clone from GitHub)

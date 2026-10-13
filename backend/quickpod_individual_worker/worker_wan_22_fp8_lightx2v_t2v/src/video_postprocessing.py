@@ -388,38 +388,40 @@ def download_rife_model(models_dir):
 
 
 def download_realesrgan_model(models_dir, upscale_factor=4):
-    """Download Real-ESRGAN model locally.
-    
-    Args:
-        models_dir: Directory to save models
-        upscale_factor: Upscale factor (2, 4, or 8)
-    
-    Returns:
-        Path to downloaded model file or None if failed
+    """Download Real-ESRGAN model locally (rockapaper/realesrgan x2plus/x4plus).
+
+    Video postprocess uses the same weight files as omni image bake (not ai-forever names).
     """
-    if upscale_factor not in [2, 4, 8]:
+    try:
+        u = int(upscale_factor)
+    except (TypeError, ValueError):
+        u = 4
+    if u not in (2, 4, 8):
         print(f"⚠️  Invalid upscale factor {upscale_factor}, must be 2, 4, or 8. Using 4x.")
-        upscale_factor = 4
-    
+        u = 4
+
     realesrgan_dir = os.path.join(models_dir, "realesrgan")
     os.makedirs(realesrgan_dir, exist_ok=True)
-    
-    model_filename = f"RealESRGAN_x{upscale_factor}.pth"
+
+    repo_id = os.environ.get("REALESRGAN_HF_REPO", "rockapaper/realesrgan")
+    model_filename = (
+        "RealESRGAN_x2plus.pth" if u <= 2 else "RealESRGAN_x4plus.pth"
+    )
     model_file = os.path.join(realesrgan_dir, model_filename)
-    
+
     if os.path.exists(model_file):
         print(f"✓ Real-ESRGAN model already exists at {model_file}")
         return model_file
-    
-    print(f"⬇️ Downloading Real-ESRGAN {upscale_factor}x model to {realesrgan_dir}...")
-    
+
+    print(f"⬇️ Downloading {repo_id} / {model_filename} → {realesrgan_dir} …")
+
     try:
         hf_hub_download(
-            repo_id="ai-forever/Real-ESRGAN",
+            repo_id=repo_id,
             filename=model_filename,
             local_dir=realesrgan_dir,
         )
-        print(f"✓ Real-ESRGAN {upscale_factor}x model downloaded successfully")
+        print(f"✓ Real-ESRGAN ({model_filename}) downloaded successfully")
         return model_file
     except Exception as e:
         print(f"❌ Failed to download Real-ESRGAN model: {e}")

@@ -19,15 +19,18 @@ All operations use database transactions to ensure atomicity.
 import logging
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 import requests
 
 from db import User, Job, CreditTransaction, Subscription, SessionLocal, utc_naive_now
+from sale_scheduler import SaleScheduler
 
 logger = logging.getLogger("credit_service")
+_sale_scheduler = SaleScheduler()
 
 
 # =============================================================================
@@ -47,6 +50,24 @@ _tool_config_cache: Dict[str, Any] = {
 # Fallback costs if tool_config.json is unavailable
 FALLBACK_CREDIT_COSTS: Dict[str, Dict[str, int]] = {
     "default": {"cost": 10, "cost_upscale": 5, "offer": 0},
+    "studio": {"cost": 25, "cost_upscale": 0, "offer": 0},
+    "qwen2_1_t2i": {"cost": 18, "cost_upscale": 0, "offer": 0},
+    "qwen2_1_i2i": {"cost": 18, "cost_upscale": 0, "offer": 0},
+    "grok_imagine_t2i": {"cost": 18, "cost_upscale": 0, "offer": 0},
+    "grok_imagine_edit": {"cost": 18, "cost_upscale": 0, "offer": 0},
+    "recraft_crisp_upscale": {"cost": 8, "cost_upscale": 0, "offer": 0},
+    "recraft_remove_background": {"cost": 8, "cost_upscale": 0, "offer": 0},
+    "gemini_ocr": {"cost": 5, "cost_upscale": 0, "offer": 0},
+}
+
+# After sale discount, never charge below these list floors.
+IMAGE_SALE_FLOORS: Dict[str, int] = {
+    "qwen2_1_t2i": 15,
+    "qwen2_1_i2i": 15,
+    "grok_imagine_t2i": 15,
+    "grok_imagine_edit": 15,
+    "recraft_crisp_upscale": 7,
+    "recraft_remove_background": 7,
 }
 
 
@@ -125,6 +146,9 @@ def _build_model_cost_map(config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         logger.info(f"[CREDIT] Built cost map for {len(model_costs)} models")
     except Exception as e:
         logger.error(f"[CREDIT] Error building model cost map: {e}")
+
+    if "studio" not in model_costs:
+        model_costs["studio"] = dict(FALLBACK_CREDIT_COSTS["studio"])
     
     return model_costs
 
@@ -172,7 +196,120 @@ def get_model_cost_info(model: str) -> Dict[str, int]:
         Dict with keys: cost, cost_upscale, offer
     """
     tool_config = get_tool_config()
-    return tool_config.get(model, FALLBACK_CREDIT_COSTS["default"])
+    if model in tool_config:
+        return tool_config[model]
+    return FALLBACK_CREDIT_COSTS.get(model, FALLBACK_CREDIT_COSTS["default"])
+
+
+def _resolve_effective_offer(model_offer_percent: int) -> Tuple[int, Dict[str, Any]]:
+    """
+    Resolve effective discount policy.
+
+    Policy: sale_overrides
+    - If sale window is active, sale discount overrides model offer.
+    - Otherwise, model offer applies.
+    """
+    try:
+        sale_state = _sale_scheduler.get_current_window_state()
+        if sale_state.is_active:
+            return int(sale_state.discount_percent), {
+                "offer_source": "sale_window_override",
+                "sale_active": True,
+                "sale_discount_percent": int(sale_state.discount_percent),
+                "sale_window_id": sale_state.window_id,
+                "sale_window_index": sale_state.window_index,
+                "sale_day_key": sale_state.day_key,
+                "sale_timezone": sale_state.timezone,
+                "sale_window_start_local": sale_state.window_start_local,
+                "sale_window_end_local": sale_state.window_end_local,
+                "model_offer_percent": int(model_offer_percent or 0),
+            }
+    except Exception as e:
+        logger.warning(f"[CREDIT] Sale scheduler check failed, falling back to model offer: {e}")
+
+    return int(model_offer_percent or 0), {
+        "offer_source": "model_offer",
+        "sale_active": False,
+        "sale_discount_percent": 0,
+        "sale_window_id": None,
+        "sale_window_index": None,
+        "sale_day_key": None,
+        "sale_timezone": getattr(_sale_scheduler, "timezone_name", "UTC"),
+        "sale_window_start_local": None,
+        "sale_window_end_local": None,
+        "model_offer_percent": int(model_offer_percent or 0),
+    }
+
+
+def get_active_sale_window_info() -> Dict[str, Any]:
+    """Expose current sale window state for observability/admin endpoints."""
+    state = _sale_scheduler.get_current_window_state()
+    return {
+        "is_active": state.is_active,
+        "discount_percent": int(state.discount_percent),
+        "day_key": state.day_key,
+        "window_index": state.window_index,
+        "window_id": state.window_id,
+        "window_start_local": state.window_start_local,
+        "window_end_local": state.window_end_local,
+        "timezone": state.timezone,
+    }
+
+
+def build_public_sale_status_payload() -> Dict[str, Any]:
+    """
+    Public JSON body for GET /sales/active (banners / client pricing preview).
+
+    Single builder for response bytes and ETag so they cannot drift.
+    Authoritative charges still use _sale_scheduler inside calculate_job_cost / submit paths.
+    """
+    info = get_active_sale_window_info()
+    next_window = None
+    try:
+        sched = _sale_scheduler
+        snapshot = sched.get_today_schedule_snapshot()
+        tz_name = snapshot.get("timezone") or "UTC"
+        tz = ZoneInfo(tz_name)
+        slot_minutes = int(snapshot.get("slot_minutes") or 15)
+        slot_interval_hours = int(snapshot.get("slot_interval_hours") or 3)
+        discount_schedule = snapshot.get("discount_schedule") or []
+        now_utc = datetime.utcnow()
+        local_now = now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+        day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        for idx, discount in enumerate(discount_schedule):
+            slot_start = day_start + timedelta(hours=idx * slot_interval_hours)
+            slot_end = slot_start + timedelta(minutes=slot_minutes)
+            if slot_start > local_now:
+                next_window = {
+                    "start_utc": slot_start.astimezone(ZoneInfo("UTC")).isoformat(),
+                    "discount_percent": int(discount),
+                }
+                break
+        if next_window is None and discount_schedule:
+            tomorrow_start = day_start + timedelta(days=1)
+            tomorrow_local = tomorrow_start
+            tomorrow_schedule = sched.get_daily_schedule(tomorrow_local)
+            if tomorrow_schedule:
+                first_slot = tomorrow_start
+                next_window = {
+                    "start_utc": first_slot.astimezone(ZoneInfo("UTC")).isoformat(),
+                    "discount_percent": int(tomorrow_schedule[0]),
+                }
+    except Exception:
+        pass
+    return {
+        "is_active": info.get("is_active", False),
+        "discount_percent": info.get("discount_percent", 0),
+        "window_start": info.get("window_start_local"),
+        "window_end": info.get("window_end_local"),
+        "timezone": info.get("timezone"),
+        "next_window": next_window,
+    }
+
+
+def get_today_sale_schedule_info() -> Dict[str, Any]:
+    """Expose today's configured sale schedule and current window."""
+    return _sale_scheduler.get_today_schedule_snapshot()
 
 
 def calculate_job_cost(
@@ -181,7 +318,8 @@ def calculate_job_cost(
     variations: int = 1,
     is_vip: bool = False,
     num_images: int = 1,
-) -> int:
+    return_meta: bool = False,
+) -> Any:
     """
     Calculate the total cost for a job (or batch of jobs).
     
@@ -216,6 +354,28 @@ def calculate_job_cost(
     Returns:
         Total credit cost (integer, minimum 1)
     """
+    # Studio: duration × tier, not a forever-flat 25.
+    if model == "studio":
+        prefs = (params or {}).get("prefs") or params or {}
+        duration_seconds = float(prefs.get("duration_seconds") or 30)
+        duration_seconds = max(5.0, min(duration_seconds, 1200.0))
+        tier = str(prefs.get("quality_tier") or "studio")
+        minutes = max(1, int((duration_seconds + 59) // 60))
+        per_min = {"draft": 8, "studio": 15, "hero": 28}.get(tier, 15)
+        extra = 10 if prefs.get("emit_shorts") or prefs.get("native_short") else 0
+        total = max(10, minutes * per_min + extra)
+        if return_meta:
+            return total, {
+                "model": model,
+                "pricing_type": "studio_duration_tier",
+                "quality_tier": tier,
+                "minutes": minutes,
+            }
+        return total
+    cost_info = get_model_cost_info(model)
+    model_offer_percent = int(cost_info.get("offer", 0) or 0)
+    effective_offer_percent, offer_meta = _resolve_effective_offer(model_offer_percent)
+
     # Special handling for video upscalers: dynamic cost based on video duration
     if model in ("video_upscaler", "flashvsr_video_upscaler") and params:
         video_duration = params.get("video_duration")
@@ -233,6 +393,9 @@ def calculate_job_cost(
                 credits_per_5_sec = 2
                 duration_5sec_blocks = max(1, int((duration_seconds + 4) // 5))  # Round up
                 per_job_cost = credits_per_5_sec * duration_5sec_blocks
+                if effective_offer_percent > 0:
+                    per_job_cost -= int(per_job_cost * effective_offer_percent / 100)
+                    per_job_cost = max(1, per_job_cost)
                 
                 # Multiply by variations count
                 variations = max(1, min(4, variations))  # Clamp to 1-4
@@ -244,13 +407,20 @@ def calculate_job_cost(
                     f"variations={variations}, total={total}"
                 )
                 
-                return max(1, total)  # Ensure minimum cost of 1
+                total = max(1, total)  # Ensure minimum cost of 1
+                if return_meta:
+                    return total, {
+                        "model": model,
+                        "pricing_type": "video_upscaler_duration",
+                        "effective_offer_percent": effective_offer_percent,
+                        **offer_meta,
+                    }
+                return total
             except (ValueError, TypeError) as e:
                 logger.warning(f"[CREDIT] Invalid video_duration for {model}: {video_duration}, error: {e}")
                 # Fall through to default calculation
     
     # Duration-based cost for create_video / animate_image models (with baseCost5Sec in tool_config)
-    cost_info = get_model_cost_info(model)
     base_cost_5_sec = cost_info.get("baseCost5Sec")
     duration_val = (params or {}).get("duration") or (params or {}).get("duration_seconds")
     if base_cost_5_sec is not None and duration_val is not None:
@@ -262,10 +432,9 @@ def calculate_job_cost(
                 # Formula: cost = baseCost5Sec * effective_duration / 5 (matches frontend: 5s→15, 8s→24, 10s→30)
                 per_job_cost = int(base_cost_5_sec * effective_duration / 5)
                 per_job_cost = max(1, per_job_cost)
-                # Apply offer discount
-                offer_percent = cost_info.get("offer", 0)
-                if offer_percent > 0:
-                    per_job_cost -= int(per_job_cost * offer_percent / 100)
+                # Apply effective offer discount (sale_overrides policy)
+                if effective_offer_percent > 0:
+                    per_job_cost -= int(per_job_cost * effective_offer_percent / 100)
                     per_job_cost = max(1, per_job_cost)
                 variations_count = max(1, min(4, variations))
                 num_images_count = max(1, num_images)
@@ -275,7 +444,15 @@ def calculate_job_cost(
                     f"effective={effective_duration:.1f}s, baseCost5Sec={base_cost_5_sec}, "
                     f"per_job={per_job_cost}, variations={variations_count}, total={total}"
                 )
-                return max(1, total)
+                total = max(1, total)
+                if return_meta:
+                    return total, {
+                        "model": model,
+                        "pricing_type": "duration_based",
+                        "effective_offer_percent": effective_offer_percent,
+                        **offer_meta,
+                    }
+                return total
         except (ValueError, TypeError) as e:
             logger.warning(f"[CREDIT] Invalid duration for {model}: {duration_val}, error: {e}")
             # Fall through to standard calculation
@@ -284,7 +461,6 @@ def calculate_job_cost(
     
     base_cost = cost_info.get("cost", 10)
     upscale_cost = cost_info.get("cost_upscale", 5)
-    offer_percent = cost_info.get("offer", 0)
     
     # Check if upscaling is enabled
     scale_factor = 1
@@ -311,13 +487,16 @@ def calculate_job_cost(
             logger.debug(f"[CREDIT] Adding upscale cost: {upscale_cost} (scale_factor={scale_factor})")
     
     # Apply offer discount
-    if offer_percent > 0:
-        discount = int(base_cost * offer_percent / 100)
+    if effective_offer_percent > 0:
+        discount = int(base_cost * effective_offer_percent / 100)
         per_job_cost -= discount
-        logger.debug(f"[CREDIT] Applying {offer_percent}% discount: -{discount}")
+        logger.debug(f"[CREDIT] Applying {effective_offer_percent}% discount: -{discount}")
     
-    # Ensure minimum cost of 1 per job
+    # Ensure minimum cost of 1 per job, then sale-safe image floors
     per_job_cost = max(1, per_job_cost)
+    floor = IMAGE_SALE_FLOORS.get(model)
+    if floor is not None:
+        per_job_cost = max(floor, per_job_cost)
     
     # Multiply by variations count and number of images (bulk edit)
     variations = max(1, min(4, variations))  # Clamp to 1-4
@@ -327,10 +506,18 @@ def calculate_job_cost(
     upscale_applied = upscale_cost if (scale_factor > 1 and not is_vip) else 0
     logger.info(
         f"[CREDIT] Cost for {model}: base={base_cost}, upscale={upscale_applied}, "
-        f"offer={offer_percent}%, per_job={per_job_cost}, variations={variations}, "
+        f"offer={effective_offer_percent}%, per_job={per_job_cost}, variations={variations}, "
         f"num_images={num_images}, is_vip={is_vip}, total={total}"
     )
-    
+    if return_meta:
+        return total, {
+            "model": model,
+            "pricing_type": "standard",
+            "base_cost": int(base_cost),
+            "upscale_cost_applied": int(upscale_applied),
+            "effective_offer_percent": int(effective_offer_percent),
+            **offer_meta,
+        }
     return total
 
 
@@ -357,6 +544,25 @@ def get_credit_cost(
         Total credit cost
     """
     return calculate_job_cost(model, params, variations, is_vip, num_images)
+
+
+def get_credit_cost_breakdown(
+    model: str,
+    params: Optional[Dict[str, Any]] = None,
+    variations: int = 1,
+    is_vip: bool = False,
+    num_images: int = 1,
+) -> Tuple[int, Dict[str, Any]]:
+    """Return cost and pricing metadata for auditing."""
+    total, meta = calculate_job_cost(
+        model,
+        params,
+        variations,
+        is_vip,
+        num_images,
+        return_meta=True,
+    )
+    return int(total), dict(meta or {})
 
 
 # =============================================================================
@@ -395,8 +601,10 @@ def lock_credits_for_job(
         Tuple of (success, message, credits_locked)
     """
     try:
-        # Get credit cost (includes upscale cost calculation, VIP free upscale)
-        cost = get_credit_cost(model, params, variations=1, is_vip=is_vip)
+        # Get credit cost + pricing metadata (includes sale window override policy)
+        cost, pricing_meta = get_credit_cost_breakdown(
+            model, params, variations=1, is_vip=is_vip
+        )
         logger.info(f"[CREDIT] Attempting to lock {cost} credits for job {job_id}, user {user_id}, model {model}, is_vip={is_vip}")
         
         # Get user (SQLite uses transaction-level locking, no with_for_update needed)
@@ -426,15 +634,36 @@ def lock_credits_for_job(
         if job:
             job.credits_locked = cost
             job.user_id = user_id
+            if isinstance(job.params, dict):
+                meta_copy = dict(job.params)
+                meta_copy["_pricing_meta"] = {
+                    "credits_locked": int(cost),
+                    "locked_at": utc_naive_now().isoformat(),
+                    **pricing_meta,
+                }
+                job.params = meta_copy
             logger.info(f"[CREDIT] Updated job {job_id} with credits_locked={cost}")
         else:
             logger.warning(f"[CREDIT] Job {job_id} not found - cannot set credits_locked")
         
         # Record transaction
+        reason = "job_submitted"
+        if pricing_meta.get("sale_active"):
+            sale_pct = pricing_meta.get("sale_discount_percent", 0)
+            window_id = pricing_meta.get("sale_window_id") or "unknown"
+            reason = f"job_submitted:sale_{sale_pct}pct:{window_id}"
+
         transaction = CreditTransaction(
             user_id=user_id,
             delta=-cost,
-            reason="job_submitted",
+            reason=reason[:255],
+            credit_metadata={
+                "event": "job_submitted",
+                "pricing": pricing_meta,
+                "model": model,
+                "is_vip": bool(is_vip),
+                "locked_credits": int(cost),
+            },
             job_id=job_id,
             created_at=utc_naive_now(),
         )
@@ -505,6 +734,11 @@ def refund_credits_for_job(
             user_id=job.user_id,
             delta=refund_amount,
             reason=reason,
+            credit_metadata={
+                "event": "job_refund",
+                "refund_reason": reason,
+                "refund_amount": int(refund_amount),
+            },
             job_id=job_id,
             created_at=utc_naive_now(),
         )
@@ -569,6 +803,12 @@ def add_topup_credits(
             user_id=user_id,
             delta=amount,
             reason=f"topup:{provider}:{payment_ref}",
+            credit_metadata={
+                "event": "topup",
+                "provider": provider,
+                "payment_ref": payment_ref,
+                "amount": int(amount),
+            },
             created_at=utc_naive_now(),
         )
         db.add(transaction)
@@ -627,6 +867,12 @@ def grant_subscription_credits(
             user_id=user_id,
             delta=amount,
             reason=f"subscription:{subscription.plan_id}",
+            credit_metadata={
+                "event": "subscription_credit",
+                "plan_id": subscription.plan_id,
+                "subscription_id": int(subscription_id),
+                "amount": int(amount),
+            },
             created_at=utc_naive_now(),
         )
         db.add(transaction)

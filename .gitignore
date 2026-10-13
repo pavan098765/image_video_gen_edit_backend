@@ -1,3 +1,9 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
 backend/controller.db
 backend/quickpod_individual_worker/realesrgan_models/RealESRGAN_x2plus.pth
 backend/quickpod_individual_worker/realesrgan_models/RealESRGAN_x4plus.pth
@@ -80,3 +86,13 @@ backend/server_controller/src/controller.db
 backend/server_controller/src/controller_export.xlsx
 *.db
 *.xlsx
+# HF Space reference clone (nested .git) next to I2V multi worker; remove inner .git to track files
+backend/quickpod_individual_worker/worker_wan_22_fp8_lightx2v_i2v_multi/wan2-2-fp8da-aoti-preview2/.git/
+
+# Local dumps / Civitai packs / bench archives (GitHub rejects files >100MB)
+/*.zip
+work_space/*.zip
+work_space/**/*.zip
+**/src/_archive/
+*.gguf
+*.safetensors

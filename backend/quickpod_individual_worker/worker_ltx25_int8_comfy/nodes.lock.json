@@ -1,0 +1,25 @@
+{
+  "comfyui": {
+    "repo": "https://github.com/Comfy-Org/ComfyUI",
+    "ref": "v0.37.0"
+  },
+  "custom_nodes": [
+    {
+      "name": "ComfyUI-KJNodes",
+      "repo": "https://github.com/kijai/ComfyUI-KJNodes",
+      "commit": "d3cfe21625e5170126ce06fbfcfe1d88108688c3",
+      "note": "Civitai pack asked KJNodes 1.5.0; this pin includes LTX2MemoryEfficientSageAttentionPatch, VRAM_Debug, PreviewAny."
+    },
+    {
+      "name": "ComfyUI-SolAttn_triton",
+      "repo": "https://github.com/kijai/ComfyUI-SolAttn_triton",
+      "commit": "842c4eaa7d91dbaef3fee3ccdbf36a39521e82fc"
+    }
+  ],
+  "local_nodes": [
+    {
+      "name": "ltx25_smart_controls",
+      "src": "custom_nodes/ltx25_smart_controls"
+    }
+  ]
+}

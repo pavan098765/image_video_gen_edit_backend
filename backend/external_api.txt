@@ -1,0 +1,804 @@
+for remove background tool (Your request will cost $0.005 per megapixel.)
+:
+fal-ai/birefnet
+About
+Remove Background Http
+
+1. Calling the API
+#
+Install the client
+#
+The client provides a convenient way to interact with the model API.
+
+
+pip install fal-client
+Setup your API Key
+#
+Set FAL_KEY as an environment variable in your runtime.
+
+
+export FAL_KEY="YOUR_API_KEY"
+Submit a request
+#
+The client API handles the API submit protocol. It will handle the request status updates and return the result when the request is completed.
+
+Python
+Python (async)
+
+import fal_client
+
+def on_queue_update(update):
+    if isinstance(update, fal_client.InProgress):
+        for log in update.logs:
+           print(log["message"])
+
+result = fal_client.subscribe(
+    "fal-ai/birefnet",
+    arguments={
+        "image_url": "https://storage.googleapis.com/falserverless/example_inputs/birefnet-input.jpeg"
+    },
+    with_logs=True,
+    on_queue_update=on_queue_update,
+)
+print(result)
+2. Authentication
+#
+The API uses an API Key for authentication. It is recommended you set the FAL_KEY environment variable in your runtime when possible.
+
+API Key
+#
+Protect your API Key
+When running code on the client-side (e.g. in a browser, mobile app or GUI applications), make sure to not expose your FAL_KEY. Instead, use a server-side proxy to make requests to the API. For more information, check out our server-side integration guide.
+
+3. Queue
+#
+Long-running requests
+For long-running requests, such as training jobs or models with slower inference times, it is recommended to check the Queue status and rely on Webhooks instead of blocking while waiting for the result.
+
+Submit a request
+#
+The client API provides a convenient way to submit requests to the model.
+
+Python
+Python (async)
+
+import fal_client
+
+handler = fal_client.submit(
+    "fal-ai/birefnet",
+    arguments={
+        "image_url": "https://storage.googleapis.com/falserverless/example_inputs/birefnet-input.jpeg"
+    },
+    webhook_url="https://optional.webhook.url/for/results",
+)
+
+request_id = handler.request_id
+Fetch request status
+#
+You can fetch the status of a request to check if it is completed or still in progress.
+
+Python
+Python (async)
+
+status = fal_client.status("fal-ai/birefnet", request_id, with_logs=True)
+Get the result
+#
+Once the request is completed, you can fetch the result. See the Output Schema for the expected result format.
+
+Python
+Python (async)
+
+result = fal_client.result("fal-ai/birefnet", request_id)
+4. Files
+#
+Some attributes in the API accept file URLs as input. Whenever that's the case you can pass your own URL or a Base64 data URI.
+
+Data URI (base64)
+#
+You can pass a Base64 data URI as a file input. The API will handle the file decoding for you. Keep in mind that for large files, this alternative although convenient can impact the request performance.
+
+Hosted files (URL)
+#
+You can also pass your own URLs as long as they are publicly accessible. Be aware that some hosts might block cross-site requests, rate-limit, or consider the request as a bot.
+
+Uploading files
+#
+We provide a convenient file storage that allows you to upload files and use them in your requests. You can upload files using the client API and use the returned URL in your requests.
+
+Python
+Python (async)
+
+url = fal_client.upload_file("path/to/file")
+Read more about file handling in our file upload guide.
+
+5. Schema
+#
+Input
+#
+model ModelEnum
+Model to use for background removal. The 'General Use (Light)' model is the original model used in the BiRefNet repository. The 'General Use (Heavy)' model is a slower but more accurate model. The 'Portrait' model is a model trained specifically for portrait images. The 'General Use (Light)' model is recommended for most use cases.
+
+The corresponding models are as follows:
+
+'General Use (Light)': BiRefNet-DIS_ep580.pth
+'General Use (Heavy)': BiRefNet-massive-epoch_240.pth
+'Portrait': BiRefNet-portrait-TR_P3M_10k-epoch_120.pth Default value: "General Use (Light)"
+Possible enum values: General Use (Light), General Use (Heavy), Portrait
+
+operating_resolution OperatingResolutionEnum
+The resolution to operate on. The higher the resolution, the more accurate the output will be for high res input images. Default value: "1024x1024"
+
+Possible enum values: 1024x1024, 2048x2048
+
+output_mask boolean
+Whether to output the mask used to remove the background
+
+refine_foreground boolean
+Whether to refine the foreground using the estimated mask Default value: true
+
+sync_mode boolean
+If True, the media will be returned as a data URI and the output data won't be available in the request history.
+
+image_url string
+URL of the image to remove background from
+
+output_format OutputFormatEnum
+The format of the output image Default value: "png"
+
+Possible enum values: webp, png, gif
+
+
+{
+  "model": "General Use (Light)",
+  "operating_resolution": "1024x1024",
+  "refine_foreground": true,
+  "image_url": "https://storage.googleapis.com/falserverless/example_inputs/birefnet-input.jpeg",
+  "output_format": "png"
+}
+Output
+#
+image ImageFile
+Image with background removed
+
+mask_image ImageFile
+Mask used to remove the background
+
+
+{
+  "image": {
+    "height": 1024,
+    "file_name": "birefnet-output.png",
+    "content_type": "image/png",
+    "url": "https://storage.googleapis.com/falserverless/example_outputs/birefnet-output.png",
+    "width": 1024
+  }
+}
+Other types
+#
+VideoInputV2
+#
+model ModelEnum
+Model to use for background removal. The 'General Use (Light)' model is the original model used in the BiRefNet repository. The 'General Use (Light 2K)' model is the original model used in the BiRefNet repository but trained with 2K images. The 'General Use (Heavy)' model is a slower but more accurate model. The 'Matting' model is a model trained specifically for matting images. The 'Portrait' model is a model trained specifically for portrait images. The 'General Use (Dynamic)' model supports dynamic resolutions from 256x256 to 2304x2304. The 'General Use (Light)' model is recommended for most use cases.
+
+The corresponding models are as follows:
+
+'General Use (Light)': BiRefNet
+'General Use (Light 2K)': BiRefNet_lite-2K
+'General Use (Heavy)': BiRefNet_lite
+'Matting': BiRefNet-matting
+'Portrait': BiRefNet-portrait
+'General Use (Dynamic)': BiRefNet_dynamic Default value: "General Use (Light)"
+Possible enum values: General Use (Light), General Use (Light 2K), General Use (Heavy), Matting, Portrait, General Use (Dynamic)
+
+operating_resolution OperatingResolutionEnum
+The resolution to operate on. The higher the resolution, the more accurate the output will be for high res input images. The '2304x2304' option is only available for the 'General Use (Dynamic)' model. Default value: "1024x1024"
+
+Possible enum values: 1024x1024, 2048x2048, 2304x2304
+
+output_mask boolean
+Whether to output the mask used to remove the background
+
+refine_foreground boolean
+Whether to refine the foreground using the estimated mask Default value: true
+
+sync_mode boolean
+If True, the media will be returned as a data URI and the output data won't be available in the request history.
+
+video_url string
+URL of the video to remove background from
+
+video_output_type VideoOutputTypeEnum
+The output type of the generated video. Default value: "X264 (.mp4)"
+
+Possible enum values: X264 (.mp4), VP9 (.webm), PRORES4444 (.mov), GIF (.gif)
+
+video_quality VideoQualityEnum
+The quality of the generated video. Default value: "high"
+
+Possible enum values: low, medium, high, maximum
+
+video_write_mode VideoWriteModeEnum
+The write mode of the generated video. Default value: "balanced"
+
+Possible enum values: fast, balanced, small
+
+ImageFile
+#
+url string
+The URL where the file can be downloaded from.
+
+content_type string
+The mime type of the file.
+
+file_name string
+The name of the file. It will be auto-generated if not provided.
+
+file_size integer
+The size of the file in bytes.
+
+width integer
+The width of the image
+
+height integer
+The height of the image
+
+VideoFile
+#
+url string
+The URL where the file can be downloaded from.
+
+content_type string
+The mime type of the file.
+
+file_name string
+The name of the file. It will be auto-generated if not provided.
+
+file_size integer
+The size of the file in bytes.
+
+width integer
+The width of the video
+
+height integer
+The height of the video
+
+fps float
+The FPS of the video
+
+duration float
+The duration of the video
+
+num_frames integer
+The number of frames in the video
+
+===============================================================================================================
+
+Expand image tool (Your request will cost $0.005 per megapixel.)
+
+
+About
+Reframe Image Flash
+
+1. Calling the API
+#
+Install the client
+#
+The client provides a convenient way to interact with the model API.
+
+
+pip install fal-client
+Setup your API Key
+#
+Set FAL_KEY as an environment variable in your runtime.
+
+
+export FAL_KEY="YOUR_API_KEY"
+Submit a request
+#
+The client API handles the API submit protocol. It will handle the request status updates and return the result when the request is completed.
+
+Python
+Python (async)
+
+import fal_client
+
+def on_queue_update(update):
+    if isinstance(update, fal_client.InProgress):
+        for log in update.logs:
+           print(log["message"])
+
+result = fal_client.subscribe(
+    "fal-ai/luma-photon/flash/reframe",
+    arguments={
+        "image_url": "https://storage.googleapis.com/falserverless/gallery/example_inputs_liuyifei.png",
+        "aspect_ratio": "16:9"
+    },
+    with_logs=True,
+    on_queue_update=on_queue_update,
+)
+print(result)
+2. Authentication
+#
+The API uses an API Key for authentication. It is recommended you set the FAL_KEY environment variable in your runtime when possible.
+
+API Key
+#
+Protect your API Key
+When running code on the client-side (e.g. in a browser, mobile app or GUI applications), make sure to not expose your FAL_KEY. Instead, use a server-side proxy to make requests to the API. For more information, check out our server-side integration guide.
+
+3. Queue
+#
+Long-running requests
+For long-running requests, such as training jobs or models with slower inference times, it is recommended to check the Queue status and rely on Webhooks instead of blocking while waiting for the result.
+
+Submit a request
+#
+The client API provides a convenient way to submit requests to the model.
+
+Python
+Python (async)
+
+import fal_client
+
+handler = fal_client.submit(
+    "fal-ai/luma-photon/flash/reframe",
+    arguments={
+        "image_url": "https://storage.googleapis.com/falserverless/gallery/example_inputs_liuyifei.png",
+        "aspect_ratio": "16:9"
+    },
+    webhook_url="https://optional.webhook.url/for/results",
+)
+
+request_id = handler.request_id
+Fetch request status
+#
+You can fetch the status of a request to check if it is completed or still in progress.
+
+Python
+Python (async)
+
+status = fal_client.status("fal-ai/luma-photon/flash/reframe", request_id, with_logs=True)
+Get the result
+#
+Once the request is completed, you can fetch the result. See the Output Schema for the expected result format.
+
+Python
+Python (async)
+
+result = fal_client.result("fal-ai/luma-photon/flash/reframe", request_id)
+4. Files
+#
+Some attributes in the API accept file URLs as input. Whenever that's the case you can pass your own URL or a Base64 data URI.
+
+Data URI (base64)
+#
+You can pass a Base64 data URI as a file input. The API will handle the file decoding for you. Keep in mind that for large files, this alternative although convenient can impact the request performance.
+
+Hosted files (URL)
+#
+You can also pass your own URLs as long as they are publicly accessible. Be aware that some hosts might block cross-site requests, rate-limit, or consider the request as a bot.
+
+Uploading files
+#
+We provide a convenient file storage that allows you to upload files and use them in your requests. You can upload files using the client API and use the returned URL in your requests.
+
+Python
+Python (async)
+
+url = fal_client.upload_file("path/to/file")
+Read more about file handling in our file upload guide.
+
+5. Schema
+#
+Input
+#
+image_url string
+URL of the input image to reframe
+
+aspect_ratio AspectRatioEnum
+The aspect ratio of the reframed image
+
+Possible enum values: 1:1, 16:9, 9:16, 4:3, 3:4, 21:9, 9:21
+
+prompt string
+Optional prompt for reframing
+
+grid_position_x integer
+X position of the grid for reframing
+
+grid_position_y integer
+Y position of the grid for reframing
+
+x_end integer
+End X coordinate for reframing
+
+x_start integer
+Start X coordinate for reframing
+
+y_end integer
+End Y coordinate for reframing
+
+y_start integer
+Start Y coordinate for reframing
+
+
+{
+  "image_url": "https://storage.googleapis.com/falserverless/gallery/example_inputs_liuyifei.png",
+  "aspect_ratio": "16:9"
+}
+Output
+#
+images list<File>
+The generated image
+
+
+{
+  "images": [
+    {
+      "url": "",
+      "content_type": "image/png",
+      "file_name": "z9RV14K95DvU.png",
+      "file_size": 4404019
+    }
+  ]
+}
+Other types
+#
+TextToImageRequest
+#
+prompt string
+aspect_ratio AspectRatioEnum
+The aspect ratio of the generated video Default value: "1:1"
+
+Possible enum values: 16:9, 9:16, 1:1, 4:3, 3:4, 21:9, 9:21
+
+File
+#
+url string
+The URL where the file can be downloaded from.
+
+content_type string
+The mime type of the file.
+
+file_name string
+The name of the file. It will be auto-generated if not provided.
+
+file_size integer
+The size of the file in bytes.
+
+ModifyImageRequest
+#
+prompt string
+Instruction for modifying the image
+
+image_url string
+URL of the input image to reframe
+
+strength float
+The strength of the initial image. Higher strength values are corresponding to more influence of the initial image on the output.
+
+aspect_ratio AspectRatioEnum
+The aspect ratio of the reframed image
+
+Possible enum values: 1:1, 16:9, 9:16, 4:3, 3:4, 21:9, 9:21
+
+===========================================================================================================
+
+Upscale image tool (Your request will cost $0.004 per image.)
+Replace photoboost, photoboost anime entirely with below (only api call for it no quickpod backend)
+
+About
+Crisp Upscale Image
+
+1. Calling the API
+#
+Install the client
+#
+The client provides a convenient way to interact with the model API.
+
+
+pip install fal-client
+Setup your API Key
+#
+Set FAL_KEY as an environment variable in your runtime.
+
+
+export FAL_KEY="YOUR_API_KEY"
+Submit a request
+#
+The client API handles the API submit protocol. It will handle the request status updates and return the result when the request is completed.
+
+Python
+Python (async)
+
+import fal_client
+
+def on_queue_update(update):
+    if isinstance(update, fal_client.InProgress):
+        for log in update.logs:
+           print(log["message"])
+
+result = fal_client.subscribe(
+    "fal-ai/recraft/upscale/crisp",
+    arguments={
+        "image_url": "https://storage.googleapis.com/falserverless/model_tests/recraft/recraft-upscaler-1.jpeg"
+    },
+    with_logs=True,
+    on_queue_update=on_queue_update,
+)
+print(result)
+2. Authentication
+#
+The API uses an API Key for authentication. It is recommended you set the FAL_KEY environment variable in your runtime when possible.
+
+API Key
+#
+Protect your API Key
+When running code on the client-side (e.g. in a browser, mobile app or GUI applications), make sure to not expose your FAL_KEY. Instead, use a server-side proxy to make requests to the API. For more information, check out our server-side integration guide.
+
+3. Queue
+#
+Long-running requests
+For long-running requests, such as training jobs or models with slower inference times, it is recommended to check the Queue status and rely on Webhooks instead of blocking while waiting for the result.
+
+Submit a request
+#
+The client API provides a convenient way to submit requests to the model.
+
+Python
+Python (async)
+
+import fal_client
+
+handler = fal_client.submit(
+    "fal-ai/recraft/upscale/crisp",
+    arguments={
+        "image_url": "https://storage.googleapis.com/falserverless/model_tests/recraft/recraft-upscaler-1.jpeg"
+    },
+    webhook_url="https://optional.webhook.url/for/results",
+)
+
+request_id = handler.request_id
+Fetch request status
+#
+You can fetch the status of a request to check if it is completed or still in progress.
+
+Python
+Python (async)
+
+status = fal_client.status("fal-ai/recraft/upscale/crisp", request_id, with_logs=True)
+Get the result
+#
+Once the request is completed, you can fetch the result. See the Output Schema for the expected result format.
+
+Python
+Python (async)
+
+result = fal_client.result("fal-ai/recraft/upscale/crisp", request_id)
+4. Files
+#
+Some attributes in the API accept file URLs as input. Whenever that's the case you can pass your own URL or a Base64 data URI.
+
+Data URI (base64)
+#
+You can pass a Base64 data URI as a file input. The API will handle the file decoding for you. Keep in mind that for large files, this alternative although convenient can impact the request performance.
+
+Hosted files (URL)
+#
+You can also pass your own URLs as long as they are publicly accessible. Be aware that some hosts might block cross-site requests, rate-limit, or consider the request as a bot.
+
+Uploading files
+#
+We provide a convenient file storage that allows you to upload files and use them in your requests. You can upload files using the client API and use the returned URL in your requests.
+
+Python
+Python (async)
+
+url = fal_client.upload_file("path/to/file")
+Read more about file handling in our file upload guide.
+
+5. Schema
+#
+Input
+#
+image_url string
+The URL of the image to be upscaled. Must be in PNG format.
+
+sync_mode boolean
+If True, the media will be returned as a data URI and the output data won't be available in the request history.
+
+enable_safety_checker boolean
+If set to true, the safety checker will be enabled.
+
+
+{
+  "image_url": "https://storage.googleapis.com/falserverless/model_tests/recraft/recraft-upscaler-1.jpeg"
+}
+Output
+#
+image File
+The upscaled image.
+
+
+{
+  "image": {
+    "url": "",
+    "content_type": "image/png",
+    "file_name": "z9RV14K95DvU.png",
+    "file_size": 4404019
+  }
+}
+Other types
+#
+RGBColor
+#
+r integer
+Red color value
+
+g integer
+Green color value
+
+b integer
+Blue color value
+
+File
+#
+url string
+The URL where the file can be downloaded from.
+
+content_type string
+The mime type of the file.
+
+file_name string
+The name of the file. It will be auto-generated if not provided.
+
+file_size integer
+The size of the file in bytes.
+
+ImageSize
+#
+width integer
+The width of the generated image. Default value: 512
+
+height integer
+The height of the generated image. Default value: 512
+
+Replace face enhancer with below (no quickpod entirely depend on api)
+juergengunz/real-esrgan-v2:e4265d21c4770b339080060fab33e452d77b8ef3ee9781fec9cae81d1973a2cf
+Set the REPLICATE_API_TOKEN environment variable
+
+export REPLICATE_API_TOKEN=<paste-your-token-here>
+
+Visibility
+
+Copy
+Learn more about authentication
+
+Install Replicate’s Python client library
+
+pip install replicate
+
+Copy
+Learn more about setup
+Run juergengunz/real-esrgan-v2 using Replicate’s API. Check out the model's schema for an overview of inputs and outputs.
+
+import replicate
+
+input = {
+    "image": "https://replicate.delivery/pbxt/KmTutYmyDQXgoBvhrGYdn9VULPisOBZ4itzy5bJ6Q0Egp84A/test.png",
+    "scale": 1
+}
+
+output = replicate.run(
+    "juergengunz/real-esrgan-v2:e4265d21c4770b339080060fab33e452d77b8ef3ee9781fec9cae81d1973a2cf",
+    input=input
+)
+
+# To access the file URL:
+print(output.url)
+#=> "https://replicate.delivery/.../output.png"
+
+# To write the file to disk:
+with open("output.png", "wb") as file:
+    file.write(output.read())
+#=> output.png written to disk
+
+==============================================================================================================================================
+
+for z image turbo (klyra) in create image (support both api and quickpod)
+
+prunaai/z-image-turbo
+
+Set the REPLICATE_API_TOKEN environment variable
+
+export REPLICATE_API_TOKEN=<paste-your-token-here>
+
+Visibility
+
+Copy
+Learn more about authentication
+
+Install Replicate’s Python client library
+
+pip install replicate
+
+Copy
+Learn more about setup
+Run prunaai/z-image-turbo using Replicate’s API. Check out the model's schema for an overview of inputs and outputs.
+
+import replicate
+
+input = {
+    "height": 768,
+    "prompt": "A hyper-realistic, close-up portrait of a tribal elder from the Omo Valley, painted with intricate white chalk patterns and adorned with a headdress made of dried flowers, seed pods, and rusted bottle caps. The focus is razor-sharp on the texture of the skin, showing every pore, wrinkle, and scar that tells a story of survival. The background is a blurred, smoky hut interior, with the warm glow of a cooking fire reflecting in the subject's dark, soulful eyes. Shot on a Leica M6 with Kodak Portra 400 film grain aesthetic."
+}
+
+output = replicate.run(
+    "prunaai/z-image-turbo",
+    input=input
+)
+
+# To access the file URL:
+print(output.url)
+#=> "https://replicate.delivery/.../output.jpeg"
+
+# To write the file to disk:
+with open("output.jpeg", "wb") as file:
+    file.write(output.read())
+#=> output.jpeg written to disk
+
+PRICING: 	
+Pricing (here we have upscale sort of feature by selecting target resolution)
+
+Criteria
+
+target resolution is 0.5
+$2.50
+per thousand output image megapixels
+
+or 400 megapixels for $1
+
+Criteria
+
+target resolution is 1
+$5
+per thousand output image megapixels
+
+or 200 megapixels for $1
+
+Criteria
+
+target resolution is 2
+$0.01
+per output image megapixel
+
+or 100 megapixels for $1
+
+Criteria
+
+target resolution is 3
+$0.015
+per output image megapixel
+
+or around 66 megapixels for $1
+
+Criteria
+
+target resolution is 4
+$0.02
+per output image megapixel
+
+or 50 megapixels for $1
+
+Readme
+Z-Image-Turbo
+An optimized version of Tongyi-MAI’s Z-Image-Turbo, accelerated with PrunaAI’s compression engine for even faster image generation.
+
+What is the pricing ?
+Pricing is based on image resolution (height × width):
+
+Up to 0.5 MP (500,000 pixels): $0.0025
+
+Up to 1 MP (1,000,000 pixels): $0.005
+
+Up to 2 MP (2,000,000 pixels): $0.01

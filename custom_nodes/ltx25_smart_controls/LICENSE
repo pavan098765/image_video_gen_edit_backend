@@ -1,0 +1,38 @@
+LICENSE SCOPE
+
+This companion package contains materials under different licenses.
+
+1. Contributor-owned code and documentation
+
+   To the extent of rights owned by contributor `sjh6229`, the MIT License in
+   `LICENSES/MIT.txt` applies to:
+
+   - `custom_nodes/ltx25_smart_controls/__init__.py`
+   - `README.md`
+   - `DEPENDENCIES.md`
+   - `NOTICE.md`
+   - `SECURITY.md`
+   - `PACKAGE-MANIFEST.json`
+   - `SHA256SUMS.txt`
+
+2. Modified companion workflow
+
+   The matching workflow JSON is uploaded separately and is not contained in
+   this ZIP. It incorporates elements of Lightricks' official LTX-2.5 ComfyUI
+   workflow and remains subject to the complete upstream license reproduced at
+   `LICENSES/ComfyUI-LTXVideo-ac4d998-LTX-2-Community-2026-01-05.txt`.
+
+3. Model license reference
+
+   No model weights are included. The official LTX-2.x license text at
+   `LICENSES/LTX-2.x-fd4ded7-Community-2026-08-11.md` is included for notice
+   and reference; recipients must also accept the terms accompanying the exact
+   separately downloaded model artifacts.
+
+4. Third-party dependencies
+
+   Third-party custom nodes and libraries are not bundled and remain governed
+   by their own licenses.
+
+See `NOTICE.md` for provenance and modified-work details. Complete license
+texts control if this summary conflicts with them.

@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "package": {
+    "name": "ltx25-smart-controls",
+    "version": "1.0.0",
+    "release_date": "2026-08-12",
+    "distribution": "Civitai Additional Components ZIP",
+    "entrypoint": "custom_nodes/ltx25_smart_controls/__init__.py"
+  },
+  "matching_workflow": {
+    "filename": "LTX-2.5-INT8-AllModes-Stage2-Speed-Quality-LoRA-Civitai-v1.0.json",
+    "sha256": "1D31375A81453B5E3E99E262E46AF839613B0B7A7A6F0A98670ABF2611189EB6",
+    "included": false
+  },
+  "source_contract": {
+    "node_classes": [
+      "LTX25AutoProfile",
+      "LTX25AllModesControls",
+      "LTX25AllModesControlsV2",
+      "LTX25Stage2Mode",
+      "LTX25ModeImageLoader",
+      "LTX25ApplyGuides",
+      "LTX25OptionalBypassLoRA"
+    ],
+    "network_requests": false,
+    "subprocesses": false,
+    "shell_commands": false,
+    "render_submissions": false,
+    "file_writes": false
+  },
+  "allowlisted_files": [
+    {
+      "path": "custom_nodes/ltx25_smart_controls/__init__.py",
+      "bytes": 32953,
+      "sha256": "E745B449618EE5C6E3E88B6954CA2E4E828725A07AE7992F2BD4B34DE039B9CB"
+    },
+    {
+      "path": "custom_nodes/ltx25_smart_controls/DEPENDENCIES.md",
+      "bytes": 3683,
+      "sha256": "E7ED766E0E5A5D3A8F8EA04EADAF83A72489AD183B45434647EB9E6561ADBB1A"
+    },
+    {
+      "path": "custom_nodes/ltx25_smart_controls/LICENSE",
+      "bytes": 1319,
+      "sha256": "00E426E556C90189204E0CB0772894FD31FD86233C00BD2152BA43CEC718B075"
+    },
+    {
+      "path": "custom_nodes/ltx25_smart_controls/LICENSES/ComfyUI-LTXVideo-ac4d998-LTX-2-Community-2026-01-05.txt",
+      "bytes": 21467,
+      "sha256": "7C8EF302FA1444A3A5650C2DFA09C6927A52B233202431023ABB32519F354397"
+    },
+    {
+      "path": "custom_nodes/ltx25_smart_controls/LICENSES/LTX-2.x-fd4ded7-Community-2026-08-11.md",
+      "bytes": 30938,
+      "sha256": "4E7DD26D9C9294E1E0549587505DCF4BA40C7C82C50850559F846F92245F6120"
+    },
+    {
+      "path": "custom_nodes/ltx25_smart_controls/LICENSES/MIT.txt",
+      "bytes": 1064,
+      "sha256": "3BD20ED850B420C31C1B6BFEFACF9E739EEEFD666D4493D130A2FC2B5C3440CD"
+    },
+    {
+      "path": "custom_nodes/ltx25_smart_controls/NOTICE.md",
+      "bytes": 2477,
+      "sha256": "FE59FB2A4A4E789EC3FE88311825A9B45437A3ECCBAC5FFC151D67C2AF166FF1"
+    },
+    {
+      "path": "custom_nodes/ltx25_smart_controls/README.md",
+      "bytes": 3712,
+      "sha256": "47A559B8E31689A735C5DF2ADE2786AC9BC8B2D2F560A81DFC546A23132D0628"
+    },
+    {
+      "path": "custom_nodes/ltx25_smart_controls/SECURITY.md",
+      "bytes": 1549,
+      "sha256": "4D4E2C2BED75BFFE5804E643B7BCB9EC138F94632E3BD7CD32861C4EC0E709D2"
+    }
+  ],
+  "checksum_manifest": "custom_nodes/ltx25_smart_controls/SHA256SUMS.txt",
+  "excluded": [
+    "model weights",
+    "LoRA weights",
+    "workflow JSON",
+    "images and generated media",
+    "credentials and environment files",
+    "__pycache__ and compiled bytecode",
+    "logs and local paths",
+    "third-party source trees"
+  ]
+}

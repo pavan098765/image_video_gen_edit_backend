@@ -25,20 +25,24 @@ REALESRGAN_DIR = os.path.join(MODELS_DIR, "realesrgan")
 os.makedirs(QWEN_DIR, exist_ok=True)
 os.makedirs(AIO_DIR, exist_ok=True)
 
+_HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+
 # ------------------------
-# 1. Download Qwen base model (skip transformer/*)
+# 1. Download Qwen base model (all except transformer/ — weights from AIO below)
 # ------------------------
 if not os.listdir(QWEN_DIR):
     try:
-        print(f"⬇️ Downloading {QWEN_REPO} into {QWEN_DIR} (excluding transformer/*)")
-        snapshot_download(
-            QWEN_REPO,
+        print(f"⬇️ Downloading {QWEN_REPO} into {QWEN_DIR} (excluding transformer/)")
+        _qwen_dl = dict(
+            repo_id=QWEN_REPO,
             local_dir=QWEN_DIR,
             local_dir_use_symlinks=False,
-            token="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",
             resume_download=True,
-            ignore_patterns=["transformer/*"],  # skip heavy transformer weights (from AIO repo)
+            ignore_patterns=["transformer/*"],
         )
+        if _HF_TOKEN:
+            _qwen_dl["token"] = _HF_TOKEN
+        snapshot_download(**_qwen_dl)
         print(f"✓ Qwen repo ready at {QWEN_DIR}")
     except Exception as e:
         print(f"❌ Failed to download {QWEN_REPO}: {e}")
@@ -89,14 +93,16 @@ if not os.listdir(aio_target_dir):
         # Repo structure is: v19/transformer/*
         # If we download to models/aio_transformers/v19/, it creates v19/v19/transformer/*
         # If we download to models/aio_transformers/, it creates v19/transformer/* ✓
-        snapshot_download(
+        _aio_dl = dict(
             repo_id=AIO_REPO_ID,
             local_dir=AIO_DIR,  # Download to parent: models/aio_transformers/
             local_dir_use_symlinks=False,
             resume_download=True,
-            token="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",
             allow_patterns=[f"{aio_version}/transformer/*"],
         )
+        if _HF_TOKEN:
+            _aio_dl["token"] = _HF_TOKEN
+        snapshot_download(**_aio_dl)
         
         # Verify the files are in the correct location
         if os.path.exists(aio_target_dir) and os.listdir(aio_target_dir):
@@ -201,11 +207,14 @@ for adapter_name, spec in ADAPTER_SPECS.items():
         
         try:
             print(f"  ⬇️ Downloading {adapter_name}/{weight_file} from {repo}")
-            downloaded_path = hf_hub_download(
+            _lora_kw = dict(
                 repo_id=repo,
                 filename=weight_file,
                 resume_download=True,
             )
+            if _HF_TOKEN:
+                _lora_kw["token"] = _HF_TOKEN
+            downloaded_path = hf_hub_download(**_lora_kw)
             shutil.copy2(downloaded_path, target_path)
             print(f"  ✓ {adapter_name}/{weight_file} downloaded")
         except Exception as e:
@@ -226,12 +235,15 @@ for filename in ("RealESRGAN_x2plus.pth", "RealESRGAN_x4plus.pth"):
         continue
     try:
         print(f"⬇️ Downloading {filename} from {REALESRGAN_HF_REPO}...")
-        hf_hub_download(
+        _rs_kw = dict(
             repo_id=REALESRGAN_HF_REPO,
             filename=filename,
             local_dir=REALESRGAN_DIR,
             resume_download=True,
         )
+        if _HF_TOKEN:
+            _rs_kw["token"] = _HF_TOKEN
+        hf_hub_download(**_rs_kw)
         print(f"✓ {filename} downloaded to {REALESRGAN_DIR}")
     except Exception as e:
         print(f"❌ Failed to download {filename}: {e}")

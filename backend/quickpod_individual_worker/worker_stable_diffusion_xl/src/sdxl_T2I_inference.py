@@ -77,6 +77,17 @@ def get_pipeline():
     return _pipeline
 
 
+def unload_models():
+    """Unload the SDXL pipeline and free GPU memory."""
+    global _pipeline
+    if _pipeline is not None:
+        del _pipeline
+        _pipeline = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 # -------------------------
 # Main Inference
 # -------------------------

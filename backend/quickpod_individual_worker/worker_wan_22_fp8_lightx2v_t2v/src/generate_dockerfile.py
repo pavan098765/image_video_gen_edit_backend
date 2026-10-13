@@ -86,7 +86,7 @@ def write_rest(f):
     f.write("COPY src /app/worker/src\n\n")
 
     # Environment variables for models and runtime
-    f.write('ENV MODEL_LOCAL_DIR="/app/models/fastdm_wan22_t2v_lightning_sdnq_fp8_svd_r32"\n')
+    f.write('ENV WAN_T2V_LOCAL_DIR="/app/models/fastdm_wan22_t2v_lightning_sdnq_fp8_svd_r32"\n')
     f.write('ENV MODELS_DIR="/app/models"\n')
     f.write('ENV PYTHONPATH="/app/worker/src:${PYTHONPATH}"\n\n')
 

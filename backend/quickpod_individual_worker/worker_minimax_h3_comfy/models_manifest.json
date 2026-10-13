@@ -1,0 +1,52 @@
+{
+  "files": [
+    {
+      "hf_repo": "MATLOWAI/minimax-h3-fused-turbo-int8-convrot",
+      "hf_path": "diffusion_models/minimax_h3_fused_refdelta_r1024_turbo8_mystic07_int8_convrot.safetensors",
+      "dest": "diffusion_models/minimax_h3_fused_refdelta_r1024_turbo8_mystic07_int8_convrot.safetensors"
+    },
+    {
+      "hf_repo": "Comfy-Org/MiniMax-H3",
+      "hf_path": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "dest": "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+    },
+    {
+      "hf_repo": "Comfy-Org/MiniMax-H3",
+      "hf_path": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "dest": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+    },
+    {
+      "hf_repo": "Kijai/MiniMax-H3-experimental",
+      "hf_path": "minimax_h3_video_vae_int8_convrot.safetensors",
+      "dest": "vae/minimax_h3_video_vae_int8_convrot.safetensors"
+    },
+    {
+      "hf_repo": "Comfy-Org/MiniMax-H3",
+      "hf_path": "minimax_h3_audio_vae_fp32.safetensors",
+      "dest": "vae/minimax_h3_audio_vae_fp32.safetensors"
+    },
+    {
+      "hf_repo": "LBH-123-AI/Minimax_h3_latent_Upscaler",
+      "hf_path": "minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors",
+      "dest": "latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors"
+    },
+    {
+      "hf_repo": "silveroxides/MiniMax-H3_tests",
+      "hf_path": "minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors",
+      "dest": "loras/MINIMAX/minimax_h3_fl2v_turbo_silver_dareties_comfy_pruned_v1.safetensors"
+    },
+    {
+      "hf_repo": "Kijai/MiniMax-H3-TAE",
+      "hf_path": "vae_approx/taeh3.safetensors",
+      "dest": "vae_approx/taeh3.safetensors"
+    }
+  ],
+  "rife": {
+    "zip_url": "https://huggingface.co/hzwer/RIFE/resolve/main/RIFEv4.26_0921.zip",
+    "filename": "flownet.pkl",
+    "dests": [
+      "rife/flownet.pkl",
+      "custom_nodes/ComfyUI-VFI/rife/train_log/flownet.pkl"
+    ]
+  }
+}
