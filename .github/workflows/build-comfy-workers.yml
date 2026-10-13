@@ -22,22 +22,50 @@ env:
   REGISTRY_IMAGE: pavanalur3/quickpod_worker
 
 jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        env:
+          WORKER: ${{ inputs.worker }}
+        run: |
+          python3 <<'PY'
+          import json, os
+          worker = os.environ["WORKER"]
+          all_workers = [
+              {
+                  "worker": "minimax_h3_comfy",
+                  "context": "backend/quickpod_individual_worker/worker_minimax_h3_comfy",
+              },
+              {
+                  "worker": "ltx25_int8_comfy",
+                  "context": "backend/quickpod_individual_worker/worker_ltx25_int8_comfy",
+              },
+              {
+                  "worker": "qwen_image_21_turbo_comfy",
+                  "context": "backend/quickpod_individual_worker/worker_qwen_image_21_turbo_comfy",
+              },
+              {
+                  "worker": "minimax_music3_comfy",
+                  "context": "backend/quickpod_individual_worker/worker_minimax_music3_comfy",
+              },
+          ]
+          chosen = all_workers if worker == "all" else [row for row in all_workers if row["worker"] == worker]
+          if not chosen:
+              raise SystemExit(f"unknown worker: {worker}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"matrix={json.dumps({'include': chosen})}\n")
+          PY
+
   build:
-    if: inputs.worker == 'all' || inputs.worker == matrix.worker
+    needs: select
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - worker: minimax_h3_comfy
-            context: backend/quickpod_individual_worker/worker_minimax_h3_comfy
-          - worker: ltx25_int8_comfy
-            context: backend/quickpod_individual_worker/worker_ltx25_int8_comfy
-          - worker: qwen_image_21_turbo_comfy
-            context: backend/quickpod_individual_worker/worker_qwen_image_21_turbo_comfy
-          - worker: minimax_music3_comfy
-            context: backend/quickpod_individual_worker/worker_minimax_music3_comfy
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
