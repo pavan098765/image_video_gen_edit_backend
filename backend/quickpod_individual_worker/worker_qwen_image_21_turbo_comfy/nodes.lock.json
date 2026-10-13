@@ -8,7 +8,7 @@
       "name": "ComfyUI-GGUF",
       "repo": "https://github.com/molbal/ComfyUI-GGUF",
       "commit": "b77b9d8124656aa1a548d95c617da4d16cab1a2e",
-      "note": "city96/ComfyUI-GGUF does not know qwen_image / qwen_image21. molbal fork (v26.10.11) loads AtomicChat Qwen Image 2.1 Turbo GGUF via UnetLoaderGGUF."
+      "note": "city96/ComfyUI-GGUF does not know qwen_image / qwen_image21. molbal fork (v26.10.11) loads unsloth Qwen Image 2.1 Turbo GGUF via UnetLoaderGGUF."
     }
   ],
   "local_nodes": [],

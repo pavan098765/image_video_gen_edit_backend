@@ -10,7 +10,7 @@ logger = logging.getLogger("qwen_patch")
 
 SUBGRAPH_TYPE = "c291ceec-b98f-4751-9d0b-7bc288f27b30"
 SAVE_NODE_ID = 461
-DEFAULT_UNET = "Qwen-Image-2.1-Turbo-Abliterated-Uncensored-Q8_0.gguf"
+DEFAULT_UNET = "qwen-image-2.1-turbo-Q8_0.gguf"
 DEFAULT_CLIP = "qwen3vl_8b_int8_convrot.safetensors"
 DEFAULT_VAE = "qwen_image_2.1_vae_bf16.safetensors"
 

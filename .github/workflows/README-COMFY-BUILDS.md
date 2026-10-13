@@ -14,7 +14,7 @@ Hugging Face weights download on **first boot** after the worker registers.
 |---|---|---|---|
 | `minimax_h3_comfy` | `pavanalur3/quickpod_worker:minimax_h3_comfy` | `worker_minimax_h3_comfy` | MiniMax H3 fused turbo INT8 + Seed Hunter extras |
 | `ltx25_int8_comfy` | `pavanalur3/quickpod_worker:ltx25_int8_comfy` | `worker_ltx25_int8_comfy` | Lightricks LTX-2.5 INT8 AllModes |
-| `qwen_image_21_turbo_comfy` | `pavanalur3/quickpod_worker:qwen_image_21_turbo_comfy` | `worker_qwen_image_21_turbo_comfy` | AtomicChat Qwen Image 2.1 Turbo **Q8_0 GGUF** + Comfy-Org CLIP/VAE |
+| `qwen_image_21_turbo_comfy` | `pavanalur3/quickpod_worker:qwen_image_21_turbo_comfy` | `worker_qwen_image_21_turbo_comfy` | Unsloth Qwen Image 2.1 Turbo **Q8_0 GGUF** + Comfy-Org CLIP/VAE |
 | `minimax_music3_comfy` | `pavanalur3/quickpod_worker:minimax_music3_comfy` | `worker_minimax_music3_comfy` | MiniMax Music 3 **int8 convrot DiT** + pruned int8 encoder + DAV VAE |
 | `all` | all four tags above, four parallel jobs | | |
 
@@ -101,22 +101,24 @@ does not kill the pod. `/run` returns 503 until ComfyUI is ready.
 
 Attached graph `qwenImage21Turbo8Steps_turbo8StepV10.json` is the default.
 
-**AtomicChat GGUF can be used, with these constraints:**
+**Unsloth denoiser GGUF** (`unsloth/Qwen-Image-2.1-Turbo-GGUF`), matching their
+ComfyUI instructions:
 
 - Swap **only** the UNET: `UNETLoader` → `UnetLoaderGGUF` pointing at
-  `Qwen-Image-2.1-Turbo-Abliterated-Uncensored-Q8_0.gguf` in `models/unet/`.
+  `qwen-image-2.1-turbo-Q8_0.gguf` in `models/unet/` (Q8_0 is closest to bf16;
+  `/run` can pass `unet_name` for Q4_K_M / other rungs you copy in).
 - Keep Comfy-Org **CLIP** (`qwen3vl_8b_int8_convrot.safetensors`, type `qwen_image`)
-  and **VAE** (`qwen_image_2.1_vae_bf16.safetensors`). AtomicChat CLIP GGUF /
-  `mmproj` files are llama.cpp-only and cannot replace `CLIPLoader`.
+  and **VAE** (`qwen_image_2.1_vae_bf16.safetensors`). A GGUF is the denoiser only.
+- Do **not** use `AtomicChat/Qwen-Image-2.1-Turbo-Uncensored-GGUF`: those files
+  are the Qwen3-VL **text encoder** for stable-diffusion.cpp `--llm`, not a
+  ComfyUI UNET. AtomicChat’s own card says they have not been run in ComfyUI
+  and measured no image-uncensoring effect vs the stock encoder.
 - Pin **molbal/ComfyUI-GGUF** (`b77b9d8124656aa1a548d95c617da4d16cab1a2e`).
   city96’s pack does not know `qwen_image` / `qwen_image21` and will raise
   `Unexpected architecture type`.
-- AtomicChat’s README still says the GGUF has not been run in ComfyUI. If the
-  file’s architecture tag is unexpected, the first `/run` will fail at UNET
-  load; the rest of the 8-step turbo graph (ManualSigmas, SamplerCustom euler,
-  cfg 1) stays the same.
+- Graph stays 8-step turbo: ManualSigmas, SamplerCustom euler, cfg 1.
 
-Optional `/run` params: `unet_name` (other AtomicChat quants you copy in),
+Optional `/run` params: `unet_name` (other Unsloth quants you copy in),
 `width`/`height`/`megapixels`/`aspect_ratio`, `seed`, `cfg`,
 `first_frame_url` / `init_image` (wired to `TextEncodeQwenImage21.image_1`).
 

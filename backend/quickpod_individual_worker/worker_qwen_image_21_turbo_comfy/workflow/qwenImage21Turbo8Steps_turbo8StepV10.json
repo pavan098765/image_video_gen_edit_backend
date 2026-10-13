@@ -110,7 +110,7 @@
     1024,
     1024,
     593103825222985,
-    "Qwen-Image-2.1-Turbo-Abliterated-Uncensored-Q8_0.gguf",
+    "qwen-image-2.1-turbo-Q8_0.gguf",
     "qwen3vl_8b_int8_convrot.safetensors",
     "qwen_image_2.1_vae_bf16.safetensors"
    ],
@@ -121,7 +121,7 @@
     "width": 1024,
     "height": 1024,
     "seed": 593103825222985,
-    "unet_name": "Qwen-Image-2.1-Turbo-Abliterated-Uncensored-Q8_0.gguf",
+    "unet_name": "qwen-image-2.1-turbo-Q8_0.gguf",
     "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
     "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
    }
@@ -454,10 +454,10 @@
        "aux_id": "molbal/ComfyUI-GGUF"
       },
       "widgets_values": [
-       "Qwen-Image-2.1-Turbo-Abliterated-Uncensored-Q8_0.gguf"
+       "qwen-image-2.1-turbo-Q8_0.gguf"
       ],
       "widgets_values_named": {
-       "unet_name": "Qwen-Image-2.1-Turbo-Abliterated-Uncensored-Q8_0.gguf"
+       "unet_name": "qwen-image-2.1-turbo-Q8_0.gguf"
       }
      },
      {

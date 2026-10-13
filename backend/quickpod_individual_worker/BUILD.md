@@ -75,7 +75,7 @@ Same self-contained pattern. **Build these on GitHub Actions**, not on the Windo
 #   pavanalur3/quickpod_worker:minimax_music3_comfy
 ```
 
-Qwen uses molbal/ComfyUI-GGUF + AtomicChat Q8_0 UNET GGUF (CLIP/VAE stay Comfy-Org). Music 3 is native ComfyUI v0.37.0 with the official `audio_minimax_music_3.json` graph and int8 convrot DiT.
+Qwen uses molbal/ComfyUI-GGUF + Unsloth Q8_0 UNET GGUF (CLIP/VAE stay Comfy-Org). Music 3 is native ComfyUI v0.37.0 with the official `audio_minimax_music_3.json` graph and int8 convrot DiT.
 
 ## `worker_multi_common`
 

@@ -67,7 +67,7 @@
     "template_name": "template_qwen_image_21_turbo_comfy",
     "template_description": "Qwen Image 2.1 Turbo GGUF ComfyUI worker (FastAPI :8000, ComfyUI UI :8188)",
     "disk_space": 80,
-    "readme": "AtomicChat Q8_0 GGUF UNET + Comfy-Org CLIP/VAE. Fill QWEN_IMAGE_21_TURBO_COMFY_TEMPLATE_UUID after the image exists in Quickpod. 16 GB class GPU floor.",
+    "readme": "Unsloth Q8_0 GGUF UNET + Comfy-Org CLIP/VAE. Fill QWEN_IMAGE_21_TURBO_COMFY_TEMPLATE_UUID after the image exists in Quickpod. 16 GB class GPU floor.",
     "is_public": false,
     "cli_command": "/app/worker/src/start.sh",
     "template_type": "gpu",

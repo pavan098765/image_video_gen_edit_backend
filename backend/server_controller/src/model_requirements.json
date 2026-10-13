@@ -1065,7 +1065,7 @@
             "3090"
         ],
         "min_gpu_count": 1,
-        "comment": "Qwen Image 2.1 Turbo 8-step. AtomicChat Q8_0 GGUF UNET + Comfy-Org CLIP/VAE. 16GB class.",
+        "comment": "Qwen Image 2.1 Turbo 8-step. Unsloth Q8_0 GGUF UNET + Comfy-Org CLIP/VAE. 16GB class.",
         "group_id": "qwen_image_21_turbo_comfy",
         "supported_models": [
             "qwen_image_21_turbo"
