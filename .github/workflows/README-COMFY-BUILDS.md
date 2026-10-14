@@ -18,7 +18,7 @@ Hugging Face weights download on **first boot** after the worker registers.
 | `minimax_music3_comfy` | `pavanalur3/quickpod_worker:minimax_music3_comfy` | `worker_minimax_music3_comfy` | MiniMax Music 3 **int8 convrot DiT** + pruned int8 encoder + DAV VAE |
 | `all` | all four tags above, four parallel jobs | | |
 
-Each push also tags `:name-<git sha>` so you can pin a build.
+Each job pushes **one** Hub tag (`:worker_name` only). Re-running overwrites that tag.
 
 Base image for all four: `pavanalur3/deps-base-new:py311-cu128`.
 

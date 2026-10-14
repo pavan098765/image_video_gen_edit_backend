@@ -96,6 +96,4 @@ jobs:
           push: true
           provenance: false
           sbom: false
-          tags: |
-            ${{ env.REGISTRY_IMAGE }}:${{ matrix.worker }}
-            ${{ env.REGISTRY_IMAGE }}:${{ matrix.worker }}-${{ github.sha }}
+          tags: ${{ env.REGISTRY_IMAGE }}:${{ matrix.worker }}
