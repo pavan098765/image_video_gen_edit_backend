@@ -373,6 +373,56 @@ def _fill_orphan_widgets(node: dict, inputs_dict: Dict[str, Any]) -> Dict[str, A
             inputs_dict["patch_dtype"] = wv[2]
         return inputs_dict
 
+    # These sampling nodes store widgets only in widgets_values; the visual
+    # ``inputs`` array is empty (or lists only linked sockets), so the
+    # positional mapper never assigns sigmas / sampler_name / add_noise.
+    if node_type == "ManualSigmas":
+        if "sigmas" not in inputs_dict:
+            if isinstance(wv, list) and wv:
+                inputs_dict["sigmas"] = wv[0]
+            elif isinstance(wv, dict) and wv.get("sigmas") is not None:
+                inputs_dict["sigmas"] = wv["sigmas"]
+        return inputs_dict
+
+    if node_type == "KSamplerSelect":
+        if "sampler_name" not in inputs_dict:
+            if isinstance(wv, list) and wv:
+                inputs_dict["sampler_name"] = wv[0]
+            elif isinstance(wv, dict) and wv.get("sampler_name") is not None:
+                inputs_dict["sampler_name"] = wv["sampler_name"]
+        return inputs_dict
+
+    if node_type == "SamplerCustom":
+        # widgets_values: [add_noise, noise_seed, control_after_generate, cfg]
+        # add_noise is not in inputs[], so the positional mapper assigns it to
+        # noise_seed. Always rebuild scalars from named / known layout; keep links.
+        named = node.get("widgets_values_named") if isinstance(node.get("widgets_values_named"), dict) else {}
+
+        def _keep_link(val: Any) -> bool:
+            return isinstance(val, (list, tuple)) and len(val) >= 2
+
+        if not _keep_link(inputs_dict.get("add_noise")):
+            add_noise = named.get("add_noise")
+            if not isinstance(add_noise, bool) and isinstance(wv, list) and wv:
+                add_noise = wv[0]
+            if isinstance(add_noise, bool):
+                inputs_dict["add_noise"] = add_noise
+            else:
+                inputs_dict["add_noise"] = True
+        if not _keep_link(inputs_dict.get("noise_seed")):
+            if "noise_seed" in named:
+                inputs_dict["noise_seed"] = named["noise_seed"]
+            elif isinstance(wv, list) and len(wv) >= 2 and not isinstance(wv[1], str):
+                inputs_dict["noise_seed"] = wv[1]
+            elif isinstance(inputs_dict.get("noise_seed"), bool):
+                inputs_dict["noise_seed"] = 0
+        if not _keep_link(inputs_dict.get("cfg")):
+            if "cfg" in named:
+                inputs_dict["cfg"] = named["cfg"]
+            elif isinstance(wv, list) and len(wv) >= 4:
+                inputs_dict["cfg"] = wv[3]
+        return inputs_dict
+
     return inputs_dict
 
 
@@ -385,6 +435,8 @@ def _merge_named_widgets(node: dict, inputs_dict: Dict[str, Any]) -> Dict[str, A
         if k in inputs_dict:
             continue
         if k.startswith("divider") or k.startswith("➕") or "Widget" in k:
+            continue
+        if k == "control_after_generate":
             continue
         if v in ({}, "", None):
             continue

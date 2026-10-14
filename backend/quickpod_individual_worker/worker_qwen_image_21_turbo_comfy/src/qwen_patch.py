@@ -173,9 +173,11 @@ def patch_inner_nodes(visual: dict, prompt: str, params: Dict[str, Any]) -> None
     for node in _find_nodes_by_type(visual, "SamplerCustom"):
         if seed is not None:
             _set_named(node, "noise_seed", int(seed))
-            _set_list_widget(node, 0, int(seed))
+            # widgets_values: [add_noise, noise_seed, control_after_generate, cfg]
+            _set_list_widget(node, 1, int(seed))
             _clear_input_link(node, "noise_seed")
         _set_named(node, "cfg", float(cfg))
+        _set_list_widget(node, 3, float(cfg))
         _clear_input_link(node, "cfg")
     if params.get("width") is not None or params.get("height") is not None:
         for node in _find_nodes_by_type(visual, "EmptyLatentImage"):

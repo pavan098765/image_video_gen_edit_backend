@@ -84,19 +84,52 @@ def _set_output_links(node: dict, slot: int, link_id: int) -> None:
 
 
 def _apply_widget_value(node: dict, slot: int, value: Any) -> None:
+    """Write a subgraph widget onto an inner node.
+
+    ``slot`` is the inner node's *input* index, not a widgets_values index.
+    SamplerCustom input 6 is noise_seed while widgets_values[0] is add_noise.
+    """
+    inputs = node.get("inputs") or []
+    name = None
+    if 0 <= slot < len(inputs) and isinstance(inputs[slot], dict):
+        widget = inputs[slot].get("widget")
+        if isinstance(widget, dict) and widget.get("name"):
+            name = str(widget.get("name"))
+        else:
+            name = inputs[slot].get("name")
+    named = node.get("widgets_values_named")
+    if name:
+        if not isinstance(named, dict):
+            named = {}
+            node["widgets_values_named"] = named
+        named[name] = value
     wv = node.get("widgets_values")
+    if isinstance(wv, dict) and name:
+        wv[name] = value
+        node["widgets_values"] = wv
+        return
+    if isinstance(wv, list) and name:
+        names: List[str] = []
+        if isinstance(named, dict) and len(named) == len(wv):
+            names = list(named.keys())
+        if not names:
+            for inp in inputs:
+                if isinstance(inp, dict) and inp.get("widget"):
+                    w = inp.get("widget")
+                    wname = w.get("name") if isinstance(w, dict) and w.get("name") else inp.get("name")
+                    if wname:
+                        names.append(str(wname))
+        if name in names:
+            idx = names.index(name)
+            while len(wv) <= idx:
+                wv.append(None)
+            wv[idx] = value
+            node["widgets_values"] = wv
+            return
     if isinstance(wv, list):
         while len(wv) <= slot:
             wv.append(None)
         wv[slot] = value
-        node["widgets_values"] = wv
-        return
-    inputs = node.get("inputs") or []
-    name = None
-    if 0 <= slot < len(inputs) and isinstance(inputs[slot], dict):
-        name = inputs[slot].get("name")
-    if isinstance(wv, dict) and name:
-        wv[name] = value
         node["widgets_values"] = wv
 
 
