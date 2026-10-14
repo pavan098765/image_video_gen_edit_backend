@@ -11,6 +11,8 @@ __pycache__/
 *.tiff
 *.ico
 *.webp
+*.mp3
+*.mp4
 *.filepart
 
 backend/controller.db

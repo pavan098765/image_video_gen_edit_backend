@@ -4,16 +4,21 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("music_patch")
 
 SUBGRAPH_TYPE = "ac99f841-a3de-4329-9564-953b81cf9e16"
 SAVE_NODE_ID = 35
-DEFAULT_UNET = "minimax_music3_dit_int8_convrot.safetensors"
-DEFAULT_CLIP = "minimax_music3_text_encoder_pruned_int8_convrot.safetensors"
-DEFAULT_VAE = "minimax_music3_dav.safetensors"
+INT8_UNET = "minimax_music3_dit_int8_convrot.safetensors"
 FP16_UNET = "minimax_music3_dit_fp16.safetensors"
+INT8_CLIP = "minimax_music3_text_encoder_pruned_int8_convrot.safetensors"
+BF16_CLIP = "minimax_music3_text_encoder_pruned_bf16.safetensors"
+DEFAULT_UNET = INT8_UNET
+DEFAULT_CLIP = INT8_CLIP
+DEFAULT_VAE = "minimax_music3_dav.safetensors"
 
 # Official subgraph instance widget order (no widgets_values_named on this graph).
 CAPTION_IDX = 0
@@ -77,16 +82,138 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _models_dir() -> Path:
+    return Path(os.environ.get("MODELS_DIR", "/app/comfyui/models"))
+
+
+def _weight_exists(rel: str) -> bool:
+    path = _models_dir() / rel.replace("\\", "/")
+    return path.is_file() and path.stat().st_size > 0
+
+
+def _detect_vram_gb() -> Optional[float]:
+    try:
+        from comfyui_bridge import detect_gpu
+        gb, _name = detect_gpu()
+        return gb
+    except Exception:
+        return None
+
+
+def resolve_precision(params: Dict[str, Any]) -> str:
+    """Job precision wins, else MUSIC3_PRECISION, else auto from VRAM."""
+    raw = params.get("precision") or params.get("quality")
+    if raw:
+        key = str(raw).strip().lower()
+        if key in ("quality", "bf16", "full", "hq"):
+            return "quality"
+        if key in ("fp16", "float16"):
+            return "fp16"
+        if key in ("int8", "fast", "lowvram", "int8_convrot"):
+            return "int8"
+    try:
+        from comfyui_bridge import music3_precision
+        env = music3_precision()
+        if env != "auto":
+            return env
+    except Exception:
+        pass
+    vram = _detect_vram_gb()
+    if vram is not None and vram >= 20.0:
+        return "quality"
+    if vram is not None and vram >= 15.0:
+        return "fp16"
+    return "int8"
+
+
 def resolve_unet(params: Dict[str, Any]) -> str:
-    raw = params.get("unet_name") or params.get("dit") or params.get("precision")
+    unet, _clip, _tiled, _fmt = resolve_quality_stack(params)
+    return unet
+
+
+def _explicit_unet(params: Dict[str, Any]) -> Optional[str]:
+    raw = params.get("unet_name") or params.get("dit")
     if not raw:
-        return DEFAULT_UNET
+        return None
     key = str(raw).strip().lower()
     if key in ("fp16", "float16", FP16_UNET.lower()):
-        return FP16_UNET
-    if key in ("int8", "int8_convrot", "convrot", DEFAULT_UNET.lower()):
-        return DEFAULT_UNET
+        return FP16_UNET if _weight_exists(f"diffusion_models/{FP16_UNET}") else INT8_UNET
+    if key in ("int8", "int8_convrot", "convrot", INT8_UNET.lower()):
+        return INT8_UNET
+    if key in ("quality", "bf16", "full", "hq", "fast", "lowvram"):
+        return None
     return str(raw)
+
+
+def resolve_quality_stack(params: Dict[str, Any]) -> Tuple[str, str, bool, str]:
+    """Return (unet, clip, tiled_decode, audio_format) for this GPU / job.
+
+    Hugging Face Space uses full BF16 + WAV. On a 3090 we use the closest
+    Comfy-Org pack that fits: pruned BF16 text encoder + FP16 DiT, dense VAE,
+    WAV. Weaker cards stay on INT8 and tiled decode.
+    """
+    prec = resolve_precision(params)
+    fp16_ok = _weight_exists(f"diffusion_models/{FP16_UNET}")
+    bf16_ok = _weight_exists(f"text_encoders/{BF16_CLIP}")
+    vram = _detect_vram_gb()
+
+    unet = INT8_UNET
+    clip = INT8_CLIP
+    tiled = True
+    fmt = "mp3"
+
+    if prec == "quality":
+        if fp16_ok:
+            unet = FP16_UNET
+        if bf16_ok:
+            clip = BF16_CLIP
+        tiled = False
+        fmt = "wav"
+        if not bf16_ok:
+            logger.warning(
+                "MUSIC3 quality requested but %s is missing; AR stays INT8. "
+                "Download Comfy-Org pruned BF16 encoder for Space-like composition.",
+                BF16_CLIP,
+            )
+        if not fp16_ok:
+            logger.warning(
+                "MUSIC3 quality requested but %s is missing; DiT stays INT8.",
+                FP16_UNET,
+            )
+    elif prec == "fp16":
+        if fp16_ok:
+            unet = FP16_UNET
+        tiled = False
+        fmt = "wav"
+    elif vram is not None and vram >= 15.0:
+        tiled = False
+        fmt = "wav"
+        if fp16_ok:
+            unet = FP16_UNET
+
+    explicit = _explicit_unet(params)
+    if explicit:
+        unet = explicit
+    if params.get("clip_name"):
+        clip = str(params["clip_name"])
+    if params.get("tiled_decode") is not None:
+        tiled = _truthy(params.get("tiled_decode"))
+    fmt_raw = params.get("audio_format") or params.get("output_format")
+    if fmt_raw:
+        key = str(fmt_raw).strip().lower()
+        if key in ("wav", "flac", "mp3", "opus", "ogg"):
+            fmt = key
+
+    logger.info(
+        "Music 3 stack precision=%s vram=%s unet=%s clip=%s tiled=%s format=%s",
+        prec,
+        f"{vram:.1f}GiB" if vram is not None else "unknown",
+        unet,
+        clip,
+        tiled,
+        fmt,
+    )
+    return unet, clip, tiled, fmt
 
 
 def patch_subgraph(visual: dict, prompt: str, params: Dict[str, Any]) -> None:
@@ -108,35 +235,27 @@ def patch_subgraph(visual: dict, prompt: str, params: Dict[str, Any]) -> None:
     if params.get("seed") is not None:
         _set_list_widget(node, SEED_IDX, int(params["seed"]))
         _set_named(node, "seed", int(params["seed"]))
-    unet = resolve_unet(params)
+    unet, clip, tiled, _fmt = resolve_quality_stack(params)
     _set_list_widget(node, UNET_IDX, unet)
     _set_named(node, "unet_name", unet)
-    if params.get("clip_name"):
-        _set_list_widget(node, CLIP_IDX, params["clip_name"])
-        _set_named(node, "clip_name", params["clip_name"])
-    else:
-        _set_list_widget(node, CLIP_IDX, DEFAULT_CLIP)
-        _set_named(node, "clip_name", DEFAULT_CLIP)
+    _set_list_widget(node, CLIP_IDX, clip)
+    _set_named(node, "clip_name", clip)
     if params.get("vae_name"):
         _set_list_widget(node, VAE_IDX, params["vae_name"])
         _set_named(node, "vae_name", params["vae_name"])
     else:
         _set_list_widget(node, VAE_IDX, DEFAULT_VAE)
         _set_named(node, "vae_name", DEFAULT_VAE)
-    tiled = params.get("tiled_decode")
-    if tiled is None:
-        tiled = True
-    _set_list_widget(node, TILED_IDX, _truthy(tiled))
-    _set_named(node, "switch", _truthy(tiled))
+    _set_list_widget(node, TILED_IDX, tiled)
+    _set_named(node, "switch", tiled)
 
 
 def patch_inner_nodes(visual: dict, prompt: str, params: Dict[str, Any]) -> None:
-    unet = resolve_unet(params)
+    unet, clip, tiled, fmt = resolve_quality_stack(params)
     for node in _find_nodes_by_type(visual, "UNETLoader"):
         _set_list_widget(node, 0, unet)
         _set_named(node, "unet_name", unet)
         _clear_input_link(node, "unet_name")
-    clip = params.get("clip_name") or DEFAULT_CLIP
     for node in _find_nodes_by_type(visual, "CLIPLoader"):
         _set_list_widget(node, 0, clip)
         _set_list_widget(node, 1, "minimax")
@@ -181,20 +300,18 @@ def patch_inner_nodes(visual: dict, prompt: str, params: Dict[str, Any]) -> None
     if params.get("cfg") is not None:
         for node in _find_nodes_by_type(visual, "KSampler"):
             _set_list_widget(node, 3, float(params["cfg"]))
-    tiled = True if params.get("tiled_decode") is None else _truthy(params.get("tiled_decode"))
     for node in _find_nodes_by_type(visual, "ComfySwitchNode"):
         _set_list_widget(node, 0, tiled)
         _set_named(node, "switch", tiled)
         _clear_input_link(node, "switch")
-    prefix = params.get("filename_prefix")
-    if prefix:
-        save = _find_node(visual, SAVE_NODE_ID) or (
-            _find_nodes_by_type(visual, "SaveAudioAdvanced")[0]
-            if _find_nodes_by_type(visual, "SaveAudioAdvanced")
-            else None
-        )
-        if save is not None:
+    saves = _find_nodes_by_type(visual, "SaveAudioAdvanced")
+    save = _find_node(visual, SAVE_NODE_ID) or (saves[0] if saves else None)
+    if save is not None:
+        prefix = params.get("filename_prefix")
+        if prefix:
             _set_list_widget(save, 0, str(prefix))
+        _set_named(save, "format", fmt)
+        _set_list_widget(save, 1, fmt)
 
 
 def apply_api_job_params(prompt_graph: dict, prompt: str, params: Dict[str, Any]) -> None:
@@ -204,10 +321,8 @@ def apply_api_job_params(prompt_graph: dict, prompt: str, params: Dict[str, Any]
     lyrics = params.get("lyrics") or params.get("negative_prompt") or ""
     duration = params.get("max_duration") or params.get("duration") or params.get("duration_seconds")
     seed = params.get("seed")
-    unet = resolve_unet(params)
-    clip = params.get("clip_name") or DEFAULT_CLIP
+    unet, clip, tiled, fmt = resolve_quality_stack(params)
     vae = params.get("vae_name") or DEFAULT_VAE
-    tiled = True if params.get("tiled_decode") is None else _truthy(params.get("tiled_decode"))
     for _, node in api_nodes_by_type(prompt_graph, "UNETLoader"):
         set_api_input(node, "unet_name", unet)
     for _, node in api_nodes_by_type(prompt_graph, "CLIPLoader"):
@@ -235,9 +350,10 @@ def apply_api_job_params(prompt_graph: dict, prompt: str, params: Dict[str, Any]
             set_api_input(node, "cfg", float(params["cfg"]))
     for _, node in api_nodes_by_type(prompt_graph, "ComfySwitchNode"):
         set_api_input(node, "switch", tiled)
-    prefix = params.get("filename_prefix")
-    if prefix:
-        for _, node in api_nodes_by_type(prompt_graph, "SaveAudioAdvanced"):
+    for _, node in api_nodes_by_type(prompt_graph, "SaveAudioAdvanced"):
+        set_api_input(node, "format", fmt)
+        prefix = params.get("filename_prefix")
+        if prefix:
             set_api_input(node, "filename_prefix", str(prefix))
 
 

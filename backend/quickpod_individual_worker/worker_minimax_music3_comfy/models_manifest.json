@@ -14,6 +14,18 @@
       "hf_repo": "Comfy-Org/MiniMax-Music-3",
       "hf_path": "vae/minimax_music3_dav.safetensors",
       "dest": "vae/minimax_music3_dav.safetensors"
+    },
+    {
+      "hf_repo": "Comfy-Org/MiniMax-Music-3",
+      "hf_path": "diffusion_models/minimax_music3_dit_fp16.safetensors",
+      "dest": "diffusion_models/minimax_music3_dit_fp16.safetensors",
+      "min_vram_gb": 15
+    },
+    {
+      "hf_repo": "Comfy-Org/MiniMax-Music-3",
+      "hf_path": "text_encoders/minimax_music3_text_encoder_pruned_bf16.safetensors",
+      "dest": "text_encoders/minimax_music3_text_encoder_pruned_bf16.safetensors",
+      "min_vram_gb": 20
     }
   ]
 }

@@ -42,12 +42,133 @@ COMFYUI_PROMPT_TIMEOUT = int(os.environ.get("COMFYUI_PROMPT_TIMEOUT", "3600"))
 # Polling interval when waiting for prompt completion
 POLL_INTERVAL = 2.0
 
+# Music 3 weight sets (Comfy-Org):
+#   INT8 TE ~8.7GB + INT8 DiT ~2.3GB + VAE ~0.2GB ≈ 11GB  (low VRAM)
+#   INT8 TE + FP16 DiT ~4.6GB ≈ 13.5GB                    (16GB cards)
+#   BF16 TE ~16.7GB + FP16 DiT ≈ 21.5GB sequential        (24GB+, HF-Space-like)
+# BF16 TE + FP16 DiT cannot stay resident together, so quality mode uses
+# --normalvram (unload TE after AR). INT8-only 24GB still uses --gpu-only.
+# Override: COMFYUI_VRAM_MODE=gpu-only|highvram|normalvram|lowvram|auto
+#           MUSIC3_PRECISION=auto|int8|fp16|quality
+# Extra flags: COMFYUI_EXTRA_ARGS="--foo --bar"
+GPU_ONLY_MIN_GB = 20.0    # 3090 / 4090 / 5090 / A5000
+HIGHVRAM_MIN_GB = 15.0    # 16GB class (reports ~15.7)
+LOWVRAM_MAX_GB = 10.0     # 8GB class
+QUALITY_TE_MIN_GB = 20.0
+FP16_DIT_MIN_GB = 15.0
+
 
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
 _comfyui_process: Optional[subprocess.Popen] = None
+
+
+def detect_gpu() -> Tuple[Optional[float], str]:
+    """Return (total VRAM in GiB, device name). None if CUDA is unavailable."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            return props.total_memory / (1024 ** 3), props.name
+    except Exception:
+        logger.debug("torch CUDA probe failed", exc_info=True)
+
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total,name", "--format=csv,noheader,nounits"],
+            text=True,
+            timeout=5,
+        ).strip().splitlines()[0]
+        mem_s, _, name = out.partition(",")
+        return float(mem_s.strip()) / 1024.0, name.strip() or "NVIDIA GPU"
+    except Exception:
+        logger.debug("nvidia-smi probe failed", exc_info=True)
+
+    return None, "unknown"
+
+
+def music3_precision() -> str:
+    """auto | int8 | fp16 | quality. Job param `precision` can still override per request."""
+    raw = (os.environ.get("MUSIC3_PRECISION") or "auto").strip().lower()
+    aliases = {
+        "bf16": "quality",
+        "full": "quality",
+        "hq": "quality",
+        "fast": "int8",
+        "lowvram": "int8",
+        "float16": "fp16",
+    }
+    return aliases.get(raw, raw if raw in ("auto", "int8", "fp16", "quality") else "auto")
+
+
+def wants_quality_encoder(vram_gb: Optional[float] = None) -> bool:
+    """True when we should run the HF-Space-like BF16 text encoder."""
+    prec = music3_precision()
+    if prec == "quality":
+        return True
+    if prec in ("int8", "fp16"):
+        return False
+    if vram_gb is None:
+        vram_gb, _ = detect_gpu()
+    return vram_gb is not None and vram_gb >= QUALITY_TE_MIN_GB
+
+
+def _vram_flags_for(vram_gb: Optional[float]) -> List[str]:
+    """Pick Comfy VRAM flags from detected capacity. Weak cards stay on default/lowvram."""
+    if vram_gb is None:
+        return []
+    if vram_gb >= GPU_ONLY_MIN_GB:
+        if wants_quality_encoder(vram_gb):
+            # BF16 TE (~17GB) must unload before FP16 DiT (~5GB) on a 24GB card.
+            return ["--normalvram"]
+        return ["--gpu-only"]
+    if vram_gb >= HIGHVRAM_MIN_GB:
+        return ["--highvram"]
+    if vram_gb < LOWVRAM_MAX_GB:
+        return ["--lowvram"]
+    return []
+
+
+def _comfyui_vram_args() -> List[str]:
+    """Resolve launch flags: env override first, else auto from GPU VRAM."""
+    import shlex
+
+    mode = (os.environ.get("COMFYUI_VRAM_MODE") or "auto").strip().lower()
+    vram_gb, gpu_name = detect_gpu()
+    vram_s = f"{vram_gb:.1f} GiB" if vram_gb is not None else "unknown"
+
+    forced = {
+        "gpu-only": ["--gpu-only"],
+        "highvram": ["--highvram"],
+        "normalvram": ["--normalvram"],
+        "lowvram": ["--lowvram"],
+        "novram": ["--novram"],
+    }
+    if mode in forced:
+        flags = forced[mode]
+        logger.info(
+            "ComfyUI VRAM mode=%s (forced) precision=%s gpu=%s vram=%s flags=%s",
+            mode, music3_precision(), gpu_name, vram_s, flags,
+        )
+    else:
+        flags = _vram_flags_for(vram_gb)
+        quality = wants_quality_encoder(vram_gb)
+        logger.info(
+            "ComfyUI VRAM mode=auto precision=%s quality_te=%s gpu=%s vram=%s flags=%s "
+            "(quality TE>=%.0fGiB uses --normalvram so DiT can load after AR; "
+            "INT8 --gpu-only>=%.0fGiB, --highvram>=%.0fGiB, --lowvram<%.0fGiB)",
+            music3_precision(), quality, gpu_name, vram_s, flags or ["(default/dynamic)"],
+            QUALITY_TE_MIN_GB, GPU_ONLY_MIN_GB, HIGHVRAM_MIN_GB, LOWVRAM_MAX_GB,
+        )
+
+    extra = os.environ.get("COMFYUI_EXTRA_ARGS", "").strip()
+    if extra:
+        extra_flags = shlex.split(extra)
+        logger.info("ComfyUI extra args: %s", extra_flags)
+        flags = flags + extra_flags
+    return flags
 
 
 def start_server() -> subprocess.Popen:
@@ -74,7 +195,7 @@ def start_server() -> subprocess.Popen:
         "--listen", COMFYUI_LISTEN,
         "--port", str(COMFYUI_PORT),
         "--disable-auto-launch",
-    ]
+    ] + _comfyui_vram_args()
 
     comfyui_log_path = os.path.join(COMFYUI_DIR, "comfyui_server.log")
     _comfyui_log_file = open(comfyui_log_path, "w")
