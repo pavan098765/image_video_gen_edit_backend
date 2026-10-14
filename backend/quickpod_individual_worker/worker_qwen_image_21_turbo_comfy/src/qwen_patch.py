@@ -283,8 +283,11 @@ def apply_api_job_params(
         set_api_input(node, "type", "qwen_image")
     for _, node in api_nodes_by_type(prompt_graph, "VAELoader"):
         set_api_input(node, "vae_name", vae)
+    text = prompt or params.get("prompt") or ""
+    if guide_image and "<image1>" not in text and "<image_1>" not in text:
+        text = "Keep the subject, pose, and composition of <image1>. " + text
     for _, node in api_nodes_by_type(prompt_graph, "TextEncodeQwenImage21"):
-        set_api_input(node, "prompt", prompt or params.get("prompt") or "")
+        set_api_input(node, "prompt", text)
         neg = params.get("negative_prompt")
         if neg is None:
             neg = params.get("negative")
@@ -318,13 +321,26 @@ def apply_api_job_params(
             set_api_input(node, "filename_prefix", str(prefix))
     if guide_image:
         encoders = api_nodes_by_type(prompt_graph, "TextEncodeQwenImage21")
+        vaes = api_nodes_by_type(prompt_graph, "VAELoader")
         if encoders:
             load_id = "qwen_guide_load"
             prompt_graph[load_id] = {
                 "class_type": "LoadImage",
                 "inputs": {"image": guide_image},
             }
-            set_api_input(encoders[0][1], "image_1", [load_id, 0])
+            enc_id, enc = encoders[0]
+            inp = enc.setdefault("inputs", {})
+            if not isinstance(inp, dict):
+                inp = {}
+                enc["inputs"] = inp
+            # execute() takes autogrow ``images`` (image_1..image_16), not a
+            # top-level image_1 kwarg. Visual socket name is images.image_1.
+            inp.pop("image_1", None)
+            inp["images.image_1"] = [load_id, 0]
+            if vaes:
+                inp["vae"] = [vaes[0][0], 0]
+            for _, sc in api_nodes_by_type(prompt_graph, "SamplerCustom"):
+                set_api_input(sc, "latent_image", [enc_id, 2])
 
 
 def apply_job_params(

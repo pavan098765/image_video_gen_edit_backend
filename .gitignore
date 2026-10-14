@@ -3,6 +3,14 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.ico
+*.webp
 
 backend/controller.db
 backend/quickpod_individual_worker/realesrgan_models/RealESRGAN_x2plus.pth
