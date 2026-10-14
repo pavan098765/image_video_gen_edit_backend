@@ -78,9 +78,50 @@ _FILENAME_CORRECTIONS: Dict[str, str] = {}
 # ---------------------------------------------------------------------------
 
 
+def is_api_prompt(data: Any) -> bool:
+    """True for ComfyUI Save (API Format) JSON (dict of class_type nodes)."""
+    if not isinstance(data, dict) or "nodes" in data:
+        return False
+    return any(isinstance(v, dict) and v.get("class_type") for v in data.values())
+
+
+def prefer_api_filename(workflow_dir: str | Path, name: str) -> str:
+    """If ``foo.json`` was requested and ``foo_api.json`` exists, use the API file."""
+    raw = str(name or "").strip()
+    if not raw:
+        return raw
+    if raw.endswith("_api.json"):
+        return raw
+    base = Path(raw).name
+    if not base.endswith(".json"):
+        return raw
+    api_name = base[:-5] + "_api.json"
+    if (Path(workflow_dir) / api_name).is_file():
+        return api_name
+    return raw
+
+
+def api_nodes_by_type(prompt: dict, class_type: str) -> List[Tuple[str, dict]]:
+    return [
+        (str(nid), node)
+        for nid, node in prompt.items()
+        if isinstance(node, dict) and node.get("class_type") == class_type
+    ]
+
+
+def set_api_input(node: dict, key: str, value: Any) -> None:
+    inputs = node.setdefault("inputs", {})
+    if not isinstance(inputs, dict):
+        inputs = {}
+        node["inputs"] = inputs
+    inputs[key] = value
+
+
 def convert_visual_to_api(visual_workflow: dict) -> dict:
     """
     Convert a full visual-format workflow dict to the API prompt dict.
+
+    If ``visual_workflow`` is already API format, it is returned unchanged.
 
     Parameters
     ----------
@@ -93,6 +134,9 @@ def convert_visual_to_api(visual_workflow: dict) -> dict:
     dict
         API-format dict suitable for ``POST /prompt {"prompt": <this>}``.
     """
+    if is_api_prompt(visual_workflow):
+        return visual_workflow
+
     nodes: List[dict] = visual_workflow.get("nodes", [])
     links: List[list] = visual_workflow.get("links", [])
 

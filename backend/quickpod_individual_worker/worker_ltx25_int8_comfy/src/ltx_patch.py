@@ -170,6 +170,84 @@ def patch_image_loader(visual: dict, node_id: int, filename: Optional[str]) -> N
     _set_list_widget(node, 0, filename or "")
 
 
+def apply_api_job_params(
+    prompt_graph: dict,
+    prompt: str,
+    params: Dict[str, Any],
+    model: str,
+    first_filename: Optional[str] = None,
+    last_filename: Optional[str] = None,
+) -> None:
+    from workflow_converter import set_api_input
+
+    mode = resolve_mode(model, params)
+    node_376 = prompt_graph.get("376")
+    if prompt and isinstance(node_376, dict):
+        set_api_input(node_376, "value", prompt)
+    node_373 = prompt_graph.get("373")
+    if params.get("negative_prompt") is not None and isinstance(node_373, dict):
+        set_api_input(node_373, "text", str(params["negative_prompt"]))
+    controls = prompt_graph.get("408")
+    if isinstance(controls, dict):
+        set_api_input(controls, "mode", mode)
+        preset = params.get("vae_decode_preset") or params.get("gpu_profile")
+        if preset:
+            key = str(preset).strip().lower()
+            set_api_input(controls, "vae_decode_preset", VAE_PRESETS.get(key, str(preset)))
+        if params.get("width") is not None:
+            set_api_input(controls, "final_width", int(params["width"]))
+        elif params.get("final_width") is not None:
+            set_api_input(controls, "final_width", int(params["final_width"]))
+        if params.get("height") is not None:
+            set_api_input(controls, "final_height", int(params["height"]))
+        elif params.get("final_height") is not None:
+            set_api_input(controls, "final_height", int(params["final_height"]))
+        if params.get("fps") is not None:
+            set_api_input(controls, "fps", float(params["fps"]))
+        if params.get("duration") is not None or params.get("duration_seconds") is not None:
+            set_api_input(controls, "timing_mode", "Duration drives frames")
+            set_api_input(
+                controls,
+                "duration_seconds",
+                float(params.get("duration") if params.get("duration") is not None else params["duration_seconds"]),
+            )
+        if params.get("frames") is not None or params.get("manual_frames") is not None:
+            set_api_input(controls, "timing_mode", "Manual exact frames")
+            set_api_input(
+                controls,
+                "manual_frames",
+                int(params.get("frames") if params.get("frames") is not None else params["manual_frames"]),
+            )
+        if params.get("seed") is not None:
+            set_api_input(controls, "seed", int(params["seed"]))
+    stage2 = prompt_graph.get("423")
+    if isinstance(stage2, dict):
+        set_api_input(stage2, "stage2_mode", resolve_stage2(params))
+    lora = prompt_graph.get("422")
+    if isinstance(lora, dict):
+        if params.get("lora_name"):
+            set_api_input(lora, "lora_name", str(params["lora_name"]))
+        if params.get("lora_strength") is not None:
+            set_api_input(lora, "strength_model", float(params["lora_strength"]))
+    first = prompt_graph.get("409")
+    last = prompt_graph.get("411")
+    if mode == MODE_T2V:
+        if isinstance(first, dict):
+            set_api_input(first, "image", "")
+        if isinstance(last, dict):
+            set_api_input(last, "image", "")
+    elif mode == MODE_I2V:
+        if isinstance(first, dict):
+            set_api_input(first, "image", first_filename or "")
+        if isinstance(last, dict):
+            set_api_input(last, "image", "")
+    else:
+        if isinstance(first, dict):
+            set_api_input(first, "image", first_filename or "")
+        if isinstance(last, dict):
+            set_api_input(last, "image", last_filename or "")
+
+
 def apply_job_params(
     visual: dict,
     prompt: str,

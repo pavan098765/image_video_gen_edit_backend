@@ -546,6 +546,83 @@ def _rewire_sigmas_from_scheduler(visual: dict) -> None:
             _add_link(visual, SCHEDULER_NODE_ID, 0, ULTIMATE_UPSCALE_NODE_ID, 5, "SIGMAS")
 
 
+def apply_fast_api_job_params(
+    prompt_graph: dict,
+    prompt: str,
+    params: Dict[str, Any],
+    media_files: Optional[Dict[str, str]] = None,
+) -> None:
+    """Patch Fast T2V or Fast I2V API graphs by class_type."""
+    from workflow_converter import api_nodes_by_type, set_api_input
+
+    params = params or {}
+    media_files = media_files or {}
+    if prompt:
+        for _, node in api_nodes_by_type(prompt_graph, "MiniMaxH3ImageToVideo"):
+            set_api_input(node, "prompt", prompt)
+    if params.get("seed") is not None:
+        try:
+            seed_i = int(params["seed"])
+        except (TypeError, ValueError):
+            seed_i = None
+        if seed_i is not None:
+            for _, node in api_nodes_by_type(prompt_graph, "RandomNoise"):
+                set_api_input(node, "noise_seed", seed_i)
+    if params.get("seconds") is not None:
+        try:
+            seconds = float(params["seconds"])
+        except (TypeError, ValueError):
+            seconds = None
+        if seconds is not None:
+            for _, node in api_nodes_by_type(prompt_graph, "PrimitiveFloat"):
+                set_api_input(node, "value", seconds)
+    for _, node in api_nodes_by_type(prompt_graph, "ResolutionSelector"):
+        if params.get("aspect_ratio") is not None:
+            set_api_input(node, "aspect_ratio", params["aspect_ratio"])
+        if params.get("megapixels") is not None:
+            set_api_input(node, "megapixels", float(params["megapixels"]))
+    if params.get("sampler_name") is not None:
+        for _, node in api_nodes_by_type(prompt_graph, "KSamplerSelect"):
+            set_api_input(node, "sampler_name", params["sampler_name"])
+    if params.get("fps") is not None:
+        for _, node in api_nodes_by_type(prompt_graph, "CreateVideo"):
+            set_api_input(node, "fps", int(params["fps"]))
+    first = media_files.get("first_frame") or media_files.get("init_image")
+    last = media_files.get("last_frame")
+    loaders = api_nodes_by_type(prompt_graph, "LoadImage")
+    if first and loaders:
+        set_api_input(loaders[0][1], "image", first)
+    if last and len(loaders) > 1:
+        set_api_input(loaders[1][1], "image", last)
+    elif last and loaders:
+        set_api_input(loaders[0][1], "image", last)
+    prefix = params.get("filename_prefix")
+    if prefix:
+        for _, node in api_nodes_by_type(prompt_graph, "SaveVideo"):
+            set_api_input(node, "filename_prefix", str(prefix))
+    sigmas = params.get("sigmas")
+    steps = params.get("steps")
+    steps_i = None
+    if steps is not None:
+        try:
+            steps_i = int(steps)
+        except (TypeError, ValueError):
+            steps_i = None
+    if isinstance(sigmas, str) and sigmas.strip():
+        for _, node in api_nodes_by_type(prompt_graph, "ManualSigmas"):
+            set_api_input(node, "sigmas", sigmas.strip())
+    elif steps_i in SIGMAS_BY_STEPS:
+        for _, node in api_nodes_by_type(prompt_graph, "ManualSigmas"):
+            set_api_input(node, "sigmas", SIGMAS_BY_STEPS[steps_i])
+    shift = api_nodes_by_type(prompt_graph, "MiniMaxH3SigmaShift")
+    if shift:
+        node = shift[0][1]
+        if params.get("shift_video") is not None:
+            set_api_input(node, "shift_video", float(params["shift_video"]))
+        if params.get("shift_audio") is not None:
+            set_api_input(node, "shift_audio", float(params["shift_audio"]))
+
+
 def apply_fast_job_params(
     visual: dict,
     prompt: str,

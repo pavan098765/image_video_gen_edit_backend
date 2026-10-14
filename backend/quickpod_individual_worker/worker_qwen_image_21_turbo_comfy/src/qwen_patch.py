@@ -264,6 +264,69 @@ def inject_guide_image(visual: dict, filename: str) -> None:
     logger.info("Attached guide image %s to TextEncodeQwenImage21", filename)
 
 
+def apply_api_job_params(
+    prompt_graph: dict,
+    prompt: str,
+    params: Dict[str, Any],
+    guide_image: Optional[str] = None,
+) -> None:
+    """Patch a ComfyUI API-format prompt (no flatten)."""
+    from workflow_converter import api_nodes_by_type, set_api_input
+
+    unet = params.get("unet_name") or params.get("gguf") or DEFAULT_UNET
+    clip = params.get("clip_name") or DEFAULT_CLIP
+    vae = params.get("vae_name") or DEFAULT_VAE
+    for _, node in api_nodes_by_type(prompt_graph, "UnetLoaderGGUF"):
+        set_api_input(node, "unet_name", unet)
+    for _, node in api_nodes_by_type(prompt_graph, "CLIPLoader"):
+        set_api_input(node, "clip_name", clip)
+        set_api_input(node, "type", "qwen_image")
+    for _, node in api_nodes_by_type(prompt_graph, "VAELoader"):
+        set_api_input(node, "vae_name", vae)
+    for _, node in api_nodes_by_type(prompt_graph, "TextEncodeQwenImage21"):
+        set_api_input(node, "prompt", prompt or params.get("prompt") or "")
+        neg = params.get("negative_prompt")
+        if neg is None:
+            neg = params.get("negative")
+        if neg is not None:
+            set_api_input(node, "negative_prompt", neg)
+        if params.get("encode_resolution") is not None:
+            set_api_input(node, "resolution", int(params["encode_resolution"]))
+    cfg = params.get("cfg")
+    if cfg is None:
+        cfg = 1
+    seed = params.get("seed")
+    for _, node in api_nodes_by_type(prompt_graph, "SamplerCustom"):
+        set_api_input(node, "cfg", float(cfg))
+        if seed is not None:
+            set_api_input(node, "noise_seed", int(seed))
+        set_api_input(node, "add_noise", True)
+    for _, node in api_nodes_by_type(prompt_graph, "ResolutionSelector"):
+        if params.get("aspect_ratio"):
+            set_api_input(node, "aspect_ratio", str(params["aspect_ratio"]))
+        if params.get("megapixels") is not None:
+            set_api_input(node, "megapixels", float(params["megapixels"]))
+    if params.get("width") is not None or params.get("height") is not None:
+        for _, node in api_nodes_by_type(prompt_graph, "EmptyLatentImage"):
+            if params.get("width") is not None:
+                set_api_input(node, "width", int(params["width"]))
+            if params.get("height") is not None:
+                set_api_input(node, "height", int(params["height"]))
+    prefix = params.get("filename_prefix")
+    if prefix:
+        for _, node in api_nodes_by_type(prompt_graph, "SaveImageAdvanced"):
+            set_api_input(node, "filename_prefix", str(prefix))
+    if guide_image:
+        encoders = api_nodes_by_type(prompt_graph, "TextEncodeQwenImage21")
+        if encoders:
+            load_id = "qwen_guide_load"
+            prompt_graph[load_id] = {
+                "class_type": "LoadImage",
+                "inputs": {"image": guide_image},
+            }
+            set_api_input(encoders[0][1], "image_1", [load_id, 0])
+
+
 def apply_job_params(
     visual: dict,
     prompt: str,

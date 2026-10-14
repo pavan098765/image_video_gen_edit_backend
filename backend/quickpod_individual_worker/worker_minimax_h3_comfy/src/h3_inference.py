@@ -17,7 +17,9 @@ logger = logging.getLogger("h3_inference")
 
 WORKFLOW_DIR = os.environ.get("WORKFLOW_DIR", "/app/worker/workflow")
 WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/workspace")
-FAST_WORKFLOW = "fastMinimaxH3_textToVideo.json"
+FAST_WORKFLOW = "fastMinimaxH3_textToVideo_api.json"
+FAST_WORKFLOW_VISUAL = "fastMinimaxH3_textToVideo.json"
+I2V_WORKFLOW = "video_fastvideo_fasth3_i2v_api.json"
 SEED_HUNTER_WORKFLOW = "minimaxH3SEEDHUNTERLatent_v21.json"
 DEFAULT_WORKFLOW = os.environ.get("H3_WORKFLOW_FILE", FAST_WORKFLOW)
 
@@ -46,12 +48,18 @@ def _truthy(value: Any) -> bool:
 
 
 def pick_workflow_file(params: Dict[str, Any]) -> str:
-    """Fast T2V/I2V/FLF2V by default; Seed Hunter when leftover extras are requested."""
+    """Fast T2V by default; dedicated I2V API graph when a first frame is present.
+
+    Seed Hunter stays on the visual JSON — ComfyUI API export of that graph
+    is a no-op on large subgraph canvases.
+    """
     params = params or {}
     raw = str(params.get("workflow") or "").strip()
     key = raw.lower()
-    if key in ("fast", "fast_minimax", "t2v_fast", FAST_WORKFLOW.lower()):
+    if key in ("fast", "fast_minimax", "t2v_fast", FAST_WORKFLOW.lower(), FAST_WORKFLOW_VISUAL.lower()):
         return FAST_WORKFLOW
+    if key in ("i2v", "fast_i2v", "image", I2V_WORKFLOW.lower()):
+        return I2V_WORKFLOW
     if key in ("seed_hunter", "seedhunter", "hunter", "quality", SEED_HUNTER_WORKFLOW.lower()):
         return SEED_HUNTER_WORKFLOW
     if raw.endswith(".json"):
@@ -64,6 +72,8 @@ def pick_workflow_file(params: Dict[str, Any]) -> str:
         return SEED_HUNTER_WORKFLOW
     if params.get("continuation_video_url"):
         return SEED_HUNTER_WORKFLOW
+    if params.get("first_frame_url") or params.get("init_image") or params.get("last_frame_url"):
+        return I2V_WORKFLOW
     return DEFAULT_WORKFLOW if DEFAULT_WORKFLOW else FAST_WORKFLOW
 
 
@@ -145,59 +155,77 @@ def _pick_output(
 
 def run_inference_h3(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
     import comfyui_bridge
-    from workflow_converter import convert_visual_to_api
+    from workflow_converter import convert_visual_to_api, is_api_prompt, prefer_api_filename
     from workflow_flatten import flatten_subgraphs
 
     params = dict(params or {})
-    wf_name = pick_workflow_file(params)
+    wf_name = prefer_api_filename(WORKFLOW_DIR, pick_workflow_file(params))
     path = Path(WORKFLOW_DIR) / wf_name
     if not path.is_file():
         raise FileNotFoundError(f"Workflow not found: {path}")
 
     with open(path, encoding="utf-8") as f:
-        visual = json.load(f)
+        graph = json.load(f)
 
     media_items = download_media_items(params, comfyui_bridge)
     prefer = None
+    is_fast = (
+        wf_name == FAST_WORKFLOW
+        or wf_name == I2V_WORKFLOW
+        or wf_name.endswith("fastMinimaxH3_textToVideo.json")
+        or wf_name.endswith("fastMinimaxH3_textToVideo_api.json")
+        or wf_name.endswith("video_fastvideo_fasth3_i2v_api.json")
+    )
 
-    if wf_name == FAST_WORKFLOW or wf_name.endswith("fastMinimaxH3_textToVideo.json"):
+    media_files: Dict[str, str] = {}
+    for item in media_items:
+        kind = item.get("kind")
+        fname = item.get("file")
+        if not fname:
+            continue
+        if str(fname).startswith("h3_first"):
+            media_files["first_frame"] = fname
+        elif str(fname).startswith("h3_last"):
+            media_files["last_frame"] = fname
+        elif str(fname).startswith("h3_init") and kind == "picture":
+            media_files.setdefault("first_frame", fname)
+
+    if is_fast and is_api_prompt(graph):
+        from h3_fast_patch import SAVE_VIDEO_NODE_ID, apply_fast_api_job_params
+
+        apply_fast_api_job_params(
+            graph,
+            prompt or params.get("prompt") or "",
+            params,
+            media_files,
+        )
+        prefer = 92 if wf_name == I2V_WORKFLOW else SAVE_VIDEO_NODE_ID
+        api_wf = graph
+    elif is_fast:
         from h3_fast_patch import SAVE_VIDEO_NODE_ID, apply_fast_job_params
 
-        media_files: Dict[str, str] = {}
-        for item in media_items:
-            kind = item.get("kind")
-            fname = item.get("file")
-            if not fname:
-                continue
-            # download_media_items prefixes first_frame / last_frame / init
-            if str(fname).startswith("h3_first"):
-                media_files["first_frame"] = fname
-            elif str(fname).startswith("h3_last"):
-                media_files["last_frame"] = fname
-            elif str(fname).startswith("h3_init") and kind == "picture":
-                media_files.setdefault("first_frame", fname)
         apply_fast_job_params(
-            visual,
+            graph,
             prompt or params.get("prompt") or "",
             params,
             media_files,
         )
         prefer = SAVE_VIDEO_NODE_ID
+        api_wf = convert_visual_to_api(graph)
     else:
         from h3_patch import apply_job_params, apply_toggles, pick_output_node_id
 
-        apply_toggles(visual, params)
-        visual = flatten_subgraphs(visual)
+        apply_toggles(graph, params)
+        graph = flatten_subgraphs(graph)
         apply_job_params(
-            visual,
+            graph,
             prompt or params.get("prompt") or "",
             params,
             media_items,
             apply_group_toggles=False,
         )
         prefer = pick_output_node_id(params)
-
-    api_wf = convert_visual_to_api(visual)
+        api_wf = convert_visual_to_api(graph)
 
     logger.info(
         "[%s] Queueing MiniMax H3 workflow %s (%d nodes)",

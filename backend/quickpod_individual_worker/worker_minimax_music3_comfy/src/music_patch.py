@@ -197,6 +197,50 @@ def patch_inner_nodes(visual: dict, prompt: str, params: Dict[str, Any]) -> None
             _set_list_widget(save, 0, str(prefix))
 
 
+def apply_api_job_params(prompt_graph: dict, prompt: str, params: Dict[str, Any]) -> None:
+    from workflow_converter import api_nodes_by_type, set_api_input
+
+    caption = params.get("caption") or prompt or ""
+    lyrics = params.get("lyrics") or params.get("negative_prompt") or ""
+    duration = params.get("max_duration") or params.get("duration") or params.get("duration_seconds")
+    seed = params.get("seed")
+    unet = resolve_unet(params)
+    clip = params.get("clip_name") or DEFAULT_CLIP
+    vae = params.get("vae_name") or DEFAULT_VAE
+    tiled = True if params.get("tiled_decode") is None else _truthy(params.get("tiled_decode"))
+    for _, node in api_nodes_by_type(prompt_graph, "UNETLoader"):
+        set_api_input(node, "unet_name", unet)
+    for _, node in api_nodes_by_type(prompt_graph, "CLIPLoader"):
+        set_api_input(node, "clip_name", clip)
+        set_api_input(node, "type", "minimax")
+    for _, node in api_nodes_by_type(prompt_graph, "VAELoader"):
+        set_api_input(node, "vae_name", vae)
+    for _, node in api_nodes_by_type(prompt_graph, "MiniMaxMusic3TextEncode"):
+        set_api_input(node, "caption", caption)
+        set_api_input(node, "lyrics", lyrics)
+        if duration is not None:
+            set_api_input(node, "max_duration", float(duration))
+        if seed is not None:
+            set_api_input(node, "seed", int(seed))
+    if seed is not None:
+        for _, node in api_nodes_by_type(prompt_graph, "SeedNode"):
+            set_api_input(node, "seed", int(seed))
+        for _, node in api_nodes_by_type(prompt_graph, "KSampler"):
+            set_api_input(node, "seed", int(seed))
+    if params.get("steps") is not None:
+        for _, node in api_nodes_by_type(prompt_graph, "KSampler"):
+            set_api_input(node, "steps", int(params["steps"]))
+    if params.get("cfg") is not None:
+        for _, node in api_nodes_by_type(prompt_graph, "KSampler"):
+            set_api_input(node, "cfg", float(params["cfg"]))
+    for _, node in api_nodes_by_type(prompt_graph, "ComfySwitchNode"):
+        set_api_input(node, "switch", tiled)
+    prefix = params.get("filename_prefix")
+    if prefix:
+        for _, node in api_nodes_by_type(prompt_graph, "SaveAudioAdvanced"):
+            set_api_input(node, "filename_prefix", str(prefix))
+
+
 def apply_job_params(visual: dict, prompt: str, params: Dict[str, Any]) -> None:
     patch_subgraph(visual, prompt, params)
     patch_inner_nodes(visual, prompt, params)

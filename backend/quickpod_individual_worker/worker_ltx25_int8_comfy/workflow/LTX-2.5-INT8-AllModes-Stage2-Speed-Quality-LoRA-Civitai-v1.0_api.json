@@ -1,0 +1,733 @@
+{
+  "75": {
+    "inputs": {
+      "filename_prefix": "video/LTX-2.5_INT8_Stage2_Mode_LoRA",
+      "format": "auto",
+      "format.codec": "auto",
+      "codec": "auto",
+      "video": [
+        "370",
+        0
+      ]
+    },
+    "class_type": "SaveVideo",
+    "_meta": {
+      "title": "OUTPUT — MP4 / H.264 / LTX audio"
+    }
+  },
+  "338": {
+    "inputs": {
+      "noise_seed": [
+        "408",
+        14
+      ]
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "Stage 2 seed"
+    }
+  },
+  "339": {
+    "inputs": {
+      "noise_seed": [
+        "408",
+        13
+      ]
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "Stage 1 seed"
+    }
+  },
+  "340": {
+    "inputs": {
+      "video_latent": [
+        "414",
+        2
+      ],
+      "audio_latent": [
+        "367",
+        1
+      ]
+    },
+    "class_type": "LTXVConcatAVLatent",
+    "_meta": {
+      "title": "Stage 2 concat video + audio"
+    }
+  },
+  "341": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "Stage 2 sampler"
+    }
+  },
+  "344": {
+    "inputs": {
+      "noise": [
+        "339",
+        0
+      ],
+      "guider": [
+        "388",
+        0
+      ],
+      "sampler": [
+        "352",
+        0
+      ],
+      "sigmas": [
+        "397",
+        0
+      ],
+      "latent_image": [
+        "377",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "Stage 1 sample · low resolution"
+    }
+  },
+  "348": {
+    "inputs": {
+      "samples": [
+        "413",
+        2
+      ],
+      "upscale_model": [
+        "371",
+        0
+      ],
+      "vae": [
+        "385",
+        0
+      ]
+    },
+    "class_type": "LTXVLatentUpsampler",
+    "_meta": {
+      "title": "Official x2 latent upsample"
+    }
+  },
+  "352": {
+    "inputs": {
+      "sampler_name": "euler_ancestral"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "Stage 1 sampler"
+    }
+  },
+  "356": {
+    "inputs": {
+      "width": [
+        "408",
+        2
+      ],
+      "height": [
+        "408",
+        3
+      ],
+      "length": [
+        "408",
+        4
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyLTXVLatentVideo",
+    "_meta": {
+      "title": "Stage 1 empty VIDEO latent — half resolution"
+    }
+  },
+  "358": {
+    "inputs": {
+      "samples": [
+        "369",
+        1
+      ],
+      "audio_vae": [
+        "386",
+        0
+      ]
+    },
+    "class_type": "LTXVAudioVAEDecode",
+    "_meta": {
+      "title": "Audio VAE decode"
+    }
+  },
+  "364": {
+    "inputs": {
+      "text": [
+        "376",
+        0
+      ],
+      "clip": [
+        "387",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Positive prompt encode"
+    }
+  },
+  "365": {
+    "inputs": {
+      "frame_rate": [
+        "408",
+        5
+      ],
+      "positive": [
+        "364",
+        0
+      ],
+      "negative": [
+        "373",
+        0
+      ]
+    },
+    "class_type": "LTXVConditioning",
+    "_meta": {
+      "title": "Frame-rate conditioning"
+    }
+  },
+  "366": {
+    "inputs": {
+      "frames_number": [
+        "408",
+        4
+      ],
+      "frame_rate": [
+        "408",
+        5
+      ],
+      "batch_size": 1,
+      "audio_vae": [
+        "386",
+        0
+      ]
+    },
+    "class_type": "LTXVEmptyLatentAudio",
+    "_meta": {
+      "title": "Stage 1 empty AUDIO latent"
+    }
+  },
+  "367": {
+    "inputs": {
+      "av_latent": [
+        "344",
+        0
+      ]
+    },
+    "class_type": "LTXVSeparateAVLatent",
+    "_meta": {
+      "title": "Separate Stage 1 video / audio"
+    }
+  },
+  "368": {
+    "inputs": {
+      "noise": [
+        "338",
+        0
+      ],
+      "guider": [
+        "391",
+        0
+      ],
+      "sampler": [
+        "341",
+        0
+      ],
+      "sigmas": [
+        "396",
+        0
+      ],
+      "latent_image": [
+        "340",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "Stage 2 sample · final resolution"
+    }
+  },
+  "369": {
+    "inputs": {
+      "av_latent": [
+        "407",
+        0
+      ]
+    },
+    "class_type": "LTXVSeparateAVLatent",
+    "_meta": {
+      "title": "Separate final video / audio"
+    }
+  },
+  "370": {
+    "inputs": {
+      "fps": [
+        "408",
+        5
+      ],
+      "bit_depth": 8,
+      "color_space": "sRGB",
+      "codec": "none",
+      "images": [
+        "374",
+        0
+      ],
+      "audio": [
+        "358",
+        0
+      ]
+    },
+    "class_type": "CreateVideo",
+    "_meta": {
+      "title": "Create video · selected FPS + LTX audio"
+    }
+  },
+  "371": {
+    "inputs": {
+      "model_name": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+    },
+    "class_type": "LatentUpscaleModelLoader",
+    "_meta": {
+      "title": "Official x2 latent upscaler"
+    }
+  },
+  "373": {
+    "inputs": {
+      "text": "pc game, console game, video game, cartoon, childish, ugly",
+      "clip": [
+        "387",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Negative prompt"
+    }
+  },
+  "374": {
+    "inputs": {
+      "tile_size": [
+        "408",
+        9
+      ],
+      "overlap": [
+        "408",
+        10
+      ],
+      "temporal_size": [
+        "408",
+        11
+      ],
+      "temporal_overlap": [
+        "408",
+        12
+      ],
+      "samples": [
+        "415",
+        2
+      ],
+      "vae": [
+        "385",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": {
+      "title": "Official Conv VAE tiled decode"
+    }
+  },
+  "376": {
+    "inputs": {
+      "value": "Use the supplied 16:9 image as the exact opening frame and character lock for a 10-second continuous image-to-video scene in polished Japanese 2D animation. Preserve the cute Japanese adult woman in her early 20s, her dark chestnut bob with airy bangs and coral-red hair clip, pale yellow cardigan, white top, facial features, ramen bowl, chopsticks, warm wooden counter, and cozy amber ramen-shop lighting. Beginning with the lifted noodles shown in the opening frame, she brings them slightly closer and gently blows on them twice; the coherent noodle bundle sways softly while delicate steam curls away from her breath. She leans forward, opens her mouth naturally, and slurps the noodles in one smooth continuous motion as her right-hand chopsticks guide the strands cleanly from the bowl without tangling, duplicating, or passing through her face. She finishes the bite, closes her mouth, and chews with her cheeks slightly puffed; her eyes briefly close, her shoulders lift with delight, and she swallows before giving the viewer a bright satisfied smile and a tiny approving nod. The table-height camera remains in one unbroken front three-quarter shot, making a subtle push toward her face only after the noodles enter her mouth and settling on her happy reaction. Preserve clean expressive line art, stable cel shading, coherent hands and utensils, and natural food motion; audible sound consists of two soft blowing breaths, a clear appetizing noodle slurp, a faint chopstick tap, simmering broth, and quiet ramen-shop ambience, with no dialogue, music, subtitles, or visible text."
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "FINISHED LTX-2.5 PROMPT — paste as-is"
+    }
+  },
+  "377": {
+    "inputs": {
+      "video_latent": [
+        "412",
+        2
+      ],
+      "audio_latent": [
+        "366",
+        0
+      ]
+    },
+    "class_type": "LTXVConcatAVLatent",
+    "_meta": {
+      "title": "Stage 1 concat video + audio"
+    }
+  },
+  "385": {
+    "inputs": {
+      "vae_name": "ltx-2.5-video-vae-conv-bf16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Official Conv Video VAE — tiled decode"
+    }
+  },
+  "386": {
+    "inputs": {
+      "vae_name": "ltx-2.5-audio-vae-bf16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Official Audio VAE"
+    }
+  },
+  "387": {
+    "inputs": {
+      "clip_name": "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+      "type": "ltxv",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Gemma4 LTX-2.5 INT8 text encoder"
+    }
+  },
+  "388": {
+    "inputs": {
+      "video_cfg": 1,
+      "audio_cfg": 1,
+      "model": [
+        "406",
+        0
+      ],
+      "positive": [
+        "412",
+        0
+      ],
+      "negative": [
+        "412",
+        1
+      ]
+    },
+    "class_type": "LTXVDualCFGGuider",
+    "_meta": {
+      "title": "Stage 1 dual CFG guider"
+    }
+  },
+  "391": {
+    "inputs": {
+      "video_cfg": 1,
+      "audio_cfg": 1,
+      "model": [
+        "424",
+        0
+      ],
+      "positive": [
+        "414",
+        0
+      ],
+      "negative": [
+        "414",
+        1
+      ]
+    },
+    "class_type": "LTXVDualCFGGuider",
+    "_meta": {
+      "title": "Stage 2 dual CFG guider"
+    }
+  },
+  "396": {
+    "inputs": {
+      "sigmas": "0.909375, 0.725, 0.421875, 0.0"
+    },
+    "class_type": "ManualSigmas",
+    "_meta": {
+      "title": "Stage 2 canonical Python sigmas · 3 deterministic steps"
+    }
+  },
+  "397": {
+    "inputs": {
+      "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+    },
+    "class_type": "ManualSigmas",
+    "_meta": {
+      "title": "Stage 1 distilled sigmas · 8 steps"
+    }
+  },
+  "405": {
+    "inputs": {
+      "triton_kernels": true,
+      "model": [
+        "422",
+        0
+      ]
+    },
+    "class_type": "LTX2MemoryEfficientSageAttentionPatch",
+    "_meta": {
+      "title": "FAST PATH · 1/2 SageAttention"
+    }
+  },
+  "406": {
+    "inputs": {
+      "tau": 1,
+      "start_percent": 0.2,
+      "end_percent": 0.9,
+      "min_tokens": 4096,
+      "int8_qk": true,
+      "sink_conditioning": "off",
+      "morton": false,
+      "morton_curve": "2d_frame",
+      "int8_pv": true,
+      "verbose": true,
+      "use_tma": false,
+      "dense_blocks": "",
+      "model": [
+        "405",
+        0
+      ]
+    },
+    "class_type": "SolAttnPatch",
+    "_meta": {
+      "title": "FAST PATH · 2/2 Sol-Attn"
+    }
+  },
+  "407": {
+    "inputs": {
+      "empty_cache": true,
+      "gc_collect": true,
+      "unload_all_models": true,
+      "any_input": [
+        "368",
+        0
+      ]
+    },
+    "class_type": "VRAM_Debug",
+    "_meta": {
+      "title": "UNLOAD all loaded models before Conv VAE decode"
+    }
+  },
+  "408": {
+    "inputs": {
+      "mode": "I2V (first frame)",
+      "vae_decode_preset": "Auto (VRAM-based)",
+      "final_width": 1920,
+      "final_height": 1088,
+      "timing_mode": "Duration drives frames",
+      "fps": 24,
+      "duration_seconds": 10,
+      "manual_frames": 361,
+      "seed": 42
+    },
+    "class_type": "LTX25AllModesControlsV2",
+    "_meta": {
+      "title": "MODE / FINAL RESOLUTION / TIMING / VAE DECODE"
+    }
+  },
+  "409": {
+    "inputs": {
+      "image": "exec-2dc5ff5b-759d-4de0-a4a2-e8bd0f9d4949.png",
+      "max_long_edge": 1536,
+      "img_compression": 18,
+      "enabled": [
+        "408",
+        7
+      ]
+    },
+    "class_type": "LTX25ModeImageLoader",
+    "_meta": {
+      "title": "FIRST FRAME — I2V / FLF2V · choose or upload here"
+    }
+  },
+  "411": {
+    "inputs": {
+      "image": "",
+      "max_long_edge": 1536,
+      "img_compression": 18,
+      "enabled": [
+        "408",
+        8
+      ]
+    },
+    "class_type": "LTX25ModeImageLoader",
+    "_meta": {
+      "title": "LAST FRAME — FLF2V only · choose or upload here"
+    }
+  },
+  "412": {
+    "inputs": {
+      "strength": 0.7,
+      "positive": [
+        "365",
+        0
+      ],
+      "negative": [
+        "365",
+        1
+      ],
+      "vae": [
+        "385",
+        0
+      ],
+      "latent": [
+        "356",
+        0
+      ],
+      "first_image": [
+        "409",
+        0
+      ],
+      "last_image": [
+        "411",
+        0
+      ]
+    },
+    "class_type": "LTX25ApplyGuides",
+    "_meta": {
+      "title": "MODE ROUTER — Stage 1 · guide strength 0.7"
+    }
+  },
+  "413": {
+    "inputs": {
+      "positive": [
+        "412",
+        0
+      ],
+      "negative": [
+        "412",
+        1
+      ],
+      "latent": [
+        "367",
+        0
+      ]
+    },
+    "class_type": "LTXVCropGuides",
+    "_meta": {
+      "title": "Crop Stage 1 guide tokens before x2 upscale"
+    }
+  },
+  "414": {
+    "inputs": {
+      "strength": 1,
+      "positive": [
+        "413",
+        0
+      ],
+      "negative": [
+        "413",
+        1
+      ],
+      "vae": [
+        "385",
+        0
+      ],
+      "latent": [
+        "348",
+        0
+      ],
+      "first_image": [
+        "409",
+        0
+      ],
+      "last_image": [
+        "411",
+        0
+      ]
+    },
+    "class_type": "LTX25ApplyGuides",
+    "_meta": {
+      "title": "MODE ROUTER — Stage 2 · guide strength 1.0"
+    }
+  },
+  "415": {
+    "inputs": {
+      "positive": [
+        "414",
+        0
+      ],
+      "negative": [
+        "414",
+        1
+      ],
+      "latent": [
+        "369",
+        0
+      ]
+    },
+    "class_type": "LTXVCropGuides",
+    "_meta": {
+      "title": "Crop Stage 2 guide tokens before Conv VAE decode"
+    }
+  },
+  "416": {
+    "inputs": {
+      "source": [
+        "408",
+        15
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "RESOLVED VALUES — shown when Queue starts"
+    }
+  },
+  "420": {
+    "inputs": {
+      "unet_name": "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "OFFICIAL DISTILLED INT8 ConvRot transformer"
+    }
+  },
+  "422": {
+    "inputs": {
+      "lora_name": "None (base INT8 model)",
+      "strength_model": 1,
+      "model": [
+        "420",
+        0
+      ]
+    },
+    "class_type": "LTX25OptionalBypassLoRA",
+    "_meta": {
+      "title": "OPTIONAL LTX LoRA · None = exact pass-through"
+    }
+  },
+  "423": {
+    "inputs": {
+      "stage2_mode": "Speed — Sage + Sol (12–16GB target)"
+    },
+    "class_type": "LTX25Stage2Mode",
+    "_meta": {
+      "title": "STAGE 2 MODE · changes Stage 2 only"
+    }
+  },
+  "424": {
+    "inputs": {
+      "switch": [
+        "423",
+        0
+      ],
+      "on_false": [
+        "422",
+        0
+      ],
+      "on_true": [
+        "406",
+        0
+      ]
+    },
+    "class_type": "ComfySwitchNode",
+    "_meta": {
+      "title": "STAGE 2 ROUTER · Quality native / Speed Sage+Sol"
+    }
+  }
+}

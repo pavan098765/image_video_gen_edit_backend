@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from ltx_patch import MODE_FLF2V, MODE_I2V, SAVE_NODE_ID, apply_job_params, resolve_mode
+from ltx_patch import MODE_FLF2V, MODE_I2V, SAVE_NODE_ID, apply_api_job_params, apply_job_params, resolve_mode
 
 logger = logging.getLogger("ltx_inference")
 
@@ -21,7 +21,7 @@ WORKFLOW_DIR = os.environ.get("WORKFLOW_DIR", "/app/worker/workflow")
 WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/workspace")
 DEFAULT_WORKFLOW = os.environ.get(
     "LTX25_WORKFLOW_FILE",
-    "LTX-2.5-INT8-AllModes-Stage2-Speed-Quality-LoRA-Civitai-v1.0.json",
+    "LTX-2.5-INT8-AllModes-Stage2-Speed-Quality-LoRA-Civitai-v1.0_api.json",
 )
 
 
@@ -70,18 +70,18 @@ def _pick_output(comfyui_bridge: Any, output_files: List[dict]) -> str:
 
 def run_inference_ltx25(job_id: str, prompt: str, params: Dict[str, Any], model: str = "ltx25_int8") -> str:
     import comfyui_bridge
-    from workflow_converter import convert_visual_to_api
+    from workflow_converter import convert_visual_to_api, is_api_prompt, prefer_api_filename
     from workflow_flatten import flatten_subgraphs
 
     params = dict(params or {})
     model = params.pop("_model_key", None) or model
-    wf_name = params.get("workflow") or DEFAULT_WORKFLOW
+    wf_name = prefer_api_filename(WORKFLOW_DIR, params.get("workflow") or DEFAULT_WORKFLOW)
     path = Path(WORKFLOW_DIR) / wf_name
     if not path.is_file():
         raise FileNotFoundError(f"Workflow not found: {path}")
 
     with open(path, encoding="utf-8") as f:
-        visual = json.load(f)
+        graph = json.load(f)
 
     mode = resolve_mode(model, params)
     first_name = None
@@ -93,9 +93,14 @@ def run_inference_ltx25(job_id: str, prompt: str, params: Dict[str, Any], model:
     if mode == MODE_FLF2V and isinstance(last_url, str) and last_url.startswith("http"):
         last_name = _download_image(last_url, f"ltx25_last{_ext_from_url(last_url)}", comfyui_bridge)
 
-    apply_job_params(visual, prompt or params.get("prompt") or "", params, model, first_name, last_name)
-    visual = flatten_subgraphs(visual)
-    api_wf = convert_visual_to_api(visual)
+    text = prompt or params.get("prompt") or ""
+    if is_api_prompt(graph):
+        apply_api_job_params(graph, text, params, model, first_name, last_name)
+        api_wf = graph
+    else:
+        apply_job_params(graph, text, params, model, first_name, last_name)
+        graph = flatten_subgraphs(graph)
+        api_wf = convert_visual_to_api(graph)
 
     logger.info("[%s] Queueing LTX-2.5 INT8 workflow (%d nodes, mode=%s)", job_id, len(api_wf), mode)
     timeout = int(params.get("comfy_timeout", getattr(comfyui_bridge, "COMFYUI_PROMPT_TIMEOUT", 3600)))
