@@ -12,6 +12,7 @@ __pycache__/
 *.ico
 *.webp
 *.mp3
+*.wav
 *.mp4
 *.filepart
 
