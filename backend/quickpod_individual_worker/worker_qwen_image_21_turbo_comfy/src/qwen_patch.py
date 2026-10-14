@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+import math
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("qwen_patch")
 
@@ -13,6 +15,165 @@ SAVE_NODE_ID = 461
 DEFAULT_UNET = "qwen-image-2.1-turbo-Q8_0.gguf"
 DEFAULT_CLIP = "qwen3vl_8b_int8_convrot.safetensors"
 DEFAULT_VAE = "qwen_image_2.1_vae_bf16.safetensors"
+
+# Official Qwen Image 2.1 native 2K canvases (multiples of 32).
+ASPECT_2K: Dict[str, Tuple[int, int]] = {
+    "1:1": (2048, 2048),
+    "4:3": (2400, 1792),
+    "3:4": (1792, 2400),
+    "3:2": (2528, 1696),
+    "2:3": (1696, 2528),
+    "16:9": (2752, 1536),
+    "9:16": (1536, 2752),
+}
+
+# ResolutionSelector combo labels in ComfyUI v0.37.
+ASPECT_SELECTOR: Dict[str, str] = {
+    "1:1": "1:1 (Square)",
+    "2:3": "2:3 (Portrait Photo)",
+    "3:2": "3:2 (Photo)",
+    "3:4": "3:4 (Portrait Standard)",
+    "4:3": "4:3 (Standard)",
+    "9:16": "9:16 (Portrait Widescreen)",
+    "16:9": "16:9 (Widescreen)",
+    "21:9": "21:9 (Ultrawide)",
+}
+
+
+def _snap32(value: float) -> int:
+    return max(32, int(round(float(value) / 32.0) * 32))
+
+
+def _canonical_aspect(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    lowered = text.lower().replace(" ", "")
+    aliases = {
+        "square": "1:1",
+        "portrait": "9:16",
+        "landscape": "16:9",
+        "widescreen": "16:9",
+        "ultrawide": "21:9",
+    }
+    if lowered in aliases:
+        return aliases[lowered]
+    token = text.split()[0].replace("×", ":").replace("x", ":").replace("X", ":")
+    match = re.match(r"^(\d+)\s*:\s*(\d+)$", token)
+    if not match:
+        return None
+    return f"{int(match.group(1))}:{int(match.group(2))}"
+
+
+def _size_tier(params: Dict[str, Any]) -> str:
+    for key in ("size", "output_size", "resolution_tier", "quality"):
+        raw = params.get(key)
+        if raw is None:
+            continue
+        token = str(raw).strip().lower().replace(" ", "")
+        if token in ("2k", "2048", "4mp", "4"):
+            return "2k"
+        if token in ("1k", "1024", "1mp", "1"):
+            return "1k"
+    megapixels = params.get("megapixels")
+    if megapixels is not None:
+        try:
+            if float(megapixels) >= 3.0:
+                return "2k"
+        except (TypeError, ValueError):
+            pass
+    return "1k"
+
+
+def _pixels_for_aspect(aspect: str, tier: str) -> Tuple[int, int]:
+    if aspect in ASPECT_2K:
+        width, height = ASPECT_2K[aspect]
+        if tier == "2k":
+            return width, height
+        return _snap32(width / 2.0), _snap32(height / 2.0)
+    parts = aspect.split(":")
+    wr, hr = int(parts[0]), int(parts[1])
+    area = (2048 * 2048) if tier == "2k" else (1024 * 1024)
+    scale = math.sqrt(area / float(wr * hr))
+    return _snap32(wr * scale), _snap32(hr * scale)
+
+
+def _pixels_for_source(src_w: int, src_h: int, tier: str) -> Tuple[int, int]:
+    area = (2048 * 2048) if tier == "2k" else (1024 * 1024)
+    scale = math.sqrt(area / float(max(1, src_w * src_h)))
+    return _snap32(src_w * scale), _snap32(src_h * scale)
+
+
+def resolve_qwen_size(
+    params: Dict[str, Any],
+    guide_wh: Optional[Tuple[int, int]] = None,
+) -> Dict[str, Any]:
+    """Pick canvas + encoder resolution for T2I vs image-edit."""
+    tier = _size_tier(params)
+    encode_res = 2048 if tier == "2k" else 1024
+    if params.get("encode_resolution") is not None:
+        try:
+            encode_res = int(params["encode_resolution"])
+        except (TypeError, ValueError):
+            pass
+    aspect = _canonical_aspect(params.get("aspect_ratio"))
+    explicit_w = params.get("width")
+    explicit_h = params.get("height")
+    try:
+        explicit_w = int(explicit_w) if explicit_w is not None else None
+        explicit_h = int(explicit_h) if explicit_h is not None else None
+    except (TypeError, ValueError):
+        explicit_w, explicit_h = None, None
+
+    if guide_wh:
+        # Edits must sample at the encoder latent size (source aspect).
+        # Changing EmptyLatentImage independently shifts the edit.
+        src_w, src_h = int(guide_wh[0]), int(guide_wh[1])
+        width, height = _pixels_for_source(src_w, src_h, tier)
+        if aspect:
+            logger.info(
+                "Ignoring aspect_ratio=%s on edit; using source %sx%s -> %sx%s (%s)",
+                aspect, src_w, src_h, width, height, tier,
+            )
+        return {
+            "tier": tier,
+            "aspect": f"{src_w}:{src_h}",
+            "selector": None,
+            "width": width,
+            "height": height,
+            "encode_resolution": encode_res,
+            "megapixels": 4.0 if tier == "2k" else 1.0,
+            "use_encoder_latent": True,
+        }
+
+    if aspect:
+        width, height = _pixels_for_aspect(aspect, tier)
+    elif explicit_w and explicit_h:
+        if (explicit_w, explicit_h) in ((1024, 1024), (2048, 2048)) and tier == "2k":
+            width, height = ASPECT_2K["1:1"]
+            aspect = "1:1"
+        elif (explicit_w, explicit_h) == (2048, 2048) and tier == "1k":
+            width, height = 1024, 1024
+            aspect = "1:1"
+        else:
+            width, height = _snap32(explicit_w), _snap32(explicit_h)
+            aspect = f"{width}:{height}"
+    else:
+        aspect = "1:1"
+        width, height = _pixels_for_aspect(aspect, tier)
+
+    return {
+        "tier": tier,
+        "aspect": aspect,
+        "selector": ASPECT_SELECTOR.get(aspect),
+        "width": width,
+        "height": height,
+        "encode_resolution": encode_res,
+        "megapixels": 4.0 if tier == "2k" else 1.0,
+        "use_encoder_latent": False,
+    }
 
 
 def _find_nodes_by_type(visual: dict, node_type: str) -> List[dict]:
@@ -105,9 +266,12 @@ def patch_subgraph(visual: dict, prompt: str, params: Dict[str, Any]) -> None:
         _set_named(node, "negative_prompt", params.get("negative_prompt") or params.get("negative") or "")
     if params.get("cfg") is not None:
         _set_named(node, "cfg", float(params["cfg"]))
-    if params.get("width") is not None:
+    size_info = params.get("_qwen_size") if isinstance(params.get("_qwen_size"), dict) else None
+    if size_info and not size_info.get("use_encoder_latent"):
+        _set_named(node, "width", int(size_info["width"]))
+        _set_named(node, "height", int(size_info["height"]))
+    elif params.get("width") is not None and params.get("height") is not None and not (size_info or {}).get("use_encoder_latent"):
         _set_named(node, "width", int(params["width"]))
-    if params.get("height") is not None:
         _set_named(node, "height", int(params["height"]))
     if params.get("seed") is not None:
         _set_named(node, "seed", int(params["seed"]))
@@ -124,11 +288,20 @@ def patch_resolution(visual: dict, params: Dict[str, Any]) -> None:
     if not nodes:
         return
     node = nodes[0]
+    size_info = params.get("_qwen_size") if isinstance(params.get("_qwen_size"), dict) else None
+    if size_info:
+        if size_info.get("selector"):
+            _set_list_widget(node, 0, str(size_info["selector"]))
+        _set_list_widget(node, 1, float(size_info["megapixels"]))
+        _set_list_widget(node, 2, 32)
+        return
     if params.get("aspect_ratio"):
-        _set_list_widget(node, 0, str(params["aspect_ratio"]))
+        aspect = _canonical_aspect(params["aspect_ratio"])
+        _set_list_widget(node, 0, ASPECT_SELECTOR.get(aspect or "", str(params["aspect_ratio"])))
     mp = params.get("megapixels")
     if mp is not None:
         _set_list_widget(node, 1, float(mp))
+    _set_list_widget(node, 2, 32)
 
 
 def patch_inner_nodes(visual: dict, prompt: str, params: Dict[str, Any]) -> None:
@@ -164,8 +337,14 @@ def patch_inner_nodes(visual: dict, prompt: str, params: Dict[str, Any]) -> None
             neg = named.get("negative_prompt") or ""
         _set_named(node, "negative_prompt", neg)
         _clear_input_link(node, "negative_prompt")
-        if params.get("encode_resolution") is not None:
-            _set_named(node, "resolution", int(params["encode_resolution"]))
+        size_info = params.get("_qwen_size") if isinstance(params.get("_qwen_size"), dict) else None
+        enc_res = None
+        if size_info:
+            enc_res = size_info.get("encode_resolution")
+        elif params.get("encode_resolution") is not None:
+            enc_res = params["encode_resolution"]
+        if enc_res is not None:
+            _set_named(node, "resolution", int(enc_res))
     seed = params.get("seed")
     cfg = params.get("cfg")
     if cfg is None:
@@ -179,7 +358,14 @@ def patch_inner_nodes(visual: dict, prompt: str, params: Dict[str, Any]) -> None
         _set_named(node, "cfg", float(cfg))
         _set_list_widget(node, 3, float(cfg))
         _clear_input_link(node, "cfg")
-    if params.get("width") is not None or params.get("height") is not None:
+    size_info = params.get("_qwen_size") if isinstance(params.get("_qwen_size"), dict) else None
+    if size_info and not size_info.get("use_encoder_latent"):
+        for node in _find_nodes_by_type(visual, "EmptyLatentImage"):
+            _set_named(node, "width", int(size_info["width"]))
+            _set_list_widget(node, 0, int(size_info["width"]))
+            _set_named(node, "height", int(size_info["height"]))
+            _set_list_widget(node, 1, int(size_info["height"]))
+    elif params.get("width") is not None or params.get("height") is not None:
         for node in _find_nodes_by_type(visual, "EmptyLatentImage"):
             if params.get("width") is not None:
                 _set_named(node, "width", int(params["width"]))
@@ -264,6 +450,32 @@ def inject_guide_image(visual: dict, filename: str) -> None:
     logger.info("Attached guide image %s to TextEncodeQwenImage21", filename)
 
 
+def _ensure_size(params: Dict[str, Any], guide_image: Optional[str] = None) -> Dict[str, Any]:
+    if isinstance(params.get("_qwen_size"), dict):
+        return params["_qwen_size"]
+    guide_wh = params.get("_guide_wh")
+    parsed_wh = None
+    if guide_wh and len(guide_wh) >= 2:
+        try:
+            parsed_wh = (int(guide_wh[0]), int(guide_wh[1]))
+        except (TypeError, ValueError):
+            parsed_wh = None
+    size_info = resolve_qwen_size(params, guide_wh=parsed_wh)
+    if guide_image:
+        size_info["use_encoder_latent"] = True
+    params["_qwen_size"] = size_info
+    logger.info(
+        "Qwen canvas tier=%s aspect=%s %sx%s encode=%s encoder_latent=%s",
+        size_info.get("tier"),
+        size_info.get("aspect"),
+        size_info.get("width"),
+        size_info.get("height"),
+        size_info.get("encode_resolution"),
+        size_info.get("use_encoder_latent"),
+    )
+    return size_info
+
+
 def apply_api_job_params(
     prompt_graph: dict,
     prompt: str,
@@ -273,6 +485,7 @@ def apply_api_job_params(
     """Patch a ComfyUI API-format prompt (no flatten)."""
     from workflow_converter import api_nodes_by_type, set_api_input
 
+    size_info = _ensure_size(params, guide_image)
     unet = params.get("unet_name") or params.get("gguf") or DEFAULT_UNET
     clip = params.get("clip_name") or DEFAULT_CLIP
     vae = params.get("vae_name") or DEFAULT_VAE
@@ -293,8 +506,7 @@ def apply_api_job_params(
             neg = params.get("negative")
         if neg is not None:
             set_api_input(node, "negative_prompt", neg)
-        if params.get("encode_resolution") is not None:
-            set_api_input(node, "resolution", int(params["encode_resolution"]))
+        set_api_input(node, "resolution", int(size_info["encode_resolution"]))
     cfg = params.get("cfg")
     if cfg is None:
         cfg = 1
@@ -305,16 +517,14 @@ def apply_api_job_params(
             set_api_input(node, "noise_seed", int(seed))
         set_api_input(node, "add_noise", True)
     for _, node in api_nodes_by_type(prompt_graph, "ResolutionSelector"):
-        if params.get("aspect_ratio"):
-            set_api_input(node, "aspect_ratio", str(params["aspect_ratio"]))
-        if params.get("megapixels") is not None:
-            set_api_input(node, "megapixels", float(params["megapixels"]))
-    if params.get("width") is not None or params.get("height") is not None:
+        if size_info.get("selector"):
+            set_api_input(node, "aspect_ratio", str(size_info["selector"]))
+        set_api_input(node, "megapixels", float(size_info["megapixels"]))
+        set_api_input(node, "multiple", 32)
+    if not size_info.get("use_encoder_latent"):
         for _, node in api_nodes_by_type(prompt_graph, "EmptyLatentImage"):
-            if params.get("width") is not None:
-                set_api_input(node, "width", int(params["width"]))
-            if params.get("height") is not None:
-                set_api_input(node, "height", int(params["height"]))
+            set_api_input(node, "width", int(size_info["width"]))
+            set_api_input(node, "height", int(size_info["height"]))
     prefix = params.get("filename_prefix")
     if prefix:
         for _, node in api_nodes_by_type(prompt_graph, "SaveImageAdvanced"):
@@ -349,6 +559,7 @@ def apply_job_params(
     params: Dict[str, Any],
     guide_image: Optional[str] = None,
 ) -> None:
+    _ensure_size(params, guide_image)
     patch_subgraph(visual, prompt, params)
     patch_resolution(visual, params)
     patch_inner_nodes(visual, prompt, params)

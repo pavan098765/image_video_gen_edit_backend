@@ -11,6 +11,7 @@ __pycache__/
 *.tiff
 *.ico
 *.webp
+*.filepart
 
 backend/controller.db
 backend/quickpod_individual_worker/realesrgan_models/RealESRGAN_x2plus.pth

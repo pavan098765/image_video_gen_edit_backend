@@ -119,8 +119,9 @@ ComfyUI instructions:
 - Graph stays 8-step turbo: ManualSigmas, SamplerCustom euler, cfg 1.
 
 Optional `/run` params: `unet_name` (other Unsloth quants you copy in),
-`width`/`height`/`megapixels`/`aspect_ratio`, `seed`, `cfg`,
-`first_frame_url` / `init_image` (wired to `TextEncodeQwenImage21.image_1`).
+`aspect_ratio` (`1:1`,`4:3`,`3:4`,`3:2`,`2:3`,`16:9`,`9:16`), `size` (`1k` or `2k`;
+aliases `megapixels` 1 or 4), `width`/`height` (T2I override only), `seed`, `cfg`,
+`first_frame_url` / `init_image` (edit; keeps the source aspect, `size` still picks 1K vs 2K).
 
 ## MiniMax Music 3 notes
 

@@ -8,7 +8,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -31,6 +31,17 @@ def _ext_from_url(url: str, fallback: str = ".png") -> str:
     if ext and len(ext) <= 8:
         return ext
     return fallback
+
+
+def _image_size(path: str) -> Optional[tuple]:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            return int(im.size[0]), int(im.size[1])
+    except Exception:
+        logger.warning("Could not read image size from %s", path, exc_info=True)
+        return None
 
 
 def _download_image(url: str, filename: str, comfyui_bridge: Any) -> str:
@@ -101,6 +112,12 @@ def run_inference_qwen21(
             f"qwen21_guide{_ext_from_url(guide_url)}",
             comfyui_bridge,
         )
+        input_dir = os.environ.get("COMFYUI_DIR", "/app/comfyui")
+        guide_path = os.path.join(input_dir, "input", guide_name)
+        guide_wh = _image_size(guide_path)
+        if guide_wh:
+            params["_guide_wh"] = guide_wh
+            logger.info("[%s] Guide image %sx%s", job_id, guide_wh[0], guide_wh[1])
 
     text = prompt or params.get("prompt") or ""
     if is_api_prompt(graph):
