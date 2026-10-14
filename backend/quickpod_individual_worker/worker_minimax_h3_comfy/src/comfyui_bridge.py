@@ -248,7 +248,7 @@ def get_output_files(history_entry: dict) -> List[Dict[str, Any]]:
     files: List[Dict[str, Any]] = []
 
     for node_id, node_output in outputs.items():
-        for key in ("gifs", "images", "videos"):
+        for key in ("gifs", "images", "videos", "audio"):
             items = node_output.get(key, [])
             for item in items:
                 if isinstance(item, dict) and "filename" in item:
