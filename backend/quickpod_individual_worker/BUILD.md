@@ -38,6 +38,10 @@ docker build -f worker_hunyan15_480p_t2V_distilled_multi/Dockerfile .
 
 Do **not** use the multi worker folder alone as context (e.g. `cd worker_flux_klein_9b_multi && docker build .`) unless you also copy every `COPY` source into that tree and adjust paths.
 
+## Shared NFS volume (planned)
+
+Weights and SolAttn Triton kernels for MiniMax H3, Music 3, and LTX 2.5 will live on a Quickpod NFS volume mounted at `/data` (not baked into images). **Not enabled yet** except H3 Triton cache auto-detect. Read **[NFS_VOLUME.md](./NFS_VOLUME.md)** before changing `start.sh`, `MODELS_DIR`, `download_models.py`, or pod env. Do not `mkdir /data` in images.
+
 ## MiniMax H3 ComfyUI (self-contained)
 
 This image is **not** a multi-worker. The Dockerfile clones ComfyUI v0.37.0 and pinned custom nodes during `docker build` (including SolAttn + Comfy Kitchen + MMH3 Ultimate Upscale for Fast MiniMax H3). Weights are **not** in the image; the container downloads them on first boot (Seed Hunter unet plus MATLOWAI fused turbo INT8). Default `/run` uses `fastMinimaxH3_textToVideo.json` (~0.4 MP). Pass `params.upscale=true` for the Civitai second pass (default 1.0 MP; set `upscale_megapixels` to 0.6–0.9 on OOM). Pass `params.workflow=seed_hunter` for the full Seed Hunter graph.

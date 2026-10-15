@@ -121,6 +121,8 @@ def ensure_weights(
     manifest_path: Optional[Path] = None,
 ) -> List[str]:
     """Download missing weights. Returns list of dest paths that are still missing."""
+    # NFS (planned): MODELS_DIR=/data/models + SKIP_RUNTIME_MODEL_DOWNLOAD=1
+    # See backend/quickpod_individual_worker/NFS_VOLUME.md
     if os.environ.get("SKIP_RUNTIME_MODEL_DOWNLOAD", "").strip() == "1":
         logger.warning("SKIP_RUNTIME_MODEL_DOWNLOAD=1 — skipping weight download")
         return []

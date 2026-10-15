@@ -32,6 +32,7 @@ def main() -> None:
         # Triton JIT for SolAttn needs a host C compiler at first sample (not at GHA build).
         'ENV CC="gcc"',
         'ENV CXX="g++"',
+        # NFS plan: backend/quickpod_individual_worker/NFS_VOLUME.md
         # Override at pod create with TRITON_CACHE_DIR=/data/triton when NFS is attached.
         'ENV TRITON_CACHE_DIR="/root/.triton"',
         "",

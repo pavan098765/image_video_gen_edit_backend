@@ -5,6 +5,7 @@ export CC="${CC:-gcc}"
 export CXX="${CXX:-g++}"
 
 # Triton/SolAttn kernel cache. Default is local /root/.triton.
+# Shared NFS plan (weights + this cache): ../NFS_VOLUME.md
 # NFS (later, not auto-created):
 #   TRITON_CACHE_DIR=/data/triton
 #   or QUICKPOD_DATA_DIR=/data with /data/triton already on the volume
