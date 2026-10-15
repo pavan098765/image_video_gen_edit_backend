@@ -29,11 +29,17 @@ def main() -> None:
         'ENV WORKSPACE_DIR="/workspace"',
         'ENV PYTHONPATH="/app/worker/src:${PYTHONPATH}"',
         "ENV GIT_TERMINAL_PROMPT=0",
+        # Triton JIT for SolAttn needs a host C compiler at first sample (not at GHA build).
+        'ENV CC="gcc"',
+        'ENV CXX="g++"',
+        # Override at pod create with TRITON_CACHE_DIR=/data/triton when NFS is attached.
+        'ENV TRITON_CACHE_DIR="/root/.triton"',
         "",
-        "RUN apt-get update && apt-get install -y --no-install-recommends git "
+        "RUN apt-get update && apt-get install -y --no-install-recommends "
+        "git build-essential ninja-build "
         "&& rm -rf /var/lib/apt/lists/*",
         "",
-        "RUN mkdir -p /app/comfyui /app/worker /workspace",
+        "RUN mkdir -p /app/comfyui /app/worker /workspace /root/.triton",
         "",
         f"RUN git clone --depth 1 --branch {comfy['ref']} {comfy['repo']} /app/comfyui "
         "&& pip install --no-cache-dir -r /app/comfyui/requirements.txt",
@@ -41,7 +47,7 @@ def main() -> None:
         "RUN mkdir -p /app/comfyui/custom_nodes /app/comfyui/models /app/comfyui/input "
         "/app/comfyui/output /app/comfyui/temp /app/comfyui/user/default/workflows",
         "",
-        "# Fast MiniMax H3: Comfy Kitchen attention + Triton for SolAttn (no Sage).",
+        "# Fast MiniMax H3: Kitchen attention + Triton (SolAttn JIT compiles on first GPU job).",
         "RUN pip install --no-cache-dir triton "
         "&& pip install --no-cache-dir comfy-kitchen "
         "|| echo 'WARNING: comfy-kitchen/triton install failed; Fast H3 attention may error'",

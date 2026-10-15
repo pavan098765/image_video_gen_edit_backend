@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import subprocess
 import time
 import uuid
@@ -41,6 +42,20 @@ COMFYUI_PROMPT_TIMEOUT = int(os.environ.get("COMFYUI_PROMPT_TIMEOUT", "3600"))
 
 # Polling interval when waiting for prompt completion
 POLL_INTERVAL = 2.0
+
+# Kitchen + Triton: SolAttnPatch and ModelAttentionBackend stay on the Fast graphs.
+# Override with COMFYUI_EXTRA_ARGS (empty string disables these defaults).
+_DEFAULT_COMFY_EXTRA = "--use-ck-attention --enable-triton-backend"
+
+
+def _comfyui_extra_args() -> List[str]:
+    raw = os.environ.get("COMFYUI_EXTRA_ARGS")
+    extra = _DEFAULT_COMFY_EXTRA if raw is None else raw.strip()
+    if not extra:
+        return []
+    flags = shlex.split(extra)
+    logger.info("ComfyUI extra args: %s", flags)
+    return flags
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +89,7 @@ def start_server() -> subprocess.Popen:
         "--listen", COMFYUI_LISTEN,
         "--port", str(COMFYUI_PORT),
         "--disable-auto-launch",
-    ]
+    ] + _comfyui_extra_args()
 
     comfyui_log_path = os.path.join(COMFYUI_DIR, "comfyui_server.log")
     _comfyui_log_file = open(comfyui_log_path, "w")

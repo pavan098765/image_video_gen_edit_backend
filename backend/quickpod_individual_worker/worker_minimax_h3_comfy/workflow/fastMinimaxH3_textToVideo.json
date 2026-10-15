@@ -2,7 +2,7 @@
   "id": "3b172ae0-10d5-4d0c-928d-49205dcbe649",
   "revision": 0,
   "last_node_id": 39,
-  "last_link_id": 47,
+  "last_link_id": 48,
   "nodes": [
     {
       "id": 16,
@@ -511,7 +511,7 @@
         90
       ],
       "flags": {},
-      "order": 14,
+      "order": 15,
       "mode": 0,
       "inputs": [
         {
@@ -1133,7 +1133,7 @@
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            41
+            48
           ]
         }
       ],
@@ -1174,6 +1174,70 @@
         "verbose": false,
         "use_tma": false,
         "dense_blocks": ""
+      }
+    },
+    {
+      "id": 38,
+      "type": "BlockSparseAttention",
+      "pos": [
+        -25.180259464595785,
+        220.0
+      ],
+      "size": [
+        333.0394086312797,
+        252
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 48
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            41
+          ]
+        }
+      ],
+      "title": "Model Sparse Attention (VSA, same as Fast I2V)",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.37.0",
+        "Node name for S&R": "BlockSparseAttention",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.8"
+        }
+      },
+      "widgets_values": [
+        "vsa",
+        10,
+        0.2,
+        1,
+        "",
+        12288,
+        256,
+        "exact_kv_and_rows",
+        false
+      ],
+      "widgets_values_named": {
+        "selection": "vsa",
+        "selection.keep_percent": 10,
+        "start_percent": 0.2,
+        "end_percent": 1,
+        "dense_blocks": "",
+        "min_tokens": 12288,
+        "extra_tokens": 256,
+        "sink_conditioning": "exact_kv_and_rows",
+        "verbose": false
       }
     }
   ],
@@ -1348,9 +1412,17 @@
     ],
     [
       41,
-      36,
+      38,
       0,
       5,
+      0,
+      "MODEL"
+    ],
+    [
+      48,
+      36,
+      0,
+      38,
       0,
       "MODEL"
     ],

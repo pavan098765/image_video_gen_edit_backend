@@ -8,16 +8,19 @@ ENV WORKFLOW_DIR="/app/worker/workflow"
 ENV WORKSPACE_DIR="/workspace"
 ENV PYTHONPATH="/app/worker/src:${PYTHONPATH}"
 ENV GIT_TERMINAL_PROMPT=0
+ENV CC="gcc"
+ENV CXX="g++"
+ENV TRITON_CACHE_DIR="/root/.triton"
 
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git build-essential ninja-build && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /app/comfyui /app/worker /workspace
+RUN mkdir -p /app/comfyui /app/worker /workspace /root/.triton
 
 RUN git clone --depth 1 --branch v0.37.0 https://github.com/Comfy-Org/ComfyUI /app/comfyui && pip install --no-cache-dir -r /app/comfyui/requirements.txt
 
 RUN mkdir -p /app/comfyui/custom_nodes /app/comfyui/models /app/comfyui/input /app/comfyui/output /app/comfyui/temp /app/comfyui/user/default/workflows
 
-# Fast MiniMax H3: Comfy Kitchen attention + Triton for SolAttn (no Sage).
+# Fast MiniMax H3: Kitchen attention + Triton (SolAttn JIT compiles on first GPU job).
 RUN pip install --no-cache-dir triton && pip install --no-cache-dir comfy-kitchen || echo 'WARNING: comfy-kitchen/triton install failed; Fast H3 attention may error'
 
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes /app/comfyui/custom_nodes/ComfyUI-KJNodes && git -C /app/comfyui/custom_nodes/ComfyUI-KJNodes checkout d3cfe21625e5170126ce06fbfcfe1d88108688c3 && git -C /app/comfyui/custom_nodes/ComfyUI-KJNodes submodule update --init --recursive && if [ -f /app/comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt ]; then pip install --no-cache-dir -r /app/comfyui/custom_nodes/ComfyUI-KJNodes/requirements.txt; fi
