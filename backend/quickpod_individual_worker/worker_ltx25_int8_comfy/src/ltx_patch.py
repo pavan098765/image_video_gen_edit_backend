@@ -40,6 +40,12 @@ MODE_ALIASES = {
 
 STAGE2_SPEED = "Speed — Sage + Sol (12–16GB target)"
 STAGE2_QUALITY = "Quality — Native exact (24GB+ recommended)"
+STAGE1_SAMPLER_ID = "344"
+UNLOAD_NODE_ID = "407"
+STAGE1_SEPARATE_ID = "367"
+VIDEO_DECODE_ID = "374"
+AUDIO_DECODE_ID = "358"
+_SKIP_STAGE2 = frozenset({"skip", "draft", "stage1", "stage1_only", "none"})
 
 VAE_PRESETS = {
     "auto": "Auto (VRAM-based)",
@@ -84,11 +90,62 @@ def resolve_mode(model: str, params: Dict[str, Any]) -> str:
     return MODE_ALIASES.get(key.lower().replace("-", "_").replace(" ", "_"), MODE_I2V)
 
 
+def _truthy(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def wants_skip_stage2(params: Dict[str, Any]) -> bool:
+    """Decode the stage-1 latent and skip the x2 refine. Output is half of final size."""
+    if _truthy(params.get("skip_stage2")) or _truthy(params.get("draft")):
+        return True
+    raw = str(params.get("stage2_mode") or params.get("quality_mode") or "").strip().lower()
+    return raw in _SKIP_STAGE2
+
+
 def resolve_stage2(params: Dict[str, Any]) -> str:
     raw = str(params.get("stage2_mode") or params.get("quality_mode") or "speed").strip().lower()
+    if raw in _SKIP_STAGE2:
+        return STAGE2_SPEED
     if raw in ("quality", "exact", "native", STAGE2_QUALITY.lower()):
         return STAGE2_QUALITY
     return STAGE2_SPEED
+
+
+def _require_class(prompt_graph: dict, node_id: str, class_type: str) -> dict:
+    node = prompt_graph.get(node_id)
+    if not isinstance(node, dict) or node.get("class_type") != class_type:
+        raise RuntimeError(
+            f"LTX API node {node_id} is not {class_type}; refusing to skip stage 2"
+        )
+    return node
+
+
+def apply_skip_stage2(prompt_graph: dict) -> None:
+    """Bypass the x2 upscaler and stage-2 sampler. Stage-1 attention path stays.
+
+    VRAM unload still runs before Conv VAE decode. Default jobs never call this.
+    """
+    stage1 = _require_class(prompt_graph, STAGE1_SAMPLER_ID, "SamplerCustomAdvanced")
+    unload = _require_class(prompt_graph, UNLOAD_NODE_ID, "VRAM_Debug")
+    separate = _require_class(prompt_graph, STAGE1_SEPARATE_ID, "LTXVSeparateAVLatent")
+    video_decode = _require_class(prompt_graph, VIDEO_DECODE_ID, "VAEDecodeTiled")
+    audio_decode = _require_class(prompt_graph, AUDIO_DECODE_ID, "LTXVAudioVAEDecode")
+    if stage1.get("_meta", {}).get("title") and "Stage 1" not in str(stage1["_meta"].get("title")):
+        raise RuntimeError("LTX node 344 is not the stage-1 sampler; refusing to skip stage 2")
+    unload_inputs = unload.setdefault("inputs", {})
+    unload_inputs["any_input"] = [STAGE1_SAMPLER_ID, 0]
+    separate.setdefault("inputs", {})["av_latent"] = [UNLOAD_NODE_ID, 0]
+    video_decode.setdefault("inputs", {})["samples"] = [STAGE1_SEPARATE_ID, 0]
+    audio_decode.setdefault("inputs", {})["samples"] = [STAGE1_SEPARATE_ID, 1]
+    logger.info(
+        "LTX stage 2 skipped: decode stage-1 latent (half of final_width x final_height)"
+    )
 
 
 def patch_prompt(visual: dict, prompt: str) -> None:
@@ -223,6 +280,8 @@ def apply_api_job_params(
     stage2 = prompt_graph.get("423")
     if isinstance(stage2, dict):
         set_api_input(stage2, "stage2_mode", resolve_stage2(params))
+    if wants_skip_stage2(params):
+        apply_skip_stage2(prompt_graph)
     lora = prompt_graph.get("422")
     if isinstance(lora, dict):
         if params.get("lora_name"):

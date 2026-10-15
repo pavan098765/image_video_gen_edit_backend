@@ -8,10 +8,13 @@ ENV WORKFLOW_DIR="/app/worker/workflow"
 ENV WORKSPACE_DIR="/workspace"
 ENV PYTHONPATH="/app/worker/src:${PYTHONPATH}"
 ENV GIT_TERMINAL_PROMPT=0
+ENV CC="gcc"
+ENV CXX="g++"
+ENV TRITON_CACHE_DIR="/root/.triton"
 
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git build-essential ninja-build && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /app/comfyui /app/worker /workspace
+RUN mkdir -p /app/comfyui /app/worker /workspace /root/.triton
 
 RUN git clone --depth 1 --branch v0.37.0 https://github.com/Comfy-Org/ComfyUI /app/comfyui && pip install --no-cache-dir -r /app/comfyui/requirements.txt
 

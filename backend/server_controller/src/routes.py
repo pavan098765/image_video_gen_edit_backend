@@ -3771,6 +3771,22 @@ async def submit_job(
             has_last,
             multi_first,
         )
+
+    # Flutter UI id "ltx25_int8" (CineReal on Animate Image) → i2v or flf2v alias
+    if model == "ltx25_int8":
+        ff_keys = full_params.get("first_frame_image_r2_keys")
+        has_last = bool(full_params.get("last_frame_image_r2_key"))
+        multi_first = isinstance(ff_keys, list) and len(ff_keys) >= 2
+        if has_last or multi_first:
+            model = "ltx25_int8_flf2v"
+        else:
+            model = "ltx25_int8_i2v"
+        logger.info(
+            "[MODEL] Normalized ltx25_int8 → %s (has_last=%s multi_first=%s)",
+            model,
+            has_last,
+            multi_first,
+        )
     
     # ==========================================================================
     # PARAM KEY NORMALIZATION
@@ -5556,6 +5572,20 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                 raise Exception(
                     f"Failed to generate last_frame_image download URL for R2 key: {r2_key}"
                 )
+
+        # Voice / guidance audio (Flutter uploads as audio_r2_key or cinereal_audio_r2_key)
+        for audio_key_name in ("audio_r2_key", "cinereal_audio_r2_key"):
+            if audio_key_name not in dispatch_params:
+                continue
+            r2_key = dispatch_params.pop(audio_key_name)
+            download_url = create_presigned_get_url(r2_key, expires_in=3600)
+            if download_url:
+                dispatch_params["audio_url"] = download_url
+                logger.info(f"[R2_MEDIA] Job {job_id}: {audio_key_name} → audio_url")
+            else:
+                raise Exception(
+                    f"Failed to generate audio download URL for R2 key: {r2_key}"
+                )
         
         # ref_image_r2_key → ref_image (presigned GET URL) — for dreamid
         if "ref_image_r2_key" in dispatch_params:
@@ -6702,6 +6732,10 @@ async def _dispatch_bulk_to_worker(job_ids: List[str], worker_id: str) -> bool:
                 ("ref_image_r2_key", "ref_image"),
                 ("ref_video_r2_key", "ref_video"),
                 ("input_video_r2_key", "input_video"),
+                ("last_frame_image_r2_key", "last_frame_image"),
+                ("first_frame_image_r2_key", "first_frame_image"),
+                ("audio_r2_key", "audio_url"),
+                ("cinereal_audio_r2_key", "audio_url"),
             ]:
                 if r2_field in dispatch_params:
                     r2_key = dispatch_params.pop(r2_field)

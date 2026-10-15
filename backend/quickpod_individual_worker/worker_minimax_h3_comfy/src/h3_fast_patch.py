@@ -546,6 +546,43 @@ def _rewire_sigmas_from_scheduler(visual: dict) -> None:
             _add_link(visual, SCHEDULER_NODE_ID, 0, ULTIMATE_UPSCALE_NODE_ID, 5, "SIGMAS")
 
 
+def _wire_i2v_frames(prompt_graph: dict, media_files: Dict[str, str]) -> None:
+    """Attach first and/or last frames without dropping a single LoadImage slot.
+
+    MiniMaxH3ImageToVideo resizes optional first_frame / last_frame to the
+    width/height already taken from ImageScaleToTotalPixels. Fast T2V has no
+    LoadImage, so this is a no-op there.
+    """
+    from workflow_converter import api_nodes_by_type, set_api_input
+
+    loaders = api_nodes_by_type(prompt_graph, "LoadImage")
+    i2v_nodes = api_nodes_by_type(prompt_graph, "MiniMaxH3ImageToVideo")
+    if not loaders or not i2v_nodes:
+        return
+    first = media_files.get("first_frame") or media_files.get("init_image")
+    last = media_files.get("last_frame")
+    loader_id, loader = loaders[0]
+    if first:
+        set_api_input(loader, "image", first)
+    elif last:
+        set_api_input(loader, "image", last)
+        for _, node in i2v_nodes:
+            inputs = node.setdefault("inputs", {})
+            inputs.pop("first_frame", None)
+            inputs["last_frame"] = [loader_id, 0]
+        return
+    if not last:
+        return
+    last_id = "h3_last_image"
+    prompt_graph[last_id] = {
+        "inputs": {"image": last},
+        "class_type": "LoadImage",
+        "_meta": {"title": "Last frame"},
+    }
+    for _, node in i2v_nodes:
+        set_api_input(node, "last_frame", [last_id, 0])
+
+
 def apply_fast_api_job_params(
     prompt_graph: dict,
     prompt: str,
@@ -576,26 +613,27 @@ def apply_fast_api_job_params(
         if seconds is not None:
             for _, node in api_nodes_by_type(prompt_graph, "PrimitiveFloat"):
                 set_api_input(node, "value", seconds)
+    megapixels = None
+    if params.get("megapixels") is not None:
+        try:
+            megapixels = float(params["megapixels"])
+        except (TypeError, ValueError):
+            megapixels = None
     for _, node in api_nodes_by_type(prompt_graph, "ResolutionSelector"):
         if params.get("aspect_ratio") is not None:
             set_api_input(node, "aspect_ratio", params["aspect_ratio"])
-        if params.get("megapixels") is not None:
-            set_api_input(node, "megapixels", float(params["megapixels"]))
+        if megapixels is not None:
+            set_api_input(node, "megapixels", megapixels)
+    if megapixels is not None:
+        for _, node in api_nodes_by_type(prompt_graph, "ImageScaleToTotalPixels"):
+            set_api_input(node, "megapixels", megapixels)
     if params.get("sampler_name") is not None:
         for _, node in api_nodes_by_type(prompt_graph, "KSamplerSelect"):
             set_api_input(node, "sampler_name", params["sampler_name"])
     if params.get("fps") is not None:
         for _, node in api_nodes_by_type(prompt_graph, "CreateVideo"):
             set_api_input(node, "fps", int(params["fps"]))
-    first = media_files.get("first_frame") or media_files.get("init_image")
-    last = media_files.get("last_frame")
-    loaders = api_nodes_by_type(prompt_graph, "LoadImage")
-    if first and loaders:
-        set_api_input(loaders[0][1], "image", first)
-    if last and len(loaders) > 1:
-        set_api_input(loaders[1][1], "image", last)
-    elif last and loaders:
-        set_api_input(loaders[0][1], "image", last)
+    _wire_i2v_frames(prompt_graph, media_files)
     prefix = params.get("filename_prefix")
     if prefix:
         for _, node in api_nodes_by_type(prompt_graph, "SaveVideo"):
@@ -614,6 +652,9 @@ def apply_fast_api_job_params(
     elif steps_i in SIGMAS_BY_STEPS:
         for _, node in api_nodes_by_type(prompt_graph, "ManualSigmas"):
             set_api_input(node, "sigmas", SIGMAS_BY_STEPS[steps_i])
+    if steps_i is not None and steps_i > 0:
+        for _, node in api_nodes_by_type(prompt_graph, "BasicScheduler"):
+            set_api_input(node, "steps", steps_i)
     shift = api_nodes_by_type(prompt_graph, "MiniMaxH3SigmaShift")
     if shift:
         node = shift[0][1]

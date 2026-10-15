@@ -47,6 +47,43 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+H3_ASPECT_SELECTOR = {
+    "1:1": "1:1 (Square)",
+    "9:16": "9:16 (Portrait Widescreen)",
+    "16:9": "16:9 (Widescreen)",
+    "4:3": "4:3 (Standard)",
+    "3:4": "3:4 (Portrait Standard)",
+    "3:2": "3:2 (Photo)",
+    "2:3": "2:3 (Portrait Photo)",
+    "21:9": "21:9 (Ultrawide)",
+}
+
+
+def normalize_h3_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Map Flutter submit keys onto the names the H3 graphs read."""
+    out = dict(params or {})
+    if not out.get("last_frame_url") and isinstance(out.get("last_frame_image"), str):
+        out["last_frame_url"] = out["last_frame_image"]
+    if not out.get("first_frame_url") and isinstance(out.get("first_frame_image"), str):
+        out["first_frame_url"] = out["first_frame_image"]
+    if out.get("seconds") is None:
+        for key in ("duration_seconds", "duration"):
+            if out.get(key) is not None:
+                try:
+                    out["seconds"] = float(out[key])
+                except (TypeError, ValueError):
+                    pass
+                break
+    raw_aspect = out.get("aspect_ratio")
+    if isinstance(raw_aspect, str):
+        key = raw_aspect.strip()
+        if key in H3_ASPECT_SELECTOR:
+            out["aspect_ratio"] = H3_ASPECT_SELECTOR[key]
+        elif ":" in key and "(" not in key:
+            out["aspect_ratio"] = H3_ASPECT_SELECTOR.get(key, key)
+    return out
+
+
 def pick_workflow_file(params: Dict[str, Any]) -> str:
     """Fast T2V by default; dedicated I2V API graph when a first frame is present.
 
@@ -97,7 +134,9 @@ def download_media_items(params: Dict[str, Any], comfyui_bridge: Any) -> List[di
     items: List[dict] = []
     mapping = [
         ("first_frame_url", "picture", "h3_first"),
+        ("first_frame_image", "picture", "h3_first"),
         ("last_frame_url", "picture", "h3_last"),
+        ("last_frame_image", "picture", "h3_last"),
         ("audio_url", "audio", "h3_audio"),
         ("continuation_video_url", "video", "h3_cont"),
         ("init_image", "picture", "h3_init"),
@@ -158,7 +197,7 @@ def run_inference_h3(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
     from workflow_converter import convert_visual_to_api, is_api_prompt, prefer_api_filename
     from workflow_flatten import flatten_subgraphs
 
-    params = dict(params or {})
+    params = normalize_h3_params(params)
     wf_name = prefer_api_filename(WORKFLOW_DIR, pick_workflow_file(params))
     path = Path(WORKFLOW_DIR) / wf_name
     if not path.is_file():

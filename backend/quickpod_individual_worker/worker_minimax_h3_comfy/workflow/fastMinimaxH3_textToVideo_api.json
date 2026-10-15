@@ -33,7 +33,7 @@
       "shift_video": 12,
       "shift_audio": 3,
       "model": [
-        "38",
+        "36",
         0
       ]
     },
@@ -264,28 +264,7 @@
     },
     "class_type": "SolAttnPatch",
     "_meta": {
-      "title": "SolAttnPatch"
-    }
-  },
-  "38": {
-    "inputs": {
-      "selection": "vsa",
-      "selection.keep_percent": 10,
-      "start_percent": 0.2,
-      "end_percent": 1,
-      "dense_blocks": "",
-      "min_tokens": 12288,
-      "extra_tokens": 256,
-      "sink_conditioning": "exact_kv_and_rows",
-      "verbose": false,
-      "model": [
-        "36",
-        0
-      ]
-    },
-    "class_type": "BlockSparseAttention",
-    "_meta": {
-      "title": "Model Sparse Attention (VSA, same as Fast I2V)"
+      "title": "SolAttnPatch (fused turbo; VSA is FastH3-only)"
     }
   },
   "37": {

@@ -30,11 +30,16 @@ def main() -> None:
         'ENV WORKSPACE_DIR="/workspace"',
         'ENV PYTHONPATH="/app/worker/src:${PYTHONPATH}"',
         "ENV GIT_TERMINAL_PROMPT=0",
+        # Triton JIT for SolAttn (stage-1 speed path) needs a C compiler on the first sample.
+        'ENV CC="gcc"',
+        'ENV CXX="g++"',
+        'ENV TRITON_CACHE_DIR="/root/.triton"',
         "",
-        "RUN apt-get update && apt-get install -y --no-install-recommends git "
+        "RUN apt-get update && apt-get install -y --no-install-recommends "
+        "git build-essential ninja-build "
         "&& rm -rf /var/lib/apt/lists/*",
         "",
-        "RUN mkdir -p /app/comfyui /app/worker /workspace",
+        "RUN mkdir -p /app/comfyui /app/worker /workspace /root/.triton",
         "",
         f"RUN git clone --depth 1 --branch {comfy['ref']} {comfy['repo']} /app/comfyui "
         "&& pip install --no-cache-dir -r /app/comfyui/requirements.txt",

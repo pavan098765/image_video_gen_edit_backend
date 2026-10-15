@@ -86,8 +86,17 @@ def run_inference_ltx25(job_id: str, prompt: str, params: Dict[str, Any], model:
     mode = resolve_mode(model, params)
     first_name = None
     last_name = None
-    first_url = params.get("first_frame_url") or params.get("init_image") or params.get("image_url")
-    last_url = params.get("last_frame_url") or params.get("last_image")
+    first_url = (
+        params.get("first_frame_url")
+        or params.get("first_frame_image")
+        or params.get("init_image")
+        or params.get("image_url")
+    )
+    last_url = (
+        params.get("last_frame_url")
+        or params.get("last_frame_image")
+        or params.get("last_image")
+    )
     if mode in (MODE_I2V, MODE_FLF2V) and isinstance(first_url, str) and first_url.startswith("http"):
         first_name = _download_image(first_url, f"ltx25_first{_ext_from_url(first_url)}", comfyui_bridge)
     if mode == MODE_FLF2V and isinstance(last_url, str) and last_url.startswith("http"):
