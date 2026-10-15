@@ -81,11 +81,23 @@ def normalize_h3_params(params: Dict[str, Any]) -> Dict[str, Any]:
             out["aspect_ratio"] = H3_ASPECT_SELECTOR[key]
         elif ":" in key and "(" not in key:
             out["aspect_ratio"] = H3_ASPECT_SELECTOR.get(key, key)
+    init = out.get("init_image")
+    if isinstance(init, list):
+        urls = [u for u in init if isinstance(u, str) and u.startswith("http")]
+        if urls:
+            out["init_image"] = urls[0]
+            if len(urls) >= 2 and not out.get("last_frame_url") and not out.get("last_frame_image"):
+                out["last_frame_url"] = urls[1]
     return out
 
 
 def pick_workflow_file(params: Dict[str, Any]) -> str:
-    """Fast T2V by default; dedicated I2V API graph when a first frame is present.
+    """Fast graph by default, including image-to-video.
+
+    The updated fast graph takes optional first_frame / last_frame on
+    MiniMaxH3ImageToVideo. Image jobs stay on that file so they use the same
+    fused turbo model, ResolutionSelector, and duration grid as text-to-video.
+    The older fl2va I2V file is only used when params explicitly request it.
 
     Seed Hunter stays on the visual JSON — ComfyUI API export of that graph
     is a no-op on large subgraph canvases.
@@ -109,8 +121,6 @@ def pick_workflow_file(params: Dict[str, Any]) -> str:
         return SEED_HUNTER_WORKFLOW
     if params.get("continuation_video_url"):
         return SEED_HUNTER_WORKFLOW
-    if params.get("first_frame_url") or params.get("init_image") or params.get("last_frame_url"):
-        return I2V_WORKFLOW
     return DEFAULT_WORKFLOW if DEFAULT_WORKFLOW else FAST_WORKFLOW
 
 

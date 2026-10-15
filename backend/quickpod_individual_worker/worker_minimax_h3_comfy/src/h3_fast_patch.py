@@ -546,41 +546,73 @@ def _rewire_sigmas_from_scheduler(visual: dict) -> None:
             _add_link(visual, SCHEDULER_NODE_ID, 0, ULTIMATE_UPSCALE_NODE_ID, 5, "SIGMAS")
 
 
-def _wire_i2v_frames(prompt_graph: dict, media_files: Dict[str, str]) -> None:
-    """Attach first and/or last frames without dropping a single LoadImage slot.
+def _linked_node_id(node: dict, slot_name: str) -> Optional[str]:
+    link = (node.get("inputs") or {}).get(slot_name)
+    if isinstance(link, list) and link:
+        return str(link[0])
+    return None
 
-    MiniMaxH3ImageToVideo resizes optional first_frame / last_frame to the
-    width/height already taken from ImageScaleToTotalPixels. Fast T2V has no
-    LoadImage, so this is a no-op there.
+
+def _ensure_api_load_image(
+    prompt_graph: dict,
+    node_id: str,
+    filename: str,
+    title: str,
+) -> str:
+    from workflow_converter import set_api_input
+
+    existing = prompt_graph.get(node_id)
+    if isinstance(existing, dict) and existing.get("class_type") == "LoadImage":
+        set_api_input(existing, "image", filename)
+        return node_id
+    prompt_graph[node_id] = {
+        "inputs": {"image": filename},
+        "class_type": "LoadImage",
+        "_meta": {"title": title},
+    }
+    return node_id
+
+
+def _wire_i2v_frames(prompt_graph: dict, media_files: Dict[str, str]) -> None:
+    """Attach optional first and/or last frames on MiniMaxH3ImageToVideo.
+
+    The fast API graph has those inputs unconnected and no LoadImage. Image
+    jobs inject loaders here so they stay on the fused turbo graph. An older
+    graph that already links a LoadImage has that node's filename updated
+    instead of leaving a placeholder image in the prompt.
     """
     from workflow_converter import api_nodes_by_type, set_api_input
 
-    loaders = api_nodes_by_type(prompt_graph, "LoadImage")
     i2v_nodes = api_nodes_by_type(prompt_graph, "MiniMaxH3ImageToVideo")
-    if not loaders or not i2v_nodes:
+    if not i2v_nodes:
         return
     first = media_files.get("first_frame") or media_files.get("init_image")
     last = media_files.get("last_frame")
-    loader_id, loader = loaders[0]
+    if not first and not last:
+        return
+
     if first:
-        set_api_input(loader, "image", first)
-    elif last:
-        set_api_input(loader, "image", last)
+        linked = _linked_node_id(i2v_nodes[0][1], "first_frame")
+        first_id = _ensure_api_load_image(
+            prompt_graph,
+            linked or "h3_first_image",
+            first,
+            "First frame",
+        )
         for _, node in i2v_nodes:
-            inputs = node.setdefault("inputs", {})
-            inputs.pop("first_frame", None)
-            inputs["last_frame"] = [loader_id, 0]
-        return
-    if not last:
-        return
-    last_id = "h3_last_image"
-    prompt_graph[last_id] = {
-        "inputs": {"image": last},
-        "class_type": "LoadImage",
-        "_meta": {"title": "Last frame"},
-    }
-    for _, node in i2v_nodes:
-        set_api_input(node, "last_frame", [last_id, 0])
+            set_api_input(node, "first_frame", [first_id, 0])
+    if last:
+        linked = _linked_node_id(i2v_nodes[0][1], "last_frame")
+        if linked and linked == _linked_node_id(i2v_nodes[0][1], "first_frame"):
+            linked = None
+        last_id = _ensure_api_load_image(
+            prompt_graph,
+            linked or "h3_last_image",
+            last,
+            "Last frame",
+        )
+        for _, node in i2v_nodes:
+            set_api_input(node, "last_frame", [last_id, 0])
 
 
 def apply_fast_api_job_params(

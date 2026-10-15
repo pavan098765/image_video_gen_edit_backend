@@ -100,6 +100,25 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def ltx_canvas_dim(value: Any) -> int:
+    """LTX25AllModesControlsV2 rejects widths and heights that are not multiples of 64."""
+    try:
+        original = int(value)
+    except (TypeError, ValueError):
+        original = 256
+    n = original
+    if n < 256:
+        n = 256
+    if n > 2048:
+        n = 2048
+    snapped = (n // 64) * 64
+    if snapped < 256:
+        snapped = 256
+    if snapped != original:
+        logger.info("LTX canvas %s snapped to multiple of 64 -> %s", value, snapped)
+    return snapped
+
+
 def wants_skip_stage2(params: Dict[str, Any]) -> bool:
     """Decode the stage-1 latent and skip the x2 refine. Output is half of final size."""
     if _truthy(params.get("skip_stage2")) or _truthy(params.get("draft")):
@@ -174,13 +193,13 @@ def patch_controls(visual: dict, mode: str, params: Dict[str, Any]) -> None:
         key = str(preset).strip().lower()
         _set_list_widget(node, 1, VAE_PRESETS.get(key, str(preset)))
     if params.get("width") is not None:
-        _set_list_widget(node, 2, int(params["width"]))
+        _set_list_widget(node, 2, ltx_canvas_dim(params["width"]))
     elif params.get("final_width") is not None:
-        _set_list_widget(node, 2, int(params["final_width"]))
+        _set_list_widget(node, 2, ltx_canvas_dim(params["final_width"]))
     if params.get("height") is not None:
-        _set_list_widget(node, 3, int(params["height"]))
+        _set_list_widget(node, 3, ltx_canvas_dim(params["height"]))
     elif params.get("final_height") is not None:
-        _set_list_widget(node, 3, int(params["final_height"]))
+        _set_list_widget(node, 3, ltx_canvas_dim(params["final_height"]))
     if params.get("fps") is not None:
         _set_list_widget(node, 5, float(params["fps"]))
     if params.get("duration") is not None or params.get("duration_seconds") is not None:
@@ -252,13 +271,13 @@ def apply_api_job_params(
             key = str(preset).strip().lower()
             set_api_input(controls, "vae_decode_preset", VAE_PRESETS.get(key, str(preset)))
         if params.get("width") is not None:
-            set_api_input(controls, "final_width", int(params["width"]))
+            set_api_input(controls, "final_width", ltx_canvas_dim(params["width"]))
         elif params.get("final_width") is not None:
-            set_api_input(controls, "final_width", int(params["final_width"]))
+            set_api_input(controls, "final_width", ltx_canvas_dim(params["final_width"]))
         if params.get("height") is not None:
-            set_api_input(controls, "final_height", int(params["height"]))
+            set_api_input(controls, "final_height", ltx_canvas_dim(params["height"]))
         elif params.get("final_height") is not None:
-            set_api_input(controls, "final_height", int(params["final_height"]))
+            set_api_input(controls, "final_height", ltx_canvas_dim(params["final_height"]))
         if params.get("fps") is not None:
             set_api_input(controls, "fps", float(params["fps"]))
         if params.get("duration") is not None or params.get("duration_seconds") is not None:
