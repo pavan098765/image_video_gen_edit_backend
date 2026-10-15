@@ -219,8 +219,25 @@ def record_info(task_id: str) -> Dict[str, Any]:
     return resp.json()
 
 
+def parse_download_url_response(body: Dict[str, Any]) -> str:
+    """Read POST /api/v1/common/download-url. `data` is the URL string."""
+    if not isinstance(body, dict):
+        raise RuntimeError(f"Kie download-url returned {type(body).__name__}")
+    code = body.get("code")
+    if code not in (None, 200, "200"):
+        raise RuntimeError(f"Kie download-url {code}: {body.get('msg') or body}")
+    data = body.get("data")
+    if isinstance(data, str) and data.strip():
+        return data.strip()
+    if isinstance(data, dict):
+        url = data.get("downloadUrl") or data.get("url") or data.get("download_url")
+        if url:
+            return str(url)
+    raise RuntimeError(f"Kie download-url missing data: {body}")
+
+
 def download_url_for(file_url: str) -> str:
-    """20-minute Kie download URL fallback when a direct GET fails."""
+    """Mint a 20-minute download link for a KIE task result URL."""
     resp = requests.post(
         f"{KIE_API}/api/v1/common/download-url",
         headers=_headers(),
@@ -228,9 +245,7 @@ def download_url_for(file_url: str) -> str:
         timeout=30,
     )
     resp.raise_for_status()
-    data = resp.json()
-    payload = data.get("data") or data
-    return str(payload.get("downloadUrl") or payload.get("url") or file_url)
+    return parse_download_url_response(resp.json())
 
 
 def fetch_result_bytes(result_url: str) -> bytes:

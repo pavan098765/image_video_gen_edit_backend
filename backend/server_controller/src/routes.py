@@ -496,8 +496,20 @@ def validate_model(model: str) -> str:
     raise InvalidModelError(model, available)
 
 
+def _kie_result_source(job: Job) -> Optional[str]:
+    params = job.params if isinstance(job.params, dict) else {}
+    source = params.get("_kie_result_url")
+    if isinstance(source, str) and source.strip():
+        return source.strip()
+    return None
+
+
 def _build_public_result_url(job: Job) -> Optional[str]:
-    """Build client-facing result URL for completed jobs."""
+    """Build client-facing result URL for completed jobs.
+
+    KIE jobs store the 20-minute download link in output_url so the app can
+    save the file immediately. Later calls to /download_url mint a new link.
+    """
     if job.output_url:
         return job.output_url
     if job.result_r2_key:
@@ -3226,13 +3238,25 @@ async def _apply_kie_job_result(job_id: str, payload: Dict[str, Any]) -> None:
             return
         urls = kie_client.parse_result_urls(payload)
         if kie_client.is_success_code(payload) and urls:
-            fake = ExternalExecutionResult(success=True, result_url=urls[0], raw=payload)
-            r2_key, output_url = _store_external_result(job_id, job.model, fake)
+            source_url = urls[0]
+            params = dict(job.params or {})
+            params["_kie_result_url"] = source_url
+            try:
+                output_url = kie_client.download_url_for(source_url)
+                params["_kie_download_minted_at"] = time.time()
+            except Exception as mint_err:
+                logger.warning(
+                    "[KIE] download-url failed for %s, sending result URL: %s",
+                    job_id,
+                    mint_err,
+                )
+                output_url = source_url
+            job.params = params
+            db.commit()
             if _job_manager:
-                _job_manager.mark_completed(job_id, result_r2_key=r2_key, output_url=output_url)
+                _job_manager.mark_completed(job_id, output_url=output_url)
             else:
                 job.status = JobState.COMPLETED.value
-                job.result_r2_key = r2_key
                 job.output_url = output_url
                 job.completed_at = utc_naive_now()
                 job.updated_at = utc_naive_now()
@@ -3328,6 +3352,19 @@ async def get_signed_download_url(job_id: str):
         job = db.query(Job).filter(Job.job_id == job_id).first()
         if not job or job.status != JobState.COMPLETED.value:
             raise HTTPException(status_code=404, detail="Result not ready")
+
+        # KIE results stay on KIE. Mint a fresh 20-minute link for each request.
+        source = _kie_result_source(job)
+        if source:
+            import kie_client
+
+            try:
+                return kie_client.download_url_for(source)
+            except Exception as mint_err:
+                logger.warning("[KIE] refresh download-url failed for %s: %s", job_id, mint_err)
+                if job.output_url:
+                    return job.output_url
+                raise HTTPException(status_code=502, detail="KIE download link unavailable")
 
         # External API route: output_url may already be a direct downloadable URL.
         if job.output_url:
