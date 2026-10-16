@@ -11,7 +11,6 @@ import logging
 import os
 import time
 import uuid
-from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -22,10 +21,6 @@ logger = logging.getLogger("kie_client")
 KIE_API = os.getenv("KIE_API_BASE", "https://api.kie.ai").rstrip("/")
 KIE_UPLOAD = os.getenv("KIE_UPLOAD_BASE", "https://kieai.redpandaai.co").rstrip("/")
 KIE_MIN_CREDITS = float(os.getenv("KIE_MIN_CREDITS", "1"))
-
-RECRAFT_MAX_BYTES = 5 * 1024 * 1024
-RECRAFT_MIN_PX = 256
-RECRAFT_MAX_PX = 4096
 
 
 def _api_key() -> str:
@@ -190,42 +185,8 @@ def upload_file_bytes(data: bytes, file_name: str, content_type: Optional[str] =
 
 
 def prepare_recraft_image(source_url: str) -> str:
-    """Enforce Recraft 5MB / 256–4096px limits. Returns a Kie-hosted URL."""
-    from PIL import Image
-
-    resp = requests.get(source_url, timeout=60)
-    resp.raise_for_status()
-    data = resp.content
-    img = Image.open(BytesIO(data))
-    w, h = img.size
-    if w < RECRAFT_MIN_PX or h < RECRAFT_MIN_PX or w > RECRAFT_MAX_PX or h > RECRAFT_MAX_PX:
-        scale = 1.0
-        if w < RECRAFT_MIN_PX or h < RECRAFT_MIN_PX:
-            scale = max(RECRAFT_MIN_PX / max(w, 1), RECRAFT_MIN_PX / max(h, 1))
-        if w * scale > RECRAFT_MAX_PX or h * scale > RECRAFT_MAX_PX:
-            scale = min(RECRAFT_MAX_PX / max(w, 1), RECRAFT_MAX_PX / max(h, 1))
-        nw = max(RECRAFT_MIN_PX, min(RECRAFT_MAX_PX, int(w * scale)))
-        nh = max(RECRAFT_MIN_PX, min(RECRAFT_MAX_PX, int(h * scale)))
-        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        data = buf.getvalue()
-    if len(data) > RECRAFT_MAX_BYTES:
-        buf = BytesIO()
-        rgb = img.convert("RGB")
-        quality = 90
-        while quality >= 40:
-            buf.seek(0)
-            buf.truncate(0)
-            rgb.save(buf, format="JPEG", quality=quality)
-            if buf.tell() <= RECRAFT_MAX_BYTES:
-                data = buf.getvalue()
-                break
-            quality -= 10
-        else:
-            raise ValueError("Image exceeds Recraft 5 MB limit after compression")
-    name = "recraft.jpg" if data[:3] == b"\xff\xd8\xff" else "recraft.png"
-    return upload_file_bytes(data, name)
+    """Rehost a remove-background or upscale source. No local image library."""
+    return upload_file_from_url(source_url)
 
 
 def create_task(model: str, input_payload: Dict[str, Any], callback_url: str) -> str:
@@ -321,6 +282,39 @@ def parse_result_urls(payload: Dict[str, Any]) -> List[str]:
     if isinstance(urls, list):
         return [str(u) for u in urls if u]
     return []
+
+
+def coerce_aspect_ratio(value: Any, allowed: List[str]) -> str:
+    """Map an app ratio onto the ratios that model actually accepts."""
+    raw = str(value or "").strip()
+    if raw in allowed:
+        return raw
+    snapped = {
+        "4:3": "3:2",
+        "3:4": "2:3",
+        "21:9": "16:9",
+        "9:21": "9:16",
+    }.get(raw)
+    if snapped and snapped in allowed:
+        return snapped
+    if "auto" in allowed:
+        return "auto"
+    return allowed[0] if allowed else raw
+
+
+def kie_failure_message(payload: Dict[str, Any]) -> str:
+    """Prefer data.failMsg. The top-level msg is only 'Playground task failed.'"""
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    fail_msg = str(data.get("failMsg") or data.get("fail_msg") or "").strip()
+    fail_code = str(data.get("failCode") or data.get("fail_code") or "").strip()
+    if fail_msg and fail_msg != "<error detail>":
+        return f"{fail_msg} ({fail_code})" if fail_code else fail_msg
+    generic = str(payload.get("msg") or payload.get("message") or "").strip()
+    if generic and generic != "Playground task failed.":
+        return generic
+    if fail_code:
+        return f"Kie task failed ({fail_code})"
+    return generic or "Kie task failed"
 
 
 def extract_task_id(payload: Dict[str, Any]) -> Optional[str]:

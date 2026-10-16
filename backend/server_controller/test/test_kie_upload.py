@@ -8,7 +8,9 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
 from kie_client import (  # noqa: E402
+    coerce_aspect_ratio,
     is_binary_object_url,
+    kie_failure_message,
     kie_hosted_file_url,
     kie_upload_is_image,
     sniff_image,
@@ -52,6 +54,24 @@ def test_bin_storage_url_is_not_an_image_url():
     stored = "https://r2.example/input-media/cf6157ff.bin?X-Amz-Signature=abc"
     assert is_binary_object_url(stored) is True
     assert is_binary_object_url("https://cdn.example/photo.webp") is False
+
+
+def test_grok_rejects_edit_ratios_qwen_accepts():
+    allowed = ["1:1", "2:3", "3:2", "16:9", "9:16", "auto"]
+    assert coerce_aspect_ratio("4:3", allowed) == "3:2"
+    assert coerce_aspect_ratio("3:4", allowed) == "2:3"
+    assert coerce_aspect_ratio("1:1", allowed) == "1:1"
+
+
+def test_playground_failure_keeps_the_real_reason():
+    message = kie_failure_message(
+        {
+            "code": 501,
+            "msg": "Playground task failed.",
+            "data": {"failCode": "500", "failMsg": "aspect_ratio is not supported"},
+        }
+    )
+    assert message == "aspect_ratio is not supported (500)"
 
 
 def test_stream_upload_sends_the_sniffed_image():

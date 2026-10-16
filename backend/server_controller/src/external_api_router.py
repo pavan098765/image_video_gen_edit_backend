@@ -498,6 +498,17 @@ class ExternalApiRouter:
             except Exception as e:
                 return ExternalExecutionResult(success=False, error=f"Kie upload failed: {e}")
 
+        allowed_ratios = cfg.get("aspect_ratios") or []
+        if allowed_ratios and input_payload.get("aspect_ratio") is not None:
+            chosen = kie_client.coerce_aspect_ratio(input_payload.get("aspect_ratio"), allowed_ratios)
+            if chosen != input_payload.get("aspect_ratio"):
+                logger.info(
+                    "Kie aspect_ratio %s is not supported; using %s",
+                    input_payload.get("aspect_ratio"),
+                    chosen,
+                )
+            input_payload["aspect_ratio"] = chosen
+
         if cfg.get("force_resolution_1k") and "resolution" in (cfg.get("param_map") or {}):
             input_payload["resolution"] = "1K"
         elif cfg.get("force_resolution_1k"):

@@ -3275,11 +3275,14 @@ async def _apply_kie_job_result(job_id: str, payload: Dict[str, Any]) -> None:
             )
             clear_cached_job_params(job_id)
             return
-        err = str(
-            payload.get("msg")
-            or payload.get("message")
-            or (payload.get("data") or {}).get("failMsg")
-            or "Kie task failed"
+        err = kie_client.kie_failure_message(payload)
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        logger.error(
+            "[KIE] job %s failed code=%s failCode=%s failMsg=%s",
+            job_id,
+            payload.get("code"),
+            data.get("failCode"),
+            data.get("failMsg"),
         )
         if _job_manager:
             _job_manager.mark_failed(job_id, err, worker_id=None)
