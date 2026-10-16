@@ -260,10 +260,11 @@
       "required_params": ["prompt", "image_urls"],
       "has_resolution": true,
       "force_resolution_1k": true,
-      "kie_upload_fields": ["image_urls"],
+      "kie_upload_fields": ["image_urls", "mask_url"],
       "param_map": {
         "prompt": { "source": "prompt", "transform": "string_trim" },
         "image_urls": { "source": "params.init_image", "transform": "as_list" },
+        "mask_url": { "source": "params.mask_image", "transform": "http_passthrough" },
         "aspect_ratio": { "source": "params.aspect_ratio", "transform": "default:1:1" },
         "resolution": { "value": "1K" },
         "enhance_prompt": { "value": true }
@@ -312,6 +313,55 @@
       "kie_upload_fields": ["image"],
       "param_map": {
         "image": { "source": "params.init_image" }
+      }
+    },
+    "gemini_tts": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "kie",
+        "model_id": "google/gemini-3-8-flash-lite-tts",
+        "api_key_env": "KIE_API_KEY"
+      },
+      "required_params": ["speakers", "dialogue_turns"],
+      "param_map": {
+        "speakers": { "source": "params.speakers", "transform": "passthrough" },
+        "dialogue_turns": { "source": "params.dialogue_turns", "transform": "passthrough" },
+        "filler_words": { "source": "params.filler_words", "transform": "passthrough" },
+        "temperature": { "value": 1 }
+      }
+    },
+    "suno_music": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "kie",
+        "model_id": "V6",
+        "api_key_env": "KIE_API_KEY"
+      },
+      "required_params": ["style"],
+      "param_map": {
+        "customMode": { "value": true },
+        "instrumental": { "value": true },
+        "title": { "source": "params.title", "transform": "string_trim" },
+        "style": { "source": "params.style", "transform": "string_trim" },
+        "lyrics": { "value": "" },
+        "negativeTags": { "value": "" },
+        "duration": { "source": "params.duration", "transform": "int_clamp:30:360" }
+      }
+    },
+    "suno_sfx": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "kie",
+        "model_id": "V6",
+        "api_key_env": "KIE_API_KEY"
+      },
+      "required_params": [],
+      "param_map": {
+        "customMode": { "value": true },
+        "instrumental": { "value": true },
+        "style": { "source": "prompt", "transform": "string_trim" },
+        "lyrics": { "value": "" },
+        "duration": { "value": 8 }
       }
     },
     "gemini_ocr": {

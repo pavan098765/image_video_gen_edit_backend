@@ -1,0 +1,8 @@
+{
+  "name": "kala-gemini-director",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/policy.test.mjs"
+  }
+}

@@ -58,6 +58,14 @@ FALLBACK_CREDIT_COSTS: Dict[str, Dict[str, int]] = {
     "recraft_crisp_upscale": {"cost": 8, "cost_upscale": 0, "offer": 0},
     "recraft_remove_background": {"cost": 8, "cost_upscale": 0, "offer": 0},
     "gemini_ocr": {"cost": 5, "cost_upscale": 0, "offer": 0},
+    "gemini_tts": {"cost": 12, "cost_upscale": 0, "offer": 0},
+    "suno_music": {"cost": 15, "cost_upscale": 0, "offer": 0},
+    "suno_sfx": {"cost": 8, "cost_upscale": 0, "offer": 0},
+    "minimax_h3": {"cost": 35, "cost_upscale": 0, "offer": 0, "baseCost5Sec": 35, "maxDuration": 15},
+    "ltx25_int8": {"cost": 35, "cost_upscale": 0, "offer": 0, "baseCost5Sec": 35, "maxDuration": 20},
+    "ltx25_int8_t2v": {"cost": 35, "cost_upscale": 0, "offer": 0, "baseCost5Sec": 35, "maxDuration": 20},
+    "ltx25_int8_i2v": {"cost": 35, "cost_upscale": 0, "offer": 0, "baseCost5Sec": 35, "maxDuration": 20},
+    "ltx25_int8_flf2v": {"cost": 35, "cost_upscale": 0, "offer": 0, "baseCost5Sec": 35, "maxDuration": 20},
 }
 
 # After sale discount, never charge below these list floors.
@@ -428,6 +436,12 @@ def calculate_job_cost(
             duration_seconds = float(duration_val)
             if duration_seconds > 0:
                 max_duration = cost_info.get("maxDuration", 10)
+                # Studio shots may run past the Explore chip. The chip stays put.
+                if (params and params.get("studio_shot")):
+                    if str(model).startswith("ltx25"):
+                        max_duration = max(int(max_duration), 20)
+                    elif model == "minimax_h3":
+                        max_duration = max(int(max_duration), 15)
                 effective_duration = min(duration_seconds, max_duration)
                 # Formula: cost = baseCost5Sec * effective_duration / 5 (matches frontend: 5s→15, 8s→24, 10s→30)
                 per_job_cost = int(base_cost_5_sec * effective_duration / 5)

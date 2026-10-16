@@ -1,0 +1,18 @@
+name = "kala-gemini-director"
+main = "src/index.js"
+compatibility_date = "2026-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+# The phone posts to https://kala-gemini-director.pavanalur3.workers.dev/v1/generate
+# GEMINI_MODEL must match GeminiDirector.model in the Flutter app.
+# FIREBASE_PROJECT_ID must be the same Firebase project the app signs in to.
+[vars]
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+FIREBASE_PROJECT_ID = "kalaai-ai-image-video-generate"
+HOURLY_LIMIT = "60"
+
+# wrangler secret put GEMINI_API_KEY
+# Create a KV namespace and set its id below.
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "b22585c111fe4106a96883b5206ae6c6"
