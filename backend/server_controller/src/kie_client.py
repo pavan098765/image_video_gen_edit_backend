@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -95,41 +96,82 @@ def ensure_credits() -> Tuple[bool, str]:
     return True, ""
 
 
-def _filename_from_url(url: str, fallback: str) -> str:
-    path = urlparse(url).path
-    name = os.path.basename(path) or fallback
-    if "." not in name:
-        name = fallback
-    return name[:180]
+def kie_hosted_file_url(body: Any) -> Optional[str]:
+    """Kie file upload returns downloadUrl. Older responses used fileUrl."""
+    if not isinstance(body, dict):
+        return None
+    code = body.get("code")
+    if code not in (None, 200, "200"):
+        return None
+    if body.get("success") is False:
+        return None
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    for source in (data, body):
+        for key in ("fileUrl", "downloadUrl", "url"):
+            value = source.get(key)
+            if isinstance(value, str) and value.startswith("http"):
+                return value
+    return None
+
+
+def kie_upload_is_image(body: Any) -> bool:
+    """A .bin object stored as octet-stream is not an image reference."""
+    if not isinstance(body, dict):
+        return False
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    mime = str(data.get("mimeType") or "").lower()
+    name = str(data.get("fileName") or "").lower()
+    if mime.startswith("image/"):
+        return True
+    if name.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+        return True
+    if not mime and not name.endswith(".bin"):
+        return True
+    return False
+
+
+def sniff_image(data: bytes) -> Optional[Tuple[str, str]]:
+    """Return a unique image filename and content type from the file header."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        ext, mime = "png", "image/png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        ext, mime = "jpg", "image/jpeg"
+    elif len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        ext, mime = "webp", "image/webp"
+    elif data.startswith(b"GIF8"):
+        ext, mime = "gif", "image/gif"
+    else:
+        return None
+    return f"{uuid.uuid4().hex}.{ext}", mime
+
+
+def is_binary_object_url(value: str) -> bool:
+    """True when a URL points at a generic .bin object rather than an image."""
+    if not isinstance(value, str) or not value.startswith("http"):
+        return False
+    return urlparse(value).path.lower().endswith(".bin")
 
 
 def upload_file_from_url(file_url: str, file_name: Optional[str] = None) -> str:
-    """Upload via Kie file-url-upload. Returns Kie fileUrl. Falls back to stream upload."""
-    name = file_name or _filename_from_url(file_url, "input.png")
-    payload = {"fileUrl": file_url, "uploadPath": "images", "fileName": name}
-    try:
-        resp = requests.post(
-            f"{KIE_UPLOAD}/api/file-url-upload",
-            headers=_headers(),
-            json=payload,
-            timeout=60,
-        )
-        if resp.status_code == 200:
-            body = resp.json()
-            kie_url = (body.get("data") or {}).get("fileUrl") or body.get("fileUrl")
-            if kie_url:
-                return str(kie_url)
-        logger.warning("Kie file-url-upload failed HTTP %s: %s", resp.status_code, resp.text[:400])
-    except Exception:
-        logger.exception("Kie file-url-upload error")
+    """Download the source and upload the real image bytes to Kie.
 
+    Storage keys are ``.bin`` with ``application/octet-stream``. Kie's
+    file-url-upload copies that name and type, so every image model receives
+    a generic file. The bytes decide the filename and content type instead.
+    """
+    del file_name  # The file header decides the name. A .bin source name is wrong.
     raw = requests.get(file_url, timeout=60)
     raw.raise_for_status()
-    return upload_file_bytes(raw.content, name)
+    return upload_file_bytes(raw.content, "input.bin")
 
 
-def upload_file_bytes(data: bytes, file_name: str) -> str:
-    files = {"file": (file_name, data)}
+def upload_file_bytes(data: bytes, file_name: str, content_type: Optional[str] = None) -> str:
+    del file_name, content_type
+    sniffed = sniff_image(data)
+    if sniffed is None:
+        raise RuntimeError("Kie image upload is not a png, jpeg, webp, or gif")
+    file_name, content_type = sniffed
+    files = {"file": (file_name, data, content_type)}
     form = {"uploadPath": "images", "fileName": file_name}
     headers = {"Authorization": f"Bearer {_api_key()}"}
     resp = requests.post(
@@ -141,10 +183,10 @@ def upload_file_bytes(data: bytes, file_name: str) -> str:
     )
     resp.raise_for_status()
     body = resp.json()
-    kie_url = (body.get("data") or {}).get("fileUrl") or body.get("fileUrl")
-    if not kie_url:
-        raise RuntimeError(f"Kie stream upload missing fileUrl: {body}")
-    return str(kie_url)
+    kie_url = kie_hosted_file_url(body)
+    if not kie_url or not kie_upload_is_image(body):
+        raise RuntimeError(f"Kie stream upload did not return an image: {body}")
+    return kie_url
 
 
 def prepare_recraft_image(source_url: str) -> str:

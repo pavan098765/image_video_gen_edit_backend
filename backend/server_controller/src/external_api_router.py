@@ -460,7 +460,13 @@ class ExternalApiRouter:
 
         input_payload = dict(args)
         recraft = bool(cfg.get("recraft_limits"))
-        upload_fields = cfg.get("kie_upload_fields") or []
+        upload_fields = list(cfg.get("kie_upload_fields") or [])
+        for key, value in input_payload.items():
+            if key in upload_fields:
+                continue
+            values = value if isinstance(value, list) else [value]
+            if any(isinstance(item, str) and kie_client.is_binary_object_url(item) for item in values):
+                upload_fields.append(key)
         for field in upload_fields:
             value = input_payload.get(field)
             if value is None:
@@ -469,14 +475,22 @@ class ExternalApiRouter:
                 if isinstance(value, list):
                     urls = []
                     for item in value:
-                        src = str(item)
+                        src = str(item).strip()
+                        if not src.startswith("http"):
+                            continue
                         if recraft:
                             urls.append(kie_client.prepare_recraft_image(src))
                         else:
                             urls.append(kie_client.upload_file_from_url(src))
-                    input_payload[field] = urls
+                    if urls:
+                        input_payload[field] = urls
+                    else:
+                        input_payload.pop(field, None)
                 else:
-                    src = str(value)
+                    src = str(value).strip()
+                    if not src.startswith("http"):
+                        input_payload.pop(field, None)
+                        continue
                     if recraft:
                         input_payload[field] = kie_client.prepare_recraft_image(src)
                     else:

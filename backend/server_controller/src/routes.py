@@ -4651,13 +4651,17 @@ async def _dispatch_to_external_api(job_id: str, retry_count: int = 0) -> bool:
             return False
 
         current_state = JobState(job.status)
-        if current_state in [
-            JobState.RUNNING,
+        finished = {
             JobState.COMPLETED,
             JobState.FAILED,
             JobState.TIMEOUT,
             JobState.CANCELLED,
-        ]:
+        }
+        # The first attempt marks the job running before the provider call.
+        # A retry must continue from that state. A fresh dispatch must not.
+        if current_state in finished or (
+            current_state == JobState.RUNNING and retry_count == 0
+        ):
             logger.info(
                 f"[EXTERNAL_API] Job {job_id} already in terminal/active state {current_state.value}"
             )
@@ -4670,17 +4674,18 @@ async def _dispatch_to_external_api(job_id: str, retry_count: int = 0) -> bool:
         if not _external_api_router.should_use_external(job.model, source_params):
             return False
 
-        # State transitions mirror worker dispatch flow.
-        if _job_manager:
-            _job_manager.update_job_state(job_id, JobState.DISPATCHING)
-            _job_manager.update_job_state(job_id, JobState.RUNNING)
-        else:
-            now = utc_naive_now()
-            job.status = JobState.RUNNING.value
-            job.dispatched_at = now
-            job.started_at = now
-            job.updated_at = now
-            db.commit()
+        if current_state != JobState.RUNNING:
+            # State transitions mirror worker dispatch flow.
+            if _job_manager:
+                _job_manager.update_job_state(job_id, JobState.DISPATCHING)
+                _job_manager.update_job_state(job_id, JobState.RUNNING)
+            else:
+                now = utc_naive_now()
+                job.status = JobState.RUNNING.value
+                job.dispatched_at = now
+                job.started_at = now
+                job.updated_at = now
+                db.commit()
 
         result = await asyncio.to_thread(
             _external_api_router.execute, job.model, job.prompt or "", source_params
