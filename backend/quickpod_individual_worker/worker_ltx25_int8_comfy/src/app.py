@@ -117,6 +117,8 @@ class RunRequest(BaseModel):
     params: Dict[str, Any] = {}
     upload_url: str
     result_key: str
+    latent_upload_url: str = ""
+    latent_result_key: str = ""
 
 
 # -----------------------
@@ -395,6 +397,8 @@ async def process_job_item(item: Dict[str, Any]):
                     raise Exception("Failed to upload result after retries")
                 logger.info(f"[{job_id}] Upload completed successfully")
 
+            latent_key = await _upload_latent_sidecar(item, out_local, job_id)
+
             # Notify controller
             is_autotest = job_id.startswith("autotest-")
             is_personal = bool(item.get("personal"))
@@ -409,6 +413,8 @@ async def process_job_item(item: Dict[str, Any]):
                     url = f"{CONTROLLER_URL.rstrip('/')}/personal/complete"
                 else:
                     payload = {"job_id": job_id, "result_r2_key": result_key}
+                    if latent_key:
+                        payload["continuation_latent_r2_key"] = latent_key
                     url = f"{CONTROLLER_URL.rstrip('/')}/job_complete"
                 try:
                     loop = asyncio.get_running_loop()
@@ -507,6 +513,22 @@ async def process_job_item(item: Dict[str, Any]):
             async with _personal_job_lock:
                 if _personal_job and _personal_job.get("job_id") == job_id:
                     _personal_job = None
+
+
+async def _upload_latent_sidecar(item: Dict[str, Any], out_local: str, job_id: str) -> str:
+    """Upload the saved latent beside the mp4 when the controller issued a second PUT."""
+    latent_url = str(item.get("latent_upload_url") or "")
+    latent_key = str(item.get("latent_result_key") or "")
+    sidecar = out_local + ".latent"
+    if not latent_url or not latent_key or not os.path.isfile(sidecar):
+        return ""
+    if latent_url.startswith("http://dummy-upload"):
+        return latent_key
+    ok = await _upload_with_retry(sidecar, latent_url, job_id)
+    if not ok:
+        logger.warning(f"[{job_id}] Continuation latent upload failed; the shot still has its mp4")
+        return ""
+    return latent_key
 
 
 async def _upload_with_retry(file_path: str, upload_url: str, job_id: str, max_retries: int = 3) -> bool:

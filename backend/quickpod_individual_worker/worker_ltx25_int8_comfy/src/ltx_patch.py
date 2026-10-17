@@ -119,6 +119,25 @@ def ltx_canvas_dim(value: Any) -> int:
     return snapped
 
 
+def apply_studio_quality(params: Dict[str, Any]) -> str:
+    """Map studio tiers onto the stage-2 switch. Absent quality leaves the graph's own default."""
+    raw = str(params.get("quality") or "").strip().lower()
+    if raw == "draft":
+        params["skip_stage2"] = True
+        return "draft"
+    if raw in ("full_refine", "full"):
+        params["stage2_mode"] = "quality"
+        params.pop("skip_stage2", None)
+        params.pop("draft", None)
+        return "full_refine"
+    if raw in ("fast_refine", "fast"):
+        params["stage2_mode"] = "speed"
+        params.pop("skip_stage2", None)
+        params.pop("draft", None)
+        return "fast_refine"
+    return ""
+
+
 def wants_skip_stage2(params: Dict[str, Any]) -> bool:
     """Decode the stage-1 latent and skip the x2 refine. Output is half of final size."""
     if _truthy(params.get("skip_stage2")) or _truthy(params.get("draft")):
@@ -256,6 +275,14 @@ def apply_api_job_params(
 ) -> None:
     from workflow_converter import set_api_input
 
+    tier = apply_studio_quality(params)
+    if tier in ("fast_refine", "full_refine") and "371" not in prompt_graph:
+        logger.warning("LTX spatial upscaler node 371 is missing; %s will run stage 2 without it", tier)
+    if params.get("audio_url") and not any(
+        isinstance(node, dict) and "AudioToVideo" in str(node.get("class_type") or "")
+        for node in prompt_graph.values()
+    ):
+        logger.info("LTX graph has no audio-to-video input; audio_url is left for the song workflow")
     mode = resolve_mode(model, params)
     node_376 = prompt_graph.get("376")
     if prompt and isinstance(node_376, dict):
@@ -324,6 +351,23 @@ def apply_api_job_params(
             set_api_input(first, "image", first_filename or "")
         if isinstance(last, dict):
             set_api_input(last, "image", last_filename or "")
+    latent_name = str(params.get("continuation_latent") or "").strip()
+    if latent_name:
+        prompt_graph["ltx_load_latent"] = {
+            "class_type": "LoadLatent",
+            "inputs": {"latent": latent_name},
+        }
+        stage1 = prompt_graph.get(STAGE1_SAMPLER_ID)
+        if isinstance(stage1, dict):
+            stage1.setdefault("inputs", {})["latent_image"] = ["ltx_load_latent", 0]
+    if latent_name or str(params.get("quality") or "").strip():
+        prompt_graph["ltx_save_latent"] = {
+            "class_type": "SaveLatent",
+            "inputs": {
+                "samples": [STAGE1_SAMPLER_ID, 0],
+                "filename_prefix": "ltx_cont",
+            },
+        }
 
 
 def apply_job_params(

@@ -65,6 +65,14 @@ def _pick_output(comfyui_bridge: Any, output_files: List[dict]) -> str:
     dest = out_dir / Path(chosen["filename"]).name
     shutil.copy2(src, dest)
     logger.info("Copied output %s -> %s", src, dest)
+    latents = [
+        item
+        for item in output_files
+        if str(item.get("filename") or "").lower().endswith(".latent")
+    ]
+    if latents:
+        latent_src = comfyui_bridge.get_output_file_path(latents[-1])
+        shutil.copy2(latent_src, str(dest) + ".latent")
     return str(dest)
 
 
@@ -101,6 +109,13 @@ def run_inference_ltx25(job_id: str, prompt: str, params: Dict[str, Any], model:
         first_name = _download_image(first_url, f"ltx25_first{_ext_from_url(first_url)}", comfyui_bridge)
     if mode == MODE_FLF2V and isinstance(last_url, str) and last_url.startswith("http"):
         last_name = _download_image(last_url, f"ltx25_last{_ext_from_url(last_url)}", comfyui_bridge)
+    latent_url = params.get("continuation_latent_url")
+    if isinstance(latent_url, str) and latent_url.startswith("http"):
+        params["continuation_latent"] = _download_image(
+            latent_url,
+            f"ltx25_latent{_ext_from_url(latent_url, '.latent')}",
+            comfyui_bridge,
+        )
 
     text = prompt or params.get("prompt") or ""
     if is_api_prompt(graph):

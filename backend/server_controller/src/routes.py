@@ -5652,6 +5652,34 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
                         f"first_frame_image_r2_keys: expected 1 or 2 keys, got {len(urls_ff)}"
                     )
 
+        if "reference_image_r2_keys" in dispatch_params:
+            keys = dispatch_params.pop("reference_image_r2_keys")
+            if isinstance(keys, list) and keys:
+                urls_ref: List[str] = []
+                for r2_key in keys[:4]:
+                    download_url = create_presigned_get_url(r2_key, expires_in=3600)
+                    if download_url:
+                        urls_ref.append(download_url)
+                    else:
+                        raise Exception(
+                            f"Failed to generate reference download URL for R2 key: {r2_key}"
+                        )
+                dispatch_params["reference_images"] = urls_ref
+                logger.info(
+                    f"[R2_MEDIA] Job {job_id}: {len(urls_ref)} reference images → download URLs"
+                )
+
+        if "continuation_latent_r2_key" in dispatch_params:
+            r2_key = dispatch_params.pop("continuation_latent_r2_key")
+            download_url = create_presigned_get_url(r2_key, expires_in=3600)
+            if download_url:
+                dispatch_params["continuation_latent_url"] = download_url
+                logger.info(f"[R2_MEDIA] Job {job_id}: continuation latent → download URL")
+            else:
+                raise Exception(
+                    f"Failed to generate continuation latent download URL for R2 key: {r2_key}"
+                )
+
         # last_frame_image_r2_key → last_frame_image
         if "last_frame_image_r2_key" in dispatch_params:
             r2_key = dispatch_params.pop("last_frame_image_r2_key")
@@ -5734,6 +5762,13 @@ async def _dispatch_to_worker(job_id: str, worker_id: str) -> bool:
             "upload_url": presigned_url,
             "result_key": job.result_r2_key,
         }
+        model_name = str(job.model or "")
+        if job.result_r2_key and (model_name == "minimax_h3" or model_name.startswith("ltx25")):
+            latent_key = f"{job.result_r2_key}.latent"
+            latent_put = create_presigned_put_url(latent_key)
+            if latent_put:
+                run_payload["latent_upload_url"] = latent_put
+                run_payload["latent_result_key"] = latent_key
         
         # Save dispatch payload as JSON (as sent to worker)
         try:
@@ -7338,6 +7373,7 @@ async def get_job_status(
             worker_id=job.worker_id,
             retry_count=job.retry_count or 0,
             result_url=result_url,
+            continuation_latent_r2_key=(job.params or {}).get("continuation_latent_r2_key"),
             error=aggregated_error,
             error_log=job.error_log,
             variations=total_variations,
@@ -8859,6 +8895,10 @@ async def job_complete(
                 completion_time = utc_naive_now()
                 job.status = JobState.COMPLETED.value
                 job.result_r2_key = payload.result_r2_key
+                if payload.continuation_latent_r2_key:
+                    stored = dict(job.params or {})
+                    stored["continuation_latent_r2_key"] = payload.continuation_latent_r2_key
+                    job.params = stored
                 job.completed_at = completion_time
                 job.updated_at = completion_time
                 

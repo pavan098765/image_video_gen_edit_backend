@@ -29,6 +29,18 @@ import requests
 from db import User, Job, CreditTransaction, Subscription, SessionLocal, utc_naive_now
 from sale_scheduler import SaleScheduler
 
+
+def _studio_quality_multiplier(model: str, params: Optional[dict]) -> int:
+    """Draft keeps the duration price. Fast refine is 2x. Full refine is 4x."""
+    if model != "minimax_h3" and not str(model).startswith("ltx25"):
+        return 1
+    raw = str((params or {}).get("quality") or "draft").strip().lower()
+    if raw in ("fast_refine", "fast"):
+        return 2
+    if raw in ("full_refine", "full"):
+        return 4
+    return 1
+
 logger = logging.getLogger("credit_service")
 _sale_scheduler = SaleScheduler()
 
@@ -445,7 +457,7 @@ def calculate_job_cost(
                 effective_duration = min(duration_seconds, max_duration)
                 # Formula: cost = baseCost5Sec * effective_duration / 5 (matches frontend: 5s→15, 8s→24, 10s→30)
                 per_job_cost = int(base_cost_5_sec * effective_duration / 5)
-                per_job_cost = max(1, per_job_cost)
+                per_job_cost = max(1, per_job_cost * _studio_quality_multiplier(model, params))
                 # Apply effective offer discount (sale_overrides policy)
                 if effective_offer_percent > 0:
                     per_job_cost -= int(per_job_cost * effective_offer_percent / 100)

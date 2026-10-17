@@ -485,6 +485,11 @@ class JobCompleteRequest(BaseModel):
         max_length=4096,
         description="Error message if job failed"
     )
+    continuation_latent_r2_key: Optional[str] = Field(
+        default=None,
+        max_length=512,
+        description="R2 key for the video latent used to continue the next shot",
+    )
     metrics: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Job execution metrics (duration, memory usage, etc.)"
@@ -641,6 +646,7 @@ class JobStatusResponse(BaseModel):
     worker_id: Optional[str] = None
     retry_count: int = 0
     result_url: Optional[str] = None
+    continuation_latent_r2_key: Optional[str] = None
     error: Optional[str] = None
     error_log: Optional[List[Dict[str, Any]]] = None
     # Variation support - all results returned together

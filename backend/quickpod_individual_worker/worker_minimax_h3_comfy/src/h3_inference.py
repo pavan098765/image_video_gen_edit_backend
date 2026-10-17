@@ -109,6 +109,9 @@ def pick_workflow_file(params: Dict[str, Any]) -> str:
         return FAST_WORKFLOW
     if key in ("i2v", "fast_i2v", "image", I2V_WORKFLOW.lower()):
         return I2V_WORKFLOW
+    # Studio tiers stay on the fast API graph. "quality" here is the old Seed Hunter alias.
+    if key in ("draft", "fast_refine", "full_refine"):
+        return FAST_WORKFLOW
     if key in ("seed_hunter", "seedhunter", "hunter", "quality", SEED_HUNTER_WORKFLOW.lower()):
         return SEED_HUNTER_WORKFLOW
     if raw.endswith(".json"):
@@ -133,9 +136,11 @@ def _ext_from_url(url: str, fallback: str) -> str:
 
 
 def _kind_for_field(field: str) -> str:
+    if "latent" in field:
+        return "latent"
     if "audio" in field:
         return "audio"
-    if "video" in field or "continuation" in field:
+    if "video" in field or field == "continuation_video_url":
         return "video"
     return "picture"
 
@@ -151,6 +156,7 @@ def download_media_items(params: Dict[str, Any], comfyui_bridge: Any) -> List[di
         ("continuation_video_url", "video", "h3_cont"),
         ("init_image", "picture", "h3_init"),
         ("init_video", "video", "h3_initvid"),
+        ("continuation_latent_url", "latent", "h3_latent"),
     ]
     seen = set()
     for field, kind, prefix in mapping:
@@ -160,13 +166,28 @@ def download_media_items(params: Dict[str, Any], comfyui_bridge: Any) -> List[di
         if url in seen:
             continue
         seen.add(url)
-        ext = _ext_from_url(url, ".png" if kind == "picture" else (".mp3" if kind == "audio" else ".mp4"))
+        fallback = ".png" if kind == "picture" else (".mp3" if kind == "audio" else (".latent" if kind == "latent" else ".mp4"))
+        ext = _ext_from_url(url, fallback)
         filename = f"{prefix}{ext}"
         logger.info("Downloading media %s -> %s", field, filename)
         resp = requests.get(url, timeout=120)
         resp.raise_for_status()
         comfyui_bridge.save_bytes_to_input(resp.content, filename)
         items.append({"kind": kind, "file": filename, "enabled": True})
+    refs = params.get("reference_images") or params.get("reference_image")
+    if isinstance(refs, str):
+        refs = [refs]
+    if isinstance(refs, list):
+        for index, url in enumerate(refs[:4]):
+            if not isinstance(url, str) or not url.startswith("http") or url in seen:
+                continue
+            seen.add(url)
+            filename = f"h3_ref_{index}{_ext_from_url(url, '.png')}"
+            logger.info("Downloading reference %s -> %s", index, filename)
+            resp = requests.get(url, timeout=120)
+            resp.raise_for_status()
+            comfyui_bridge.save_bytes_to_input(resp.content, filename)
+            items.append({"kind": "reference", "file": filename, "enabled": True})
     return items
 
 
@@ -199,7 +220,22 @@ def _pick_output(
     dest = out_dir / Path(chosen["filename"]).name
     shutil.copy2(src, dest)
     logger.info("Copied output %s -> %s", src, dest)
+    _copy_latent_beside(comfyui_bridge, output_files, str(dest))
     return str(dest)
+
+
+def _copy_latent_beside(comfyui_bridge: Any, output_files: List[dict], dest_mp4: str) -> None:
+    latents = [
+        item
+        for item in output_files
+        if str(item.get("filename") or "").lower().endswith(".latent")
+    ]
+    if not latents:
+        return
+    src = comfyui_bridge.get_output_file_path(latents[-1])
+    sidecar = dest_mp4 + ".latent"
+    shutil.copy2(src, sidecar)
+    logger.info("Copied continuation latent %s -> %s", src, sidecar)
 
 
 def run_inference_h3(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
@@ -238,6 +274,10 @@ def run_inference_h3(job_id: str, prompt: str, params: Dict[str, Any]) -> str:
             media_files["last_frame"] = fname
         elif str(fname).startswith("h3_init") and kind == "picture":
             media_files.setdefault("first_frame", fname)
+        elif kind == "reference":
+            media_files.setdefault("references", []).append(fname)
+        elif kind == "latent":
+            media_files["continuation_latent"] = fname
 
     if is_fast and is_api_prompt(graph):
         from h3_fast_patch import SAVE_VIDEO_NODE_ID, apply_fast_api_job_params

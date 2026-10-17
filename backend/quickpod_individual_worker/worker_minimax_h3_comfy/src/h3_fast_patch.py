@@ -36,6 +36,13 @@ UPSCALE_PARAM_NODE_ID = 52
 ULTIMATE_UPSCALE_NODE_ID = 53
 DEFAULT_UPSCALE_MP = 1.0
 UPSCALE_MODEL = "minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors"
+H3_BASE_MODEL = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+QUALITY_DRAFT = "draft"
+QUALITY_FAST_REFINE = "fast_refine"
+QUALITY_FULL_REFINE = "full_refine"
+REFINE_STEPS = 4
+REFINE_DENOISE = 0.35
+FULL_PASS_STEPS = 20
 
 MODE_ALWAYS = 0
 MODE_BYPASS = 4
@@ -615,6 +622,176 @@ def _wire_i2v_frames(prompt_graph: dict, media_files: Dict[str, str]) -> None:
             set_api_input(node, "last_frame", [last_id, 0])
 
 
+def resolve_h3_quality(params: Optional[Dict[str, Any]]) -> str:
+    """Studio tier. Absent or unknown stays on today's turbo graph."""
+    raw = str((params or {}).get("quality") or "").strip().lower()
+    if raw in (QUALITY_FAST_REFINE, "fast", "refine"):
+        return QUALITY_FAST_REFINE
+    if raw in (QUALITY_FULL_REFINE, "full", "refined"):
+        return QUALITY_FULL_REFINE
+    return QUALITY_DRAFT
+
+
+def _reference_names(media_files: Dict[str, str]) -> list:
+    raw = media_files.get("references") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return [str(name) for name in raw if str(name).strip()][:4]
+
+
+def apply_h3_tier(
+    prompt_graph: dict,
+    params: Dict[str, Any],
+    media_files: Optional[Dict[str, str]] = None,
+) -> str:
+    """Draft leaves the API graph alone. Refine adds the latent upscaler and a short turbo cleanup.
+
+    Full refine runs the pruned base weight for the long first pass. The fused turbo checkpoint
+    stays the cleanup model. Reference sheets switch the prompt node to reference-to-video.
+    """
+    media_files = media_files or {}
+    quality = resolve_h3_quality(params)
+    _wire_api_references(prompt_graph, _reference_names(media_files))
+    latent_name = str(media_files.get("continuation_latent") or "").strip()
+    if latent_name:
+        prompt_graph["h3_load_latent"] = {
+            "class_type": "LoadLatent",
+            "inputs": {"latent": latent_name},
+        }
+        sampler = prompt_graph.get("15")
+        if isinstance(sampler, dict):
+            sampler.setdefault("inputs", {})["latent_image"] = ["h3_load_latent", 0]
+    if quality == QUALITY_DRAFT:
+        if latent_name or str(params.get("quality") or "").strip():
+            _wire_api_save_latent(prompt_graph, "15")
+        return quality
+
+    i2v = prompt_graph.get("10")
+    if not isinstance(i2v, dict):
+        return quality
+    res = prompt_graph.get("7")
+    aspect = "16:9 (Widescreen)"
+    if isinstance(res, dict):
+        aspect = str(res.get("inputs", {}).get("aspect_ratio") or aspect)
+        if quality == QUALITY_FULL_REFINE:
+            res.setdefault("inputs", {})["megapixels"] = 0.25
+    prompt_graph["h3_up_res"] = {
+        "class_type": "ResolutionSelector",
+        "inputs": {"aspect_ratio": aspect, "megapixels": 0.9, "multiple": 32},
+    }
+    prompt_graph["h3_up_param"] = {
+        "class_type": "MMH3LatentUpscaleWithModelParams",
+        "inputs": {
+            "model_name": UPSCALE_MODEL,
+            "width": ["h3_up_res", 0],
+            "height": ["h3_up_res", 1],
+            "device": "cuda",
+            "precision": "fp16",
+            "offload_model": True,
+        },
+    }
+    second = {
+        "class_type": i2v.get("class_type") or "MiniMaxH3ImageToVideo",
+        "inputs": dict(i2v.get("inputs") or {}),
+    }
+    second["inputs"]["width"] = ["h3_up_res", 0]
+    second["inputs"]["height"] = ["h3_up_res", 1]
+    prompt_graph["h3_i2v2"] = second
+    prompt_graph["h3_pass2"] = {
+        "class_type": "BasicScheduler",
+        "inputs": {
+            "scheduler": "simple",
+            "steps": REFINE_STEPS,
+            "denoise": REFINE_DENOISE,
+            "model": ["5", 0],
+        },
+    }
+    if quality == QUALITY_FULL_REFINE:
+        prompt_graph["h3_base"] = {
+            "class_type": "DiffusionModelLoaderKJ",
+            "inputs": {
+                "model_name": H3_BASE_MODEL,
+                "weight_dtype": "default",
+                "compute_dtype": "default",
+                "patch_cublaslinear": False,
+                "sage_attention": "disabled",
+                "enable_fp16_accumulation": True,
+            },
+        }
+        prompt_graph["h3_base_shift"] = {
+            "class_type": "MiniMaxH3SigmaShift",
+            "inputs": {"shift_video": 12, "shift_audio": 3, "model": ["h3_base", 0]},
+        }
+        prompt_graph["h3_pass1"] = {
+            "class_type": "BasicScheduler",
+            "inputs": {
+                "scheduler": "simple",
+                "steps": FULL_PASS_STEPS,
+                "denoise": 1.0,
+                "model": ["h3_base_shift", 0],
+            },
+        }
+        prompt_graph["h3_base_guider"] = {
+            "class_type": "BasicGuider",
+            "inputs": {
+                "model": ["h3_base_shift", 0],
+                "conditioning": ["10", 0],
+            },
+        }
+        sampler = prompt_graph.get("15")
+        if isinstance(sampler, dict):
+            sampler.setdefault("inputs", {})["sigmas"] = ["h3_pass1", 0]
+            sampler["inputs"]["guider"] = ["h3_base_guider", 0]
+    prompt_graph["h3_ultimate"] = {
+        "class_type": "MMH3UltimateUpscale",
+        "inputs": {
+            "model": ["5", 0],
+            "conditioning": ["h3_i2v2", 0],
+            "latent": ["15", 0],
+            "noise": ["11", 0],
+            "sampler": ["12", 0],
+            "sigmas": ["h3_pass2", 0],
+            "latent_upscale_param": ["h3_up_param", 0],
+            "cfg": 1.0,
+        },
+    }
+    for node_id in ("16", "17"):
+        node = prompt_graph.get(node_id)
+        if isinstance(node, dict) and "samples" in (node.get("inputs") or {}):
+            node["inputs"]["samples"] = ["h3_ultimate", 0]
+    _wire_api_save_latent(prompt_graph, "h3_ultimate")
+    logger.info(
+        "H3 %s: refine %s steps at denoise %s (pass-1 model %s)",
+        quality,
+        REFINE_STEPS,
+        REFINE_DENOISE,
+        "base" if quality == QUALITY_FULL_REFINE else "turbo",
+    )
+    return quality
+
+
+def _wire_api_references(prompt_graph: dict, names: list) -> None:
+    i2v = prompt_graph.get("10")
+    if not isinstance(i2v, dict) or not names:
+        return
+    inputs = i2v.setdefault("inputs", {})
+    has_frame = "first_frame" in inputs or "last_frame" in inputs
+    for index, name in enumerate(names):
+        node_id = f"h3_ref_{index}"
+        prompt_graph[node_id] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        inputs[f"ref_images.ref_image_{index}"] = [node_id, 0]
+    if not has_frame:
+        i2v["class_type"] = "MiniMaxH3ReferenceToVideo"
+        inputs.setdefault("audio_vae", ["4", 0])
+
+
+def _wire_api_save_latent(prompt_graph: dict, source: str) -> None:
+    prompt_graph["h3_save_latent"] = {
+        "class_type": "SaveLatent",
+        "inputs": {"samples": [source, 0], "filename_prefix": "h3_cont"},
+    }
+
+
 def apply_fast_api_job_params(
     prompt_graph: dict,
     prompt: str,
@@ -694,6 +871,7 @@ def apply_fast_api_job_params(
             set_api_input(node, "shift_video", float(params["shift_video"]))
         if params.get("shift_audio") is not None:
             set_api_input(node, "shift_audio", float(params["shift_audio"]))
+    apply_h3_tier(prompt_graph, params, media_files)
 
 
 def apply_fast_job_params(
