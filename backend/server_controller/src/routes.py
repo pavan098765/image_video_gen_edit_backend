@@ -3224,6 +3224,48 @@ def _generate_signed_download_url(r2_key: str, expires_in_seconds: int = 86400) 
     return f"https://img-vid-gen-download.pavanalur3.workers.dev/d/{r2_key}?exp={expires}&sig={sig}"
 
 
+def _scale_requested(params: Dict[str, Any]) -> bool:
+    try:
+        return float(params.get("scale_factor", 1) or 1) > 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _should_chain_kie_upscale(model: str, params: Dict[str, Any]) -> bool:
+    if model == "recraft_crisp_upscale" or params.get("_kie_upscale_started"):
+        return False
+    return _scale_requested(params)
+
+
+async def _chain_kie_upscale(db, job, source_url: str, params: Dict[str, Any]) -> bool:
+    """Send the finished image through Kie crisp upscale on the same job."""
+    import kie_client
+    from db import KieTask
+
+    public = (os.getenv("CONTROLLER_PUBLIC_URL") or os.getenv("CONTROLLER_URL") or "").rstrip("/")
+    if not public:
+        logger.warning("[KIE] upscale chain skipped, CONTROLLER_PUBLIC_URL is unset")
+        return False
+    try:
+        hosted = await asyncio.to_thread(kie_client.upload_file_from_url, source_url)
+        task_id = await asyncio.to_thread(
+            kie_client.create_task,
+            "recraft/crisp-upscale",
+            {"image": hosted, "nsfw_checker": True},
+            f"{public}/kie/callback",
+        )
+    except Exception:
+        logger.exception("[KIE] upscale chain failed for %s", job.job_id)
+        return False
+    db.add(KieTask(task_id=task_id, job_id=job.job_id, model="recraft_crisp_upscale"))
+    params["_kie_upscale_started"] = True
+    params["_kie_result_url"] = source_url
+    job.params = params
+    db.commit()
+    logger.info("[KIE] Job %s chaining crisp upscale task %s", job.job_id, task_id)
+    return True
+
+
 async def _apply_kie_job_result(job_id: str, payload: Dict[str, Any]) -> None:
     import kie_client
 
@@ -3240,6 +3282,10 @@ async def _apply_kie_job_result(job_id: str, payload: Dict[str, Any]) -> None:
         if kie_client.is_success_code(payload) and urls:
             source_url = urls[0]
             params = dict(job.params or {})
+            if _should_chain_kie_upscale(job.model, params):
+                chained = await _chain_kie_upscale(db, job, source_url, params)
+                if chained:
+                    return
             params["_kie_result_url"] = source_url
             try:
                 output_url = kie_client.download_url_for(source_url)
