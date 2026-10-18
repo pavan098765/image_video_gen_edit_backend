@@ -515,12 +515,10 @@ class ExternalApiRouter:
         if input_payload.get("background") == "transparent" and str(input_payload.get("output_format") or "").lower() == "jpeg":
             input_payload["output_format"] = "png"
 
-        if cfg.get("force_resolution_1k") and "resolution" in (cfg.get("param_map") or {}):
-            input_payload["resolution"] = "1K"
-        elif cfg.get("force_resolution_1k"):
-            # Only set if the Kie model documents a resolution field
-            if cfg.get("has_resolution", True):
-                input_payload["resolution"] = "1K"
+        if cfg.get("force_resolution_1k"):
+            chosen = str(input_payload.get("resolution") or "1K").upper()
+            allow_2k = cfg.get("allow_resolution_2k") is True and chosen == "2K"
+            input_payload["resolution"] = "2K" if allow_2k else "1K"
 
         kie_model = cfg.get("provider", {}).get("model_id")
         if not kie_model:

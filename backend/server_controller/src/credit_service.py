@@ -486,6 +486,11 @@ def calculate_job_cost(
     # Standard cost calculation for other models
     
     base_cost = cost_info.get("cost", 10)
+    if (
+        model == "qwen2_1_i2i"
+        and str((params or {}).get("resolution") or "1K").upper() == "2K"
+    ):
+        base_cost *= 2
     upscale_cost = cost_info.get("cost_upscale", 5)
     
     # Check if upscaling is enabled

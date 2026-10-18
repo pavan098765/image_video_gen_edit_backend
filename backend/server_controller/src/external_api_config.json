@@ -261,13 +261,14 @@
       "required_params": ["prompt", "image_urls"],
       "has_resolution": true,
       "force_resolution_1k": true,
+      "allow_resolution_2k": true,
       "kie_upload_fields": ["image_urls", "mask_url"],
       "param_map": {
         "prompt": { "source": "prompt", "transform": "string_trim" },
         "image_urls": { "source": "params.init_image", "transform": "as_list" },
         "mask_url": { "source": "params.mask_image", "transform": "http_passthrough" },
         "aspect_ratio": { "source": "params.aspect_ratio", "transform": "default:auto" },
-        "resolution": { "value": "1K" },
+        "resolution": { "source": "params.resolution", "transform": "default:1K" },
         "background": { "source": "params.background", "transform": "default:opaque" },
         "output_format": { "value": "png" },
         "enhance_prompt": { "value": true }
