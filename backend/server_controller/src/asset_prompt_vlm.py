@@ -1,49 +1,45 @@
 # asset_prompt_vlm.py
 """
-Vision-LM captioning for auto-fill prompts via NVIDIA Nemotron VL (integrate API).
+Vision captioning for auto-fill prompts via the Gemini Cloudflare worker.
 
-Matches NVIDIA sample style: system ``/think`` for images, user content with text + ``image_url``
-using ``data:{mime};base64,...``. Model default ``nvidia/nemotron-nano-12b-v2-vl``.
+The controller loads the image from R2 and posts it to the worker. The worker
+checks the user's Firebase token and calls Gemini. The Gemini key stays on
+the worker.
 
 Env:
-  ASSET_PROMPT_VLM_ENABLED          "true" to allow the route (default "false")
-  NVIDIA_API_KEY or NVIDIA_LLM_API  Bearer token
-  NVIDIA_SYSTEM_PROMPT_IMAGE        Default /think
+  ASSET_PROMPT_VLM_ENABLED          "true" to allow the route (default "true")
+  GEMINI_DIRECTOR_URL               Worker POST URL
+  GEMINI_DIRECTOR_MODEL             Must be on the worker allowlist
   ASSET_PROMPT_VLM_TIMEOUT          Per-request timeout seconds (default "120")
-  ASSET_PROMPT_MAX_IMAGE_BYTES      Max object size from R2 (default 12 MiB)
-  NVIDIA_MAX_TOKENS, NVIDIA_TEMPERATURE, NVIDIA_STREAM, etc. (see nvidia_chat_client)
+  ASSET_PROMPT_MAX_IMAGE_BYTES      Max object size from R2 (default 4 MiB)
 """
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 from typing import Tuple
 
-from nvidia_chat_client import (
-    build_messages_chat_with_media,
-    default_max_tokens,
-    default_temperature,
-    get_nvidia_api_key,
-    get_system_prompt_for_media_extensions,
-    nvidia_chat_completion_try_models,
-    nvidia_models_for_asset,
-    resolve_media_extension,
-)
+import requests
 
 logger = logging.getLogger("asset_prompt_vlm")
 
-_INSTRUCTION_QUERY = """You are helping users write a single prompt for AI image or video generation.
-Look at the attached image and write one concise, vivid English prompt that describes the main subject,
-setting, lighting, mood, and style. The prompt should be usable as-is in a text-to-image or image-to-video model.
-Rules:
-- Output ONLY the prompt text. No title, no quotes, no bullet list, no preamble like "Here is".
-- Aim for roughly 40–120 words unless the scene is very simple.
-- Do not mention that you are an AI or that you see an image."""
+_DEFAULT_WORKER_URL = "https://kala-gemini-director.pavanalur3.workers.dev/v1/generate"
+
+_INSTRUCTION = (
+    "You are helping users write a single prompt for AI image or video generation. "
+    "Look at the attached image and write one concise, vivid English prompt that describes "
+    "the main subject, setting, lighting, mood, and style. The prompt should be usable as-is "
+    "in a text-to-image or image-to-video model. "
+    "Output ONLY the prompt text. No title, no quotes, no bullet list, no preamble. "
+    "Aim for roughly 40-120 words unless the scene is very simple. "
+    "Do not mention that you are an AI or that you see an image."
+)
 
 
 def is_asset_prompt_vlm_enabled() -> bool:
-    return os.getenv("ASSET_PROMPT_VLM_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+    return os.getenv("ASSET_PROMPT_VLM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 
 def get_timeout_seconds() -> float:
@@ -55,55 +51,90 @@ def get_timeout_seconds() -> float:
 
 def get_max_image_bytes() -> int:
     try:
-        return int(os.getenv("ASSET_PROMPT_MAX_IMAGE_BYTES", str(12 * 1024 * 1024)))
+        return int(os.getenv("ASSET_PROMPT_MAX_IMAGE_BYTES", str(4 * 1024 * 1024)))
     except ValueError:
-        return 12 * 1024 * 1024
+        return 4 * 1024 * 1024
 
 
-async def describe_image_with_nvidia(
+def _mime(r2_key: str, mime_hint: str) -> str:
+    hint = (mime_hint or "").split(";", 1)[0].strip().lower()
+    if hint in ("image/jpeg", "image/png", "image/webp"):
+        return hint
+    ext = ""
+    if "." in (r2_key or ""):
+        ext = r2_key.rsplit(".", 1)[-1].lower()
+    if ext in ("jpg", "jpeg"):
+        return "image/jpeg"
+    if ext == "png":
+        return "image/png"
+    if ext == "webp":
+        return "image/webp"
+    return ""
+
+
+def _prompt_from_gemini(body: dict) -> str:
+    candidates = body.get("candidates") or []
+    if not candidates:
+        return ""
+    parts = ((candidates[0].get("content") or {}).get("parts") or [])
+    texts = [p.get("text") or "" for p in parts if isinstance(p, dict)]
+    return "\n".join(t for t in texts if t).strip()
+
+
+def describe_image_with_gemini(
     r2_key: str,
     raw: bytes,
     mime_hint: str,
+    authorization: str,
 ) -> Tuple[bool, str]:
-    """
-    Encode image bytes as a data URL inside Nemotron-compatible ``messages`` and call NVIDIA.
-    ``mime_hint`` is Content-Type or from key; used to resolve extension when key has no suffix.
-    """
-    api_key = get_nvidia_api_key()
-    if not api_key:
-        logger.error("NVIDIA_API_KEY / NVIDIA_LLM_API is not set")
-        return False, "Vision prompt service is not configured"
+    """POST the image to the Gemini worker using the caller's Firebase token."""
+    token = (authorization or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if not token:
+        return False, "Sign in required"
 
-    ext = resolve_media_extension(r2_key, mime_hint)
-    if not ext:
+    mime = _mime(r2_key, mime_hint)
+    if not mime:
         return False, "Unsupported or unknown image format (use png, jpg, jpeg, or webp)."
 
+    model = (os.getenv("GEMINI_DIRECTOR_MODEL") or "gemini-3.5-flash-lite").strip()
+    url = (os.getenv("GEMINI_DIRECTOR_URL") or _DEFAULT_WORKER_URL).strip()
+    payload = {
+        "step": "asset_prompt",
+        "model": model,
+        "maxOutputTokens": 1024,
+        "contents": [
+            {
+                "parts": [
+                    {"text": _INSTRUCTION},
+                    {"inline_data": {"mime_type": mime, "data": base64.b64encode(raw).decode("ascii")}},
+                ]
+            }
+        ],
+    }
     try:
-        messages = build_messages_chat_with_media(
-            system_prompt=get_system_prompt_for_media_extensions([ext]),
-            query=_INSTRUCTION_QUERY,
-            media_files=[(ext, raw)],
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=get_timeout_seconds(),
         )
-    except ValueError as e:
-        return False, str(e)
+    except requests.RequestException as exc:
+        logger.warning("Gemini worker request failed: %s", exc)
+        return False, "Auto-prompt service is unavailable"
 
-    models = nvidia_models_for_asset()
-    timeout = get_timeout_seconds()
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    if resp.status_code >= 400:
+        err = body.get("error") if isinstance(body, dict) else None
+        return False, str(err or f"Auto-prompt failed ({resp.status_code})")
 
-    ok, text = await nvidia_chat_completion_try_models(
-        messages=messages,
-        models=models,
-        api_key=api_key,
-        timeout=timeout,
-        max_tokens=default_max_tokens(),
-        temperature=default_temperature(),
-        min_chars=8,
-        log_prefix="asset_vlm",
-        stream=None,
-    )
-    if not ok:
-        return False, text
-
+    text = _prompt_from_gemini(body if isinstance(body, dict) else {})
+    if not text:
+        return False, "Auto-prompt returned no text"
     if len(text) > 4000:
         text = text[:4000]
     return True, text

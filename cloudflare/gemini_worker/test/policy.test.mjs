@@ -52,6 +52,29 @@ test("google_search is removed unless step is research", () => {
   assert.deepEqual(research.upstream.tools, tools);
 });
 
+test("an image caption body can exceed the text size cap", () => {
+  const textOnly = sanitizeRequest(
+    {
+      step: "script",
+      model: "gemini-2.5-flash",
+      contents: [{ parts: [{ text: "x".repeat(130_000) }] }],
+    },
+    { allowlist: allow },
+  );
+  assert.equal(textOnly.ok, false);
+  assert.equal(textOnly.status, 413);
+
+  const image = sanitizeRequest(
+    {
+      step: "asset_prompt",
+      model: "gemini-2.5-flash",
+      contents: [{ parts: [{ inline_data: { mime_type: "image/jpeg", data: "abc" } }] }],
+    },
+    { allowlist: allow, maxBodyChars: 10, maxImageBodyChars: 5000 },
+  );
+  assert.equal(image.ok, true);
+});
+
 test("the response check catches a leaked key", () => {
   assert.equal(responseHasKey({ text: "secret-key-value" }, "secret-key-value"), true);
   assert.equal(responseHasKey({ text: "ok" }, "secret-key-value"), false);

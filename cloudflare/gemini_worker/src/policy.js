@@ -1,7 +1,21 @@
 /** Pure request policy for the Gemini director worker. No secrets, no I/O. */
 
 const DEFAULT_MAX_BODY = 120_000;
+const DEFAULT_MAX_IMAGE_BODY = 8_000_000;
 const DEFAULT_MAX_TOKENS = 8192;
+
+function hasInlineImage(contents) {
+  if (!Array.isArray(contents)) return false;
+  for (const item of contents) {
+    const parts = item && item.parts;
+    if (!Array.isArray(parts)) continue;
+    for (const part of parts) {
+      const blob = part && (part.inline_data || part.inlineData);
+      if (blob && typeof blob.data === "string" && blob.data.length > 0) return true;
+    }
+  }
+  return false;
+}
 
 export function sanitizeRequest(body, options = {}) {
   const allow = new Set(options.allowlist || []);
@@ -10,7 +24,10 @@ export function sanitizeRequest(body, options = {}) {
     return { ok: false, status: 400, error: "JSON body required" };
   }
   const raw = JSON.stringify(body);
-  if (raw.length > maxBody) {
+  const limit = hasInlineImage(body.contents)
+    ? options.maxImageBodyChars || DEFAULT_MAX_IMAGE_BODY
+    : maxBody;
+  if (raw.length > limit) {
     return { ok: false, status: 413, error: "Body is too large" };
   }
   const step = typeof body.step === "string" ? body.step.trim() : "";

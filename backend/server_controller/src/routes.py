@@ -115,7 +115,7 @@ from prompt_enhancement import (
     should_enhance_for_model,
 )
 from asset_prompt_vlm import (
-    describe_image_with_nvidia,
+    describe_image_with_gemini,
     get_max_image_bytes,
     is_asset_prompt_vlm_enabled,
 )
@@ -3616,11 +3616,12 @@ async def _reserve_asset_prompt_daily_slot(user_id: str) -> None:
 )
 async def describe_asset_for_prompt(
     payload: DescribeAssetForPromptRequest,
+    authorization: Optional[str] = Header(None),
     auth: Dict = Depends(require_firebase_auth),
 ):
     """
-    Load image bytes from R2 and send Nemotron VL-style ``messages`` to NVIDIA (base64 data URL
-    in ``image_url``, system ``/think`` for images per NVIDIA samples).
+    Load image bytes from R2 and ask the Gemini Cloudflare worker for one generation prompt.
+    The caller's Firebase token is forwarded so the worker can authorize the request.
 
     R2-only: request body must contain ``input_r2_key`` under the app's ``input-media/`` prefix.
     For video sources, the client should upload a single JPEG frame to R2 and pass that key
@@ -3686,7 +3687,9 @@ async def describe_asset_for_prompt(
     if not mime.startswith("image/"):
         mime = _mime_from_r2_key(key)
 
-    ok, text = await describe_image_with_nvidia(key, raw, mime)
+    ok, text = await asyncio.to_thread(
+        describe_image_with_gemini, key, raw, mime, authorization or ""
+    )
     if not ok:
         logger.warning(
             f"[DESCRIBE_ASSET] VLM failed user_id={uid!s} key_prefix={key[:48]!r} err={text[:200]!r}"
