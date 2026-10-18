@@ -268,6 +268,8 @@
         "mask_url": { "source": "params.mask_image", "transform": "http_passthrough" },
         "aspect_ratio": { "source": "params.aspect_ratio", "transform": "default:auto" },
         "resolution": { "value": "1K" },
+        "background": { "source": "params.background", "transform": "default:opaque" },
+        "output_format": { "value": "png" },
         "enhance_prompt": { "value": true }
       }
     },

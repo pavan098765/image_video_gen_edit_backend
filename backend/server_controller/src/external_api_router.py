@@ -509,6 +509,12 @@ class ExternalApiRouter:
                 )
             input_payload["aspect_ratio"] = chosen
 
+        if input_payload.get("mask_url") and input_payload.get("background") == "transparent":
+            logger.info("Kie local edit cannot use a transparent background; using opaque")
+            input_payload["background"] = "opaque"
+        if input_payload.get("background") == "transparent" and str(input_payload.get("output_format") or "").lower() == "jpeg":
+            input_payload["output_format"] = "png"
+
         if cfg.get("force_resolution_1k") and "resolution" in (cfg.get("param_map") or {}):
             input_payload["resolution"] = "1K"
         elif cfg.get("force_resolution_1k"):
