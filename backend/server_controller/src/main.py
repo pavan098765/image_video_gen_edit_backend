@@ -305,6 +305,13 @@ class AppState:
         )
         self.background_tasks.append(task)
         logger.info("Started Kie recordInfo fallback sweeper")
+
+        task = asyncio.create_task(
+            self._runware_poll_sweeper_task(),
+            name="runware_poll_sweeper",
+        )
+        self.background_tasks.append(task)
+        logger.info("Started Runware getResponse sweeper")
         
         logger.info(f"Started {len(self.background_tasks)} background tasks")
     
@@ -385,7 +392,68 @@ class AppState:
                 raise
             except Exception:
                 logger.exception("Kie recordInfo sweeper error")
-    
+
+    async def _runware_poll_sweeper_task(self):
+        """Poll getResponse when a webhook does not arrive."""
+        from datetime import timedelta
+        from db import SessionLocal, RunwareTask, utc_naive_now
+        from routes import (
+            _apply_runware_job_result,
+            _claim_runware_task,
+            _release_runware_task,
+        )
+        import runware_client
+
+        await asyncio.sleep(20)
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(10)
+                db = SessionLocal()
+                try:
+                    cutoff = utc_naive_now() - timedelta(seconds=8)
+                    stale = (
+                        db.query(RunwareTask)
+                        .filter(
+                            RunwareTask.callback_received == False,  # noqa: E712
+                            RunwareTask.created_at < cutoff,
+                        )
+                        .limit(20)
+                        .all()
+                    )
+                    pending = [(rec.task_id, rec.job_id, rec.created_at) for rec in stale]
+                finally:
+                    db.close()
+                for task_id, job_id, created_at in pending:
+                    try:
+                        payload = await asyncio.to_thread(runware_client.get_response, task_id)
+                    except Exception:
+                        logger.exception("Runware getResponse failed for %s", task_id)
+                        continue
+                    created = created_at.replace(tzinfo=None) if created_at and created_at.tzinfo else created_at
+                    age = utc_naive_now() - created if created else timedelta(0)
+                    if runware_client.is_processing(payload):
+                        if age > timedelta(minutes=25):
+                            payload = {
+                                "errors": [
+                                    {
+                                        "taskUUID": task_id,
+                                        "message": "Runware task timed out",
+                                    }
+                                ]
+                            }
+                        else:
+                            continue
+                    claimed = _claim_runware_task(task_id)
+                    if not claimed:
+                        continue
+                    outcome = await _apply_runware_job_result(claimed, payload)
+                    if outcome == "processing":
+                        _release_runware_task(task_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Runware poll sweeper error")
+
     async def _idle_worker_reaper_task(self):
         """Reap idle workers"""
         from db import SessionLocal, Worker, Job

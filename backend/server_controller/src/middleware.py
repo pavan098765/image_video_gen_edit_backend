@@ -118,6 +118,7 @@ ALLOWED_PATHS: List[str] = [
     "/describe_asset_for_prompt",  # VLM caption from R2 key (Firebase auth)
     "/batch_status",           # Batch/variation status polling
     "/kie",
+    "/runware",
     "/admin",
     "/personal",
 ]
@@ -152,6 +153,7 @@ PUBLIC_PATHS: List[str] = [
     "/sales",
     "/ads/admob/ssv",  # AdMob SSV callback (called by Google, no auth)
     "/kie/callback",
+    "/runware/callback",
     "/personal/ui",
 ]
 

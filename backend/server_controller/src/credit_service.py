@@ -73,12 +73,31 @@ FALLBACK_CREDIT_COSTS: Dict[str, Dict[str, int]] = {
     "gemini_tts": {"cost": 12, "cost_upscale": 0, "offer": 0},
     "suno_music": {"cost": 15, "cost_upscale": 0, "offer": 0},
     "suno_sfx": {"cost": 8, "cost_upscale": 0, "offer": 0},
+    "flux2_klein_9b": {"cost": 10, "cost_upscale": 0, "offer": 0},
+    "flux2_klein_9b_edit": {"cost": 10, "cost_upscale": 0, "offer": 0},
+    "muse_image": {"cost": 10, "cost_upscale": 0, "offer": 0},
+    "muse_image_edit": {"cost": 10, "cost_upscale": 0, "offer": 0},
+    "p_image_upscale": {"cost": 8, "cost_upscale": 0, "offer": 0},
+    "realesrgan_upscale": {"cost": 5, "cost_upscale": 0, "offer": 0},
+    "xai_tts": {"cost": 8, "cost_upscale": 0, "offer": 0},
+    "qwen_voice_design": {"cost": 8, "cost_upscale": 0, "offer": 0},
+    "qwen_voice_clone": {"cost": 8, "cost_upscale": 0, "offer": 0},
+    "ace_step_music": {"cost": 25, "cost_upscale": 0, "offer": 0, "costPer60Sec": 25},
+    "minimax_music_26": {"cost": 100, "cost_upscale": 0, "offer": 0},
     "minimax_h3": {"cost": 35, "cost_upscale": 0, "offer": 0, "baseCost5Sec": 35, "maxDuration": 15},
     "ltx25_int8": {"cost": 35, "cost_upscale": 0, "offer": 0, "baseCost5Sec": 35, "maxDuration": 20},
     "ltx25_int8_t2v": {"cost": 35, "cost_upscale": 0, "offer": 0, "baseCost5Sec": 35, "maxDuration": 20},
     "ltx25_int8_i2v": {"cost": 35, "cost_upscale": 0, "offer": 0, "baseCost5Sec": 35, "maxDuration": 20},
     "ltx25_int8_flf2v": {"cost": 35, "cost_upscale": 0, "offer": 0, "baseCost5Sec": 35, "maxDuration": 20},
 }
+
+# Extra upscale pass a generate/edit job can chain. The add-on is that model's own cost.
+OUTPUT_UPSCALE_MODEL_IDS = frozenset({
+    "recraft_crisp_upscale",
+    "realesrgan_upscale",
+    "p_image_upscale",
+})
+
 
 # After sale discount, never charge below these list floors.
 IMAGE_SALE_FLOORS: Dict[str, int] = {
@@ -148,6 +167,9 @@ def _build_model_cost_map(config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 max_dur = m.get("maxDuration", m.get("max_duration"))
                 if max_dur is not None:
                     entry["maxDuration"] = int(max_dur)
+                per_minute = m.get("costPer60Sec", m.get("cost_per_60_sec"))
+                if per_minute is not None:
+                    entry["costPer60Sec"] = int(per_minute)
                 model_costs[model_id] = entry
         
         # 2. categories[].tools[] (fallback for configs with older structure)
@@ -219,6 +241,33 @@ def get_model_cost_info(model: str) -> Dict[str, int]:
     if model in tool_config:
         return tool_config[model]
     return FALLBACK_CREDIT_COSTS.get(model, FALLBACK_CREDIT_COSTS["default"])
+
+
+def _chosen_output_upscale(params: Optional[Dict[str, Any]]) -> str:
+    choice = str((params or {}).get("upscale_model") or "recraft_crisp_upscale").strip()
+    if choice not in OUTPUT_UPSCALE_MODEL_IDS:
+        return "recraft_crisp_upscale"
+    return choice
+
+
+def _chained_upscale_cost(
+    model: str,
+    params: Optional[Dict[str, Any]],
+    scale_factor: int,
+    is_vip: bool,
+    legacy_cost_upscale: int,
+) -> int:
+    """Credits for an extra upscale pass. Dedicated upscale tools already bill their own cost.
+
+    A chosen upscale_model bills that upscaler. Older clients only send scale_factor
+    and keep the source model's cost_upscale.
+    """
+    if scale_factor <= 1 or is_vip or model in OUTPUT_UPSCALE_MODEL_IDS:
+        return 0
+    if not str((params or {}).get("upscale_model") or "").strip():
+        return max(0, int(legacy_cost_upscale or 0))
+    info = get_model_cost_info(_chosen_output_upscale(params))
+    return max(0, int(info.get("cost") or 0))
 
 
 def _resolve_effective_offer(model_offer_percent: int) -> Tuple[int, Dict[str, Any]]:
@@ -482,6 +531,34 @@ def calculate_job_cost(
         except (ValueError, TypeError) as e:
             logger.warning(f"[CREDIT] Invalid duration for {model}: {duration_val}, error: {e}")
             # Fall through to standard calculation
+
+    # Music billed per minute (Kala Song): 25 credits at 60 seconds, scaled to the chosen length.
+    per_minute = cost_info.get("costPer60Sec")
+    if per_minute:
+        raw_duration = (params or {}).get("duration") or 60
+        try:
+            seconds = float(raw_duration)
+        except (TypeError, ValueError):
+            seconds = 60.0
+        seconds = max(30.0, min(300.0, seconds))
+        # Half-up, same as the app button (30s → 13, 60s → 25, 90s → 38, 120s → 50).
+        per_job_cost = max(1, int(float(per_minute) * seconds / 60.0 + 0.5))
+        if effective_offer_percent > 0:
+            per_job_cost = max(1, per_job_cost - int(per_job_cost * effective_offer_percent / 100))
+        variations_count = max(1, min(4, variations))
+        total = max(1, per_job_cost * variations_count)
+        logger.info(
+            f"[CREDIT] Per-minute cost for {model}: duration={seconds:.0f}s, "
+            f"per60={per_minute}, per_job={per_job_cost}, total={total}"
+        )
+        if return_meta:
+            return total, {
+                "model": model,
+                "pricing_type": "per_minute",
+                "effective_offer_percent": effective_offer_percent,
+                **offer_meta,
+            }
+        return total
     
     # Standard cost calculation for other models
     
@@ -491,7 +568,7 @@ def calculate_job_cost(
         and str((params or {}).get("resolution") or "1K").upper() == "2K"
     ):
         base_cost *= 2
-    upscale_cost = cost_info.get("cost_upscale", 5)
+    legacy_cost_upscale = int(cost_info.get("cost_upscale", 5) or 0)
     
     # Check if upscaling is enabled
     scale_factor = 1
@@ -504,18 +581,23 @@ def calculate_job_cost(
             except ValueError:
                 sf = 1
         scale_factor = int(sf) if sf else 1
+
+    upscale_cost = _chained_upscale_cost(
+        model, params, scale_factor, is_vip, legacy_cost_upscale
+    )
     
     # Calculate per-job cost
     per_job_cost = base_cost
     
-    # Add upscale cost if scale_factor > 1
-    # VIP BENEFIT: Free upscale for VIP users
-    if scale_factor > 1:
-        if is_vip:
-            logger.debug(f"[CREDIT] VIP user - FREE upscale (scale_factor={scale_factor})")
-        else:
-            per_job_cost += upscale_cost
-            logger.debug(f"[CREDIT] Adding upscale cost: {upscale_cost} (scale_factor={scale_factor})")
+    # Add the chosen upscaler's own price. VIP upscale stays free.
+    if upscale_cost:
+        per_job_cost += upscale_cost
+        logger.debug(
+            f"[CREDIT] Adding upscale cost: {upscale_cost} "
+            f"({_chosen_output_upscale(params)}, scale_factor={scale_factor})"
+        )
+    elif scale_factor > 1 and is_vip:
+        logger.debug(f"[CREDIT] VIP user - FREE upscale (scale_factor={scale_factor})")
     
     # Apply offer discount
     if effective_offer_percent > 0:

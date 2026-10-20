@@ -380,6 +380,180 @@
       "param_map": {
         "image": { "source": "params.init_image" }
       }
+    },
+    "flux2_klein_9b": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "runware:400@2",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": { "profile": "flux_image", "task_type": "imageInference", "output_format": "PNG" },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt"],
+      "param_map": {
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      }
+    },
+    "flux2_klein_9b_edit": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "runware:400@2",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": { "profile": "flux_image", "task_type": "imageInference", "output_format": "PNG" },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt", "referenceImages"],
+      "param_map": {
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "referenceImages": { "source": "params.init_image", "transform": "as_list" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      }
+    },
+    "muse_image": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "meta:muse@image",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": { "profile": "muse_image", "task_type": "imageInference", "output_format": "PNG" },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt"],
+      "param_map": {
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      }
+    },
+    "muse_image_edit": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "meta:muse@image",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": { "profile": "muse_image", "task_type": "imageInference", "output_format": "PNG" },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt", "referenceImages"],
+      "param_map": {
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "referenceImages": { "source": "params.init_image", "transform": "as_list" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      }
+    },
+    "p_image_upscale": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "prunaai:p-image@upscale",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": { "profile": "upscale_p", "task_type": "upscale", "output_format": "PNG" },
+      "required_params": ["image"],
+      "param_map": {
+        "image": { "source": "params.init_image" },
+        "upscaleFactor": { "source": "params.upscale_factor", "transform": "default:2|int_clamp:2:16" },
+        "enhanceDetails": { "source": "params.enhance_details", "transform": "bool" },
+        "realism": { "source": "params.realism", "transform": "bool" }
+      }
+    },
+    "realesrgan_upscale": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "runware:504@1",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": { "profile": "upscale_esrgan", "task_type": "upscale", "output_format": "PNG" },
+      "required_params": ["image"],
+      "param_map": {
+        "image": { "source": "params.init_image" },
+        "upscaleFactor": { "source": "params.upscale_factor", "transform": "default:2" }
+      }
+    },
+    "xai_tts": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "xai:tts@0",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": { "profile": "speech_xai", "task_type": "audioInference", "output_format": "MP3" },
+      "required_params": ["text"],
+      "param_map": {
+        "text": { "source": "prompt", "transform": "string_trim" },
+        "voice": { "source": "params.voice", "transform": "default:eve" },
+        "language": { "source": "params.language", "transform": "default:en" }
+      }
+    },
+    "qwen_voice_design": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "alibaba:qwen@3-tts-1.7b-voicedesign",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": { "profile": "speech_design", "task_type": "audioInference", "output_format": "MP3" },
+      "required_params": ["text", "positivePrompt"],
+      "param_map": {
+        "text": { "source": "prompt", "transform": "string_trim" },
+        "positivePrompt": { "source": "params.voice_description", "transform": "string_trim" },
+        "language": { "source": "params.language", "transform": "default:Auto" }
+      }
+    },
+    "qwen_voice_clone": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "alibaba:qwen@3-tts-1.7b-base",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": { "profile": "speech_clone", "task_type": "audioInference", "output_format": "MP3" },
+      "required_params": ["text", "audio"],
+      "param_map": {
+        "text": { "source": "prompt", "transform": "string_trim" },
+        "audio": { "source": "params.reference_audio" },
+        "language": { "source": "params.language", "transform": "default:Auto" }
+      }
+    },
+    "ace_step_music": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "runware:ace-step@v1.5-xl-sft",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": { "profile": "music_ace", "task_type": "audioInference", "output_format": "MP3" },
+      "required_params": ["positivePrompt"],
+      "param_map": {
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "duration": { "source": "params.duration", "transform": "default:60|int_clamp:30:300" },
+        "lyrics": { "source": "params.lyrics", "transform": "string_trim" }
+      }
+    },
+    "minimax_music_26": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "minimax:music@2.6",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": { "profile": "music_minimax", "task_type": "audioInference", "output_format": "MP3" },
+      "required_params": [],
+      "param_map": {
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "lyrics": { "source": "params.lyrics", "transform": "string_trim" }
+      }
     }
   }
 }

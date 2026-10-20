@@ -80,6 +80,7 @@ class ExternalExecutionResult:
     result_bytes: Optional[bytes] = None
     result_text: Optional[str] = None
     result_content_type: Optional[str] = None
+    provider: Optional[str] = None
 
 
 class ExternalApiRouter:
@@ -165,6 +166,8 @@ class ExternalApiRouter:
             return self._run_replicate(cfg, args)
         if provider == "kie":
             return self._run_kie(cfg, args, prompt or "", params or {})
+        if provider == "runware":
+            return self._run_runware(cfg, args, prompt or "", params or {})
         if provider == "gemini":
             return self._run_gemini(cfg, args, params or {})
         return ExternalExecutionResult(
@@ -288,6 +291,14 @@ class ExternalApiRouter:
                     continue
                 if not isinstance(out, list):
                     out = [out]
+                continue
+            if t == "bool":
+                if isinstance(out, str):
+                    raw = out.strip().lower()
+                    if raw in ("true", "1", "yes", "on"):
+                        out = True
+                    elif raw in ("false", "0", "no", "off", ""):
+                        out = False
                 continue
             # Unknown transform -> keep current value.
         return out
@@ -531,7 +542,51 @@ class ExternalApiRouter:
             success=True,
             pending=True,
             external_task_id=task_id,
+            provider="kie",
             raw={"taskId": task_id},
+        )
+
+    def _run_runware(
+        self,
+        cfg: Dict[str, Any],
+        args: Dict[str, Any],
+        prompt: str,
+        params: Dict[str, Any],
+    ) -> ExternalExecutionResult:
+        import runware_client
+
+        merged = dict(args)
+        if prompt and not merged.get("positivePrompt") and not merged.get("text"):
+            merged["prompt"] = prompt
+        for key in ("width", "height", "aspect_ratio"):
+            if key not in merged and params.get(key) not in (None, ""):
+                merged[key] = params.get(key)
+        try:
+            task_uuid = runware_client.new_task_uuid()
+            task = runware_client.assemble_task(
+                cfg, merged, task_uuid, runware_client.webhook_url()
+            )
+            body = runware_client.submit_task(task)
+        except Exception as e:
+            return ExternalExecutionResult(success=False, error=str(e), provider="runware")
+
+        url = runware_client.media_url(body)
+        if url:
+            return ExternalExecutionResult(
+                success=True,
+                result_url=url,
+                provider="runware",
+                raw=body if isinstance(body, dict) else None,
+            )
+        err = runware_client.failure_message(body)
+        if err:
+            return ExternalExecutionResult(success=False, error=err, provider="runware", raw=body)
+        return ExternalExecutionResult(
+            success=True,
+            pending=True,
+            external_task_id=task_uuid,
+            provider="runware",
+            raw=body if isinstance(body, dict) else {"taskUUID": task_uuid},
         )
 
     def _run_gemini(

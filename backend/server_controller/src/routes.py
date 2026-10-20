@@ -98,6 +98,7 @@ from db import (
     AdFreePurchase,
     Purchase,
     KieTask,
+    RunwareTask,
     PersonalQueueItem,
     get_app_config_int,
     create_audit_log,
@@ -551,6 +552,19 @@ def _prepare_external_params(params: Dict[str, Any]) -> Dict[str, Any]:
     if "image" in out and "init_image" not in out:
         out["init_image"] = out["image"]
 
+    # Any leftover "<name>_r2_key" becomes a presigned URL under "<name>".
+    for key in list(out.keys()):
+        if not str(key).endswith("_r2_key"):
+            continue
+        r2_key = out.get(key)
+        if not isinstance(r2_key, str) or not r2_key.strip():
+            continue
+        download_url = create_presigned_get_url(r2_key.strip(), expires_in=3600)
+        dest = str(key)[: -len("_r2_key")]
+        existing = out.get(dest)
+        if download_url and not (isinstance(existing, str) and existing.startswith("http")):
+            out[dest] = download_url
+
     # Strip internal metadata keys from params for provider payload mapping.
     for k in list(out.keys()):
         if str(k).startswith("_"):
@@ -588,6 +602,18 @@ def _store_external_result(job_id: str, model: str, result: ExternalExecutionRes
         elif path.endswith(".mp4"):
             ext = "mp4"
             content_type = "video/mp4"
+        elif path.endswith(".mp3"):
+            ext = "mp3"
+            content_type = "audio/mpeg"
+        elif path.endswith(".wav"):
+            ext = "wav"
+            content_type = "audio/wav"
+        elif path.endswith(".ogg"):
+            ext = "ogg"
+            content_type = "audio/ogg"
+        elif path.endswith(".flac"):
+            ext = "flac"
+            content_type = "audio/flac"
     if not body:
         raise RuntimeError("Empty external result")
     key = f"results/{model}/{job_id}.{ext}"
@@ -3231,10 +3257,26 @@ def _scale_requested(params: Dict[str, Any]) -> bool:
         return False
 
 
-def _should_chain_kie_upscale(model: str, params: Dict[str, Any]) -> bool:
-    if model == "recraft_crisp_upscale" or params.get("_kie_upscale_started"):
-        return False
-    return _scale_requested(params)
+_RUNWARE_UPSCALE_SPECS = {
+    "realesrgan_upscale": ("runware:504@1", "upscale_esrgan"),
+    "p_image_upscale": ("prunaai:p-image@upscale", "upscale_p"),
+}
+
+
+def _output_upscale_choice(model: str, params: Dict[str, Any]) -> Optional[str]:
+    """Which extra upscale to run, if the client asked for one."""
+    from credit_service import OUTPUT_UPSCALE_MODEL_IDS
+
+    if model in OUTPUT_UPSCALE_MODEL_IDS:
+        return None
+    if params.get("_kie_upscale_started") or params.get("_runware_upscale_started"):
+        return None
+    if not _scale_requested(params):
+        return None
+    choice = str(params.get("upscale_model") or "recraft_crisp_upscale").strip()
+    if choice not in OUTPUT_UPSCALE_MODEL_IDS:
+        choice = "recraft_crisp_upscale"
+    return choice
 
 
 async def _chain_kie_upscale(db, job, source_url: str, params: Dict[str, Any]) -> bool:
@@ -3282,10 +3324,8 @@ async def _apply_kie_job_result(job_id: str, payload: Dict[str, Any]) -> None:
         if kie_client.is_success_code(payload) and urls:
             source_url = urls[0]
             params = dict(job.params or {})
-            if _should_chain_kie_upscale(job.model, params):
-                chained = await _chain_kie_upscale(db, job, source_url, params)
-                if chained:
-                    return
+            if await _chain_output_upscale(db, job, source_url, params):
+                return
             params["_kie_result_url"] = source_url
             try:
                 output_url = kie_client.download_url_for(source_url)
@@ -3383,6 +3423,205 @@ async def kie_callback(request: Request):
     finally:
         db.close()
     await _apply_kie_job_result(job_id, payload)
+    return {"ok": True}
+
+
+def _claim_runware_task(task_id: str) -> Optional[str]:
+    """Mark the task claimed. Returns the job id, or None when already handled."""
+    db = SessionLocal()
+    try:
+        rec = (
+            db.query(RunwareTask)
+            .filter(
+                RunwareTask.task_id == task_id,
+                RunwareTask.callback_received == False,  # noqa: E712
+            )
+            .first()
+        )
+        if not rec:
+            return None
+        rec.callback_received = True
+        rec.updated_at = utc_naive_now()
+        job_id = rec.job_id
+        db.commit()
+        return job_id
+    finally:
+        db.close()
+
+
+def _release_runware_task(task_id: str) -> None:
+    db = SessionLocal()
+    try:
+        rec = db.query(RunwareTask).filter(RunwareTask.task_id == task_id).first()
+        if not rec:
+            return
+        rec.callback_received = False
+        rec.updated_at = utc_naive_now()
+        db.commit()
+    finally:
+        db.close()
+
+
+async def _chain_output_upscale(db, job, source_url: str, params: Dict[str, Any]) -> bool:
+    """Run the upscaler the client picked. Crisp stays on Kie; the other two are Runware."""
+    choice = _output_upscale_choice(job.model, params)
+    if not choice:
+        return False
+    if choice == "recraft_crisp_upscale":
+        return await _chain_kie_upscale(db, job, source_url, params)
+    return await _chain_runware_upscale(db, job, source_url, params, choice)
+
+
+async def _chain_runware_upscale(
+    db, job, source_url: str, params: Dict[str, Any], upscale_model: str
+) -> bool:
+    """2× General Upscale or Fine Upscale on the same job."""
+    import runware_client
+
+    spec = _RUNWARE_UPSCALE_SPECS.get(upscale_model)
+    if not spec or params.get("_runware_upscale_started"):
+        return False
+    model_id, profile = spec
+    task_uuid = runware_client.new_task_uuid()
+    try:
+        task = runware_client.assemble_task(
+            {
+                "provider": {"model_id": model_id},
+                "runware": {
+                    "profile": profile,
+                    "task_type": "upscale",
+                    "output_format": "PNG",
+                },
+            },
+            {"image": source_url, "upscaleFactor": 2},
+            task_uuid,
+            runware_client.webhook_url(),
+        )
+        await asyncio.to_thread(runware_client.submit_task, task)
+    except Exception:
+        logger.exception("[RUNWARE] upscale chain failed for %s", job.job_id)
+        return False
+    db.add(RunwareTask(task_id=task_uuid, job_id=job.job_id, model=upscale_model))
+    params["_runware_upscale_started"] = True
+    params["upscale_model"] = upscale_model
+    job.params = params
+    db.commit()
+    logger.info("[RUNWARE] Job %s chaining %s task %s", job.job_id, upscale_model, task_uuid)
+    return True
+
+
+async def _apply_runware_job_result(job_id: str, payload: Dict[str, Any]) -> str:
+    """Apply a Runware payload. Returns applied, failed, processing, or ignored."""
+    import runware_client
+
+    if runware_client.is_processing(payload):
+        return "processing"
+
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if not job:
+            logger.error("[RUNWARE] job %s not found", job_id)
+            return "ignored"
+        if job.status in (JobState.COMPLETED.value, JobState.FAILED.value, JobState.CANCELLED.value):
+            logger.info("[RUNWARE] job %s already terminal (%s)", job_id, job.status)
+            return "ignored"
+
+        url = runware_client.media_url(payload)
+        if url:
+            params = dict(job.params or {})
+            if await _chain_output_upscale(db, job, url, params):
+                return "applied"
+            stored_key = None
+            output_url = url
+            try:
+                stored = ExternalExecutionResult(success=True, result_url=url)
+                stored_key, output_url = _store_external_result(job_id, job.model, stored)
+            except Exception:
+                logger.exception("[RUNWARE] store failed for %s; keeping provider URL", job_id)
+                stored_key = None
+                output_url = url
+            if _job_manager:
+                if stored_key:
+                    _job_manager.mark_completed(job_id, result_r2_key=stored_key)
+                    output_url = create_presigned_get_url(stored_key, expires_in=3600) or output_url
+                else:
+                    _job_manager.mark_completed(job_id, output_url=output_url)
+            else:
+                job.status = JobState.COMPLETED.value
+                job.result_r2_key = stored_key
+                job.output_url = None if stored_key else output_url
+                job.completed_at = utc_naive_now()
+                job.updated_at = utc_naive_now()
+                db.commit()
+                if stored_key:
+                    output_url = create_presigned_get_url(stored_key, expires_in=3600) or output_url
+            job = db.query(Job).filter(Job.job_id == job_id).first()
+            meta = job.params if isinstance(job.params, dict) else {}
+            await _send_job_notification(
+                token=job.fcm_token,
+                job_id=job.job_id,
+                model=job.model,
+                success=True,
+                download_url=output_url,
+                batch_id=meta.get("_batch_id"),
+                variation_index=int(meta.get("_variation_index", 0) or 0),
+                total_variations=int(meta.get("_total_variations", 1) or 1),
+            )
+            clear_cached_job_params(job_id)
+            return "applied"
+
+        err = runware_client.failure_message(payload) or "Runware task failed"
+        logger.error("[RUNWARE] job %s failed: %s", job_id, err)
+        if _job_manager:
+            _job_manager.mark_failed(job_id, err, worker_id=None)
+        else:
+            job.status = JobState.FAILED.value
+            job.error = err
+            job.updated_at = utc_naive_now()
+            db.commit()
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        meta = job.params if isinstance(job.params, dict) else {}
+        await _send_job_notification(
+            token=job.fcm_token,
+            job_id=job.job_id,
+            model=job.model,
+            success=False,
+            batch_id=meta.get("_batch_id"),
+            variation_index=int(meta.get("_variation_index", 0) or 0),
+            total_variations=int(meta.get("_total_variations", 1) or 1),
+        )
+        clear_cached_job_params(job_id)
+        return "failed"
+    finally:
+        db.close()
+
+
+@public_router.post("/runware/callback")
+async def runware_callback(request: Request, token: str = ""):
+    import runware_client
+
+    if not runware_client.verify_webhook_token(token):
+        raise HTTPException(status_code=401, detail="Invalid webhook token")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if isinstance(payload, list):
+        payload = {"data": payload}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    task_id = runware_client.task_uuid_of(payload)
+    if not task_id:
+        raise HTTPException(status_code=400, detail="Missing taskUUID")
+    if runware_client.is_processing(payload):
+        return {"ok": True, "pending": True}
+    job_id = _claim_runware_task(task_id)
+    if not job_id:
+        return {"ok": True, "duplicate": True}
+    outcome = await _apply_runware_job_result(job_id, payload)
+    if outcome == "processing":
+        _release_runware_task(task_id)
     return {"ok": True}
 
 
@@ -4106,7 +4345,14 @@ async def submit_job(
             "ltx25_int8", "ltx25_int8_t2v", "ltx25_int8_i2v", "ltx25_int8_flf2v",
         }
         TEXT_OUTPUT_MODELS = {"glm_ocr"}
-        AUDIO_OUTPUT_MODELS = {"minimax_music3"}
+        AUDIO_OUTPUT_MODELS = {
+            "minimax_music3",
+            "xai_tts",
+            "qwen_voice_design",
+            "qwen_voice_clone",
+            "ace_step_music",
+            "minimax_music_26",
+        }
         model_l = model.lower()
         is_video_model = model_l in VIDEO_MODELS or "video" in model_l
         is_text_output_model = model_l in TEXT_OUTPUT_MODELS
@@ -4744,7 +4990,28 @@ async def _dispatch_to_external_api(job_id: str, retry_count: int = 0) -> bool:
         )
 
         if result.pending and result.external_task_id:
-            from db import KieTask
+            if result.provider == "runware":
+                existing = (
+                    db.query(RunwareTask)
+                    .filter(RunwareTask.task_id == result.external_task_id)
+                    .first()
+                )
+                if not existing:
+                    db.add(
+                        RunwareTask(
+                            task_id=result.external_task_id,
+                            job_id=job_id,
+                            model=job.model,
+                        )
+                    )
+                job_row = db.query(Job).filter(Job.job_id == job_id).first()
+                if job_row:
+                    params = dict(job_row.params or {})
+                    params["_runware_task_id"] = result.external_task_id
+                    job_row.params = params
+                db.commit()
+                logger.info("[RUNWARE] Job %s submitted task %s", job_id, result.external_task_id)
+                return True
             existing = db.query(KieTask).filter(KieTask.task_id == result.external_task_id).first()
             if not existing:
                 db.add(
