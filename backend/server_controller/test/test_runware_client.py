@@ -125,6 +125,7 @@ def test_speech_and_music_shapes():
     )
     assert clone["speech"]["voice"] == "clone"
     assert clone["inputs"]["audio"] == "https://cdn.example/voice.mp3"
+    assert clone["settings"] == {"xVectorOnly": True}
 
     ace = assemble_task(
         _cfg("music_ace", "runware:ace-step@v1.5-xl-sft", "audioInference", "MP3"),

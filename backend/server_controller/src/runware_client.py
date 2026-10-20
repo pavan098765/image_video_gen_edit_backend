@@ -289,6 +289,13 @@ def _fill_clone_speech(task: Dict[str, Any], args: Dict[str, Any]) -> None:
         "voice": "clone",
         "language": language,
     }
+    # ICL mode requires a transcript of the sample. The app only sends the
+    # recording, so use speaker embedding unless a transcript is provided.
+    transcript = _clean_text(args.get("transcript"))
+    if transcript:
+        task["settings"] = {"transcript": transcript[:2000], "xVectorOnly": False}
+    else:
+        task["settings"] = {"xVectorOnly": True}
 
 
 def _fill_ace(task: Dict[str, Any], args: Dict[str, Any]) -> None:
