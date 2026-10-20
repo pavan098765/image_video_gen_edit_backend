@@ -297,26 +297,63 @@ def _fill_ace(task: Dict[str, Any], args: Dict[str, Any]) -> None:
         raise ValueError("Describe the music in at least a few words")
     task["positivePrompt"] = prompt[:3000]
     duration = _as_int(args.get("duration")) or 60
-    task["duration"] = max(30, min(300, duration))
+    task["duration"] = max(30, min(240, duration))
     task["steps"] = 50
+    negative = _clean_text(args.get("negativePrompt"))
+    if len(negative) >= 2:
+        task["negativePrompt"] = negative[:3000]
+    settings: Dict[str, Any] = {}
     lyrics = _clean_text(args.get("lyrics"))
     if len(lyrics) >= 10:
-        task["settings"] = {"lyrics": lyrics[:3000]}
+        settings["lyrics"] = lyrics[:3000]
+    bpm = _as_int(args.get("bpm"))
+    if bpm is not None:
+        settings["bpm"] = max(30, min(300, bpm))
+    key_scale = _clean_text(args.get("keyScale"))
+    if key_scale and key_scale.lower() != "auto":
+        settings["keyScale"] = key_scale[:40]
+    meter = _as_int(args.get("timeSignature"))
+    if meter in (2, 3, 4, 6):
+        settings["timeSignature"] = meter
+    language = _clean_text(args.get("vocalLanguage"))
+    if language and language.lower() not in ("auto", ""):
+        settings["vocalLanguage"] = "unknown" if language.lower() == "unknown" else language[:8]
+    if settings:
+        task["settings"] = settings
 
 
 def _fill_minimax(task: Dict[str, Any], args: Dict[str, Any]) -> None:
     prompt = _clean_text(args.get("positivePrompt") or args.get("prompt"))
     lyrics = _clean_text(args.get("lyrics"))
-    if lyrics:
+    instrumental = _as_bool(args.get("instrumental"))
+    optimizer = _as_bool(args.get("lyricsOptimizer")) is True
+    negative = _clean_text(args.get("negativePrompt"))
+    if instrumental is True:
+        lyrics = ""
+        optimizer = False
+    if not lyrics and not optimizer and instrumental is not False:
+        instrumental = True
+    if instrumental is True:
+        if len(prompt) < 1:
+            raise ValueError("Describe the track")
+        task["positivePrompt"] = prompt[:2000]
+        task["settings"] = {"instrumental": True}
+    elif lyrics:
         if not prompt:
             prompt = "Vocal song matching the lyrics"
         task["positivePrompt"] = prompt[:2000]
-        task["settings"] = {"lyrics": lyrics[:3500], "lyricsOptimizer": False}
-        return
-    if not prompt:
-        raise ValueError("Describe the track, or add lyrics")
-    task["positivePrompt"] = prompt[:2000]
-    task["settings"] = {"instrumental": True}
+        task["settings"] = {
+            "lyrics": lyrics[:3500],
+            "instrumental": False,
+            "lyricsOptimizer": optimizer,
+        }
+    elif optimizer and prompt:
+        task["positivePrompt"] = prompt[:2000]
+        task["settings"] = {"lyricsOptimizer": True, "instrumental": False}
+    else:
+        raise ValueError("Add lyrics, or turn vocals off")
+    if len(negative) >= 1 and instrumental is not True:
+        task["negativePrompt"] = negative[:3500]
 
 
 def _walk_tasks(payload: Any) -> List[Dict[str, Any]]:

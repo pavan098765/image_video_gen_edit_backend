@@ -537,8 +537,13 @@
       "required_params": ["positivePrompt"],
       "param_map": {
         "positivePrompt": { "source": "prompt", "transform": "string_trim" },
-        "duration": { "source": "params.duration", "transform": "default:60|int_clamp:30:300" },
-        "lyrics": { "source": "params.lyrics", "transform": "string_trim" }
+        "duration": { "source": "params.duration", "transform": "default:60|int_clamp:30:240" },
+        "lyrics": { "source": "params.lyrics", "transform": "string_trim" },
+        "negativePrompt": { "source": "params.negative_prompt", "transform": "string_trim" },
+        "bpm": { "source": "params.bpm", "transform": "int_or_null" },
+        "keyScale": { "source": "params.key_scale", "transform": "string_trim" },
+        "timeSignature": { "source": "params.time_signature", "transform": "int_or_null" },
+        "vocalLanguage": { "source": "params.vocal_language", "transform": "string_trim" }
       }
     },
     "minimax_music_26": {
@@ -552,7 +557,10 @@
       "required_params": [],
       "param_map": {
         "positivePrompt": { "source": "prompt", "transform": "string_trim" },
-        "lyrics": { "source": "params.lyrics", "transform": "string_trim" }
+        "lyrics": { "source": "params.lyrics", "transform": "string_trim" },
+        "negativePrompt": { "source": "params.negative_prompt", "transform": "string_trim" },
+        "instrumental": { "source": "params.instrumental", "transform": "bool" },
+        "lyricsOptimizer": { "source": "params.lyrics_optimizer", "transform": "bool" }
       }
     }
   }

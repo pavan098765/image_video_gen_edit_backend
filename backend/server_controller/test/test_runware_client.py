@@ -134,6 +134,26 @@ def test_speech_and_music_shapes():
     assert ace["duration"] == 30
     assert "settings" not in ace
 
+    arranged = assemble_task(
+        _cfg("music_ace", "runware:ace-step@v1.5-xl-sft", "audioInference", "MP3"),
+        {
+            "positivePrompt": "soft piano",
+            "duration": 90,
+            "lyrics": "[Verse]\nHome again tonight",
+            "bpm": 96,
+            "keyScale": "D major",
+            "timeSignature": 3,
+            "vocalLanguage": "en",
+            "negativePrompt": "no drums",
+        },
+        "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    )
+    assert arranged["duration"] == 90
+    assert arranged["settings"]["bpm"] == 96
+    assert arranged["settings"]["keyScale"] == "D major"
+    assert arranged["settings"]["timeSignature"] == 3
+    assert arranged["negativePrompt"] == "no drums"
+
     instrumental = assemble_task(
         _cfg("music_minimax", "minimax:music@2.6", "audioInference", "MP3"),
         {"positivePrompt": "city lights"},
@@ -147,7 +167,8 @@ def test_speech_and_music_shapes():
         "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
     )
     assert vocal["settings"]["lyrics"].startswith("[Chorus]")
-    assert "instrumental" not in vocal["settings"]
+    assert vocal["settings"]["instrumental"] is False
+    assert vocal["settings"]["lyricsOptimizer"] is False
 
 
 def test_response_parser_covers_webhook_poll_and_errors():

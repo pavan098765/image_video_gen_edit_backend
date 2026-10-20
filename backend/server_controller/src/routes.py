@@ -4273,6 +4273,8 @@ async def submit_job(
     # VIP benefits: Free upscale
     # Total cost = per_job_cost * variations * num_images
     # For video_upscaler: dynamic cost based on video_duration (2 credits per 5 seconds)
+    if model in ("xai_tts", "qwen_voice_design", "qwen_voice_clone"):
+        full_params["speech_text"] = payload.prompt or full_params.get("prompt") or ""
     credit_cost = get_credit_cost(
         model, 
         full_params, 

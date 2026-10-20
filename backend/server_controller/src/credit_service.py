@@ -79,10 +79,10 @@ FALLBACK_CREDIT_COSTS: Dict[str, Dict[str, int]] = {
     "muse_image_edit": {"cost": 10, "cost_upscale": 0, "offer": 0},
     "p_image_upscale": {"cost": 8, "cost_upscale": 0, "offer": 0},
     "realesrgan_upscale": {"cost": 5, "cost_upscale": 0, "offer": 0},
-    "xai_tts": {"cost": 8, "cost_upscale": 0, "offer": 0},
-    "qwen_voice_design": {"cost": 8, "cost_upscale": 0, "offer": 0},
-    "qwen_voice_clone": {"cost": 8, "cost_upscale": 0, "offer": 0},
-    "ace_step_music": {"cost": 25, "cost_upscale": 0, "offer": 0, "costPer60Sec": 25},
+    "xai_tts": {"cost": 15, "cost_upscale": 0, "offer": 0, "costPer60Sec": 15, "speechCharsPerMin": 600},
+    "qwen_voice_design": {"cost": 15, "cost_upscale": 0, "offer": 0, "costPer60Sec": 15, "speechCharsPerMin": 600},
+    "qwen_voice_clone": {"cost": 15, "cost_upscale": 0, "offer": 0, "costPer60Sec": 15, "speechCharsPerMin": 600},
+    "ace_step_music": {"cost": 25, "cost_upscale": 0, "offer": 0, "costPer60Sec": 25, "maxDuration": 240},
     "minimax_music_26": {"cost": 100, "cost_upscale": 0, "offer": 0},
     "minimax_h3": {"cost": 35, "cost_upscale": 0, "offer": 0, "baseCost5Sec": 35, "maxDuration": 15},
     "ltx25_int8": {"cost": 35, "cost_upscale": 0, "offer": 0, "baseCost5Sec": 35, "maxDuration": 20},
@@ -170,6 +170,9 @@ def _build_model_cost_map(config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 per_minute = m.get("costPer60Sec", m.get("cost_per_60_sec"))
                 if per_minute is not None:
                     entry["costPer60Sec"] = int(per_minute)
+                chars_per_min = m.get("speechCharsPerMin", m.get("speech_chars_per_min"))
+                if chars_per_min is not None:
+                    entry["speechCharsPerMin"] = int(chars_per_min)
                 model_costs[model_id] = entry
         
         # 2. categories[].tools[] (fallback for configs with older structure)
@@ -532,6 +535,34 @@ def calculate_job_cost(
             logger.warning(f"[CREDIT] Invalid duration for {model}: {duration_val}, error: {e}")
             # Fall through to standard calculation
 
+    # Speech: 15 credits per minute, estimated at 600 characters of script.
+    chars_per_min = cost_info.get("speechCharsPerMin")
+    if model in ("xai_tts", "qwen_voice_design", "qwen_voice_clone"):
+        chars_per_min = int(chars_per_min or 600)
+    if chars_per_min:
+        per_minute_cost = int(cost_info.get("costPer60Sec") or 15)
+        script = str((params or {}).get("speech_text") or (params or {}).get("prompt") or "").strip()
+        if not script:
+            per_job_cost = max(1, per_minute_cost)
+        else:
+            per_job_cost = max(1, int(per_minute_cost * len(script) / float(chars_per_min) + 0.5))
+        if effective_offer_percent > 0:
+            per_job_cost = max(1, per_job_cost - int(per_job_cost * effective_offer_percent / 100))
+        variations_count = max(1, min(4, variations))
+        total = max(1, per_job_cost * variations_count)
+        logger.info(
+            f"[CREDIT] Speech cost for {model}: chars={len(script)}, "
+            f"per60={per_minute_cost}, per_job={per_job_cost}, total={total}"
+        )
+        if return_meta:
+            return total, {
+                "model": model,
+                "pricing_type": "speech_characters",
+                "effective_offer_percent": effective_offer_percent,
+                **offer_meta,
+            }
+        return total
+
     # Music billed per minute (Kala Song): 25 credits at 60 seconds, scaled to the chosen length.
     per_minute = cost_info.get("costPer60Sec")
     if per_minute:
@@ -540,7 +571,8 @@ def calculate_job_cost(
             seconds = float(raw_duration)
         except (TypeError, ValueError):
             seconds = 60.0
-        seconds = max(30.0, min(300.0, seconds))
+        max_seconds = float(cost_info.get("maxDuration") or 240)
+        seconds = max(30.0, min(max_seconds, seconds))
         # Half-up, same as the app button (30s → 13, 60s → 25, 90s → 38, 120s → 50).
         per_job_cost = max(1, int(float(per_minute) * seconds / 60.0 + 0.5))
         if effective_offer_percent > 0:
