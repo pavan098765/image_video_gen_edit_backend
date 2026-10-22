@@ -565,6 +565,24 @@ def _prepare_external_params(params: Dict[str, Any]) -> Dict[str, Any]:
         if download_url and not (isinstance(existing, str) and existing.startswith("http")):
             out[dest] = download_url
 
+    for key in list(out.keys()):
+        if not str(key).endswith("_r2_keys"):
+            continue
+        values = out.get(key)
+        if not isinstance(values, list):
+            continue
+        urls: List[str] = []
+        for item in values:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            download_url = create_presigned_get_url(item.strip(), expires_in=3600)
+            if download_url:
+                urls.append(download_url)
+        dest = str(key)[: -len("_r2_keys")]
+        existing = out.get(dest)
+        if urls and not existing:
+            out[dest] = urls
+
     # Strip internal metadata keys from params for provider payload mapping.
     for k in list(out.keys()):
         if str(k).startswith("_"):
@@ -3308,6 +3326,193 @@ async def _chain_kie_upscale(db, job, source_url: str, params: Dict[str, Any]) -
     return True
 
 
+def _stash_suno_submission(db, job_id: str, result: ExternalExecutionResult) -> None:
+    """Keep the Suno pipeline state on the job before the callback arrives."""
+    raw = result.raw if isinstance(result.raw, dict) else {}
+    if "suno_context" not in raw and "music" not in raw:
+        return
+    job_row = db.query(Job).filter(Job.job_id == job_id).first()
+    if not job_row:
+        return
+    params = dict(job_row.params or {})
+    if isinstance(raw.get("suno_context"), dict):
+        params["_suno"] = raw["suno_context"]
+    if isinstance(raw.get("music"), dict):
+        params["_music"] = raw["music"]
+    job_row.params = params
+    db.commit()
+
+
+def _public_suno_music(job: Job) -> Optional[Dict[str, Any]]:
+    if job.model != "suno_v6":
+        return None
+    music = (job.params or {}).get("_music") if isinstance(job.params, dict) else None
+    if not isinstance(music, dict):
+        return None
+    return dict(music)
+
+
+def _mint_suno_url(url: Optional[str]) -> Optional[str]:
+    import kie_client
+
+    if not isinstance(url, str) or not url.startswith("http"):
+        return url
+    try:
+        return kie_client.download_url_for(url)
+    except Exception as exc:
+        logger.warning("[SUNO] download link was not minted: %s", exc)
+        return url
+
+
+async def _complete_suno_job(db, job, params: Dict[str, Any], primary_url: Optional[str]) -> None:
+    music = dict(params.get("_music") or {})
+    tracks = []
+    for track in music.get("tracks") or []:
+        if not isinstance(track, dict):
+            continue
+        item = dict(track)
+        if item.get("audio_url"):
+            item["download_url"] = await asyncio.to_thread(_mint_suno_url, item.get("audio_url"))
+        tracks.append(item)
+    if tracks:
+        music["tracks"] = tracks
+    if music.get("video_url"):
+        music["video_download_url"] = await asyncio.to_thread(_mint_suno_url, music.get("video_url"))
+    stems = []
+    for stem in music.get("stems") or []:
+        if not isinstance(stem, dict):
+            continue
+        item = dict(stem)
+        if item.get("url"):
+            item["download_url"] = await asyncio.to_thread(_mint_suno_url, item.get("url"))
+        stems.append(item)
+    if stems:
+        music["stems"] = stems
+    music["download_minted_at"] = time.time()
+    params["_music"] = music
+    output_url = None
+    if primary_url:
+        params["_kie_result_url"] = primary_url
+        output_url = await asyncio.to_thread(_mint_suno_url, primary_url)
+    job.params = params
+    db.commit()
+    if _job_manager:
+        _job_manager.mark_completed(job.job_id, output_url=output_url)
+    else:
+        job.status = JobState.COMPLETED.value
+        job.output_url = output_url
+        job.completed_at = utc_naive_now()
+        job.updated_at = utc_naive_now()
+        db.commit()
+    done = db.query(Job).filter(Job.job_id == job.job_id).first()
+    meta = done.params if done and isinstance(done.params, dict) else {}
+    await _send_job_notification(
+        token=done.fcm_token if done else None,
+        job_id=job.job_id,
+        model=job.model,
+        success=True,
+        download_url=output_url,
+        batch_id=meta.get("_batch_id"),
+        variation_index=int(meta.get("_variation_index", 0) or 0),
+        total_variations=int(meta.get("_total_variations", 1) or 1),
+    )
+    clear_cached_job_params(job.job_id)
+
+
+async def _fail_suno_job(db, job, params: Dict[str, Any], error: str) -> None:
+    job.params = params
+    db.commit()
+    if _job_manager:
+        _job_manager.mark_failed(job.job_id, error, worker_id=None)
+    else:
+        job.status = JobState.FAILED.value
+        job.error = error
+        job.updated_at = utc_naive_now()
+        db.commit()
+    done = db.query(Job).filter(Job.job_id == job.job_id).first()
+    meta = done.params if done and isinstance(done.params, dict) else {}
+    await _send_job_notification(
+        token=done.fcm_token if done else None,
+        job_id=job.job_id,
+        model=job.model,
+        success=False,
+        batch_id=meta.get("_batch_id"),
+        variation_index=int(meta.get("_variation_index", 0) or 0),
+        total_variations=int(meta.get("_total_variations", 1) or 1),
+    )
+    clear_cached_job_params(job.job_id)
+
+
+async def _apply_suno_v6(db, job, payload: Dict[str, Any]) -> None:
+    """Advance the lyrics → song → cover pipeline, or finish a follow-up action."""
+    import kie_client
+    import suno_v6
+    from db import KieTask
+
+    if job.status in (JobState.COMPLETED.value, JobState.FAILED.value, JobState.CANCELLED.value):
+        logger.info("[SUNO] job %s already terminal (%s)", job.job_id, job.status)
+        return
+    params = dict(job.params or {})
+    context = params.get("_suno") if isinstance(params.get("_suno"), dict) else {}
+    music = params.get("_music") if isinstance(params.get("_music"), dict) else {}
+    step = suno_v6.advance(context, music, suno_v6.interpret(payload))
+    params["_suno"] = step["context"]
+    params["_music"] = step["music"]
+
+    if step["action"] == "update":
+        job.params = params
+        job.updated_at = utc_naive_now()
+        db.commit()
+        return
+
+    if step["action"] == "submit":
+        public = (os.getenv("CONTROLLER_PUBLIC_URL") or os.getenv("CONTROLLER_URL") or "").rstrip("/")
+        if not public:
+            await _fail_suno_job(db, job, params, "CONTROLLER_PUBLIC_URL is required for Kie callBackUrl")
+            return
+        try:
+            task_id = await asyncio.to_thread(
+                kie_client.create_task,
+                step["kie_model"],
+                step["kie_input"],
+                f"{public}/kie/callback",
+            )
+        except Exception as exc:
+            logger.exception("[SUNO] follow-up task failed for %s", job.job_id)
+            if step.get("optional"):
+                note = dict(params.get("_music") or {})
+                note["note"] = "Extra covers were not ready. Each version still has its own cover."
+                note["phase"] = "complete"
+                note["label"] = "Ready"
+                params["_music"] = note
+                suno_state = dict(params.get("_suno") or {})
+                suno_state["phase"] = "done"
+                params["_suno"] = suno_state
+                await _complete_suno_job(db, job, params, step.get("primary_url"))
+                return
+            await _fail_suno_job(db, job, params, str(exc))
+            return
+        db.add(KieTask(task_id=task_id, job_id=job.job_id, model="suno_v6"))
+        if step.get("kie_model") == "ai-music-api/generate":
+            suno_state = dict(params.get("_suno") or {})
+            suno_state["music_task_id"] = task_id
+            params["_suno"] = suno_state
+            music_state = dict(params.get("_music") or {})
+            music_state["task_id"] = task_id
+            params["_music"] = music_state
+        params["_kie_task_id"] = task_id
+        job.params = params
+        job.updated_at = utc_naive_now()
+        db.commit()
+        logger.info("[SUNO] Job %s chained %s as %s", job.job_id, step.get("kie_model"), task_id)
+        return
+
+    if step["action"] == "finish":
+        await _complete_suno_job(db, job, params, step.get("primary_url"))
+        return
+    await _fail_suno_job(db, job, params, step.get("error") or "Music generation failed")
+
+
 async def _apply_kie_job_result(job_id: str, payload: Dict[str, Any]) -> None:
     import kie_client
 
@@ -3316,6 +3521,9 @@ async def _apply_kie_job_result(job_id: str, payload: Dict[str, Any]) -> None:
         job = db.query(Job).filter(Job.job_id == job_id).first()
         if not job:
             logger.error("[KIE] job %s not found for callback", job_id)
+            return
+        if job.model == "suno_v6":
+            await _apply_suno_v6(db, job, payload)
             return
         if job.status in (JobState.COMPLETED.value, JobState.FAILED.value, JobState.CANCELLED.value):
             logger.info("[KIE] job %s already terminal (%s)", job_id, job.status)
@@ -3416,13 +3624,32 @@ async def kie_callback(request: Request):
             return {"ok": True, "ignored": True}
         if rec.callback_received:
             return {"ok": True, "duplicate": True}
-        rec.callback_received = True
-        rec.updated_at = utc_naive_now()
         job_id = rec.job_id
-        db.commit()
+        partial = False
+        defer_claim = rec.model == "suno_v6"
+        if defer_claim:
+            import suno_v6
+            disposition = suno_v6.interpret(payload).get("disposition")
+            partial = disposition in ("pending", "progress")
+        if not defer_claim:
+            rec.callback_received = True
+            rec.updated_at = utc_naive_now()
+            db.commit()
     finally:
         db.close()
     await _apply_kie_job_result(job_id, payload)
+    if defer_claim and not partial:
+        claim_db = SessionLocal()
+        try:
+            claimed = claim_db.query(KieTask).filter(KieTask.task_id == task_id).first()
+            if claimed and not claimed.callback_received:
+                claimed.callback_received = True
+                claimed.updated_at = utc_naive_now()
+                claim_db.commit()
+        finally:
+            claim_db.close()
+    if partial:
+        return {"ok": True, "partial": True}
     return {"ok": True}
 
 
@@ -4135,6 +4362,9 @@ async def submit_job(
     max_variations = 4 if is_vip else 2
     requested_variations = payload.variations
     variations = max(1, min(max_variations, requested_variations))
+    if model == "suno_v6":
+        # One request already returns both song versions.
+        variations = 1
     
     # If user requested more variations than allowed, notify them
     if requested_variations > max_variations:
@@ -4151,8 +4381,35 @@ async def submit_job(
     images_to_process = []
     using_r2_images = False   # True when images come from presigned R2 uploads
     r2_input_keys = []        # Track all input R2 keys for cleanup after job completion
-    
-    if payload.input_image_r2_keys and len(payload.input_image_r2_keys) > 0:
+
+    if model == "suno_v6" and payload.input_image_r2_keys:
+        merged: List[str] = []
+        existing_refs = full_params.get("init_image_r2_keys")
+        if isinstance(existing_refs, list):
+            merged.extend(key.strip() for key in existing_refs if isinstance(key, str) and key.strip())
+        elif isinstance(full_params.get("init_image_r2_key"), str) and full_params.get("init_image_r2_key").strip():
+            merged.append(full_params["init_image_r2_key"].strip())
+        for entry in payload.input_image_r2_keys:
+            if isinstance(entry, str) and entry.strip():
+                if entry.strip() not in merged:
+                    merged.append(entry.strip())
+            elif isinstance(entry, list):
+                for key in entry:
+                    if isinstance(key, str) and key.strip() and key.strip() not in merged:
+                        merged.append(key.strip())
+        full_params["init_image_r2_keys"] = merged[:5]
+        full_params.pop("init_image_r2_key", None)
+
+    if model == "suno_v6":
+        # Reference images stay on this one song. They are not a bulk edit.
+        images_to_process = [None]
+        for key in full_params.get("init_image_r2_keys") or []:
+            if isinstance(key, str) and key not in r2_input_keys:
+                r2_input_keys.append(key)
+        single_ref = full_params.get("init_image_r2_key")
+        if isinstance(single_ref, str) and single_ref.strip() and single_ref not in r2_input_keys:
+            r2_input_keys.append(single_ref.strip())
+    elif payload.input_image_r2_keys and len(payload.input_image_r2_keys) > 0:
         # R2 presigned upload path – images are already in R2
         using_r2_images = True
         try:
@@ -4273,6 +4530,13 @@ async def submit_job(
     # VIP benefits: Free upscale
     # Total cost = per_job_cost * variations * num_images
     # For video_upscaler: dynamic cost based on video_duration (2 credits per 5 seconds)
+    if model == "suno_v6":
+        try:
+            import suno_v6
+            suno_v6.prepare(payload.prompt or "", full_params, for_submit=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     if model in ("xai_tts", "qwen_voice_design", "qwen_voice_clone"):
         full_params["speech_text"] = payload.prompt or full_params.get("prompt") or ""
     credit_cost = get_credit_cost(
@@ -4354,12 +4618,20 @@ async def submit_job(
             "qwen_voice_clone",
             "ace_step_music",
             "minimax_music_26",
+            "suno_v6",
         }
         model_l = model.lower()
         is_video_model = model_l in VIDEO_MODELS or "video" in model_l
         is_text_output_model = model_l in TEXT_OUTPUT_MODELS
         is_audio_output_model = model_l in AUDIO_OUTPUT_MODELS or "music" in model_l
-        if is_audio_output_model:
+        suno_action = str(full_params.get("action") or "song").strip().lower()
+        if model_l == "suno_v6" and suno_action in ("video", "music_video", "mp4"):
+            output_extension = ".mp4"
+        elif model_l == "suno_v6" and suno_action in ("covers", "cover", "cover_art"):
+            output_extension = ".png"
+        elif model_l == "suno_v6" and suno_action in ("lyrics", "lyric", "persona", "voice"):
+            output_extension = ".txt"
+        elif is_audio_output_model:
             output_extension = ".mp3"
         elif is_video_model:
             output_extension = ".mp4"
@@ -4990,6 +5262,7 @@ async def _dispatch_to_external_api(job_id: str, retry_count: int = 0) -> bool:
         result = await asyncio.to_thread(
             _external_api_router.execute, job.model, job.prompt or "", source_params
         )
+        _stash_suno_submission(db, job_id, result)
 
         if result.pending and result.external_task_id:
             if result.provider == "runware":
@@ -7653,6 +7926,7 @@ async def get_job_status(
             all_completed=all_completed,
             estimated_wait_seconds=estimated_wait_seconds,
             queue_position=queue_position,
+            music=_public_suno_music(job),
         )
     finally:
         db.close()

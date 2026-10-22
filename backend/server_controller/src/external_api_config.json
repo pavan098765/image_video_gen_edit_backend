@@ -353,6 +353,17 @@
         "duration": { "source": "params.duration", "transform": "int_clamp:30:360" }
       }
     },
+    "suno_v6": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "kie",
+        "model_id": "ai-music-api/generate",
+        "api_key_env": "KIE_API_KEY"
+      },
+      "kie_profile": "suno_v6",
+      "required_params": [],
+      "param_map": {}
+    },
     "suno_sfx": {
       "route_policy": "external_only",
       "provider": {
@@ -430,7 +441,12 @@
         "positivePrompt": { "source": "prompt", "transform": "string_trim" },
         "aspect_ratio": { "source": "params.aspect_ratio" },
         "width": { "source": "params.width" },
-        "height": { "source": "params.height" }
+        "height": { "source": "params.height" },
+        "thinkingLevel": { "source": "params.thinking_level" },
+        "webSearch": { "source": "params.web_search", "transform": "bool" },
+        "imageSearch": { "source": "params.image_search", "transform": "bool" },
+        "shell": { "source": "params.layout_tools", "transform": "bool" },
+        "moderation": { "source": "params.moderation" }
       }
     },
     "muse_image_edit": {
@@ -446,9 +462,11 @@
       "param_map": {
         "positivePrompt": { "source": "prompt", "transform": "string_trim" },
         "referenceImages": { "source": "params.init_image", "transform": "as_list" },
-        "aspect_ratio": { "source": "params.aspect_ratio" },
-        "width": { "source": "params.width" },
-        "height": { "source": "params.height" }
+        "thinkingLevel": { "source": "params.thinking_level" },
+        "webSearch": { "source": "params.web_search", "transform": "bool" },
+        "imageSearch": { "source": "params.image_search", "transform": "bool" },
+        "shell": { "source": "params.layout_tools", "transform": "bool" },
+        "moderation": { "source": "params.moderation" }
       }
     },
     "p_image_upscale": {
@@ -543,7 +561,11 @@
         "bpm": { "source": "params.bpm", "transform": "int_or_null" },
         "keyScale": { "source": "params.key_scale", "transform": "string_trim" },
         "timeSignature": { "source": "params.time_signature", "transform": "int_or_null" },
-        "vocalLanguage": { "source": "params.vocal_language", "transform": "string_trim" }
+        "vocalLanguage": { "source": "params.vocal_language", "transform": "string_trim" },
+        "audio": { "source": "params.source_audio" },
+        "strength": { "source": "params.strength" },
+        "repaintingStart": { "source": "params.repaint_start" },
+        "repaintingEnd": { "source": "params.repaint_end" }
       }
     },
     "minimax_music_26": {
@@ -558,7 +580,6 @@
       "param_map": {
         "positivePrompt": { "source": "prompt", "transform": "string_trim" },
         "lyrics": { "source": "params.lyrics", "transform": "string_trim" },
-        "negativePrompt": { "source": "params.negative_prompt", "transform": "string_trim" },
         "instrumental": { "source": "params.instrumental", "transform": "bool" },
         "lyricsOptimizer": { "source": "params.lyrics_optimizer", "transform": "bool" }
       }

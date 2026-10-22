@@ -658,6 +658,10 @@ class JobStatusResponse(BaseModel):
     all_completed: bool = Field(True, description="True if all variations are complete")
     estimated_wait_seconds: Optional[int] = Field(None, description="Estimated seconds until job completes (processing jobs only)")
     queue_position: Optional[int] = Field(None, description="Position in worker queue (processing jobs only)")
+    music: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Suno V6 studio payload: tracks, lyrics, covers, stems, video, and phase.",
+    )
 
 
 class WorkerResponse(BaseModel):

@@ -382,6 +382,22 @@ class AppState:
                         except Exception:
                             logger.exception("Kie recordInfo failed for %s", rec.task_id)
                             continue
+                        if rec.model == "suno_v6":
+                            import suno_v6
+                            from datetime import timedelta as _td
+                            disposition = suno_v6.interpret(payload).get("disposition")
+                            created = rec.created_at.replace(tzinfo=None) if rec.created_at and rec.created_at.tzinfo else rec.created_at
+                            age = utc_naive_now() - created if created else _td(0)
+                            if disposition in ("pending", "progress") and age < _td(minutes=20):
+                                if disposition == "progress":
+                                    await _apply_kie_job_result(rec.job_id, payload)
+                                continue
+                            if disposition in ("pending", "progress"):
+                                payload = {
+                                    "code": 500,
+                                    "msg": "Music generation timed out",
+                                    "data": {"state": "fail", "failMsg": "Music generation timed out"},
+                                }
                         rec.callback_received = True
                         rec.updated_at = utc_naive_now()
                         db.commit()

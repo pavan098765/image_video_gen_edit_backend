@@ -461,6 +461,8 @@ class ExternalApiRouter:
         ok, err = kie_client.ensure_credits()
         if not ok:
             return ExternalExecutionResult(success=False, error=err)
+        if cfg.get("kie_profile") == "suno_v6":
+            return self._run_suno_v6(kie_client, prompt, params)
 
         public = (os.getenv("CONTROLLER_PUBLIC_URL") or os.getenv("CONTROLLER_URL") or "").rstrip("/")
         if not public:
@@ -545,6 +547,80 @@ class ExternalApiRouter:
             provider="kie",
             raw={"taskId": task_id},
         )
+
+    def _run_suno_v6(self, kie_client: Any, prompt: str, params: Dict[str, Any]) -> ExternalExecutionResult:
+        import suno_v6
+
+        public = (os.getenv("CONTROLLER_PUBLIC_URL") or os.getenv("CONTROLLER_URL") or "").rstrip("/")
+        if not public:
+            return ExternalExecutionResult(
+                success=False, error="CONTROLLER_PUBLIC_URL is required for Kie callBackUrl"
+            )
+        callback_url = f"{public}/kie/callback"
+        try:
+            prepared = suno_v6.prepare(prompt, params, for_submit=False)
+            self._host_suno_images(kie_client, prepared)
+        except ValueError as exc:
+            return ExternalExecutionResult(success=False, error=str(exc))
+        except Exception as exc:
+            return ExternalExecutionResult(success=False, error=f"Kie upload failed: {exc}")
+
+        if prepared.kind == "persona":
+            try:
+                data = kie_client.create_task_response(prepared.kie_model, prepared.kie_input, callback_url)
+            except Exception as exc:
+                return ExternalExecutionResult(success=False, error=str(exc), provider="kie")
+            if data.get("persona_id"):
+                music = suno_v6.persona_music(prepared.music, data)
+                return ExternalExecutionResult(
+                    success=True,
+                    result_text=json.dumps(music),
+                    result_content_type="application/json",
+                    provider="kie",
+                    raw={"music": music, "suno_context": prepared.context},
+                )
+            task_id = data.get("taskId") or data.get("task_id")
+            if not task_id:
+                return ExternalExecutionResult(
+                    success=False, error="Kie persona did not return an id", provider="kie", raw=data
+                )
+            return ExternalExecutionResult(
+                success=True,
+                pending=True,
+                external_task_id=str(task_id),
+                provider="kie",
+                raw={"taskId": str(task_id), "music": prepared.music, "suno_context": prepared.context},
+            )
+
+        try:
+            task_id = kie_client.create_task(prepared.kie_model, prepared.kie_input, callback_url)
+        except Exception as exc:
+            return ExternalExecutionResult(success=False, error=str(exc), provider="kie")
+
+        if prepared.kind == "voice":
+            return ExternalExecutionResult(
+                success=True,
+                result_text=json.dumps(prepared.music),
+                result_content_type="application/json",
+                provider="kie",
+                raw={"taskId": task_id, "music": prepared.music, "suno_context": prepared.context},
+            )
+        return ExternalExecutionResult(
+            success=True,
+            pending=True,
+            external_task_id=task_id,
+            provider="kie",
+            raw={"taskId": task_id, "music": prepared.music, "suno_context": prepared.context},
+        )
+
+    def _host_suno_images(self, kie_client: Any, prepared: Any) -> None:
+        images = list((prepared.context or {}).get("image_urls") or [])
+        if not images:
+            return
+        hosted = [kie_client.upload_file_from_url(src) for src in images]
+        prepared.context["image_urls"] = hosted
+        if isinstance(prepared.kie_input, dict) and prepared.kie_input.get("image_urls"):
+            prepared.kie_input["image_urls"] = hosted
 
     def _run_runware(
         self,

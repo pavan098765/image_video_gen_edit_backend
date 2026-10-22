@@ -65,6 +65,29 @@ def test_muse_uses_only_documented_frames_and_drops_size_when_editing():
     assert edited["inputs"]["referenceImages"] == ["https://cdn.example/a.jpg"]
 
 
+def test_muse_forwards_canvas_settings_and_can_turn_them_off():
+    task = assemble_task(
+        _cfg("muse_image", "meta:muse@image", "imageInference"),
+        {
+            "positivePrompt": "a clinic",
+            "aspect_ratio": "1:1",
+            "thinkingLevel": "low",
+            "webSearch": False,
+            "imageSearch": True,
+            "shell": False,
+            "moderation": "auto",
+        },
+        "99999999-9999-4999-8999-999999999999",
+    )
+    assert task["settings"] == {
+        "thinkingLevel": "low",
+        "webSearch": False,
+        "imageSearch": True,
+        "shell": False,
+        "moderation": "auto",
+    }
+
+
 def test_muse_rejects_a_non_url_reference():
     try:
         assemble_task(
@@ -154,6 +177,37 @@ def test_speech_and_music_shapes():
     assert arranged["settings"]["keyScale"] == "D major"
     assert arranged["settings"]["timeSignature"] == 3
     assert arranged["negativePrompt"] == "no drums"
+    assert arranged["CFGScale"] == 4
+
+    remix = assemble_task(
+        _cfg("music_ace", "runware:ace-step@v1.5-xl-sft", "audioInference", "MP3"),
+        {
+            "positivePrompt": "Reinterpret the track as a quiet piano cover",
+            "duration": 90,
+            "audio": "https://cdn.example/song.mp3",
+            "strength": 0.55,
+        },
+        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    )
+    assert "duration" not in remix
+    assert remix["inputs"]["audio"] == "https://cdn.example/song.mp3"
+    assert remix["strength"] == 0.55
+    assert "repaintingStart" not in remix.get("settings", {})
+
+    repaint = assemble_task(
+        _cfg("music_ace", "runware:ace-step@v1.5-xl-sft", "audioInference", "MP3"),
+        {
+            "positivePrompt": "Replace the middle passage with a dry marimba figure",
+            "audio": "https://cdn.example/song.mp3",
+            "strength": 0.75,
+            "repaintingStart": 8,
+            "repaintingEnd": 18,
+        },
+        "ffffffff-ffff-4fff-8fff-ffffffffffff",
+    )
+    assert repaint["strength"] == 0.75
+    assert repaint["settings"]["repaintingStart"] == 8
+    assert repaint["settings"]["repaintingEnd"] == 18
 
     instrumental = assemble_task(
         _cfg("music_minimax", "minimax:music@2.6", "audioInference", "MP3"),

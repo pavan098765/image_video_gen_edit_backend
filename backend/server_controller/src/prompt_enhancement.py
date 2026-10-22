@@ -176,7 +176,7 @@ async def enhance_prompt(
 
 
 def should_enhance_for_model(model: str, mode: Optional[str] = None) -> bool:
-    no_prompt_models = {"basic_utils", "real_esrgan", "upscaler"}
+    no_prompt_models = {"basic_utils", "real_esrgan", "upscaler", "suno_v6"}
     if model.lower() in no_prompt_models:
         return False
 

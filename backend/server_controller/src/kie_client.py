@@ -189,7 +189,8 @@ def prepare_recraft_image(source_url: str) -> str:
     return upload_file_from_url(source_url)
 
 
-def create_task(model: str, input_payload: Dict[str, Any], callback_url: str) -> str:
+def create_task_response(model: str, input_payload: Dict[str, Any], callback_url: str) -> Dict[str, Any]:
+    """POST createTask. Kie returns HTTP 200 even when `code` is an error."""
     body = {
         "model": model,
         "callBackUrl": callback_url,
@@ -204,10 +205,23 @@ def create_task(model: str, input_payload: Dict[str, Any], callback_url: str) ->
     if resp.status_code >= 400:
         raise RuntimeError(f"Kie createTask HTTP {resp.status_code}: {resp.text[:800]}")
     data = resp.json()
-    payload = data.get("data") or data
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Kie createTask returned {type(data).__name__}")
+    code = data.get("code")
+    if code not in (None, 200, "200"):
+        message = data.get("msg") or data.get("message") or f"Kie createTask code {code}"
+        raise RuntimeError(str(message))
+    payload = data.get("data")
+    if isinstance(payload, dict):
+        return payload
+    return data
+
+
+def create_task(model: str, input_payload: Dict[str, Any], callback_url: str) -> str:
+    payload = create_task_response(model, input_payload, callback_url)
     task_id = payload.get("taskId") or payload.get("task_id")
     if not task_id:
-        raise RuntimeError(f"Kie createTask missing taskId: {data}")
+        raise RuntimeError(f"Kie createTask missing taskId: {payload}")
     return str(task_id)
 
 

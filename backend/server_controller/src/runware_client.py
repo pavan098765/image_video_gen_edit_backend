@@ -223,6 +223,20 @@ def _fill_image(task: Dict[str, Any], args: Dict[str, Any], profile: str) -> Non
         task["height"] = height
     if profile == "flux_image":
         task["steps"] = 4
+    if profile == "muse_image":
+        settings: Dict[str, Any] = {}
+        thinking = _clean_text(args.get("thinkingLevel")).lower()
+        if thinking in ("high", "low"):
+            settings["thinkingLevel"] = thinking
+        for key in ("webSearch", "imageSearch", "shell"):
+            flag = _as_bool(args.get(key))
+            if flag is not None:
+                settings[key] = flag
+        moderation = _clean_text(args.get("moderation")).lower()
+        if moderation in ("auto", "low"):
+            settings["moderation"] = moderation
+        if settings:
+            task["settings"] = settings
 
 
 def _fill_p_upscale(task: Dict[str, Any], args: Dict[str, Any]) -> None:
@@ -303,12 +317,22 @@ def _fill_ace(task: Dict[str, Any], args: Dict[str, Any]) -> None:
     if len(prompt) < 2:
         raise ValueError("Describe the music in at least a few words")
     task["positivePrompt"] = prompt[:3000]
-    duration = _as_int(args.get("duration")) or 60
-    task["duration"] = max(30, min(240, duration))
+    audio_urls = _http_urls(args.get("audio"))
+    if audio_urls:
+        task["inputs"] = {"audio": audio_urls[0]}
+        try:
+            strength = float(args.get("strength"))
+        except (TypeError, ValueError):
+            strength = 0.55
+        task["strength"] = round(max(0.0, min(1.0, strength)), 2)
+    else:
+        duration = _as_int(args.get("duration")) or 60
+        task["duration"] = max(30, min(240, duration))
     task["steps"] = 50
     negative = _clean_text(args.get("negativePrompt"))
     if len(negative) >= 2:
         task["negativePrompt"] = negative[:3000]
+        task["CFGScale"] = 4
     settings: Dict[str, Any] = {}
     lyrics = _clean_text(args.get("lyrics"))
     if len(lyrics) >= 10:
@@ -325,6 +349,12 @@ def _fill_ace(task: Dict[str, Any], args: Dict[str, Any]) -> None:
     language = _clean_text(args.get("vocalLanguage"))
     if language and language.lower() not in ("auto", ""):
         settings["vocalLanguage"] = "unknown" if language.lower() == "unknown" else language[:8]
+    if audio_urls:
+        start = _as_int(args.get("repaintingStart"))
+        end = _as_int(args.get("repaintingEnd"))
+        if start is not None and end is not None and end > start:
+            settings["repaintingStart"] = max(-300, min(300, start))
+            settings["repaintingEnd"] = max(0, min(300, end))
     if settings:
         task["settings"] = settings
 
@@ -334,7 +364,6 @@ def _fill_minimax(task: Dict[str, Any], args: Dict[str, Any]) -> None:
     lyrics = _clean_text(args.get("lyrics"))
     instrumental = _as_bool(args.get("instrumental"))
     optimizer = _as_bool(args.get("lyricsOptimizer")) is True
-    negative = _clean_text(args.get("negativePrompt"))
     if instrumental is True:
         lyrics = ""
         optimizer = False
@@ -359,8 +388,6 @@ def _fill_minimax(task: Dict[str, Any], args: Dict[str, Any]) -> None:
         task["settings"] = {"lyricsOptimizer": True, "instrumental": False}
     else:
         raise ValueError("Add lyrics, or turn vocals off")
-    if len(negative) >= 1 and instrumental is not True:
-        task["negativePrompt"] = negative[:3500]
 
 
 def _walk_tasks(payload: Any) -> List[Dict[str, Any]]:

@@ -73,6 +73,25 @@ FALLBACK_CREDIT_COSTS: Dict[str, Dict[str, int]] = {
     "gemini_tts": {"cost": 12, "cost_upscale": 0, "offer": 0},
     "suno_music": {"cost": 15, "cost_upscale": 0, "offer": 0},
     "suno_sfx": {"cost": 8, "cost_upscale": 0, "offer": 0},
+    # Song sell price is 65 credits (~20 INR). Kie costs about 6 INR ($0.06).
+    "suno_v6": {
+        "cost": 65,
+        "cost_upscale": 0,
+        "offer": 0,
+        "actionCosts": {
+            "song": 65,
+            "sounds": 65,
+            "replace": 65,
+            "lyrics": 5,
+            "covers": 10,
+            "video": 20,
+            "stems": 20,
+            "stems_split": 40,
+            "stems_advanced": 30,
+            "persona": 10,
+            "voice": 2,
+        },
+    },
     "flux2_klein_9b": {"cost": 10, "cost_upscale": 0, "offer": 0},
     "flux2_klein_9b_edit": {"cost": 10, "cost_upscale": 0, "offer": 0},
     "muse_image": {"cost": 10, "cost_upscale": 0, "offer": 0},
@@ -173,6 +192,16 @@ def _build_model_cost_map(config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 chars_per_min = m.get("speechCharsPerMin", m.get("speech_chars_per_min"))
                 if chars_per_min is not None:
                     entry["speechCharsPerMin"] = int(chars_per_min)
+                action_costs = m.get("actionCosts") or m.get("action_costs")
+                if isinstance(action_costs, dict):
+                    parsed_actions = {}
+                    for action_name, action_cost in action_costs.items():
+                        try:
+                            parsed_actions[str(action_name)] = int(action_cost)
+                        except (TypeError, ValueError):
+                            continue
+                    if parsed_actions:
+                        entry["actionCosts"] = parsed_actions
                 model_costs[model_id] = entry
         
         # 2. categories[].tools[] (fallback for configs with older structure)
@@ -447,6 +476,33 @@ def calculate_job_cost(
     cost_info = get_model_cost_info(model)
     model_offer_percent = int(cost_info.get("offer", 0) or 0)
     effective_offer_percent, offer_meta = _resolve_effective_offer(model_offer_percent)
+
+    if model == "suno_v6":
+        import suno_v6
+
+        per_job_cost = suno_v6.user_credit_cost(params, cost_info)
+        if effective_offer_percent > 0:
+            per_job_cost = max(1, per_job_cost - int(per_job_cost * effective_offer_percent / 100))
+        variations_count = max(1, min(4, variations))
+        num_images_count = max(1, num_images)
+        total = max(1, per_job_cost * variations_count * num_images_count)
+        logger.info(
+            "[CREDIT] Suno V6 cost action=%s per_job=%s variations=%s total=%s",
+            (params or {}).get("action") or "song",
+            per_job_cost,
+            variations_count,
+            total,
+        )
+        if return_meta:
+            return total, {
+                "model": model,
+                "pricing_type": "suno_v6_action",
+                "action": (params or {}).get("action") or "song",
+                "base_cost": int(per_job_cost),
+                "effective_offer_percent": effective_offer_percent,
+                **offer_meta,
+            }
+        return total
 
     # Special handling for video upscalers: dynamic cost based on video duration
     if model in ("video_upscaler", "flashvsr_video_upscaler") and params:
