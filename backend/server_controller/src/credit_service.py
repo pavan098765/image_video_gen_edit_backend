@@ -80,7 +80,7 @@ FALLBACK_CREDIT_COSTS: Dict[str, Dict[str, int]] = {
         "offer": 0,
         "actionCosts": {
             "song": 65,
-            "sounds": 65,
+            "sounds": 15,
             "replace": 65,
             "lyrics": 5,
             "covers": 10,

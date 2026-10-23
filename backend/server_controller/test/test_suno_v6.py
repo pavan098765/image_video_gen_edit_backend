@@ -74,12 +74,14 @@ def test_easy_idea_starts_with_lyrics_then_song_then_covers():
     assert lyrics_step["action"] == "submit"
     assert lyrics_step["kie_model"] == "ai-music-api/generate"
     song = lyrics_step["kie_input"]
-    assert song["custom_mode"] is True
+    assert song["custom_mode"] is False
     assert song["instrumental"] is False
     assert song["model"] == "V6"
-    assert song["title"] == "Starry Night Dreams"
+    assert song["prompt"] == IDEA
     assert song["lyrics"].startswith("[Verse]")
+    assert "title" not in song
     assert "duration" not in song
+    assert "vocal_gender" not in song
     assert len(lyrics_step["music"]["lyrics"]) == 2
 
     song_step = suno_v6.advance(lyrics_step["context"], lyrics_step["music"], _song_event())
@@ -122,16 +124,18 @@ def test_easy_with_lyrics_skips_the_lyrics_call():
         {"mode": "easy", "lyrics": "[Chorus]\nWindows down\n", "style": "acoustic pop", "vocal_gender": "female", "duration": 90},
     )
     assert prepared.kie_model == "ai-music-api/generate"
-    assert prepared.kie_input["custom_mode"] is True
+    assert prepared.kie_input["custom_mode"] is False
     assert prepared.kie_input["lyrics"].startswith("[Chorus]")
     assert prepared.kie_input["style"] == "acoustic pop"
-    assert prepared.kie_input["vocal_gender"] == "f"
-    assert prepared.kie_input["duration"] == 90
+    assert prepared.kie_input["prompt"] == "summer road trip"
+    assert "vocal_gender" not in prepared.kie_input
+    assert "duration" not in prepared.kie_input
 
 
 def test_easy_instrumental_does_not_ask_for_lyrics():
     prepared = suno_v6.prepare("warm piano in an empty church", {"mode": "easy", "instrumental": True})
     assert prepared.kie_model == "ai-music-api/generate"
+    assert prepared.kie_input["custom_mode"] is False
     assert prepared.kie_input["instrumental"] is True
     assert "lyrics" not in prepared.kie_input
     assert "audio_weight" not in prepared.kie_input
@@ -153,7 +157,36 @@ def test_references_use_simple_mode_and_keep_photos():
     assert "Song length" in prepared.music["note"]
 
 
-def test_custom_mode_rejects_an_empty_request_and_reference_files():
+def test_a_reference_alone_is_enough_in_easy_mode():
+    prepared = suno_v6.prepare(
+        "",
+        {"mode": "easy", "image_urls": ["https://cdn.example/photo.png"]},
+    )
+    assert prepared.kie_model == "ai-music-api/generate"
+    assert prepared.kie_input["custom_mode"] is False
+    assert prepared.kie_input["image_urls"] == ["https://cdn.example/photo.png"]
+    assert "prompt" not in prepared.kie_input
+    assert "lyrics" not in prepared.kie_input
+
+
+def test_custom_mode_keeps_length_voice_and_variety():
+    prepared = suno_v6.prepare(
+        "",
+        {
+            "mode": "custom",
+            "style": "jazz trio",
+            "lyrics": "[Chorus]\nNight train",
+            "vocal_gender": "male",
+            "duration": 180,
+            "variety": 2,
+        },
+    )
+    assert prepared.kie_input["custom_mode"] is True
+    assert prepared.kie_input["title"]
+    assert prepared.kie_input["style"] == "jazz trio"
+    assert prepared.kie_input["vocal_gender"] == "m"
+    assert prepared.kie_input["duration"] == 180
+    assert prepared.kie_input["variety"] == 2
     try:
         suno_v6.prepare("", {"mode": "custom"})
         raise AssertionError("expected a validation error")
@@ -348,7 +381,7 @@ def test_prices_match_the_sell_schedule():
          patch("credit_service._resolve_effective_offer", return_value=(0, {})):
         assert calculate_job_cost("suno_v6", {"action": "song"}) == 65
         assert calculate_job_cost("suno_v6", {}) == 65
-        assert calculate_job_cost("suno_v6", {"action": "sounds"}) == 65
+        assert calculate_job_cost("suno_v6", {"action": "sounds"}) == 15
         assert calculate_job_cost("suno_v6", {"action": "replace"}) == 65
         assert calculate_job_cost("suno_v6", {"action": "lyrics"}) == 5
         assert calculate_job_cost("suno_v6", {"action": "covers"}) == 10

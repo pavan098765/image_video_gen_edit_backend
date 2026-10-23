@@ -21,7 +21,7 @@ The job stays `running` while lyrics, the song, and extra covers are produced. R
 | Action | Credits | What they get |
 | --- | --- | --- |
 | `song` (default) | 65 | Two versions, lyrics, a cover on each version, and in Easy mode a second set of covers. Commercial rights included. |
-| `sounds` | 65 | A sound or loop. Commercial rights included. |
+| `sounds` | 15 | A sound or loop. Commercial rights included. |
 | `replace` | 65 | The song with one section regenerated. Commercial rights included. |
 | `lyrics` | 5 | Lyric options only, when they want words before a song. |
 | `covers` | 10 | Another pair of cover images for a finished song. |
@@ -42,8 +42,8 @@ The prompt is the idea, not the lyric sheet. Example: "a late-night drive throug
 
 What the server does:
 
-1. If there are no lyrics yet, and the song is not instrumental, it calls the lyrics endpoint. `music.phase` is `writing_lyrics`.
-2. It sings the first lyric option and keeps the others in `music.lyrics`. `music.phase` becomes `composing`.
+1. If there are no lyrics yet, the song is not instrumental, and there is an idea, it calls the lyrics endpoint. `music.phase` is `writing_lyrics`. A photo, clip, or track by itself skips that call.
+2. It submits generate with `custom_mode: false`. The idea stays in `prompt`. Written lyrics ride along as `lyrics`. `music.phase` becomes `composing`.
 3. When the first version has audio, `music.phase` becomes `first_track` while `status` is still `running`. Start the player.
 4. When both versions are done, it asks for extra cover images. `music.phase` is `cover_art`.
 5. `status` becomes `completed`. Each version already has `cover_url`. `music.covers` is the extra pair.
@@ -56,16 +56,7 @@ Instrumental: `params.instrumental: true`. No lyric call. Describe the piece in 
 
 ### Optional Easy controls
 
-These ride along when the song is composed in custom mode (no reference file):
-
-- `style` — genre or mood, up to 1000 characters. A style chip belongs here.
-- `vocal_gender` — `male` or `female`. This raises the odds. It does not guarantee the voice.
-- `duration` — seconds, 10 to 360. Omit it and the model picks the length.
-- `negative_tags` — styles to avoid.
-- `style_weight`, `weirdness_constraint`, `audio_weight` — 0 to 1. `audio_weight` is ignored on instrumentals.
-- `variety` — 0 exact, 1 balanced (default), 2 distinct, 3 bold, 4 maximum.
-- `variant` — `V6` (default), `V6_MINI`, or `V6_WILD`. Same price.
-- `persona_id` plus `persona_model` — `style_persona` or `voice_persona`.
+Easy generate does not accept length, vocal gender, variety, or the style weights. Those belong in Custom mode. A style or negative tags can still ride along, and `variant` stays `V6` unless another variant is sent.
 
 ### Reference photo, video, or audio
 
@@ -78,7 +69,7 @@ References only work in Easy mode. Put them on the same submit:
 
 Images should be png, jpeg, or webp. The server rehosts them before the provider sees them.
 
-Style, lyrics, images, the video, and audio clips together cannot exceed 10 attachments. With a reference attached, the model chooses the length, vocal gender, and style strength. If they also set `duration`, `music.note` explains that. The idea still goes in the prompt. A reference clip steers a new song. It does not edit or split that file. Editing and splitting are the replace and stems actions.
+Style, lyrics, images, the video, and audio clips together cannot exceed 10 attachments. A reference is enough on its own. The idea can be omitted. A reference clip steers a new song. It does not edit or split that file. Editing and splitting are the replace and stems actions. Length, voice, and variety are not sent in Easy mode.
 
 Custom mode rejects reference files. Ask them to switch to Easy.
 
@@ -91,7 +82,7 @@ Use this when they want to write the song themselves.
 - `title` — up to 80 characters. If they leave it blank, the server takes it from the first lyric line.
 - `style` and/or `lyrics`. Lyrics win over the prompt. The prompt is sung only when `lyrics` is empty.
 - `instrumental: true` needs a style or a description, and does not take lyrics.
-- Same optional controls as Easy: vocal gender, duration, weights, variety, negative tags, persona, variant.
+- Optional controls: vocal gender, duration (10–360), weights, variety (0–4), negative tags, persona, variant.
 
 Do not send reference images, video, or audio in Custom mode.
 
@@ -304,7 +295,7 @@ The user picks a version of a song they made here that does not already have a p
 
 The result is `music.persona`. Store it on that version and in the persona list. On a later song the user taps the name. The client sends `persona_id` with `persona_model: "style_persona"`.
 
-### Sounds — 65
+### Sounds — 15
 
 For beds, loops, and ambience. Not the lyric song flow.
 

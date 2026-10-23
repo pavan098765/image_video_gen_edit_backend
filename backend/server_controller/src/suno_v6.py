@@ -22,7 +22,7 @@ COMMERCIAL_ACTIONS = ("song", "sounds", "replace")
 # Smaller actions keep the same ratio to a song. Override with tool_config actionCosts.
 ACTION_CREDITS = {
     "song": SONG_USER_CREDITS,
-    "sounds": SONG_USER_CREDITS,
+    "sounds": 15,
     "replace": SONG_USER_CREDITS,
     "lyrics": 5,
     "covers": 10,
@@ -449,6 +449,12 @@ def _prepare_song(context: Dict[str, Any], *, for_submit: bool) -> Prepared:
         music = _blank_music(context, "composing")
         return Prepared(KIE_MODELS["song"], _custom_song_input(context, None), context, music, "async")
 
+    # Easy is non-custom. Length, voice, variety, and style weights are ignored.
+    dropped_length = context.get("duration")
+    for key in ("duration", "style_weight", "weirdness_constraint", "audio_weight", "variety"):
+        context[key] = None
+    context["vocal_gender"] = ""
+
     if has_references:
         _reject_too_many(
             {"images": context["image_urls"], "videos": context["video_urls"], "audios": context["audio_urls"]},
@@ -456,41 +462,40 @@ def _prepare_song(context: Dict[str, Any], *, for_submit: bool) -> Prepared:
             lyrics=context["lyrics"],
             will_add_lyrics=not context["instrumental"] and not context["lyrics"] and bool(idea),
         )
+
+    def easy_song(sheets: Optional[List[Dict[str, str]]] = None) -> Prepared:
+        context["phase"] = "song"
+        music = _blank_music(context, "composing")
+        if sheets:
+            music["lyrics"] = sheets
+            music["lyrics_used"] = 0
+        if has_references and dropped_length:
+            music["note"] = "Song length is chosen by the model when you add a photo, video, or audio reference."
+        return Prepared(KIE_MODELS["song"], _referenced_song_input(context, None), context, music, "async")
+
     if context["instrumental"]:
         if not (idea or context["style"] or context["negative_tags"] or has_references):
-            raise ValueError("Describe the instrumental, or add a style.")
-        context["phase"] = "song"
-        music = _blank_music(context, "composing")
-        if has_references and context["duration"]:
-            music["note"] = "Song length is chosen by the model when you add a photo, video, or audio reference."
-        payload = _referenced_song_input(context, None) if has_references else _custom_song_input(context, None)
-        return Prepared(KIE_MODELS["song"], payload, context, music, "async")
+            raise ValueError("Describe the instrumental, add a style, or attach a reference.")
+        return easy_song()
     if context["lyrics"]:
-        if not (context["title"] or idea or context["style"]):
+        if not context["title"]:
             context["title"] = _title_from(context["lyrics"])
-        context["phase"] = "song"
-        music = _blank_music(context, "composing")
-        if has_references and context["duration"]:
+        return easy_song([{"title": context["title"], "text": context["lyrics"]}])
+    if idea:
+        context["phase"] = "lyrics"
+        music = _blank_music(context, "writing_lyrics")
+        if has_references and dropped_length:
             music["note"] = "Song length is chosen by the model when you add a photo, video, or audio reference."
-        music["lyrics"] = [{"title": context["title"], "text": context["lyrics"]}]
-        music["lyrics_used"] = 0
-        payload = _referenced_song_input(context, None) if has_references else _custom_song_input(context, None)
-        return Prepared(KIE_MODELS["song"], payload, context, music, "async")
-    if not idea and not has_references:
-        raise ValueError("Describe the song you want, or paste lyrics.")
-    if not idea and has_references:
-        raise ValueError("Add a short idea so the song has something to say about your reference.")
-    context["phase"] = "lyrics"
-    music = _blank_music(context, "writing_lyrics")
-    if has_references and context["duration"]:
-        music["note"] = "Song length is chosen by the model when you add a photo, video, or audio reference."
-    return Prepared(
-        KIE_MODELS["lyrics"],
-        {"prompt": _lyrics_prompt(idea)},
-        context,
-        music,
-        "async",
-    )
+        return Prepared(
+            KIE_MODELS["lyrics"],
+            {"prompt": _lyrics_prompt(idea)},
+            context,
+            music,
+            "async",
+        )
+    if has_references:
+        return easy_song()
+    raise ValueError("Describe the song you want, paste lyrics, or add a photo, clip, or track.")
 
 
 def _validate_custom_song(context: Dict[str, Any]) -> None:
@@ -518,7 +523,8 @@ def _submit_song(ctx: Dict[str, Any], music: Dict[str, Any], lyric: Optional[Dic
         ctx["lyrics"] = lyric.get("text") or ctx.get("lyrics") or ""
         if lyric.get("title") and not ctx.get("title"):
             ctx["title"] = _clip(lyric["title"], 80)
-    payload = _referenced_song_input(ctx, lyric) if has_references else _custom_song_input(ctx, lyric)
+    # Easy stays non-custom even after lyrics are written and even with no reference file.
+    payload = _referenced_song_input(ctx, lyric) if ctx.get("easy") or has_references else _custom_song_input(ctx, lyric)
     ctx["phase"] = "song"
     return _step(
         "submit",
