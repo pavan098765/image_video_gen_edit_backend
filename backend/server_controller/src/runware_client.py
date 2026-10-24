@@ -40,7 +40,25 @@ MUSE_SIZES: Dict[str, Tuple[int, int]] = {
     "21:9": (2352, 1008),
 }
 
-SIZE_TABLES = {"flux": FLUX_SIZES, "muse": MUSE_SIZES}
+# Recraft V4.1 Flash accepts only these frames. 16:9 is 1344×768, not the Flux pair.
+RECRAFT_SIZES: Dict[str, Tuple[int, int]] = {
+    "1:1": (1024, 1024),
+    "2:1": (1536, 768),
+    "1:2": (768, 1536),
+    "3:2": (1280, 832),
+    "2:3": (832, 1280),
+    "4:3": (1216, 896),
+    "3:4": (896, 1216),
+    "5:4": (1152, 896),
+    "4:5": (896, 1152),
+    "6:10": (832, 1344),
+    "14:10": (1280, 896),
+    "10:14": (896, 1280),
+    "16:9": (1344, 768),
+    "9:16": (768, 1344),
+}
+
+SIZE_TABLES = {"flux": FLUX_SIZES, "muse": MUSE_SIZES, "recraft": RECRAFT_SIZES}
 
 MEDIA_URL_KEYS = ("imageURL", "audioURL", "videoURL")
 
@@ -179,7 +197,7 @@ def assemble_task(
         task["webhookURL"] = webhook
 
     if profile in ("flux_image", "muse_image"):
-        _fill_image(task, args, profile)
+        _fill_image(task, args, profile, spec)
     elif profile == "upscale_p":
         _fill_p_upscale(task, args)
     elif profile == "upscale_esrgan":
@@ -202,28 +220,66 @@ def assemble_task(
     return _drop_empty(task)
 
 
-def _fill_image(task: Dict[str, Any], args: Dict[str, Any], profile: str) -> None:
+def _fill_image(
+    task: Dict[str, Any],
+    args: Dict[str, Any],
+    profile: str,
+    spec: Optional[Dict[str, Any]] = None,
+) -> None:
+    spec = spec or {}
     prompt = _clean_text(args.get("positivePrompt") or args.get("prompt"))
+    if not prompt:
+        prompt = _clean_text(spec.get("blank_prompt"))
     if not prompt:
         raise ValueError("Prompt is required")
     task["positivePrompt"] = prompt[:10000 if profile == "flux_image" else 200000]
-    raw_refs = args.get("referenceImages")
-    refs = _http_urls(raw_refs)
-    if "referenceImages" in args and not refs:
-        raise ValueError("Reference image must be a downloadable URL")
-    table = MUSE_SIZES if profile == "muse_image" else FLUX_SIZES
-    if profile == "flux_image":
-        refs = refs[:4]
-    else:
-        refs = refs[:10]
+
+    image_input = str(spec.get("image_input") or "reference")
+    table_name = spec.get("size_table") or ("muse" if profile == "muse_image" else "flux")
+    table = SIZE_TABLES.get(str(table_name), FLUX_SIZES)
+    inputs: Dict[str, Any] = {}
+    refs: List[str] = []
+
+    if image_input == "seed":
+        raw_seed = args.get("seedImage") if "seedImage" in args else args.get("referenceImages")
+        urls = _http_urls(raw_seed)
+        if not urls:
+            raise ValueError("An image is required")
+        inputs["seedImage"] = urls[0]
+        if spec.get("require_mask"):
+            masks = _http_urls(args.get("maskImage"))
+            if not masks:
+                raise ValueError("A mask image is required")
+            inputs["maskImage"] = masks[0]
+    elif image_input == "reference":
+        raw_refs = args.get("referenceImages")
+        refs = _http_urls(raw_refs)
+        if "referenceImages" in args and not refs:
+            raise ValueError("Reference image must be a downloadable URL")
+        limit = spec.get("max_reference_images")
+        if limit is None:
+            limit = 4 if profile == "flux_image" else 10
+        refs = refs[: int(limit)]
+        if refs:
+            inputs["referenceImages"] = refs
+
+    if inputs:
+        task["inputs"] = inputs
+
     omit_size = profile == "muse_image" and bool(refs)
-    if refs:
-        task["inputs"] = {"referenceImages": refs}
+    if not omit_size and spec.get("omit_size_without_aspect"):
+        aspect = _clean_text(args.get("aspect_ratio")).replace(" ", "")
+        if aspect not in table:
+            omit_size = True
     if not omit_size:
         width, height = choose_size(args, table)
         task["width"] = width
         task["height"] = height
-    if profile == "flux_image":
+    if "steps" in spec:
+        steps = _as_int(spec.get("steps"))
+        if steps:
+            task["steps"] = steps
+    elif profile == "flux_image":
         task["steps"] = 4
     if profile == "muse_image":
         settings: Dict[str, Any] = {}

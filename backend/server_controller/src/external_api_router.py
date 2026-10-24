@@ -83,6 +83,13 @@ class ExternalExecutionResult:
     provider: Optional[str] = None
 
 
+def carry_moderation_flag(raw: Any, prepared: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep the moderation decision after internal keys are stripped for the provider."""
+    if isinstance(raw, dict) and raw.get("_moderation_flagged") is True:
+        prepared["_moderation_flagged"] = True
+    return prepared
+
+
 class ExternalApiRouter:
     def __init__(self, config_path: Optional[str] = None):
         default_path = str(Path(__file__).resolve().parent / "external_api_config.json")
@@ -124,6 +131,20 @@ class ExternalApiRouter:
         self._load_config()
         return self._config.get("models", {}).get(model)
 
+    def resolve_model_config(
+        self, model: str, params: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Runware is the default. Qwen uses its Kie block only when this job was flagged."""
+        cfg = self.get_model_config(model)
+        if not cfg:
+            return None
+        params = params or {}
+        if params.get("_moderation_flagged") is True:
+            alternate = cfg.get("when_flagged")
+            if isinstance(alternate, dict) and alternate.get("provider"):
+                return alternate
+        return cfg
+
     def should_use_external(self, model: str, params: Optional[Dict[str, Any]]) -> bool:
         cfg = self.get_model_config(model)
         if not cfg or not cfg.get("provider"):
@@ -146,7 +167,7 @@ class ExternalApiRouter:
     def execute(
         self, model: str, prompt: str, params: Dict[str, Any]
     ) -> ExternalExecutionResult:
-        cfg = self.get_model_config(model)
+        cfg = self.resolve_model_config(model, params)
         if not cfg:
             return ExternalExecutionResult(
                 success=False, error=f"No external config for model: {model}"

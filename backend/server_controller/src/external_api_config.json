@@ -221,19 +221,41 @@
     "qwen2_1_t2i": {
       "route_policy": "external_only",
       "provider": {
-        "type": "kie",
-        "model_id": "qwen2-1/text-to-image",
-        "api_key_env": "KIE_API_KEY"
+        "type": "runware",
+        "model_id": "alibaba:qwen-image@2.1-turbo",
+        "api_key_env": "RUNWARE_API_KEY"
       },
-      "required_params": ["prompt"],
-      "has_resolution": true,
-      "force_resolution_1k": true,
+      "runware": {
+        "profile": "flux_image",
+        "task_type": "imageInference",
+        "output_format": "PNG",
+        "steps": null,
+        "image_input": "none"
+      },
+      "required_params": ["positivePrompt"],
       "param_map": {
-        "prompt": { "source": "prompt", "transform": "string_trim" },
-        "aspect_ratio": { "source": "params.aspect_ratio", "transform": "default:1:1" },
-        "resolution": { "value": "1K" },
-        "output_format": { "value": "png" },
-        "enhance_prompt": { "value": true }
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      },
+      "when_flagged": {
+        "route_policy": "external_only",
+        "provider": {
+          "type": "kie",
+          "model_id": "qwen2-1/text-to-image",
+          "api_key_env": "KIE_API_KEY"
+        },
+        "required_params": ["prompt"],
+        "has_resolution": true,
+        "force_resolution_1k": true,
+        "param_map": {
+          "prompt": { "source": "prompt", "transform": "string_trim" },
+          "aspect_ratio": { "source": "params.aspect_ratio", "transform": "default:1:1" },
+          "resolution": { "value": "1K" },
+          "output_format": { "value": "png" },
+          "enhance_prompt": { "value": true }
+        }
       }
     },
     "grok_imagine_t2i": {
@@ -254,24 +276,49 @@
     "qwen2_1_i2i": {
       "route_policy": "external_only",
       "provider": {
-        "type": "kie",
-        "model_id": "qwen2-1/image-to-image",
-        "api_key_env": "KIE_API_KEY"
+        "type": "runware",
+        "model_id": "alibaba:qwen-image@2.1-turbo",
+        "api_key_env": "RUNWARE_API_KEY"
       },
-      "required_params": ["prompt", "image_urls"],
-      "has_resolution": true,
-      "force_resolution_1k": true,
-      "allow_resolution_2k": true,
-      "kie_upload_fields": ["image_urls", "mask_url"],
+      "runware": {
+        "profile": "flux_image",
+        "task_type": "imageInference",
+        "output_format": "PNG",
+        "steps": null,
+        "image_input": "reference",
+        "max_reference_images": 10,
+        "omit_size_without_aspect": true
+      },
+      "required_params": ["positivePrompt", "referenceImages"],
       "param_map": {
-        "prompt": { "source": "prompt", "transform": "string_trim" },
-        "image_urls": { "source": "params.init_image", "transform": "as_list" },
-        "mask_url": { "source": "params.mask_image", "transform": "http_passthrough" },
-        "aspect_ratio": { "source": "params.aspect_ratio", "transform": "default:auto" },
-        "resolution": { "source": "params.resolution", "transform": "default:1K" },
-        "background": { "source": "params.background", "transform": "default:opaque" },
-        "output_format": { "value": "png" },
-        "enhance_prompt": { "value": true }
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "referenceImages": { "source": "params.init_image", "transform": "as_list" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      },
+      "when_flagged": {
+        "route_policy": "external_only",
+        "provider": {
+          "type": "kie",
+          "model_id": "qwen2-1/image-to-image",
+          "api_key_env": "KIE_API_KEY"
+        },
+        "required_params": ["prompt", "image_urls"],
+        "has_resolution": true,
+        "force_resolution_1k": true,
+        "allow_resolution_2k": true,
+        "kie_upload_fields": ["image_urls", "mask_url"],
+        "param_map": {
+          "prompt": { "source": "prompt", "transform": "string_trim" },
+          "image_urls": { "source": "params.init_image", "transform": "as_list" },
+          "mask_url": { "source": "params.mask_image", "transform": "http_passthrough" },
+          "aspect_ratio": { "source": "params.aspect_ratio", "transform": "default:auto" },
+          "resolution": { "source": "params.resolution", "transform": "default:1K" },
+          "background": { "source": "params.background", "transform": "default:opaque" },
+          "output_format": { "value": "png" },
+          "enhance_prompt": { "value": true }
+        }
       }
     },
     "grok_imagine_edit": {
@@ -467,6 +514,236 @@
         "imageSearch": { "source": "params.image_search", "transform": "bool" },
         "shell": { "source": "params.layout_tools", "transform": "bool" },
         "moderation": { "source": "params.moderation" }
+      }
+    },
+    "twinflow_z_image": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "runware:twinflow-z-image-turbo@0",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": {
+        "profile": "flux_image",
+        "task_type": "imageInference",
+        "output_format": "PNG",
+        "steps": 4,
+        "image_input": "none"
+      },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt"],
+      "param_map": {
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      }
+    },
+    "juggernaut_lightning": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "rundiffusion:110@101",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": {
+        "profile": "flux_image",
+        "task_type": "imageInference",
+        "output_format": "PNG",
+        "steps": 4,
+        "image_input": "none"
+      },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt"],
+      "param_map": {
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      }
+    },
+    "juggernaut_lightning_expand": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "rundiffusion:110@101",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": {
+        "profile": "flux_image",
+        "task_type": "imageInference",
+        "output_format": "PNG",
+        "steps": 4,
+        "image_input": "seed",
+        "blank_prompt": "Extend the scene beyond the original image, matching its style, lighting, and perspective."
+      },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt", "seedImage"],
+      "param_map": {
+        "positivePrompt": {
+          "source": "prompt",
+          "transform": "string_trim|default:Extend the scene beyond the original image, matching its style, lighting, and perspective."
+        },
+        "seedImage": { "source": "params.init_image" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      }
+    },
+    "krea2_turbo": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "krea:krea@2-turbo",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": {
+        "profile": "flux_image",
+        "task_type": "imageInference",
+        "output_format": "PNG",
+        "steps": 8,
+        "image_input": "none"
+      },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt"],
+      "param_map": {
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      }
+    },
+    "krea2_turbo_edit": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "krea:krea@2-turbo",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": {
+        "profile": "flux_image",
+        "task_type": "imageInference",
+        "output_format": "PNG",
+        "steps": 8,
+        "image_input": "reference",
+        "max_reference_images": 4
+      },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt", "referenceImages"],
+      "param_map": {
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "referenceImages": { "source": "params.init_image", "transform": "as_list" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      }
+    },
+    "recraft_v41_flash": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "recraft:v4.1@flash",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": {
+        "profile": "flux_image",
+        "task_type": "imageInference",
+        "output_format": "PNG",
+        "steps": null,
+        "size_table": "recraft",
+        "image_input": "none"
+      },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt"],
+      "param_map": {
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      }
+    },
+    "z_image_turbo_edit": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "runware:z-image@turbo",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": {
+        "profile": "flux_image",
+        "task_type": "imageInference",
+        "output_format": "PNG",
+        "steps": 8,
+        "image_input": "seed",
+        "omit_size_without_aspect": true
+      },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt", "seedImage"],
+      "param_map": {
+        "positivePrompt": { "source": "prompt", "transform": "string_trim" },
+        "seedImage": { "source": "params.init_image" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      }
+    },
+    "z_image_turbo_inpaint": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "runware:z-image@turbo",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": {
+        "profile": "flux_image",
+        "task_type": "imageInference",
+        "output_format": "PNG",
+        "steps": 8,
+        "image_input": "seed",
+        "require_mask": true,
+        "omit_size_without_aspect": true,
+        "blank_prompt": "Fill the painted area so it matches the surrounding image."
+      },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt", "seedImage", "maskImage"],
+      "param_map": {
+        "positivePrompt": {
+          "source": "prompt",
+          "transform": "string_trim|default:Fill the painted area so it matches the surrounding image."
+        },
+        "seedImage": { "source": "params.init_image" },
+        "maskImage": { "source": "params.mask_image" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
+      }
+    },
+    "z_image_turbo_expand": {
+      "route_policy": "external_only",
+      "provider": {
+        "type": "runware",
+        "model_id": "runware:z-image@turbo",
+        "api_key_env": "RUNWARE_API_KEY"
+      },
+      "runware": {
+        "profile": "flux_image",
+        "task_type": "imageInference",
+        "output_format": "PNG",
+        "steps": 8,
+        "image_input": "seed",
+        "blank_prompt": "Extend the scene beyond the original image, matching its style, lighting, and perspective."
+      },
+      "allow_output_upscale": true,
+      "required_params": ["positivePrompt", "seedImage"],
+      "param_map": {
+        "positivePrompt": {
+          "source": "prompt",
+          "transform": "string_trim|default:Extend the scene beyond the original image, matching its style, lighting, and perspective."
+        },
+        "seedImage": { "source": "params.init_image" },
+        "aspect_ratio": { "source": "params.aspect_ratio" },
+        "width": { "source": "params.width" },
+        "height": { "source": "params.height" }
       }
     },
     "p_image_upscale": {

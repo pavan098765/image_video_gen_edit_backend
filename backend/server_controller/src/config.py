@@ -174,6 +174,13 @@ class SchedulerConfig:
 
 
 @dataclass
+class ModerationConfig:
+    """OpenAI content-moderation gate. The API key is never written to logs."""
+    allow_flagged: bool = False
+    openai_api_key: Optional[str] = None
+
+
+@dataclass
 class AppConfig:
     """Main application configuration"""
     profile: DeploymentProfile = DeploymentProfile.DEV
@@ -191,6 +198,7 @@ class AppConfig:
     job: JobConfig = field(default_factory=JobConfig)
     pod: PodConfig = field(default_factory=PodConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    moderation: ModerationConfig = field(default_factory=ModerationConfig)
     
     # Template UUIDs
     template_uuids: Dict[str, Optional[str]] = field(default_factory=dict)
@@ -273,6 +281,7 @@ class ConfigManager:
         self._load_pod_config()
         self._load_scheduler_config()
         self._load_template_config()
+        self._load_moderation_config()
         
         return self._config
     
@@ -341,6 +350,16 @@ class ConfigManager:
         sec_config.ban_duration = int(os.getenv("BAN_DURATION", "300"))
         sec_config.max_body_size = int(os.getenv("MAX_BODY_SIZE", "10000000"))
     
+    def _load_moderation_config(self):
+        """Load the content-moderation flag and OpenAI API key. Never log the key."""
+        from moderation_client import openai_api_key_from_env, parse_allow_moderation_flagged
+
+        self._config.moderation.allow_flagged = parse_allow_moderation_flagged(
+            os.getenv("ALLOW_MODERATION_FLAGGED")
+        )
+        key = openai_api_key_from_env()
+        self._config.moderation.openai_api_key = key or None
+
     def _load_worker_config(self):
         """Load worker configuration"""
         worker_config = self._config.worker
@@ -587,6 +606,9 @@ class ConfigManager:
         r2 = self._config.r2
         if not all([r2.endpoint, r2.access_key_id, r2.secret_access_key]):
             warnings.append("R2 storage not fully configured - result upload disabled")
+
+        if not self._config.moderation.openai_api_key:
+            warnings.append("OPENAI_API_KEY is not set - content moderation will fail closed")
         
         # Log findings
         for warning in warnings:
@@ -645,6 +667,11 @@ class ConfigManager:
         logger.info(f"R2 Configured: {bool(self._config.r2.endpoint)}")
         logger.info(f"Firebase Configured: {bool(self._config.firebase.credentials_path)}")
         logger.info(f"API Keys Count: {len(self._config.security.api_keys)}")
+        logger.info(
+            "Content moderation: allow_flagged=%s openai_api_key_set=%s",
+            self._config.moderation.allow_flagged,
+            bool(self._config.moderation.openai_api_key),
+        )
         logger.info("=" * 60)
     
     def get_s3_client(self):

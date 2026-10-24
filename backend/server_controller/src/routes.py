@@ -156,7 +156,7 @@ from exceptions import (
 from job_manager import JobManager, JobState
 from pod_manager import MAX_JOBS_PER_POD
 from logging_config import get_audit_logger
-from external_api_router import ExternalApiRouter, ExternalExecutionResult
+from external_api_router import ExternalApiRouter, ExternalExecutionResult, carry_moderation_flag
 
 logger = logging.getLogger("routes")
 audit_logger = get_audit_logger()
@@ -4405,6 +4405,10 @@ async def submit_job(
     
     # Full params for dispatch (R2 keys only; embedded media rejected in SubmitRequest)
     full_params = dict(payload.params) if payload.params else {}
+    # The client cannot choose the provider. Only a flagged request the gate allowed through is marked.
+    full_params.pop("_moderation_flagged", None)
+    if getattr(request.state, "moderation_flagged", False) is True:
+        full_params["_moderation_flagged"] = True
 
     # Flutter UI id "ltx2_3_cinereal" → concrete LTX 2.3 worker model (must match worker registry)
     if model == "ltx2_3_cinereal":
@@ -5335,8 +5339,8 @@ async def _dispatch_to_external_api(job_id: str, retry_count: int = 0) -> bool:
             return True
 
         cached_params = get_cached_job_params(job_id)
-        source_params = cached_params if cached_params else (job.params or {})
-        source_params = _prepare_external_params(source_params)
+        raw_params = cached_params if cached_params else (job.params or {})
+        source_params = carry_moderation_flag(raw_params, _prepare_external_params(raw_params))
 
         if not _external_api_router.should_use_external(job.model, source_params):
             return False

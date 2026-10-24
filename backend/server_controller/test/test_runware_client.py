@@ -6,13 +6,20 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
+from external_api_router import (  # noqa: E402
+    ExternalApiRouter,
+    ExternalExecutionResult,
+    carry_moderation_flag,
+)
 from runware_client import (  # noqa: E402
     assemble_task,
     failure_message,
     is_processing,
     media_url,
     snap_size,
+    FLUX_SIZES,
     MUSE_SIZES,
+    RECRAFT_SIZES,
 )
 
 
@@ -266,3 +273,167 @@ def test_response_parser_covers_webhook_poll_and_errors():
 
 def test_snap_falls_back_to_square():
     assert snap_size(None, None, MUSE_SIZES) == MUSE_SIZES["1:1"]
+
+
+def _task(model, prompt, params, task_uuid="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"):
+    router = ExternalApiRouter()
+    cfg = router.get_model_config(model)
+    args = router._build_arguments(cfg, prompt, params)
+    return assemble_task(cfg, args, task_uuid)
+
+
+def test_new_image_models_build_the_documented_task():
+    glimpse = _task("twinflow_z_image", "a fox", {"aspect_ratio": "1:1"})
+    assert glimpse["model"] == "runware:twinflow-z-image-turbo@0"
+    assert glimpse["steps"] == 4
+    assert (glimpse["width"], glimpse["height"]) == FLUX_SIZES["1:1"]
+    assert "inputs" not in glimpse
+
+    poster = _task("recraft_v41_flash", "a poster", {"aspect_ratio": "16:9"})
+    assert poster["model"] == "recraft:v4.1@flash"
+    assert (poster["width"], poster["height"]) == RECRAFT_SIZES["16:9"]
+    assert (poster["width"], poster["height"]) == (1344, 768)
+    assert "steps" not in poster
+
+    palette = _task(
+        "krea2_turbo_edit",
+        "match the coat",
+        {"init_image": [f"https://cdn.example/{i}.jpg" for i in range(5)]},
+    )
+    assert palette["model"] == "krea:krea@2-turbo"
+    assert palette["steps"] == 8
+    assert palette["inputs"]["referenceImages"] == [f"https://cdn.example/{i}.jpg" for i in range(4)]
+
+    touch = _task("z_image_turbo_edit", "change the sky", {"init_image": "https://cdn.example/a.jpg"})
+    assert touch["model"] == "runware:z-image@turbo"
+    assert touch["steps"] == 8
+    assert touch["inputs"] == {"seedImage": "https://cdn.example/a.jpg"}
+    assert "width" not in touch and "height" not in touch
+
+    filled = _task("z_image_turbo_inpaint", "  ", {
+        "init_image": "https://cdn.example/a.jpg",
+        "mask_image": "https://cdn.example/mask.png",
+    })
+    assert filled["positivePrompt"] == "Fill the painted area so it matches the surrounding image."
+    assert filled["inputs"]["seedImage"] == "https://cdn.example/a.jpg"
+    assert filled["inputs"]["maskImage"] == "https://cdn.example/mask.png"
+    assert "width" not in filled and "steps" in filled and filled["steps"] == 8
+
+    vista = _task("juggernaut_lightning_expand", "", {
+        "init_image": "https://cdn.example/a.jpg",
+        "aspect_ratio": "9:16",
+    })
+    assert vista["model"] == "rundiffusion:110@101"
+    assert vista["steps"] == 4
+    assert vista["inputs"]["seedImage"] == "https://cdn.example/a.jpg"
+    assert (vista["width"], vista["height"]) == FLUX_SIZES["9:16"]
+    assert vista["positivePrompt"].startswith("Extend the scene")
+
+    widened = _task("z_image_turbo_expand", "more sky", {
+        "init_image": ["https://cdn.example/a.jpg", "https://cdn.example/b.jpg"],
+        "aspect_ratio": "16:9",
+    })
+    assert widened["inputs"]["seedImage"] == "https://cdn.example/a.jpg"
+    assert (widened["width"], widened["height"]) == FLUX_SIZES["16:9"]
+    assert widened["steps"] == 8
+
+
+def test_seed_and_mask_reject_non_urls():
+    try:
+        _task("z_image_turbo_edit", "edit", {"init_image": "{{init_image}}"})
+    except ValueError as exc:
+        assert "image" in str(exc).lower()
+    else:
+        raise AssertionError("placeholder seed was accepted")
+
+    try:
+        _task("z_image_turbo_inpaint", "edit", {
+            "init_image": "https://cdn.example/a.jpg",
+            "mask_image": "masks/local.png",
+        })
+    except ValueError as exc:
+        assert "mask" in str(exc).lower()
+    else:
+        raise AssertionError("non-url mask was accepted")
+
+
+def test_qwen_stays_on_runware_unless_this_job_was_flagged():
+    router = ExternalApiRouter()
+    seen = {}
+
+    def runware(cfg, args, prompt, params):
+        seen["type"] = cfg["provider"]["type"]
+        seen["model"] = cfg["provider"]["model_id"]
+        seen["args"] = args
+        return ExternalExecutionResult(success=True, pending=True, external_task_id="rw", provider="runware")
+
+    def kie(cfg, args, prompt, params):
+        seen["type"] = cfg["provider"]["type"]
+        seen["model"] = cfg["provider"]["model_id"]
+        seen["args"] = args
+        return ExternalExecutionResult(success=True, pending=True, external_task_id="kie", provider="kie")
+
+    router._run_runware = runware
+    router._run_kie = kie
+
+    clean = router.execute("qwen2_1_t2i", "a fox", {"aspect_ratio": "16:9"})
+    assert clean.provider == "runware"
+    assert seen == {
+        "type": "runware",
+        "model": "alibaba:qwen-image@2.1-turbo",
+        "args": seen["args"],
+    }
+    assert "steps" not in seen["args"]
+    task = assemble_task(router.resolve_model_config("qwen2_1_t2i", {}), seen["args"], "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    assert "steps" not in task
+    assert (task["width"], task["height"]) == FLUX_SIZES["16:9"]
+
+    edited = _task("qwen2_1_i2i", "change the jacket", {
+        "init_image": ["https://cdn.example/a.jpg", "https://cdn.example/b.jpg"],
+        "aspect_ratio": "auto",
+    })
+    assert edited["model"] == "alibaba:qwen-image@2.1-turbo"
+    assert edited["inputs"]["referenceImages"] == [
+        "https://cdn.example/a.jpg",
+        "https://cdn.example/b.jpg",
+    ]
+    assert "steps" not in edited
+    assert "width" not in edited and "height" not in edited
+
+    seen.clear()
+    flagged = router.execute("qwen2_1_i2i", "change the jacket", {
+        "_moderation_flagged": True,
+        "init_image": "https://cdn.example/a.jpg",
+    })
+    assert flagged.provider == "kie"
+    assert seen["type"] == "kie"
+    assert seen["model"] == "qwen2-1/image-to-image"
+    assert seen["args"]["image_urls"] == ["https://cdn.example/a.jpg"]
+
+    seen.clear()
+    not_this_job = router.execute("qwen2_1_t2i", "a fox", {"_moderation_flagged": "true"})
+    assert not_this_job.provider == "runware"
+    assert seen["model"] == "alibaba:qwen-image@2.1-turbo"
+
+    prepared = carry_moderation_flag(
+        {"_moderation_flagged": True, "_batch_id": "b"},
+        {"aspect_ratio": "1:1"},
+    )
+    assert prepared["_moderation_flagged"] is True
+    assert "_batch_id" not in prepared
+    assert "_moderation_flagged" not in carry_moderation_flag({"_moderation_flagged": False}, {})
+
+
+def test_flagged_qwen_text_uses_the_kie_text_model():
+    router = ExternalApiRouter()
+    seen = {}
+
+    def kie(cfg, args, prompt, params):
+        seen["model"] = cfg["provider"]["model_id"]
+        return ExternalExecutionResult(success=True, pending=True, external_task_id="kie", provider="kie")
+
+    router._run_kie = kie
+    router._run_runware = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("runware"))
+    result = router.execute("qwen2_1_t2i", "a fox", {"_moderation_flagged": True, "aspect_ratio": "1:1"})
+    assert result.provider == "kie"
+    assert seen["model"] == "qwen2-1/text-to-image"
