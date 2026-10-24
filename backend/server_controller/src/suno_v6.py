@@ -237,6 +237,48 @@ def prepare(prompt: str, params: Optional[Dict[str, Any]], *, for_submit: bool =
     raise ValueError("Choose a music action: song, lyrics, covers, video, stems, replace, sounds, persona, or voice.")
 
 
+def callback_summary(payload: Dict[str, Any]) -> str:
+    """One log line for a Kie music callback. URLs are omitted."""
+    data, result_json = _unwrap(payload if isinstance(payload, dict) else {})
+    response = data.get("response") if isinstance(data.get("response"), dict) else {}
+    obj = result_json.get("resultObject") if isinstance(result_json.get("resultObject"), dict) else {}
+    callback = str(data.get("callbackType") or data.get("callback_type") or "").strip().lower()
+    state = str(data.get("state") or data.get("status") or "").strip().lower()
+    counts = []
+    raw_ids = []
+    for name, source in (("data", data), ("response", response), ("result", obj), ("json", result_json)):
+        if not isinstance(source, dict):
+            continue
+        for key in ("data", "sunoData", "suno_data", "clips"):
+            items = source.get(key)
+            if not isinstance(items, list):
+                continue
+            counts.append(f"{name}.{key}={len(items)}")
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                clip_id = _first_text(item.get("id"), item.get("audio_id"), item.get("audioId")) or "-"
+                audio = bool(_first_text(item.get("audio_url"), item.get("audioUrl"), item.get("source_audio_url")))
+                stream = bool(_first_text(
+                    item.get("stream_audio_url"), item.get("stream_url"),
+                    item.get("streamAudioUrl"), item.get("source_stream_audio_url"),
+                ))
+                raw_ids.append(f"{clip_id}:audio={int(audio)}:stream={int(stream)}")
+    event = interpret(payload if isinstance(payload, dict) else {})
+    parsed = [
+        f"{track.get('id') or '-'}:audio={int(bool(track.get('audio_url')))}:stream={int(bool(track.get('stream_url')))}"
+        for track in event.get("tracks") or []
+    ]
+    return (
+        f"code={payload.get('code') if isinstance(payload, dict) else '-'} "
+        f"msg={payload.get('msg') if isinstance(payload, dict) else '-'} "
+        f"callback={callback or '-'} state={state or '-'} "
+        f"raw={counts or ['none']} raw_clips={raw_ids or ['none']} "
+        f"parsed={len(parsed)} {parsed or ['none']} "
+        f"disposition={event.get('disposition')} kind={event.get('kind') or '-'}"
+    )
+
+
 def interpret(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Read a Kie callback or recordInfo body."""
     data, result_json = _unwrap(payload)
@@ -319,14 +361,26 @@ def advance(context: Dict[str, Any], music: Dict[str, Any], event: Dict[str, Any
     phase = ctx.get("phase") or "song"
 
     if disposition == "pending":
-        return _step("update", ctx, current)
+        playable = any(_track_has_audio(track) for track in current.get("tracks") or [])
+        # A long wait can accept the one clip that already arrived, even when
+        # the latest poll has no new file yet.
+        if not (ctx.get("accept_single_track") and playable):
+            return _step("update", ctx, current)
+        kind = "tracks"
     if disposition == "progress":
         _apply_assets(current, event)
-        if any(track.get("audio_url") or track.get("stream_url") for track in current.get("tracks") or []):
-            if phase == "song":
-                current["phase"] = "first_track"
-                current["label"] = PHASE_LABELS["first_track"]
-        return _step("update", ctx, current)
+        playable = any(_track_has_audio(track) for track in current.get("tracks") or [])
+        if playable and phase == "song":
+            current["phase"] = "first_track"
+            current["label"] = PHASE_LABELS["first_track"]
+            if hold_for_second_version(ctx, current):
+                return _step("update", ctx, current)
+            if ctx.get("accept_single_track"):
+                kind = "tracks"
+            else:
+                return _step("update", ctx, current)
+        else:
+            return _step("update", ctx, current)
     if disposition == "failed":
         if phase == "covers":
             current["phase"] = "complete"
@@ -363,6 +417,11 @@ def advance(context: Dict[str, Any], music: Dict[str, Any], event: Dict[str, Any
         if event.get("task_id"):
             ctx["music_task_id"] = event["task_id"]
             current["task_id"] = event["task_id"]
+        if hold_for_second_version(ctx, current):
+            ctx["phase"] = "song"
+            current["phase"] = "first_track"
+            current["label"] = PHASE_LABELS["first_track"]
+            return _step("update", ctx, current)
         if phase == "song" and ctx.get("easy") and ctx.get("action") == "song" and ctx.get("music_task_id"):
             ctx["phase"] = "covers"
             current["phase"] = "cover_art"
@@ -827,9 +886,34 @@ def _blank_music(context: Dict[str, Any], phase: str) -> Dict[str, Any]:
     }
 
 
+def hold_for_second_version(
+    context: Optional[Dict[str, Any]],
+    music: Optional[Dict[str, Any]],
+    event: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Keep a HitMaker song open until both clips are stored.
+
+    A short timer used to claim the Kie task after one clip. The callback that
+    carries the second clip was then ignored. The task stays open until two
+    clips can play, unless the caller sets accept_single_track after a long wait.
+    """
+    ctx = context or {}
+    current = music or {}
+    action = ctx.get("action") or current.get("action") or "song"
+    if action != "song" or ctx.get("accept_single_track"):
+        return False
+    tracks = list(current.get("tracks") or [])
+    if event and event.get("tracks"):
+        tracks = _merge_tracks(tracks, event.get("tracks") or [])
+    playable = [track for track in tracks if _track_has_audio(track)]
+    if len(playable) >= 2 or not playable:
+        return False
+    return True
+
+
 def _apply_assets(music: Dict[str, Any], event: Dict[str, Any]) -> None:
     if event.get("tracks"):
-        music["tracks"] = event["tracks"]
+        music["tracks"] = _merge_tracks(music.get("tracks") or [], event["tracks"])
     if event.get("lyrics"):
         music["lyrics"] = event["lyrics"]
     if event.get("covers"):
@@ -896,40 +980,93 @@ def _unwrap(payload: Dict[str, Any]):
 
 def _tracks_from(data: Dict[str, Any], result_json: Dict[str, Any]) -> List[Dict[str, Any]]:
     raw_lists = []
-    if isinstance(data.get("data"), list):
-        raw_lists.append(data["data"])
     response = data.get("response") if isinstance(data.get("response"), dict) else {}
-    if isinstance(response.get("data"), list):
-        raw_lists.append(response["data"])
     obj = result_json.get("resultObject") if isinstance(result_json.get("resultObject"), dict) else {}
-    if isinstance(obj.get("data"), list):
-        raw_lists.append(obj["data"])
+    for source in (data, response, obj, result_json):
+        if not isinstance(source, dict):
+            continue
+        for key in ("data", "sunoData", "suno_data", "clips"):
+            if isinstance(source.get(key), list):
+                raw_lists.append(source[key])
     tracks = []
-    seen = set()
     for raw in raw_lists:
+        incoming = []
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            if not (item.get("audio_url") or item.get("stream_audio_url") or item.get("id")):
+            audio_url = _first_text(
+                item.get("audio_url"),
+                item.get("audioUrl"),
+                item.get("source_audio_url"),
+            )
+            stream_url = _first_text(
+                item.get("stream_audio_url"),
+                item.get("stream_url"),
+                item.get("streamAudioUrl"),
+                item.get("source_stream_audio_url"),
+            )
+            track_id = _first_text(item.get("id"), item.get("audio_id"), item.get("audioId"))
+            if not (audio_url or stream_url or track_id):
                 continue
-            if item.get("text") and not item.get("audio_url") and not item.get("stream_audio_url"):
+            if item.get("text") and not audio_url and not stream_url:
                 continue
-            track_id = str(item.get("id") or "")
-            if track_id and track_id in seen:
-                continue
-            if track_id:
-                seen.add(track_id)
-            tracks.append({
+            incoming.append({
                 "id": track_id or None,
                 "title": item.get("title") or "",
                 "lyrics": item.get("prompt") or item.get("lyrics") or "",
                 "tags": item.get("tags") or "",
                 "duration": item.get("duration"),
-                "audio_url": item.get("audio_url") or "",
-                "stream_url": item.get("stream_audio_url") or "",
-                "cover_url": item.get("image_url") or "",
+                "audio_url": audio_url,
+                "stream_url": stream_url,
+                "cover_url": _first_text(
+                    item.get("image_url"),
+                    item.get("imageUrl"),
+                    item.get("source_image_url"),
+                    item.get("cover_url"),
+                ),
             })
+        tracks = _merge_tracks(tracks, incoming)
     return tracks
+
+
+def _track_has_audio(track: Dict[str, Any]) -> bool:
+    return bool(track.get("audio_url") or track.get("stream_url"))
+
+
+def _track_key(track: Dict[str, Any]) -> str:
+    track_id = str(track.get("id") or "").strip()
+    if track_id:
+        return "id:" + track_id
+    for field in ("audio_url", "stream_url", "download_url"):
+        url = str(track.get(field) or "").strip()
+        if url:
+            return "url:" + url
+    return ""
+
+
+def _merge_tracks(current: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = [dict(item) for item in current if isinstance(item, dict)]
+    for raw in incoming:
+        if not isinstance(raw, dict):
+            continue
+        key = _track_key(raw)
+        if not key:
+            out.append(dict(raw))
+            continue
+        for index, kept in enumerate(out):
+            if _track_key(kept) != key:
+                continue
+            merged = dict(kept)
+            for field, value in raw.items():
+                if value not in (None, ""):
+                    merged[field] = value
+            if not merged.get("stream_url") and kept.get("stream_url"):
+                merged["stream_url"] = kept["stream_url"]
+            out[index] = merged
+            break
+        else:
+            out.append(dict(raw))
+    return out
 
 
 def _lyrics_from(data: Dict[str, Any], result_json: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -955,7 +1092,16 @@ def _lyrics_from(data: Dict[str, Any], result_json: Dict[str, Any]) -> List[Dict
 def _covers_from(data: Dict[str, Any], result_json: Dict[str, Any]) -> List[str]:
     images = data.get("images")
     if isinstance(images, list):
-        return [str(item) for item in images if isinstance(item, str) and item.startswith("http")]
+        found = []
+        for item in images:
+            if isinstance(item, str) and item.startswith("http"):
+                found.append(item)
+            elif isinstance(item, dict):
+                url = _first_text(item.get("url"), item.get("image_url"), item.get("imageUrl"))
+                if url and url.startswith("http"):
+                    found.append(url)
+        if found:
+            return found
     urls = result_json.get("resultUrls") or result_json.get("result_urls") or []
     if isinstance(urls, list) and urls and all(isinstance(item, str) and _looks_like_image(item) for item in urls):
         return [str(item) for item in urls]

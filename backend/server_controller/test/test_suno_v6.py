@@ -57,7 +57,17 @@ def _song_event(callback_type="complete"):
                     "title": "Starry Night Dreams",
                     "tags": "nostalgic, acoustic",
                     "duration": 198.44,
-                }
+                },
+                {
+                    "id": "audio-2",
+                    "audio_url": "https://cdn.example/b.mp3",
+                    "stream_audio_url": "https://cdn.example/b-stream",
+                    "image_url": "https://cdn.example/b.jpg",
+                    "prompt": "[Verse]\nMoonlight",
+                    "title": "Starry Night Dreams",
+                    "tags": "nostalgic, acoustic",
+                    "duration": 201.2,
+                },
             ],
         },
     })
@@ -90,6 +100,7 @@ def test_easy_idea_starts_with_lyrics_then_song_then_covers():
     assert song_step["kie_input"] == {"task_id": "song-task"}
     assert song_step["optional"] is True
     assert song_step["music"]["tracks"][0]["id"] == "audio-1"
+    assert song_step["music"]["tracks"][1]["id"] == "audio-2"
     assert song_step["music"]["tracks"][0]["cover_url"] == "https://cdn.example/a.jpg"
     assert song_step["music"]["phase"] == "cover_art"
 
@@ -111,11 +122,122 @@ def test_easy_idea_starts_with_lyrics_then_song_then_covers():
 
 def test_first_track_stays_in_progress():
     prepared = suno_v6.prepare(IDEA, {"mode": "easy", "lyrics": "[Chorus]\nAlready written"})
-    event = _song_event("first")
+    event = suno_v6.interpret({
+        "code": 200,
+        "data": {
+            "callbackType": "first",
+            "task_id": "song-task",
+            "data": [{
+                "id": "audio-1",
+                "audio_url": "https://cdn.example/a.mp3",
+                "stream_audio_url": "https://cdn.example/a-stream",
+                "title": "Starry Night Dreams",
+                "duration": 198.44,
+            }],
+        },
+    })
     step = suno_v6.advance(prepared.context, prepared.music, event)
     assert step["action"] == "update"
     assert step["music"]["phase"] == "first_track"
     assert step["context"]["phase"] == "song"
+
+
+def test_one_version_waits_and_the_second_is_kept():
+    prepared = suno_v6.prepare(IDEA, {"mode": "easy", "lyrics": "[Chorus]\nAlready written"})
+    first = suno_v6.interpret({
+        "code": 200,
+        "data": {
+            "callbackType": "complete",
+            "task_id": "song-task",
+            "data": [{
+                "id": "audio-1",
+                "audio_url": "https://cdn.example/a.mp3",
+                "stream_audio_url": "https://cdn.example/a-stream",
+                "title": "Same Song",
+            }],
+        },
+    })
+    waiting = suno_v6.advance(prepared.context, prepared.music, first)
+    assert waiting["action"] == "update"
+    assert waiting["music"]["phase"] == "first_track"
+    assert suno_v6.hold_for_second_version(waiting["context"], waiting["music"], first) is True
+    second = suno_v6.interpret({
+        "code": 200,
+        "data": {
+            "callbackType": "complete",
+            "task_id": "song-task",
+            "data": [{
+                "id": "audio-2",
+                "audio_url": "https://cdn.example/b.mp3",
+                "stream_audio_url": "https://cdn.example/b-stream",
+                "title": "Same Song",
+            }],
+        },
+    })
+    done = suno_v6.advance(waiting["context"], waiting["music"], second)
+    assert [track["id"] for track in done["music"]["tracks"]] == ["audio-1", "audio-2"]
+    assert done["action"] == "submit"
+    assert done["music"]["phase"] == "cover_art"
+
+
+def test_one_clip_stays_open_until_the_wait_is_given_up():
+    prepared = suno_v6.prepare(IDEA, {"mode": "easy", "lyrics": "[Chorus]\nAlready written"})
+    first = suno_v6.interpret({
+        "code": 200,
+        "data": {
+            "callbackType": "complete",
+            "task_id": "song-task",
+            "data": [{
+                "id": "audio-1",
+                "audio_url": "https://cdn.example/a.mp3",
+                "title": "Same Song",
+            }],
+        },
+    })
+    waiting = suno_v6.advance(prepared.context, prepared.music, first)
+    ctx = dict(waiting["context"])
+    ctx["pair_wait_since"] = 1
+    still = suno_v6.advance(ctx, waiting["music"], first)
+    assert still["action"] == "update"
+    assert suno_v6.hold_for_second_version(ctx, still["music"], first) is True
+    ctx["accept_single_track"] = True
+    released = suno_v6.advance(ctx, still["music"], first)
+    assert released["action"] == "submit"
+    assert [track["id"] for track in released["music"]["tracks"]] == ["audio-1"]
+
+
+def test_a_finished_song_keeps_a_late_second_version():
+    prepared = suno_v6.prepare(IDEA, {"mode": "custom", "style": "jazz", "lyrics": "[Chorus]\nNight"})
+    first = suno_v6.interpret({
+        "code": 200,
+        "data": {
+            "callbackType": "complete",
+            "task_id": "song-task",
+            "data": [{
+                "id": "audio-1",
+                "audio_url": "https://cdn.example/a.mp3",
+                "title": "Same Song",
+            }],
+        },
+    })
+    waiting = suno_v6.advance(prepared.context, prepared.music, first)
+    ctx = dict(waiting["context"])
+    ctx["phase"] = "done"
+    second = suno_v6.interpret({
+        "code": 200,
+        "data": {
+            "callbackType": "complete",
+            "task_id": "song-task",
+            "data": [{
+                "id": "audio-2",
+                "audio_url": "https://cdn.example/b.mp3",
+                "title": "Same Song",
+            }],
+        },
+    })
+    late = suno_v6.advance(ctx, waiting["music"], second)
+    assert late["action"] == "update"
+    assert [track["id"] for track in late["music"]["tracks"]] == ["audio-1", "audio-2"]
 
 
 def test_easy_with_lyrics_skips_the_lyrics_call():

@@ -356,7 +356,7 @@ class AppState:
     async def _kie_recordinfo_sweeper_task(self):
         """Once-per-task fallback if Kie never POSTs callBackUrl."""
         from datetime import timedelta
-        from db import SessionLocal, KieTask, utc_naive_now
+        from db import SessionLocal, Job, KieTask, utc_naive_now
         from routes import _apply_kie_job_result
         import kie_client
 
@@ -385,14 +385,46 @@ class AppState:
                         if rec.model == "suno_v6":
                             import suno_v6
                             from datetime import timedelta as _td
-                            disposition = suno_v6.interpret(payload).get("disposition")
+                            event = suno_v6.interpret(payload)
+                            disposition = event.get("disposition")
                             created = rec.created_at.replace(tzinfo=None) if rec.created_at and rec.created_at.tzinfo else rec.created_at
                             age = utc_naive_now() - created if created else _td(0)
-                            if disposition in ("pending", "progress") and age < _td(minutes=20):
-                                if disposition == "progress":
+                            job = db.query(Job).filter(Job.job_id == rec.job_id).first()
+                            params = job.params if job and isinstance(job.params, dict) else {}
+                            context = params.get("_suno") if isinstance(params.get("_suno"), dict) else {}
+                            music = params.get("_music") if isinstance(params.get("_music"), dict) else {}
+                            action = context.get("action") or music.get("action") or "song"
+                            tracks = list(music.get("tracks") or [])
+                            if event.get("tracks"):
+                                tracks = suno_v6._merge_tracks(tracks, event.get("tracks") or [])
+                            playable = sum(1 for track in tracks if suno_v6._track_has_audio(track))
+                            # One clip is not a finished HitMaker song. Keep polling
+                            # until the second arrives, then accept the single clip
+                            # after a long wait instead of failing a playable song.
+                            if (
+                                action == "song"
+                                and playable == 1
+                                and age >= _td(minutes=12)
+                                and disposition in ("pending", "progress", "success")
+                                and not context.get("accept_single_track")
+                                and job is not None
+                            ):
+                                context = dict(context)
+                                context["accept_single_track"] = True
+                                params = dict(params)
+                                params["_suno"] = context
+                                job.params = params
+                                db.commit()
+                            holding = suno_v6.hold_for_second_version(context, music, event)
+                            if holding or (
+                                disposition in ("pending", "progress")
+                                and age < _td(minutes=20)
+                                and not context.get("accept_single_track")
+                            ):
+                                if disposition in ("progress", "success") or holding:
                                     await _apply_kie_job_result(rec.job_id, payload)
                                 continue
-                            if disposition in ("pending", "progress"):
+                            if disposition in ("pending", "progress") and playable < 1:
                                 payload = {
                                     "code": 500,
                                     "msg": "Music generation timed out",

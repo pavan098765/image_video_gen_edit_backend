@@ -169,10 +169,12 @@ def assemble_task(
         "model": provider.get("model_id"),
         "outputType": "URL",
         "outputFormat": spec.get("output_format") or "PNG",
-        "numberResults": 1,
         "includeCost": True,
         "deliveryMethod": "async",
     }
+    # Upscale tasks return one image. Runware rejects numberResults on them.
+    if profile not in ("upscale_p", "upscale_esrgan"):
+        task["numberResults"] = 1
     if webhook:
         task["webhookURL"] = webhook
 

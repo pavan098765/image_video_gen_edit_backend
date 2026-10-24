@@ -115,6 +115,7 @@ def test_upscale_factors_stay_inside_each_model():
     assert p_image["upscaleFactor"] == 4
     assert p_image["inputs"]["image"] == "https://cdn.example/in.jpg"
     assert p_image["settings"] == {"enhanceDetails": True}
+    assert "numberResults" not in p_image
 
     esrgan = assemble_task(
         _cfg("upscale_esrgan", "runware:504@1", "upscale"),
@@ -122,6 +123,7 @@ def test_upscale_factors_stay_inside_each_model():
         "66666666-6666-4666-8666-666666666666",
     )
     assert esrgan["upscaleFactor"] == 2
+    assert "numberResults" not in esrgan
 
 
 def test_speech_and_music_shapes():

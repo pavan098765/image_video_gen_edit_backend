@@ -3366,13 +3366,24 @@ def _mint_suno_url(url: Optional[str]) -> Optional[str]:
 
 async def _complete_suno_job(db, job, params: Dict[str, Any], primary_url: Optional[str]) -> None:
     music = dict(params.get("_music") or {})
+    minted_covers = []
+    for url in music.get("covers") or []:
+        if isinstance(url, str) and url.startswith("http"):
+            minted_covers.append(await asyncio.to_thread(_mint_suno_url, url))
+    if minted_covers:
+        music["covers"] = minted_covers
     tracks = []
-    for track in music.get("tracks") or []:
+    for index, track in enumerate(music.get("tracks") or []):
         if not isinstance(track, dict):
             continue
         item = dict(track)
         if item.get("audio_url"):
             item["download_url"] = await asyncio.to_thread(_mint_suno_url, item.get("audio_url"))
+        cover = item.get("cover_url")
+        if isinstance(cover, str) and cover.startswith("http"):
+            item["cover_url"] = await asyncio.to_thread(_mint_suno_url, cover)
+        elif minted_covers:
+            item["cover_url"] = minted_covers[index] if index < len(minted_covers) else minted_covers[0]
         tracks.append(item)
     if tracks:
         music["tracks"] = tracks
@@ -3449,15 +3460,27 @@ async def _apply_suno_v6(db, job, payload: Dict[str, Any]) -> None:
     import suno_v6
     from db import KieTask
 
-    if job.status in (JobState.COMPLETED.value, JobState.FAILED.value, JobState.CANCELLED.value):
+    if job.status == JobState.COMPLETED.value:
+        await _keep_late_suno_versions(db, job, payload)
+        return
+    if job.status in (JobState.FAILED.value, JobState.CANCELLED.value):
         logger.info("[SUNO] job %s already terminal (%s)", job.job_id, job.status)
         return
     params = dict(job.params or {})
     context = params.get("_suno") if isinstance(params.get("_suno"), dict) else {}
     music = params.get("_music") if isinstance(params.get("_music"), dict) else {}
-    step = suno_v6.advance(context, music, suno_v6.interpret(payload))
+    event = suno_v6.interpret(payload)
+    step = suno_v6.advance(context, music, event)
     params["_suno"] = step["context"]
     params["_music"] = step["music"]
+    stored = step["music"].get("tracks") if isinstance(step.get("music"), dict) else []
+    logger.info(
+        "[SUNO] job %s decided %s phase=%s stored=%s",
+        job.job_id,
+        step.get("action"),
+        (step.get("music") or {}).get("phase"),
+        [track.get("id") for track in stored or [] if isinstance(track, dict)],
+    )
 
     if step["action"] == "update":
         job.params = params
@@ -3511,6 +3534,44 @@ async def _apply_suno_v6(db, job, payload: Dict[str, Any]) -> None:
         await _complete_suno_job(db, job, params, step.get("primary_url"))
         return
     await _fail_suno_job(db, job, params, step.get("error") or "Music generation failed")
+
+
+async def _keep_late_suno_versions(db, job, payload: Dict[str, Any]) -> None:
+    """Store a clip that arrives after the song was already marked ready.
+
+    Finishing the job used to ignore every later callback, so the second
+    version was dropped. This only updates the stored tracks.
+    """
+    import suno_v6
+
+    event = suno_v6.interpret(payload)
+    incoming = event.get("tracks") or []
+    if not incoming:
+        return
+    params = dict(job.params or {})
+    music = params.get("_music") if isinstance(params.get("_music"), dict) else {}
+    music = dict(music)
+    before = list(music.get("tracks") or [])
+    merged = suno_v6._merge_tracks(before, incoming)
+    if json.dumps(before, sort_keys=True, default=str) == json.dumps(merged, sort_keys=True, default=str):
+        return
+    music["tracks"] = merged
+    params["_music"] = music
+    job.params = params
+    job.updated_at = utc_naive_now()
+    db.commit()
+    logger.info("[SUNO] job %s kept a late version (%s tracks)", job.job_id, len(merged))
+
+
+async def _merge_late_suno_tracks(job_id: str, payload: Dict[str, Any]) -> None:
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if not job or job.status in (JobState.FAILED.value, JobState.CANCELLED.value):
+            return
+        await _keep_late_suno_versions(db, job, payload)
+    finally:
+        db.close()
 
 
 async def _apply_kie_job_result(job_id: str, payload: Dict[str, Any]) -> None:
@@ -3617,26 +3678,60 @@ async def kie_callback(request: Request):
     if not task_id or not kie_client.verify_webhook_signature(task_id, timestamp, signature):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
     db = SessionLocal()
+    job_id = None
+    late_job_id = None
+    partial = False
+    defer_claim = False
     try:
         rec = db.query(KieTask).filter(KieTask.task_id == task_id).first()
         if not rec:
             logger.warning("[KIE] callback for unknown task %s", task_id)
             return {"ok": True, "ignored": True}
         if rec.callback_received:
-            return {"ok": True, "duplicate": True}
-        job_id = rec.job_id
-        partial = False
-        defer_claim = rec.model == "suno_v6"
-        if defer_claim:
+            # A claimed song task can still carry the second version.
+            if rec.model == "suno_v6":
+                late_job_id = rec.job_id
+            else:
+                return {"ok": True, "duplicate": True}
+        else:
+            job_id = rec.job_id
+            defer_claim = rec.model == "suno_v6"
+        if defer_claim or late_job_id:
             import suno_v6
-            disposition = suno_v6.interpret(payload).get("disposition")
+            event = suno_v6.interpret(payload)
+            disposition = event.get("disposition")
             partial = disposition in ("pending", "progress")
+            job = db.query(Job).filter(Job.job_id == (late_job_id or job_id)).first()
+            params = job.params if job and isinstance(job.params, dict) else {}
+            context = params.get("_suno") if isinstance(params.get("_suno"), dict) else {}
+            music = params.get("_music") if isinstance(params.get("_music"), dict) else {}
+            if not partial:
+                partial = suno_v6.hold_for_second_version(context, music, event)
+            stored_ids = [
+                track.get("id") for track in (music.get("tracks") or []) if isinstance(track, dict)
+            ]
+            incoming_ids = [
+                track.get("id") for track in (event.get("tracks") or []) if isinstance(track, dict)
+            ]
+            logger.info(
+                "[KIE] suno callback task=%s job=%s already_claimed=%s waiting=%s stored=%s incoming=%s %s",
+                task_id,
+                late_job_id or job_id,
+                bool(late_job_id),
+                partial,
+                stored_ids,
+                incoming_ids,
+                suno_v6.callback_summary(payload),
+            )
         if not defer_claim:
             rec.callback_received = True
             rec.updated_at = utc_naive_now()
             db.commit()
     finally:
         db.close()
+    if late_job_id:
+        await _merge_late_suno_tracks(late_job_id, payload)
+        return {"ok": True, "duplicate": True}
     await _apply_kie_job_result(job_id, payload)
     if defer_claim and not partial:
         claim_db = SessionLocal()
