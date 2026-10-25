@@ -580,6 +580,19 @@ class DescribeAssetForPromptResponse(BaseModel):
     prompt: str = Field(..., description="VLM-generated prompt text for the composer")
 
 
+class SuggestPromptRequest(BaseModel):
+    model_id: str = Field(..., min_length=1, max_length=80)
+    field: str = Field(default="prompt", max_length=40)
+    text: str = Field(default="", max_length=4000)
+    caption: Optional[str] = Field(default=None, max_length=1500)
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+
+class SuggestPromptResponse(BaseModel):
+    prompt: str = Field(..., description="One prompt for the text box")
+
+
 # =============================================================================
 # Response Models
 # =============================================================================
@@ -658,6 +671,10 @@ class JobStatusResponse(BaseModel):
     all_completed: bool = Field(True, description="True if all variations are complete")
     estimated_wait_seconds: Optional[int] = Field(None, description="Estimated seconds until job completes (processing jobs only)")
     queue_position: Optional[int] = Field(None, description="Position in worker queue (processing jobs only)")
+    music: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Suno V6 studio payload: tracks, lyrics, covers, stems, video, and phase.",
+    )
 
 
 class WorkerResponse(BaseModel):

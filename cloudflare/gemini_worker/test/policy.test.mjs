@@ -75,6 +75,23 @@ test("an image caption body can exceed the text size cap", () => {
   assert.equal(image.ok, true);
 });
 
+test("a system instruction is forwarded and clipped", () => {
+  const out = sanitizeRequest(
+    {
+      step: "music_easy",
+      model: "gemini-2.5-flash",
+      systemInstruction: "Follow the ACE-Step caption rules.",
+      contents: [{ parts: [{ text: "a rainy song" }] }],
+    },
+    { allowlist: allow },
+  );
+  assert.equal(out.ok, true);
+  assert.equal(
+    out.upstream.systemInstruction.parts[0].text,
+    "Follow the ACE-Step caption rules.",
+  );
+});
+
 test("the response check catches a leaked key", () => {
   assert.equal(responseHasKey({ text: "secret-key-value" }, "secret-key-value"), true);
   assert.equal(responseHasKey({ text: "ok" }, "secret-key-value"), false);

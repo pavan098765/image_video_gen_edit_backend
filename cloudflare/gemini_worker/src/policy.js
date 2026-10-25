@@ -53,6 +53,11 @@ export function sanitizeRequest(body, options = {}) {
     upstream.generationConfig.responseMimeType = "application/json";
     upstream.generationConfig.responseSchema = body.responseSchema;
   }
+  const systemText =
+    typeof body.systemInstruction === "string" ? body.systemInstruction.trim() : "";
+  if (systemText) {
+    upstream.systemInstruction = { parts: [{ text: systemText.slice(0, 20000) }] };
+  }
   if (step === "research" && body.tools) {
     upstream.tools = body.tools;
   }

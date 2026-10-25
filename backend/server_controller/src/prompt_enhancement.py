@@ -10,10 +10,13 @@ Configuration via environment variables:
 - NVIDIA_MAX_TOKENS, NVIDIA_TEMPERATURE, NVIDIA_STREAM: shared Nemotron payload (see nvidia_chat_client)
 """
 
+import json
 import logging
 import os
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
+from asset_prompt_vlm import suggest_text_with_gemini
 from nvidia_chat_client import (
     build_messages_chat_with_media,
     default_max_tokens,
@@ -175,8 +178,107 @@ async def enhance_prompt(
     return False, prompt, None
 
 
+def _style_book() -> Dict[str, Any]:
+    path = Path(__file__).with_name("prompt_styles.json")
+    with path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("prompt_styles.json must be an object")
+    return data
+
+
+def _fallback_kind(model: str, field: str) -> str:
+    if field in ("lyrics",):
+        return "lyrics"
+    if field in ("style",):
+        return "style"
+    if field in ("negative", "negative_prompt", "negative_tags"):
+        return "negative"
+    if field in ("voice_description",):
+        return "voice_description"
+    name = (model or "").lower()
+    if any(token in name for token in ("expand",)):
+        return "expand"
+    if any(token in name for token in ("edit", "inpaint", "i2i")):
+        return "edit"
+    if any(token in name for token in ("suno", "music", "ace_step", "minimax_music")):
+        return "music"
+    if any(token in name for token in ("tts", "voice", "speech")):
+        return "speech"
+    if any(token in name for token in ("video", "ltx", "wan", "i2v", "t2v", "h3")):
+        return "video"
+    return "image"
+
+
+def _model_field_spec(entry: Dict[str, Any], field: str) -> Optional[Dict[str, Any]]:
+    names = {
+        "negative": ("negative", "negative_prompt", "negative_tags"),
+        "negative_prompt": ("negative_prompt", "negative", "negative_tags"),
+        "negative_tags": ("negative_tags", "negative", "negative_prompt"),
+    }.get(field, (field,))
+    for name in names:
+        spec = entry.get(name)
+        if isinstance(spec, dict):
+            return spec
+    if field in ("", "prompt"):
+        prompt = entry.get("prompt")
+        if isinstance(prompt, dict):
+            return prompt
+    return None
+
+
+def instruction_for(model: str, field: str, invent: bool) -> str:
+    book = _style_book()
+    fallbacks = book.get("fallbacks") if isinstance(book.get("fallbacks"), dict) else {}
+    models = book.get("models") if isinstance(book.get("models"), dict) else {}
+    entry = models.get(model) if isinstance(models.get(model), dict) else {}
+    spec = _model_field_spec(entry, field or "prompt")
+    kind = ""
+    if isinstance(spec, dict):
+        if spec.get("refine") or spec.get("invent"):
+            text = spec.get("invent" if invent else "refine")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+        kind = str(spec.get("kind") or "")
+    if not kind:
+        kind = _fallback_kind(model, field)
+    chosen = fallbacks.get(kind) if isinstance(fallbacks.get(kind), dict) else None
+    if chosen is None:
+        chosen = fallbacks.get("image") if isinstance(fallbacks.get("image"), dict) else {}
+    text = chosen.get("invent" if invent else "refine") if isinstance(chosen, dict) else ""
+    if not isinstance(text, str) or not text.strip():
+        return "Write one clear prompt. No explanation."
+    return text.strip()
+
+
+def suggest_prompt(
+    model: str,
+    field: str,
+    text: str,
+    caption: Optional[str] = None,
+    authorization: str = "",
+) -> str:
+    """Write or refine one prompt through the Gemini director worker."""
+    typed = (text or "").strip()
+    picture = (caption or "").strip()
+    invent = not typed
+    instruction = instruction_for(model or "", field or "prompt", invent)
+    parts = [instruction]
+    if picture:
+        parts.append(f"Picture description:\n{picture[:1500]}")
+    if typed:
+        parts.append(f"User text:\n{typed[:4000]}")
+    else:
+        parts.append("The box is empty. Write one new prompt.")
+    parts.append("Reply with only the prompt text.")
+    ok, result = suggest_text_with_gemini("\n\n".join(parts), authorization)
+    if not ok:
+        raise RuntimeError(result or "Prompt suggestion failed.")
+    return result.strip()
+
+
 def should_enhance_for_model(model: str, mode: Optional[str] = None) -> bool:
-    no_prompt_models = {"basic_utils", "real_esrgan", "upscaler"}
+    no_prompt_models = {"basic_utils", "real_esrgan", "upscaler", "suno_v6"}
     if model.lower() in no_prompt_models:
         return False
 

@@ -189,7 +189,8 @@ def prepare_recraft_image(source_url: str) -> str:
     return upload_file_from_url(source_url)
 
 
-def create_task(model: str, input_payload: Dict[str, Any], callback_url: str) -> str:
+def create_task_response(model: str, input_payload: Dict[str, Any], callback_url: str) -> Dict[str, Any]:
+    """POST createTask. Kie returns HTTP 200 even when `code` is an error."""
     body = {
         "model": model,
         "callBackUrl": callback_url,
@@ -204,10 +205,43 @@ def create_task(model: str, input_payload: Dict[str, Any], callback_url: str) ->
     if resp.status_code >= 400:
         raise RuntimeError(f"Kie createTask HTTP {resp.status_code}: {resp.text[:800]}")
     data = resp.json()
-    payload = data.get("data") or data
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Kie createTask returned {type(data).__name__}")
+    code = data.get("code")
+    if code not in (None, 200, "200"):
+        message = data.get("msg") or data.get("message") or f"Kie createTask code {code}"
+        raise RuntimeError(str(message))
+    payload = data.get("data")
+    if isinstance(payload, dict):
+        return payload
+    return data
+
+
+def _task_input_summary(model: str, input_payload: Dict[str, Any]) -> str:
+    """Request fields that explain a music task, without the lyric text or file URLs."""
+    payload = input_payload if isinstance(input_payload, dict) else {}
+    parts = [f"model={model}"]
+    for key in ("custom_mode", "instrumental", "model", "style", "title", "vocal_gender", "duration", "variety"):
+        if key in payload and payload.get(key) not in (None, ""):
+            parts.append(f"{key}={payload.get(key)}")
+    prompt = payload.get("prompt")
+    lyrics = payload.get("lyrics")
+    parts.append(f"prompt_len={len(prompt) if isinstance(prompt, str) else 0}")
+    parts.append(f"lyrics_len={len(lyrics) if isinstance(lyrics, str) else 0}")
+    for key in ("image_urls", "audio_urls", "video_urls"):
+        value = payload.get(key)
+        if isinstance(value, list) and value:
+            parts.append(f"{key}={len(value)}")
+    return " ".join(str(part) for part in parts)
+
+
+def create_task(model: str, input_payload: Dict[str, Any], callback_url: str) -> str:
+    logger.info("[KIE] createTask %s", _task_input_summary(model, input_payload))
+    payload = create_task_response(model, input_payload, callback_url)
     task_id = payload.get("taskId") or payload.get("task_id")
     if not task_id:
-        raise RuntimeError(f"Kie createTask missing taskId: {data}")
+        raise RuntimeError(f"Kie createTask missing taskId: {payload}")
+    logger.info("[KIE] createTask response task=%s", task_id)
     return str(task_id)
 
 

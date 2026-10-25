@@ -267,6 +267,21 @@ class KieTask(Base):
     __table_args__ = (Index("ix_kie_task_job", "job_id"),)
 
 
+class RunwareTask(Base):
+    """Runware taskUUID → job. Polling and the webhook share this row."""
+
+    __tablename__ = "runware_tasks"
+
+    task_id = Column(String(64), primary_key=True)
+    job_id = Column(String(128), index=True, nullable=False)
+    model = Column(String(64), nullable=True)
+    callback_received = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now)
+
+    __table_args__ = (Index("ix_runware_task_job", "job_id"),)
+
+
 class PersonalQueueItem(Base):
     """Admin leftover-pod work. Not a client Job row; does not lock credits."""
 

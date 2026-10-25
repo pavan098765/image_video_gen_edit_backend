@@ -9,6 +9,7 @@ Provides:
 - Request logging
 - Request timeout handling
 - Worker IP whitelist exemptions
+- OpenAI content-moderation gate on frontend requests
 """
 
 import os
@@ -24,6 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
+from content_moderation import ContentModerationMiddleware
+from moderation_client import allow_flagged_from_env, openai_api_key_from_env
 from security import ip_ban_manager, security_config
 
 logger = logging.getLogger("middleware")
@@ -116,8 +119,10 @@ ALLOWED_PATHS: List[str] = [
     "/get_video_upload_url",   # R2 presigned video upload
     "/get_media_upload_urls",  # R2 presigned media upload (images/videos)
     "/describe_asset_for_prompt",  # VLM caption from R2 key (Firebase auth)
+    "/suggest_prompt",
     "/batch_status",           # Batch/variation status polling
     "/kie",
+    "/runware",
     "/admin",
     "/personal",
 ]
@@ -141,6 +146,7 @@ TRUSTED_API_PATHS: List[str] = [
     "/get_video_upload_url",
     "/get_media_upload_urls",
     "/describe_asset_for_prompt",
+    "/suggest_prompt",
     "/auth",  # Firebase auth endpoints require Bearer token
     "/admin",
 ]
@@ -152,6 +158,7 @@ PUBLIC_PATHS: List[str] = [
     "/sales",
     "/ads/admob/ssv",  # AdMob SSV callback (called by Google, no auth)
     "/kie/callback",
+    "/runware/callback",
     "/personal/ui",
 ]
 
@@ -510,7 +517,12 @@ def setup_middleware(app, debug: bool = False):
     # Request timeout
     timeout = int(os.getenv("REQUEST_TIMEOUT", "30"))
     app.add_middleware(RequestTimeoutMiddleware, timeout=timeout)
-    
+
+    # Content moderation is inside the path whitelist and the security middleware.
+    # Starlette runs the last added middleware first, so unknown paths are rejected
+    # before this gate calls OpenAI.
+    app.add_middleware(ContentModerationMiddleware)
+
     # Path whitelist
     app.add_middleware(PathWhitelistMiddleware, debug=debug)
     
@@ -522,5 +534,10 @@ def setup_middleware(app, debug: bool = False):
         max_body_size=max_body,
     )
     
-    logger.info("Middleware configured")
+    if not openai_api_key_from_env():
+        logger.warning("OPENAI_API_KEY is not set; requests with user content will fail closed")
+    logger.info(
+        "Middleware configured (content moderation allow_flagged=%s)",
+        allow_flagged_from_env(),
+    )
 

@@ -80,6 +80,14 @@ class ExternalExecutionResult:
     result_bytes: Optional[bytes] = None
     result_text: Optional[str] = None
     result_content_type: Optional[str] = None
+    provider: Optional[str] = None
+
+
+def carry_moderation_flag(raw: Any, prepared: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep the moderation decision after internal keys are stripped for the provider."""
+    if isinstance(raw, dict) and raw.get("_moderation_flagged") is True:
+        prepared["_moderation_flagged"] = True
+    return prepared
 
 
 class ExternalApiRouter:
@@ -123,6 +131,20 @@ class ExternalApiRouter:
         self._load_config()
         return self._config.get("models", {}).get(model)
 
+    def resolve_model_config(
+        self, model: str, params: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Runware is the default. Qwen uses its Kie block only when this job was flagged."""
+        cfg = self.get_model_config(model)
+        if not cfg:
+            return None
+        params = params or {}
+        if params.get("_moderation_flagged") is True:
+            alternate = cfg.get("when_flagged")
+            if isinstance(alternate, dict) and alternate.get("provider"):
+                return alternate
+        return cfg
+
     def should_use_external(self, model: str, params: Optional[Dict[str, Any]]) -> bool:
         cfg = self.get_model_config(model)
         if not cfg or not cfg.get("provider"):
@@ -145,7 +167,7 @@ class ExternalApiRouter:
     def execute(
         self, model: str, prompt: str, params: Dict[str, Any]
     ) -> ExternalExecutionResult:
-        cfg = self.get_model_config(model)
+        cfg = self.resolve_model_config(model, params)
         if not cfg:
             return ExternalExecutionResult(
                 success=False, error=f"No external config for model: {model}"
@@ -165,6 +187,8 @@ class ExternalApiRouter:
             return self._run_replicate(cfg, args)
         if provider == "kie":
             return self._run_kie(cfg, args, prompt or "", params or {})
+        if provider == "runware":
+            return self._run_runware(cfg, args, prompt or "", params or {})
         if provider == "gemini":
             return self._run_gemini(cfg, args, params or {})
         return ExternalExecutionResult(
@@ -288,6 +312,14 @@ class ExternalApiRouter:
                     continue
                 if not isinstance(out, list):
                     out = [out]
+                continue
+            if t == "bool":
+                if isinstance(out, str):
+                    raw = out.strip().lower()
+                    if raw in ("true", "1", "yes", "on"):
+                        out = True
+                    elif raw in ("false", "0", "no", "off", ""):
+                        out = False
                 continue
             # Unknown transform -> keep current value.
         return out
@@ -450,6 +482,8 @@ class ExternalApiRouter:
         ok, err = kie_client.ensure_credits()
         if not ok:
             return ExternalExecutionResult(success=False, error=err)
+        if cfg.get("kie_profile") == "suno_v6":
+            return self._run_suno_v6(kie_client, prompt, params)
 
         public = (os.getenv("CONTROLLER_PUBLIC_URL") or os.getenv("CONTROLLER_URL") or "").rstrip("/")
         if not public:
@@ -531,7 +565,131 @@ class ExternalApiRouter:
             success=True,
             pending=True,
             external_task_id=task_id,
+            provider="kie",
             raw={"taskId": task_id},
+        )
+
+    def _run_suno_v6(self, kie_client: Any, prompt: str, params: Dict[str, Any]) -> ExternalExecutionResult:
+        import suno_v6
+
+        public = (os.getenv("CONTROLLER_PUBLIC_URL") or os.getenv("CONTROLLER_URL") or "").rstrip("/")
+        if not public:
+            return ExternalExecutionResult(
+                success=False, error="CONTROLLER_PUBLIC_URL is required for Kie callBackUrl"
+            )
+        callback_url = f"{public}/kie/callback"
+        try:
+            prepared = suno_v6.prepare(prompt, params, for_submit=False)
+            self._host_suno_images(kie_client, prepared)
+        except ValueError as exc:
+            return ExternalExecutionResult(success=False, error=str(exc))
+        except Exception as exc:
+            return ExternalExecutionResult(success=False, error=f"Kie upload failed: {exc}")
+
+        if prepared.kind == "persona":
+            try:
+                data = kie_client.create_task_response(prepared.kie_model, prepared.kie_input, callback_url)
+            except Exception as exc:
+                return ExternalExecutionResult(success=False, error=str(exc), provider="kie")
+            if data.get("persona_id"):
+                music = suno_v6.persona_music(prepared.music, data)
+                return ExternalExecutionResult(
+                    success=True,
+                    result_text=json.dumps(music),
+                    result_content_type="application/json",
+                    provider="kie",
+                    raw={"music": music, "suno_context": prepared.context},
+                )
+            task_id = data.get("taskId") or data.get("task_id")
+            if not task_id:
+                return ExternalExecutionResult(
+                    success=False, error="Kie persona did not return an id", provider="kie", raw=data
+                )
+            return ExternalExecutionResult(
+                success=True,
+                pending=True,
+                external_task_id=str(task_id),
+                provider="kie",
+                raw={"taskId": str(task_id), "music": prepared.music, "suno_context": prepared.context},
+            )
+
+        try:
+            task_id = kie_client.create_task(prepared.kie_model, prepared.kie_input, callback_url)
+        except Exception as exc:
+            return ExternalExecutionResult(success=False, error=str(exc), provider="kie")
+
+        # The generate id is what Create Music Video needs. A later cover task
+        # must not be the only id left on the job.
+        if prepared.kie_model == suno_v6.KIE_MODELS["song"]:
+            prepared.music["task_id"] = task_id
+            prepared.context["music_task_id"] = task_id
+
+        if prepared.kind == "voice":
+            return ExternalExecutionResult(
+                success=True,
+                result_text=json.dumps(prepared.music),
+                result_content_type="application/json",
+                provider="kie",
+                raw={"taskId": task_id, "music": prepared.music, "suno_context": prepared.context},
+            )
+        return ExternalExecutionResult(
+            success=True,
+            pending=True,
+            external_task_id=task_id,
+            provider="kie",
+            raw={"taskId": task_id, "music": prepared.music, "suno_context": prepared.context},
+        )
+
+    def _host_suno_images(self, kie_client: Any, prepared: Any) -> None:
+        images = list((prepared.context or {}).get("image_urls") or [])
+        if not images:
+            return
+        hosted = [kie_client.upload_file_from_url(src) for src in images]
+        prepared.context["image_urls"] = hosted
+        if isinstance(prepared.kie_input, dict) and prepared.kie_input.get("image_urls"):
+            prepared.kie_input["image_urls"] = hosted
+
+    def _run_runware(
+        self,
+        cfg: Dict[str, Any],
+        args: Dict[str, Any],
+        prompt: str,
+        params: Dict[str, Any],
+    ) -> ExternalExecutionResult:
+        import runware_client
+
+        merged = dict(args)
+        if prompt and not merged.get("positivePrompt") and not merged.get("text"):
+            merged["prompt"] = prompt
+        for key in ("width", "height", "aspect_ratio"):
+            if key not in merged and params.get(key) not in (None, ""):
+                merged[key] = params.get(key)
+        try:
+            task_uuid = runware_client.new_task_uuid()
+            task = runware_client.assemble_task(
+                cfg, merged, task_uuid, runware_client.webhook_url()
+            )
+            body = runware_client.submit_task(task)
+        except Exception as e:
+            return ExternalExecutionResult(success=False, error=str(e), provider="runware")
+
+        url = runware_client.media_url(body)
+        if url:
+            return ExternalExecutionResult(
+                success=True,
+                result_url=url,
+                provider="runware",
+                raw=body if isinstance(body, dict) else None,
+            )
+        err = runware_client.failure_message(body)
+        if err:
+            return ExternalExecutionResult(success=False, error=err, provider="runware", raw=body)
+        return ExternalExecutionResult(
+            success=True,
+            pending=True,
+            external_task_id=task_uuid,
+            provider="runware",
+            raw=body if isinstance(body, dict) else {"taskUUID": task_uuid},
         )
 
     def _run_gemini(
