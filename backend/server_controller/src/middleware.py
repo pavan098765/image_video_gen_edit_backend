@@ -119,6 +119,7 @@ ALLOWED_PATHS: List[str] = [
     "/get_video_upload_url",   # R2 presigned video upload
     "/get_media_upload_urls",  # R2 presigned media upload (images/videos)
     "/describe_asset_for_prompt",  # VLM caption from R2 key (Firebase auth)
+    "/suggest_prompt",
     "/batch_status",           # Batch/variation status polling
     "/kie",
     "/runware",
@@ -145,6 +146,7 @@ TRUSTED_API_PATHS: List[str] = [
     "/get_video_upload_url",
     "/get_media_upload_urls",
     "/describe_asset_for_prompt",
+    "/suggest_prompt",
     "/auth",  # Firebase auth endpoints require Bearer token
     "/admin",
 ]

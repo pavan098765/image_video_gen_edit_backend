@@ -618,6 +618,12 @@ class ExternalApiRouter:
         except Exception as exc:
             return ExternalExecutionResult(success=False, error=str(exc), provider="kie")
 
+        # The generate id is what Create Music Video needs. A later cover task
+        # must not be the only id left on the job.
+        if prepared.kie_model == suno_v6.KIE_MODELS["song"]:
+            prepared.music["task_id"] = task_id
+            prepared.context["music_task_id"] = task_id
+
         if prepared.kind == "voice":
             return ExternalExecutionResult(
                 success=True,

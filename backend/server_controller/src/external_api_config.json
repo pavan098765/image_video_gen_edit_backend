@@ -575,6 +575,8 @@
         "output_format": "PNG",
         "steps": 4,
         "image_input": "seed",
+        "require_outpaint": true,
+        "keep_subject": true,
         "blank_prompt": "Extend the scene beyond the original image, matching its style, lighting, and perspective."
       },
       "allow_output_upscale": true,
@@ -585,9 +587,13 @@
           "transform": "string_trim|default:Extend the scene beyond the original image, matching its style, lighting, and perspective."
         },
         "seedImage": { "source": "params.init_image" },
-        "aspect_ratio": { "source": "params.aspect_ratio" },
         "width": { "source": "params.width" },
-        "height": { "source": "params.height" }
+        "height": { "source": "params.height" },
+        "outpaintTop": { "source": "params.outpaint_top" },
+        "outpaintBottom": { "source": "params.outpaint_bottom" },
+        "outpaintLeft": { "source": "params.outpaint_left" },
+        "outpaintRight": { "source": "params.outpaint_right" },
+        "outpaintBlur": { "source": "params.outpaint_blur" }
       }
     },
     "krea2_turbo": {
@@ -731,6 +737,8 @@
         "output_format": "PNG",
         "steps": 8,
         "image_input": "seed",
+        "require_outpaint": true,
+        "keep_subject": true,
         "blank_prompt": "Extend the scene beyond the original image, matching its style, lighting, and perspective."
       },
       "allow_output_upscale": true,
@@ -741,9 +749,13 @@
           "transform": "string_trim|default:Extend the scene beyond the original image, matching its style, lighting, and perspective."
         },
         "seedImage": { "source": "params.init_image" },
-        "aspect_ratio": { "source": "params.aspect_ratio" },
         "width": { "source": "params.width" },
-        "height": { "source": "params.height" }
+        "height": { "source": "params.height" },
+        "outpaintTop": { "source": "params.outpaint_top" },
+        "outpaintBottom": { "source": "params.outpaint_bottom" },
+        "outpaintLeft": { "source": "params.outpaint_left" },
+        "outpaintRight": { "source": "params.outpaint_right" },
+        "outpaintBlur": { "source": "params.outpaint_blur" }
       }
     },
     "p_image_upscale": {

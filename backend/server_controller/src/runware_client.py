@@ -228,11 +228,19 @@ def _fill_image(
 ) -> None:
     spec = spec or {}
     prompt = _clean_text(args.get("positivePrompt") or args.get("prompt"))
+    if spec.get("keep_subject"):
+        base = _clean_text(spec.get("blank_prompt"))
+        note = "" if not prompt or prompt == base else prompt
+        prompt = f"{base} {note}".strip() if note else base
     if not prompt:
         prompt = _clean_text(spec.get("blank_prompt"))
     if not prompt:
         raise ValueError("Prompt is required")
     task["positivePrompt"] = prompt[:10000 if profile == "flux_image" else 200000]
+
+    outpaint = _outpaint_box(args) if spec.get("require_outpaint") or _has_outpaint(args) else None
+    if spec.get("require_outpaint") and outpaint is None:
+        raise ValueError("Say how far to expand the image.")
 
     image_input = str(spec.get("image_input") or "reference")
     table_name = spec.get("size_table") or ("muse" if profile == "muse_image" else "flux")
@@ -266,15 +274,26 @@ def _fill_image(
     if inputs:
         task["inputs"] = inputs
 
-    omit_size = profile == "muse_image" and bool(refs)
-    if not omit_size and spec.get("omit_size_without_aspect"):
-        aspect = _clean_text(args.get("aspect_ratio")).replace(" ", "")
-        if aspect not in table:
-            omit_size = True
-    if not omit_size:
-        width, height = choose_size(args, table)
+    if outpaint is not None:
+        width = _as_int(args.get("width"))
+        height = _as_int(args.get("height"))
+        if not width or not height:
+            raise ValueError("Expand needs a width and height.")
+        if width % 64 or height % 64 or width > 2048 or height > 2048 or width < 128 or height < 128:
+            raise ValueError("Expand size must be a multiple of 64, from 128 to 2048.")
+        task["outpaint"] = outpaint
         task["width"] = width
         task["height"] = height
+    else:
+        omit_size = profile == "muse_image" and bool(refs)
+        if not omit_size and spec.get("omit_size_without_aspect"):
+            aspect = _clean_text(args.get("aspect_ratio")).replace(" ", "")
+            if aspect not in table:
+                omit_size = True
+        if not omit_size:
+            width, height = choose_size(args, table)
+            task["width"] = width
+            task["height"] = height
     if "steps" in spec:
         steps = _as_int(spec.get("steps"))
         if steps:
@@ -295,6 +314,40 @@ def _fill_image(
             settings["moderation"] = moderation
         if settings:
             task["settings"] = settings
+
+
+def _has_outpaint(args: Dict[str, Any]) -> bool:
+    return any(args.get(name) not in (None, "") for name in (
+        "outpaintTop", "outpaintBottom", "outpaintLeft", "outpaintRight"
+    ))
+
+
+def _outpaint_side(args: Dict[str, Any], name: str) -> int:
+    raw = args.get(name)
+    if raw in (None, ""):
+        return 0
+    number = _as_int(raw)
+    if number is None or number < 0 or number % 64:
+        raise ValueError("Expand margins must be multiples of 64.")
+    return number
+
+
+def _outpaint_box(args: Dict[str, Any]) -> Optional[Dict[str, int]]:
+    if not _has_outpaint(args) and args.get("outpaintBlur") in (None, ""):
+        return None
+    box = {
+        "top": _outpaint_side(args, "outpaintTop"),
+        "bottom": _outpaint_side(args, "outpaintBottom"),
+        "left": _outpaint_side(args, "outpaintLeft"),
+        "right": _outpaint_side(args, "outpaintRight"),
+    }
+    if not any(box.values()):
+        return None
+    blur = args.get("outpaintBlur")
+    box["blur"] = 16 if blur in (None, "") else (_as_int(blur) or 0)
+    if box["blur"] < 0 or box["blur"] > 32:
+        raise ValueError("Expand blur must be from 0 to 32.")
+    return box
 
 
 def _fill_p_upscale(task: Dict[str, Any], args: Dict[str, Any]) -> None:

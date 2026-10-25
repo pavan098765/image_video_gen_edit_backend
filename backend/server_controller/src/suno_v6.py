@@ -414,9 +414,10 @@ def advance(context: Dict[str, Any], music: Dict[str, Any], event: Dict[str, Any
             _apply_assets(current, event)
             return _step("update", ctx, current)
         _apply_assets(current, event)
-        if event.get("task_id"):
-            ctx["music_task_id"] = event["task_id"]
+        if event.get("task_id") and not current.get("task_id"):
             current["task_id"] = event["task_id"]
+        if not ctx.get("music_task_id"):
+            ctx["music_task_id"] = current.get("task_id") or event.get("task_id")
         if hold_for_second_version(ctx, current):
             ctx["phase"] = "song"
             current["phase"] = "first_track"
@@ -450,7 +451,7 @@ def advance(context: Dict[str, Any], music: Dict[str, Any], event: Dict[str, Any
         return _step("finish", ctx, current, primary_url=primary)
     if kind == "video":
         current["video_url"] = event.get("video_url")
-        if event.get("task_id"):
+        if event.get("task_id") and ctx.get("action") == "video":
             current["task_id"] = event["task_id"]
         ctx["phase"] = "done"
         current["phase"] = "complete"
@@ -458,7 +459,7 @@ def advance(context: Dict[str, Any], music: Dict[str, Any], event: Dict[str, Any
         return _step("finish", ctx, current, primary_url=current.get("video_url"))
     if kind == "stems":
         current["stems"] = list(event.get("stems") or [])
-        if event.get("task_id"):
+        if event.get("task_id") and ctx.get("action") == "stems":
             current["task_id"] = event["task_id"]
         ctx["phase"] = "done"
         current["phase"] = "complete"
@@ -924,7 +925,7 @@ def _apply_assets(music: Dict[str, Any], event: Dict[str, Any]) -> None:
         music["video_url"] = event["video_url"]
     if event.get("persona"):
         music["persona"] = event["persona"]
-    if event.get("task_id") and music.get("action") in COMMERCIAL_ACTIONS:
+    if event.get("task_id") and music.get("action") in COMMERCIAL_ACTIONS and not music.get("task_id"):
         music["task_id"] = event["task_id"]
 
 

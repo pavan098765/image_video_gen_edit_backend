@@ -114,6 +114,7 @@ from credit_service import (
 from prompt_enhancement import (
     enhance_prompt,
     should_enhance_for_model,
+    suggest_prompt,
 )
 from asset_prompt_vlm import (
     describe_image_with_gemini,
@@ -125,6 +126,8 @@ from models import (
     SubmitResponse,
     DescribeAssetForPromptRequest,
     DescribeAssetForPromptResponse,
+    SuggestPromptRequest,
+    SuggestPromptResponse,
     RegisterWorkerRequest,
     HeartbeatRequest,
     JobStartedRequest,
@@ -4261,6 +4264,31 @@ async def describe_asset_for_prompt(
         f"[DESCRIBE_ASSET] ok user_id={uid!s} key_prefix={key[:48]!r} prompt_len={len(text)}"
     )
     return DescribeAssetForPromptResponse(prompt=text)
+
+
+@client_router.post(
+    "/suggest_prompt",
+    response_model=SuggestPromptResponse,
+)
+async def suggest_prompt_route(
+    payload: SuggestPromptRequest,
+    auth: Dict = Depends(require_firebase_auth),
+):
+    """Write or refine one prompt for the selected model. No gem charge."""
+    uid = auth.get("user_id")
+    if uid is None:
+        raise HTTPException(status_code=401, detail="User id missing from auth")
+    await _reserve_asset_prompt_daily_slot(str(uid))
+    try:
+        text = await suggest_prompt(
+            payload.model_id,
+            payload.field,
+            payload.text,
+            payload.caption,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return SuggestPromptResponse(prompt=text)
 
 
 def _bulk_entries_include_multi_image_group(entries: Optional[List[Any]]) -> bool:

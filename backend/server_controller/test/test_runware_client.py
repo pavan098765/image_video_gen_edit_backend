@@ -319,23 +319,54 @@ def test_new_image_models_build_the_documented_task():
     assert filled["inputs"]["maskImage"] == "https://cdn.example/mask.png"
     assert "width" not in filled and "steps" in filled and filled["steps"] == 8
 
-    vista = _task("juggernaut_lightning_expand", "", {
+    vista = _task("juggernaut_lightning_expand", "more sky", {
         "init_image": "https://cdn.example/a.jpg",
-        "aspect_ratio": "9:16",
+        "width": 768,
+        "height": 1344,
+        "outpaint_top": 128,
+        "outpaint_bottom": 128,
+        "outpaint_left": 64,
+        "outpaint_right": 64,
+        "outpaint_blur": 16,
     })
     assert vista["model"] == "rundiffusion:110@101"
     assert vista["steps"] == 4
     assert vista["inputs"]["seedImage"] == "https://cdn.example/a.jpg"
-    assert (vista["width"], vista["height"]) == FLUX_SIZES["9:16"]
+    assert vista["outpaint"] == {
+        "top": 128, "bottom": 128, "left": 64, "right": 64, "blur": 16,
+    }
+    assert (vista["width"], vista["height"]) == (768, 1344)
     assert vista["positivePrompt"].startswith("Extend the scene")
+    assert "more sky" in vista["positivePrompt"]
+    assert "strength" not in vista
+    assert "hiresFix" not in vista
 
-    widened = _task("z_image_turbo_expand", "more sky", {
-        "init_image": ["https://cdn.example/a.jpg", "https://cdn.example/b.jpg"],
-        "aspect_ratio": "16:9",
+    widened = _task("z_image_turbo_expand", "", {
+        "init_image": "https://cdn.example/a.jpg",
+        "width": 1344,
+        "height": 768,
+        "outpaint_top": 0,
+        "outpaint_bottom": 0,
+        "outpaint_left": 128,
+        "outpaint_right": 128,
     })
     assert widened["inputs"]["seedImage"] == "https://cdn.example/a.jpg"
-    assert (widened["width"], widened["height"]) == FLUX_SIZES["16:9"]
+    assert widened["outpaint"] == {
+        "top": 0, "bottom": 0, "left": 128, "right": 128, "blur": 16,
+    }
+    assert (widened["width"], widened["height"]) == (1344, 768)
     assert widened["steps"] == 8
+    assert widened["positivePrompt"].startswith("Extend the scene")
+
+    try:
+        _task("z_image_turbo_expand", "more sky", {
+            "init_image": "https://cdn.example/a.jpg",
+            "aspect_ratio": "16:9",
+        })
+    except ValueError as exc:
+        assert "expand" in str(exc).lower()
+    else:
+        raise AssertionError("expand without outpaint was accepted")
 
 
 def test_seed_and_mask_reject_non_urls():
