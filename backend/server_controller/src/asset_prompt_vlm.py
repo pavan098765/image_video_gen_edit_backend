@@ -81,38 +81,25 @@ def _prompt_from_gemini(body: dict) -> str:
     return "\n".join(t for t in texts if t).strip()
 
 
-def describe_image_with_gemini(
-    r2_key: str,
-    raw: bytes,
-    mime_hint: str,
-    authorization: str,
-) -> Tuple[bool, str]:
-    """POST the image to the Gemini worker using the caller's Firebase token."""
+def _bearer_token(authorization: str) -> str:
     token = (authorization or "").strip()
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
-    if not token:
-        return False, "Sign in required"
+    return token
 
-    mime = _mime(r2_key, mime_hint)
-    if not mime:
-        return False, "Unsupported or unknown image format (use png, jpg, jpeg, or webp)."
 
+def _gemini_target() -> Tuple[str, str]:
     model = (os.getenv("GEMINI_DIRECTOR_MODEL") or "gemini-3.5-flash-lite").strip()
     url = (os.getenv("GEMINI_DIRECTOR_URL") or _DEFAULT_WORKER_URL).strip()
-    payload = {
-        "step": "asset_prompt",
-        "model": model,
-        "maxOutputTokens": 1024,
-        "contents": [
-            {
-                "parts": [
-                    {"text": _INSTRUCTION},
-                    {"inline_data": {"mime_type": mime, "data": base64.b64encode(raw).decode("ascii")}},
-                ]
-            }
-        ],
-    }
+    return model, url
+
+
+def _post_gemini(payload: dict, authorization: str, max_chars: int) -> Tuple[bool, str]:
+    """POST one generateContent body to the Gemini worker with the caller's Firebase token."""
+    token = _bearer_token(authorization)
+    if not token:
+        return False, "Sign in required"
+    _, url = _gemini_target()
     try:
         resp = requests.post(
             url,
@@ -135,6 +122,49 @@ def describe_image_with_gemini(
     text = _prompt_from_gemini(body if isinstance(body, dict) else {})
     if not text:
         return False, "Auto-prompt returned no text"
-    if len(text) > 4000:
-        text = text[:4000]
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip()
     return True, text
+
+
+def describe_image_with_gemini(
+    r2_key: str,
+    raw: bytes,
+    mime_hint: str,
+    authorization: str,
+) -> Tuple[bool, str]:
+    """POST the image to the Gemini worker using the caller's Firebase token."""
+    mime = _mime(r2_key, mime_hint)
+    if not mime:
+        return False, "Unsupported or unknown image format (use png, jpg, jpeg, or webp)."
+
+    model, _ = _gemini_target()
+    payload = {
+        "step": "asset_prompt",
+        "model": model,
+        "maxOutputTokens": 1024,
+        "contents": [
+            {
+                "parts": [
+                    {"text": _INSTRUCTION},
+                    {"inline_data": {"mime_type": mime, "data": base64.b64encode(raw).decode("ascii")}},
+                ]
+            }
+        ],
+    }
+    return _post_gemini(payload, authorization, 4000)
+
+
+def suggest_text_with_gemini(prompt_text: str, authorization: str) -> Tuple[bool, str]:
+    """Ask Gemini for one prompt. Text only. Same worker and Firebase token as image auto-prompt."""
+    text = (prompt_text or "").strip()
+    if not text:
+        return False, "Prompt text is required"
+    model, _ = _gemini_target()
+    payload = {
+        "step": "suggest_prompt",
+        "model": model,
+        "maxOutputTokens": 1024,
+        "contents": [{"parts": [{"text": text[:20000]}]}],
+    }
+    return _post_gemini(payload, authorization, 2000)

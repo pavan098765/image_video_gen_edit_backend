@@ -4272,22 +4272,30 @@ async def describe_asset_for_prompt(
 )
 async def suggest_prompt_route(
     payload: SuggestPromptRequest,
+    authorization: Optional[str] = Header(None),
     auth: Dict = Depends(require_firebase_auth),
 ):
     """Write or refine one prompt for the selected model. No gem charge."""
+    if not is_asset_prompt_vlm_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Auto-prompt is disabled on the server.",
+        )
     uid = auth.get("user_id")
     if uid is None:
         raise HTTPException(status_code=401, detail="User id missing from auth")
     await _reserve_asset_prompt_daily_slot(str(uid))
     try:
-        text = await suggest_prompt(
+        text = await asyncio.to_thread(
+            suggest_prompt,
             payload.model_id,
             payload.field,
             payload.text,
             payload.caption,
+            authorization or "",
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return SuggestPromptResponse(prompt=text)
 
 

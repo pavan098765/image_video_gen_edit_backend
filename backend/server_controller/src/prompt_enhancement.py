@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from asset_prompt_vlm import suggest_text_with_gemini
 from nvidia_chat_client import (
     build_messages_chat_with_media,
     default_max_tokens,
@@ -250,13 +251,14 @@ def instruction_for(model: str, field: str, invent: bool) -> str:
     return text.strip()
 
 
-async def suggest_prompt(
+def suggest_prompt(
     model: str,
     field: str,
     text: str,
     caption: Optional[str] = None,
-    timeout: float = 20.0,
+    authorization: str = "",
 ) -> str:
+    """Write or refine one prompt through the Gemini director worker."""
     typed = (text or "").strip()
     picture = (caption or "").strip()
     invent = not typed
@@ -269,31 +271,10 @@ async def suggest_prompt(
     else:
         parts.append("The box is empty. Write one new prompt.")
     parts.append("Reply with only the prompt text.")
-    api_key = get_nvidia_api_key()
-    if not api_key:
-        raise RuntimeError("Prompt suggestions are unavailable.")
-    messages = build_messages_chat_with_media(
-        system_prompt=get_system_prompt_for_media_extensions([]),
-        query="\n\n".join(parts),
-        media_files=[],
-    )
-    ok, result = await nvidia_chat_completion_try_models(
-        messages=messages,
-        models=nvidia_models_for_enhancement(),
-        api_key=api_key,
-        timeout=timeout if timeout > 0 else get_enhancement_timeout(),
-        max_tokens=default_max_tokens(),
-        temperature=default_temperature(),
-        min_chars=5,
-        log_prefix="suggest_prompt",
-        stream=None,
-    )
+    ok, result = suggest_text_with_gemini("\n\n".join(parts), authorization)
     if not ok:
         raise RuntimeError(result or "Prompt suggestion failed.")
-    cleaned = result.strip()
-    if len(cleaned) > 2000:
-        cleaned = cleaned[:2000].rstrip()
-    return cleaned
+    return result.strip()
 
 
 def should_enhance_for_model(model: str, mode: Optional[str] = None) -> bool:
