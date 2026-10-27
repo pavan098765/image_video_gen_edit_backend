@@ -49,6 +49,45 @@ POLL_INTERVAL = 2.0
 
 _comfyui_process: Optional[subprocess.Popen] = None
 
+# Cards that report more than 16 GiB can hold the text encoder, unet, and VAE together.
+_HIGHVRAM_MIN_MIB = 16 * 1024
+
+
+def _gpu_vram_mib() -> Optional[int]:
+    """Total memory of GPU 0 in MiB, or None when it cannot be read."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    first = out.strip().splitlines()[0].strip() if out.strip() else ""
+    try:
+        return int(float(first))
+    except ValueError:
+        return None
+
+
+def _vram_launch_args() -> List[str]:
+    """Use --highvram only when the card is larger than 16 GiB."""
+    mib = _gpu_vram_mib()
+    if mib is None:
+        logger.info("GPU VRAM was not detected; starting ComfyUI in normal VRAM mode")
+        return []
+    if mib > _HIGHVRAM_MIN_MIB:
+        logger.info(
+            "GPU VRAM %d MiB is above 16 GiB; starting ComfyUI with --highvram",
+            mib,
+        )
+        return ["--highvram"]
+    logger.info(
+        "GPU VRAM %d MiB is 16 GiB or less; starting ComfyUI in normal VRAM mode",
+        mib,
+    )
+    return []
+
 
 def start_server() -> subprocess.Popen:
     """
@@ -74,6 +113,7 @@ def start_server() -> subprocess.Popen:
         "--listen", COMFYUI_LISTEN,
         "--port", str(COMFYUI_PORT),
         "--disable-auto-launch",
+        *_vram_launch_args(),
     ]
 
     comfyui_log_path = os.path.join(COMFYUI_DIR, "comfyui_server.log")
