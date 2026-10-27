@@ -115,6 +115,7 @@ from prompt_enhancement import (
     enhance_prompt,
     should_enhance_for_model,
     suggest_prompt,
+    suggest_related,
 )
 from asset_prompt_vlm import (
     describe_image_with_gemini,
@@ -4286,17 +4287,30 @@ async def suggest_prompt_route(
         raise HTTPException(status_code=401, detail="User id missing from auth")
     await _reserve_asset_prompt_daily_slot(str(uid))
     try:
-        text = await asyncio.to_thread(
-            suggest_prompt,
-            payload.model_id,
-            payload.field,
-            payload.text,
-            payload.caption,
-            authorization or "",
-        )
+        if payload.context or payload.also:
+            text, related = await asyncio.to_thread(
+                suggest_related,
+                payload.model_id,
+                payload.field,
+                payload.text,
+                payload.caption,
+                authorization or "",
+                payload.context,
+                payload.also,
+            )
+        else:
+            text = await asyncio.to_thread(
+                suggest_prompt,
+                payload.model_id,
+                payload.field,
+                payload.text,
+                payload.caption,
+                authorization or "",
+            )
+            related = {}
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return SuggestPromptResponse(prompt=text)
+    return SuggestPromptResponse(prompt=text, related=related)
 
 
 def _bulk_entries_include_multi_image_group(entries: Optional[List[Any]]) -> bool:

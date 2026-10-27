@@ -585,12 +585,37 @@ class SuggestPromptRequest(BaseModel):
     field: str = Field(default="prompt", max_length=40)
     text: str = Field(default="", max_length=4000)
     caption: Optional[str] = Field(default=None, max_length=1500)
+    context: Dict[str, str] = Field(default_factory=dict)
+    also: List[str] = Field(default_factory=list)
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    @field_validator("also")
+    @classmethod
+    def _cap_also(cls, value: List[str]) -> List[str]:
+        cleaned: List[str] = []
+        for item in value:
+            name = item.strip()[:40]
+            if name and name not in cleaned:
+                cleaned.append(name)
+            if len(cleaned) >= 6:
+                break
+        return cleaned
+
+    @field_validator("context")
+    @classmethod
+    def _cap_context(cls, value: Dict[str, str]) -> Dict[str, str]:
+        capped: Dict[str, str] = {}
+        for key, text in list(value.items())[:6]:
+            name = key.strip()[:40]
+            if name:
+                capped[name] = text[:2000]
+        return capped
 
 
 class SuggestPromptResponse(BaseModel):
     prompt: str = Field(..., description="One prompt for the text box")
+    related: Dict[str, str] = Field(default_factory=dict)
 
 
 # =============================================================================

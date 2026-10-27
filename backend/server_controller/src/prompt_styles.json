@@ -1,246 +1,276 @@
 {
   "fallbacks": {
     "image": {
-      "refine": "Rewrite this as one image prompt in normal sentences. Keep the user's subject, counts, colors, and any words they put in quotes. Add the place, the light, and the framing only when the user left them out. Do not use a keyword list. Do not name any model. Reply with the prompt only.",
-      "invent": "Write one original image prompt in normal sentences: one subject, where it is, and the light. Safe for all ages. Do not use a keyword list. Do not name any model. Reply with the prompt only."
+      "refine": "Rewrite this as one image prompt in normal sentences. Keep the user's subject, counts, colors, and any words they put in quotes. Add the place, the light, and the framing only when the user left them out. Do not use a keyword list.",
+      "invent": "Write one original image prompt in normal sentences: one subject, where it is, and the light. Safe for all ages. Do not use a keyword list."
     },
     "video": {
-      "refine": "Rewrite this as one video prompt. Keep the user's action. Name who is in frame, what they do, and one camera move. Do not add a second scene. Do not name any model. Reply with the prompt only.",
-      "invent": "Write one original video prompt: who is there, the action, and one camera move. Safe for all ages. Do not name any model. Reply with the prompt only."
+      "refine": "Rewrite this as one continuous shot. Keep the user's action. Name who is in frame, what they do from start to finish, and one camera move plus where that move ends. Do not add a second scene.",
+      "invent": "Write one original continuous shot: who is there, the action from start to finish, the light, and one camera move plus where that move ends. Safe for all ages."
     },
     "edit": {
-      "refine": "Rewrite this as one edit instruction. Lead with the change the user asked for. Then name what must stay the same, including face, pose, framing, and light, unless they asked to change those. Do not name any model. Reply with the instruction only.",
-      "invent": "Write one edit instruction for a photo, such as a lighting or background change. Say what must stay the same. Safe for all ages. Do not name any model. Reply with the instruction only."
+      "refine": "Rewrite this as one edit instruction. Lead with the change the user asked for. Then name what must stay the same, including face, pose, framing, and light, unless they asked to change those.",
+      "invent": "Write one edit instruction for a photo, such as a lighting or background change. Say what must stay the same. Safe for all ages."
     },
     "expand": {
-      "refine": "Rewrite this as a note about what continues outside the photo. Keep the user's idea. Do not add a new subject or change the original scene. Do not name any model. Reply with the note only.",
-      "invent": "Write one short note that continues the existing scene past the frame, matching its light and perspective. Do not add new people. Do not name any model. Reply with the note only."
+      "refine": "Rewrite this as a note about what continues outside the photo. Keep the user's idea. Do not add a new subject or change the original scene.",
+      "invent": "Write one short note that continues the existing scene past the frame, matching its light and perspective. Do not add new people."
     },
     "music": {
-      "refine": "Rewrite this as a music caption: genre, mood, vocal type, and the main instruments. Keep the user's idea. Do not put lyrics or bracket tags in this field. Do not name any model. Reply with the caption only.",
-      "invent": "Write one original music caption: genre, mood, vocal type, and the main instruments. No lyrics and no bracket tags. Do not name any model. Reply with the caption only."
+      "refine": "Rewrite this as a music caption: genre, mood, vocal type, and the main instruments. Keep the user's idea. Do not put lyrics or bracket tags in this field.",
+      "invent": "Write one original music caption: genre, mood, vocal type, and the main instruments. No lyrics and no bracket tags."
     },
     "lyrics": {
-      "refine": "Rewrite these lyrics. Keep the theme. Put each section tag on its own line, and keep tags the user already used. Do not name any model. Reply with the lyrics only.",
-      "invent": "Write a short original lyric. Put [Verse] and [Chorus] on their own lines. Safe for all ages. Do not name any model. Reply with the lyrics only."
+      "refine": "Rewrite these lyrics. Keep the theme. Put each section tag on its own line, and keep tags the user already used.",
+      "invent": "Write a short original lyric. Put [Verse] and [Chorus] on their own lines. Safe for all ages."
     },
     "style": {
-      "refine": "Rewrite this as comma-separated style tags: genre, mood, vocal type, and instruments. No brackets and no artist names. Keep the user's direction. Do not name any model. Reply with the tag line only.",
-      "invent": "Write one line of comma-separated style tags: genre, mood, vocal type, and instruments. No brackets and no artist names. Do not name any model. Reply with the tag line only."
+      "refine": "Rewrite this as a style description that leads with genre, then mood, vocal type, and instruments. No brackets and no artist names. Keep the user's direction.",
+      "invent": "Write a style description that leads with genre, then mood, vocal type, and instruments. No brackets and no artist names."
     },
     "negative": {
-      "refine": "Rewrite this as a short list of things to leave out. Keep the user's exclusions. Do not restate the positive idea. Do not name any model. Reply with the list only.",
-      "invent": "Write a short list of defects to avoid for this kind of result. Do not name any model. Reply with the list only."
+      "refine": "Rewrite this as a short list of things to leave out. Keep the user's exclusions. Do not restate the positive idea.",
+      "invent": "Write a short list of audible defects to avoid for this kind of result."
     },
     "speech": {
-      "refine": "Rewrite this as words to be spoken aloud. Keep the user's meaning. Use natural sentences. Do not add a voice, an accent, or stage directions. Do not name any model. Reply with the spoken text only.",
-      "invent": "Write two or three sentences someone could say aloud. Safe for all ages. Do not add a voice description. Do not name any model. Reply with the spoken text only."
+      "refine": "Rewrite this as words to be spoken aloud. Keep the user's meaning. Use natural sentences. Do not add a voice, an accent, or stage directions.",
+      "invent": "Write two or three sentences someone could say aloud. Safe for all ages. Do not add a voice description."
     },
     "voice_description": {
-      "refine": "Rewrite this as one voice description: age, gender, pitch, pace, emotion, and accent. Keep the user's voice. Do not name any model. Reply with the description only.",
-      "invent": "Write one voice description: age, gender, pitch, pace, emotion, and accent. Do not name any model. Reply with the description only."
+      "refine": "Rewrite this as one voice description: age, gender, pitch, pace, emotion, and accent. Keep the user's voice.",
+      "invent": "Write one voice description: age, gender, pitch, pace, emotion, and accent."
     }
   },
   "models": {
     "flux2_klein_9b": {
       "prompt": {
-        "refine": "Rewrite this as one image prompt in narrative prose, about 40 to 70 words. Put the subject first, then what they are doing, the place, the light, and the mood. Keep the user's subject, counts, and any exact color they named. Write a color as a hex code only when they already gave one. A short line will not be expanded for you, so the prompt itself must carry the detail. Do not use keyword lists, tags, or a negative prompt. Do not name any model. Reply with the prompt only.",
-        "invent": "Write one original image prompt in narrative prose, about 40 to 70 words. Safe for all ages. Open with a clear subject, then the action, the place, the light, and the mood. Describe the scene the way a novelist would. Do not use keyword lists or tags, and do not add a negative prompt. Do not name any model. Reply with the prompt only."
+        "refine": "Rewrite this as one image prompt in narrative prose, about 40 to 70 words. The first words are the priority, so put the subject first, then what they are doing, the place, the light, and the mood. Keep the user's subject, counts, and any exact color they named. Write a color as a hex code only when they already gave one. A short line will not be expanded later, so the prompt itself must carry the detail. Do not use keyword lists, tags, or a negative prompt.",
+        "invent": "Write one original image prompt in narrative prose, about 40 to 70 words. Safe for all ages. Open with a clear subject, then the action, the place, the light, and the mood. Describe the scene the way a novelist would. Do not use keyword lists or tags, and do not add a negative prompt."
       }
     },
     "flux2_klein_9b_edit": {
       "prompt": {
-        "refine": "Rewrite this as one image-edit instruction in prose. Lead with the single change the user asked for, then say what must stay the same, including face, pose, framing, and light, unless they asked to change those. If several reference photos are involved, call them image 1, image 2, image 3, and image 4 in the order given. Keep their subject and their requested change. Do not use keyword lists. Do not name any model. Reply with the instruction only.",
-        "invent": "Write one image-edit instruction in prose. Safe for all ages. Name one change, such as the light or the background, then say what must stay the same. If you refer to more than one photo, call them image 1 through image 4. Do not use keyword lists. Do not name any model. Reply with the instruction only."
+        "refine": "Rewrite this as one image-edit instruction in prose. Lead with the single change the user asked for, then say what must stay the same, including face, pose, framing, and light, unless they asked to change those. If several reference photos are involved, call them image 1, image 2, image 3, and image 4 in the order given. Keep their subject and their requested change. Do not use keyword lists.",
+        "invent": "Write one image-edit instruction in prose. Safe for all ages. Name one change, such as the light or the background, then say what must stay the same. If you refer to more than one photo, call them image 1 through image 4. Do not use keyword lists."
       }
     },
     "qwen2_1_t2i": {
       "prompt": {
-        "refine": "Rewrite this as one image prompt in normal sentences, in the same language the user wrote. Keep every quoted string, count, color, and position exactly. Put any words that must appear in the picture in double quotes, and do not translate those quoted words. Do not drop a number or swap a color. Do not use keyword lists. Do not name any model. Reply with the prompt only.",
-        "invent": "Write one original image prompt in normal sentences. Safe for all ages. Name one subject, the place, the light, and the framing. If the picture needs words, put each short phrase in double quotes and do not paraphrase those words. Keep every count exact. Do not use keyword lists. Do not name any model. Reply with the prompt only."
+        "refine": "Rewrite this as one image prompt in normal sentences, in the same language the user wrote. Keep every quoted string, count, color, and position exactly. Put any words that must appear in the picture in double quotes, and do not translate those quoted words. Do not drop a number or swap a color. Do not use keyword lists.",
+        "invent": "Write one original image prompt in normal sentences. Safe for all ages. Name one subject, the place, the light, and the framing. If the picture needs words, put each short phrase in double quotes and do not paraphrase those words. Keep every count exact. Do not use keyword lists."
       }
     },
     "qwen2_1_i2i": {
       "prompt": {
-        "refine": "Rewrite this as one edit instruction in the user's language. Change only the attribute they named, and make that change unmistakable. Then say what stays: face, pose, light, and framing, unless they asked to change those. Keep every quoted string, count, and color. When more than one photo is used, call them image 1 and image 2. Put any replacement words in double quotes. Do not use keyword lists. Do not name any model. Reply with the instruction only.",
-        "invent": "Write one edit instruction in normal sentences. Safe for all ages. Change one attribute of a photo, such as the jacket or the background, and say that the face, pose, light, and framing stay. If words must be replaced, put the new words in double quotes. Call a second photo image 2 only when the idea uses a reference. Do not use keyword lists. Do not name any model. Reply with the instruction only."
+        "refine": "Rewrite this as one short edit instruction in the user's language. Change only the attribute they named, and make that change unmistakable. Then say what stays: face, pose, light, and framing, unless they asked to change those. Keep every quoted string, count, and color. When more than one photo is used, call them image 1 and image 2. Put any replacement words in double quotes. Do not use keyword lists.",
+        "invent": "Write one short edit instruction in normal sentences. Safe for all ages. Change one attribute of a photo, such as the jacket or the background, and say that the face, pose, light, and framing stay. If words must be replaced, put the new words in double quotes. Call a second photo image 2 only when the idea uses a reference. Do not use keyword lists."
       }
     },
     "grok_imagine_t2i": {
       "prompt": {
-        "refine": "Rewrite this as one photograph. Keep this order: the subject and its physical form, how many there are, the camera angle, the named props, where the light comes from and how hard it is, then the subject's colors and the background colors as separate notes. Keep the user's subject and counts. Do not open with mood or film stock. Do not use keyword lists. Do not name any model. Reply with the prompt only.",
-        "invent": "Write one original photograph description. Safe for all ages. Use this order: the subject and its physical form, how many, the camera angle, two or three named props, the light direction, then the subject's colors and the background colors. Do not open with mood or film stock. Do not use keyword lists. Do not name any model. Reply with the prompt only."
+        "refine": "Rewrite this as one photograph. Keep this order: the subject and its physical form, how many there are, the camera angle, the named props, where the light comes from and how hard it is, then the subject's colors and the background colors as separate notes. Keep the user's subject and counts. Do not open with mood or film stock. Do not use keyword lists.",
+        "invent": "Write one original photograph description. Safe for all ages. Use this order: the subject and its physical form, how many, the camera angle, two or three named props, the light direction, then the subject's colors and the background colors. Do not open with mood or film stock. Do not use keyword lists."
       }
     },
     "grok_imagine_edit": {
       "prompt": {
-        "refine": "Rewrite this as an edit of a photograph that is already right. Lead with the one to three changes the user asked for. Then name the subject, the crop, and the props that must stay. Do not redesign the scene. Do not open with mood or film stock. Do not use keyword lists. Do not name any model. Reply with the instruction only.",
-        "invent": "Write one edit for a photograph that is already composed. Safe for all ages. Lead with one change, such as the light or one prop, then name the subject, crop, and props that stay. Do not open with mood or film stock. Do not use keyword lists. Do not name any model. Reply with the instruction only."
+        "refine": "Rewrite this as an edit of a photograph that is already right. Lead with the one to three changes the user asked for. Then name the subject, the crop, and the props that must stay. Do not redesign the scene. Do not open with mood or film stock. Do not use keyword lists.",
+        "invent": "Write one edit for a photograph that is already composed. Safe for all ages. Lead with one change, such as the light or one prop, then name the subject, crop, and props that stay. Do not open with mood or film stock. Do not use keyword lists."
       }
     },
     "muse_image": {
       "prompt": {
-        "refine": "Rewrite this as one layout brief a photographer could shoot. Say each fact once, in this order: who or what is in frame, what they are doing, what they wear, which props are present and where they sit, the setting, the camera angle, where the light comes from, and what is sharp. Keep the user's subject, counts, and positions. If words must appear, quote each short string on its own, such as a headline, a name, or a price, and write the number itself rather than a discount. Do not repeat a clause. Do not use keyword lists. Do not name any model. Reply with the brief only.",
-        "invent": "Write one original layout brief a photographer could shoot. Safe for all ages. Say each fact once: who is in frame, what they are doing, what they wear, where the props sit, the setting, the camera, the light, and what is sharp. If the picture needs words, quote a short headline and write any number explicitly. Do not use keyword lists. Do not name any model. Reply with the brief only."
+        "refine": "Rewrite this as one layout brief a photographer could shoot. Say each fact once, in this order: who or what is in frame, what they are doing, what they wear, which props are present and where they sit, the setting, the camera angle, where the light comes from, and what is sharp. Keep the user's subject, counts, and positions. If words must appear, quote each short string on its own, such as a headline, a name, or a price, and write the number itself rather than a discount. Do not repeat a clause. Do not use keyword lists.",
+        "invent": "Write one original layout brief a photographer could shoot. Safe for all ages. Say each fact once: who is in frame, what they are doing, what they wear, where the props sit, the setting, the camera, the light, and what is sharp. If the picture needs words, quote a short headline and write any number explicitly. Do not use keyword lists."
       }
     },
     "muse_image_edit": {
       "prompt": {
-        "refine": "Rewrite this as a scoped edit, not a new layout. Keep the existing arrangement. Say the one region or detail that changes, then what must remain, including identity, props, crop, and light. If a word in the picture must change, quote the new short string and write any number explicitly. Do not restate the whole scene. Do not use keyword lists. Do not name any model. Reply with the instruction only.",
-        "invent": "Write one scoped edit of an existing photo. Safe for all ages. Change one region only, and say that identity, props, crop, and light stay. If a label changes, quote the new short string and write the number explicitly. Do not invent a new layout. Do not use keyword lists. Do not name any model. Reply with the instruction only."
+        "refine": "Rewrite this as a scoped edit, not a new layout. Keep the existing arrangement. Say the one region or detail that changes, then what must remain, including identity, props, crop, and light. If a word in the picture must change, quote the new short string and write any number explicitly. Do not restate the whole scene. Do not use keyword lists.",
+        "invent": "Write one scoped edit of an existing photo. Safe for all ages. Change one region only, and say that identity, props, crop, and light stay. If a label changes, quote the new short string and write the number explicitly. Do not invent a new layout. Do not use keyword lists."
       }
     },
     "krea2_turbo": {
       "prompt": {
-        "refine": "Rewrite this as one flowing paragraph. Start with the subject and the pose. Then the clothes and materials, the framing, the place, the light, the palette, and the medium. Do not start with 'the photo shows'. Do not use a comma-separated tag list. Keep the user's subject. If a sign has words, put them in double quotes. Do not name any model. Reply with the paragraph only.",
-        "invent": "Write one original paragraph. Safe for all ages. Start with a subject and a pose, then clothes and materials, framing, place, light, palette, and medium. Do not start with 'the photo shows' and do not use a tag list. If a sign appears, put its words in double quotes. Do not name any model. Reply with the paragraph only."
+        "refine": "Rewrite this as one flowing paragraph. Start with the subject and the pose. Then the clothes and materials, the framing, the place, the light, the palette, and the medium. Do not start with 'the photo shows'. Do not use a comma-separated tag list. Keep the user's subject. If a sign has words, put them in double quotes.",
+        "invent": "Write one original paragraph. Safe for all ages. Start with a subject and a pose, then clothes and materials, framing, place, light, palette, and medium. Do not start with 'the photo shows' and do not use a tag list. If a sign appears, put its words in double quotes."
       }
     },
     "krea2_turbo_edit": {
       "prompt": {
-        "refine": "Rewrite this as one edit paragraph. Say which look to take from the reference, such as color, light, or materials, and name what in the photo actually changes. Say what must stay, including the person's identity and pose, unless the user asked to change those. Write flowing prose, not a tag list, and do not start with 'the photo shows'. Quote any sign text. Do not name any model. Reply with the paragraph only.",
-        "invent": "Write one edit paragraph. Safe for all ages. Match the color and light of a reference photo, and name one thing in the picture that changes. Say that identity and pose stay. Use flowing prose, not a tag list, and do not start with 'the photo shows'. Do not name any model. Reply with the paragraph only."
+        "refine": "Rewrite this as one edit paragraph. Say which look to take from the reference, such as color, light, or materials, and name what in the photo actually changes. Say what must stay, including the person's identity and pose, unless the user asked to change those. Write flowing prose, not a tag list, and do not start with 'the photo shows'. Quote any sign text.",
+        "invent": "Write one edit paragraph. Safe for all ages. Match the color and light of a reference photo, and name one thing in the picture that changes. Say that identity and pose stay. Use flowing prose, not a tag list, and do not start with 'the photo shows'."
       }
     },
     "recraft_v41_flash": {
       "prompt": {
-        "refine": "Rewrite this as one design or photo prompt. Name the format in the first words: poster, logo, icon, photo, or illustration. For a poster, logo, or icon, give the hierarchy, the palette, where each element sits, and constraints such as flat color or no gradients. Put every word that must appear in the image in quotation marks, and do not paraphrase those words. For a photo, keep the prompt shorter and name the lens and the light. Keep the user's subject and exact text. Do not use a keyword dump. Do not name any model. Reply with the prompt only.",
-        "invent": "Write one original design prompt. Safe for all ages. Begin with the format: poster, logo, or icon. Give the hierarchy, a small palette, where the type sits, and a constraint such as flat color or no gradients. Put the words that appear in the image in quotation marks. Do not use a keyword dump. Do not name any model. Reply with the prompt only."
+        "refine": "Rewrite this as one design or photo prompt. Name the format in the first words: poster, logo, icon, photo, or illustration. For a poster, logo, or icon, give the hierarchy, the palette, where each element sits, and constraints such as flat color or no gradients. Put every word that must appear in the image in double quotes, and do not paraphrase those words. For a photo, keep the prompt shorter and name the lens and the light. Keep the user's subject and exact text. Do not use a keyword dump, and do not add words such as masterpiece or best quality.",
+        "invent": "Write one original design prompt. Safe for all ages. Begin with the format: poster, logo, or icon. Give the hierarchy, a small palette, where the type sits, and a constraint such as flat color or no gradients. Put the words that appear in the image in double quotes. Do not use a keyword dump."
       }
     },
     "twinflow_z_image": {
       "prompt": {
-        "refine": "Rewrite this as one short scene, not a long brief. Keep the user's subject. In normal sentences, name the subject, the place, and one light, and then stop. Leave out extra clauses, lens catalogs, and keyword lists. Do not add a negative prompt. Do not name any model. Reply with the prompt only.",
-        "invent": "Write one original short scene. Safe for all ages. Name one subject, one place, and one light, in a few normal sentences, and then stop. Do not write a long brief or a keyword list. Do not name any model. Reply with the prompt only."
+        "refine": "Rewrite this as one short scene of under 60 words, not a long brief. Keep the user's subject. Put the subject first, then the place, then one light, and then stop. Leave out extra clauses, lens catalogs, and keyword lists. Do not add a negative prompt.",
+        "invent": "Write one original short scene of under 60 words. Safe for all ages. Put one subject first, then one place, then one light, in a few normal sentences, and then stop. Do not write a long brief or a keyword list."
       }
     },
     "juggernaut_lightning": {
       "prompt": {
-        "refine": "Rewrite this as one photograph in normal sentences. Keep the user's subject. Name the subject, the place, one lens, the light, and the skin or material texture you can actually see. Do not stack film stocks. Do not use a keyword list or a negative prompt. Do not name any model. Reply with the prompt only.",
-        "invent": "Write one original photograph in normal sentences. Safe for all ages. Name a subject, a place, one lens, the light, and a skin or material texture. Do not use a keyword list or a negative prompt. Do not name any model. Reply with the prompt only."
+        "refine": "Rewrite this as one photograph in normal sentences. Keep the user's subject. Name the subject, the place, one lens, the light, and the skin or material texture you can actually see. Do not stack film stocks. Do not use a keyword list or a negative prompt.",
+        "invent": "Write one original photograph in normal sentences. Safe for all ages. Name a subject, a place, one lens, the light, and a skin or material texture. Do not use a keyword list or a negative prompt."
       }
     },
     "juggernaut_lightning_expand": {
       "prompt": {
-        "refine": "Rewrite this as a note about what continues outside the frame. Keep the user's idea and the existing subject. Describe only the space beyond the current edges, matching the same lens, light, and texture. Do not add a new subject or a new person. Do not use keyword lists. Do not name any model. Reply with the note only.",
-        "invent": "Write one note that continues a photograph past its edges. Match the existing lens, light, and texture. Do not add a new subject or a new person. Do not use keyword lists. Do not name any model. Reply with the note only."
+        "refine": "Rewrite this as a note about what continues outside the frame. Keep the user's idea and the existing subject. Describe only the space beyond the current edges, matching the same lens, light, and texture. Do not add a new subject or a new person. Do not use keyword lists.",
+        "invent": "Write one note that continues a photograph past its edges. Match the existing lens, light, and texture. Do not add a new subject or a new person. Do not use keyword lists."
       }
     },
     "z_image_turbo_edit": {
       "prompt": {
-        "refine": "Rewrite this as one or two normal sentences that edit a photo. Name the change, then what must remain, including the person and the light. Say what you want as something present, such as a plain wall, not as a negative like no clutter. Do not write a negative list. Keep the user's request. Do not name any model. Reply with the instruction only.",
-        "invent": "Write one or two sentences that edit a photo. Safe for all ages. Name one change, then say the person and the light remain. State the result as something present, such as a plain wall, not as a negative list. Do not name any model. Reply with the instruction only."
+        "refine": "Rewrite this as one or two normal sentences, under 60 words, that edit a photo. Name the change, then what must remain, including the person and the light. Say what you want as something present, such as a plain wall, not as a negative like no clutter. Do not write a negative list. Keep the user's request.",
+        "invent": "Write one or two sentences, under 60 words, that edit a photo. Safe for all ages. Name one change, then say the person and the light remain. State the result as something present, such as a plain wall, not as a negative list."
       }
     },
     "z_image_turbo_inpaint": {
       "prompt": {
-        "refine": "Rewrite this as a fill for the painted area. Name what should appear inside that painted region, then say the rest of the photo must remain, including the subject, the light, and the perspective. Describe the fill as something present, not as a negative list. Keep the user's request. Do not name any model. Reply with the instruction only.",
-        "invent": "Write one fill for a painted area in a photo. Safe for all ages. Say what appears in the painted region so it matches the surrounding image, and say the subject, light, and perspective stay. Describe that fill as something present, not as a negative list. Do not name any model. Reply with the instruction only."
+        "refine": "Rewrite this as a fill for the painted area, in under 60 words. Name what should appear inside that painted region, then say the rest of the photo must remain, including the subject, the light, and the perspective. Describe the fill as something present, not as a negative list. Keep the user's request.",
+        "invent": "Write one fill for a painted area in a photo, in under 60 words. Safe for all ages. Say what appears in the painted region so it matches the surrounding image, and say the subject, light, and perspective stay. Describe that fill as something present, not as a negative list."
       }
     },
     "z_image_turbo_expand": {
       "prompt": {
-        "refine": "Rewrite this as a continuation of the existing scene past the frame. Keep the user's idea. Match the light and the perspective already in the photo. Do not add a new subject. Say what continues as something present, such as more of the same street, not as a negative list. Do not name any model. Reply with the note only.",
-        "invent": "Write one continuation of a photo past the frame. Match the existing light and perspective. Do not add a new subject or a new person. Say what continues as something present, not as a negative list. Do not name any model. Reply with the note only."
+        "refine": "Rewrite this as a continuation of the existing scene past the frame, in under 60 words. Keep the user's idea. Match the light and the perspective already in the photo. Do not add a new subject. Say what continues as something present, such as more of the same street, not as a negative list.",
+        "invent": "Write one continuation of a photo past the frame, in under 60 words. Match the existing light and perspective. Do not add a new subject or a new person. Say what continues as something present, not as a negative list."
       }
     },
     "suno_v6": {
       "prompt": {
-        "refine": "Rewrite this as a short song idea in plain sentences: the genre, the mood, who is singing, and what the song is about. Keep the user's idea. Do not put bracket tags, sung lines, or artist names in this field. Do not name any model. Reply with the idea only.",
-        "invent": "Write one original song idea in plain sentences: a genre, a mood, who sings, and what the song is about. Safe for all ages. No bracket tags, no sung lines, and no artist names. Do not name any model. Reply with the idea only."
+        "refine": "Rewrite this as a short song idea in plain sentences: the genre and subgenre, the mood, who is singing, and what the song is about. Keep the user's idea. Do not put bracket tags, sung lines, or artist names in this field.",
+        "invent": "Write one original song idea in plain sentences: a genre and subgenre, a mood, who sings, and what the song is about. Safe for all ages. No bracket tags, no sung lines, and no artist names."
       },
       "style": {
-        "refine": "Rewrite this as one line of comma-separated style tags: genre, mood, vocal type, and a few instruments. No brackets and no artist names. Do not write exclusions such as no drums in this line. Keep the user's direction. Do not name any model. Reply with the tag line only.",
-        "invent": "Write one line of comma-separated style tags: genre, mood, vocal type, and a few instruments. No brackets, no artist names, and no exclusions. Do not name any model. Reply with the tag line only."
+        "refine": "Rewrite this as the Style of Music in natural language, with no brackets. Lead with the genre and subgenre, then the mood, the vocal type and texture, the signature instruments and production, and a tempo feel. Use about 8 to 15 descriptors, and put the genre first because the first words carry the most weight. No artist names. Do not put exclusions such as no drums in this box. Keep the user's direction.",
+        "invent": "Write the Style of Music in natural language, with no brackets. Lead with a genre and subgenre, then a mood, a vocal type and texture, the signature instruments and production, and a tempo feel. Use about 8 to 15 descriptors, genre first. No artist names and no exclusions."
       },
       "lyrics": {
-        "refine": "Rewrite these lyrics. Keep the theme and any section tags the user already used. Put each tag on its own line, using [Verse], [Chorus], [Bridge], [Outro], and close with [End]. Repeat the chorus text word for word under each [Chorus]. Do not put style tags in the sung lines. Do not name any model. Reply with the lyrics only.",
-        "invent": "Write a short original lyric. Safe for all ages. Put [Verse], [Chorus], [Bridge], [Outro], and [End] on their own lines, and repeat the chorus text word for word under each [Chorus]. Do not name any model. Reply with the lyrics only."
+        "refine": "Rewrite these lyrics. Keep the theme. Put each section tag on its own line, using [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Bridge], [Outro], and close with [End]. One short modifier is allowed, as in [Chorus | anthemic], not a stack of modifiers. Repeat the chorus lines word for word under every [Chorus]. Ad-libs go in parentheses on their own line, three words or fewer. Do not put style tags in the sung lines.",
+        "invent": "Write a short original lyric. Safe for all ages. Put [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Bridge], [Outro], and [End] each on its own line. One short modifier is allowed, as in [Chorus | anthemic], not a stack. Repeat the chorus lines word for word under every [Chorus]. Ad-libs go in parentheses on their own line, three words or fewer."
       },
       "negative": {
-        "refine": "Rewrite this as a few comma-separated exclusions, such as an unwanted instrument or vocal style. Keep the user's exclusions. Do not restate the genre they want, and do not hide a phrase like no drums inside the style line. Do not name any model. Reply with the exclusions only.",
-        "invent": "Write a few comma-separated exclusions for a song, such as an unwanted vocal effect or instrument. Do not restate a genre. Do not name any model. Reply with the exclusions only."
+        "refine": "Rewrite this as a few comma-separated audible exclusions, such as an unwanted instrument or vocal effect. Keep the user's exclusions. Do not restate the genre they want, and do not hide a phrase like no drums inside the style line.",
+        "invent": "Write a few comma-separated audible exclusions for a song, such as an unwanted vocal effect or instrument. Do not restate a genre."
       },
       "negative_tags": {
-        "refine": "Rewrite this as a few comma-separated exclusions, such as an unwanted instrument or vocal style. Keep the user's exclusions. Do not restate the genre they want, and do not hide a phrase like no drums inside the style line. Do not name any model. Reply with the exclusions only.",
-        "invent": "Write a few comma-separated exclusions for a song, such as an unwanted vocal effect or instrument. Do not restate a genre. Do not name any model. Reply with the exclusions only."
+        "refine": "Rewrite this as a few comma-separated audible exclusions, such as an unwanted instrument or vocal effect. Keep the user's exclusions. Do not restate the genre they want, and do not hide a phrase like no drums inside the style line.",
+        "invent": "Write a few comma-separated audible exclusions for a song, such as an unwanted vocal effect or instrument. Do not restate a genre."
       }
     },
     "suno_music": {
       "prompt": {
-        "refine": "Rewrite this as a short song idea in plain sentences: the genre, the mood, who is singing, and what the song is about. Keep the user's idea. Do not put bracket tags, sung lines, or artist names in this field. Do not name any model. Reply with the idea only.",
-        "invent": "Write one original song idea in plain sentences: a genre, a mood, who sings, and what the song is about. Safe for all ages. No bracket tags, no sung lines, and no artist names. Do not name any model. Reply with the idea only."
+        "refine": "Rewrite this as a short song idea in plain sentences: the genre and subgenre, the mood, who is singing, and what the song is about. Keep the user's idea. Do not put bracket tags, sung lines, or artist names in this field.",
+        "invent": "Write one original song idea in plain sentences: a genre and subgenre, a mood, who sings, and what the song is about. Safe for all ages. No bracket tags, no sung lines, and no artist names."
       },
       "style": {
-        "refine": "Rewrite this as one line of comma-separated style tags: genre, mood, vocal type, and a few instruments. No brackets and no artist names. Do not write exclusions such as no drums in this line. Keep the user's direction. Do not name any model. Reply with the tag line only.",
-        "invent": "Write one line of comma-separated style tags: genre, mood, vocal type, and a few instruments. No brackets, no artist names, and no exclusions. Do not name any model. Reply with the tag line only."
+        "refine": "Rewrite this as the Style of Music in natural language, with no brackets. Lead with the genre and subgenre, then the mood, the vocal type and texture, the signature instruments and production, and a tempo feel. Use about 8 to 15 descriptors, and put the genre first. No artist names and no exclusions. Keep the user's direction.",
+        "invent": "Write the Style of Music in natural language, with no brackets. Lead with a genre and subgenre, then a mood, a vocal type and texture, the signature instruments and production, and a tempo feel. Use about 8 to 15 descriptors, genre first. No artist names and no exclusions."
       },
       "lyrics": {
-        "refine": "Rewrite these lyrics. Keep the theme and any section tags the user already used. Put each tag on its own line, using [Verse], [Chorus], [Bridge], [Outro], and close with [End]. Repeat the chorus text word for word under each [Chorus]. Do not put style tags in the sung lines. Do not name any model. Reply with the lyrics only.",
-        "invent": "Write a short original lyric. Safe for all ages. Put [Verse], [Chorus], [Bridge], [Outro], and [End] on their own lines, and repeat the chorus text word for word under each [Chorus]. Do not name any model. Reply with the lyrics only."
+        "refine": "Rewrite these lyrics. Keep the theme. Put each section tag on its own line, using [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Bridge], [Outro], and close with [End]. One short modifier is allowed, as in [Chorus | anthemic], not a stack. Repeat the chorus lines word for word under every [Chorus]. Ad-libs go in parentheses on their own line, three words or fewer. Do not put style tags in the sung lines.",
+        "invent": "Write a short original lyric. Safe for all ages. Put [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Bridge], [Outro], and [End] each on its own line. One short modifier is allowed, as in [Chorus | anthemic], not a stack. Repeat the chorus lines word for word under every [Chorus]."
       },
       "negative": {
-        "refine": "Rewrite this as a few comma-separated exclusions, such as an unwanted instrument or vocal style. Keep the user's exclusions. Do not restate the genre they want. Do not name any model. Reply with the exclusions only.",
-        "invent": "Write a few comma-separated exclusions for a song, such as an unwanted vocal effect or instrument. Do not restate a genre. Do not name any model. Reply with the exclusions only."
+        "refine": "Rewrite this as a few comma-separated audible exclusions, such as an unwanted instrument or vocal effect. Keep the user's exclusions. Do not restate the genre they want.",
+        "invent": "Write a few comma-separated audible exclusions for a song, such as an unwanted vocal effect or instrument. Do not restate a genre."
       }
     },
     "suno_sfx": {
       "prompt": {
-        "refine": "Rewrite this as one short sound effect: a single event, what makes the sound, and the space it is in. Keep the user's event. Do not write a song, lyrics, or section tags such as [Chorus]. Do not name any model. Reply with the description only.",
-        "invent": "Write one original sound effect: a single event, what makes the sound, and the space it is in. Safe for all ages. Do not write a song or section tags. Do not name any model. Reply with the description only."
+        "refine": "Rewrite this as one short sound effect: a single event, what makes the sound, the room it is in, and how the sound ends. Keep the user's event. Do not write a song, lyrics, or section tags such as [Chorus].",
+        "invent": "Write one original sound effect: a single event, what makes the sound, the room it is in, and how the sound ends. Safe for all ages. Do not write a song or section tags."
       }
     },
     "ace_step_music": {
       "prompt": {
-        "refine": "Rewrite this as a music caption: genre, mood, the main instruments, and the vocal color. Keep the user's idea. Do not put section tags or sung lines in this caption. The caption must describe the same arrangement the lyrics will follow. Do not name any model. Reply with the caption only.",
-        "invent": "Write one original music caption: genre, mood, the main instruments, and a vocal color, or say it is instrumental. Safe for all ages. Do not put section tags or sung lines here. Do not name any model. Reply with the caption only."
+        "refine": "Rewrite this as the caption, the portrait of the track: style, emotion, instruments, timbre, era, production, and vocal color. Keep the user's idea. Do not put BPM, key, section tags, or sung lines in this caption. The instruments and vocal color must be the same ones the lyrics will use.",
+        "invent": "Write one original caption: style, emotion, instruments, timbre, era, production, and a vocal color, or say it is instrumental. Safe for all ages. Do not put BPM, key, section tags, or sung lines here."
       },
       "lyrics": {
-        "refine": "Rewrite these lyrics as a timeline. Keep the theme. Use one short tag per section, such as [Chorus - anthemic], on its own line. Do not stack many tags inside one bracket. Instrument and vocal tags must agree with the caption. Do not name any model. Reply with the lyrics only.",
-        "invent": "Write a short original lyric as a timeline. Safe for all ages. Use one short tag per section, such as [Verse] and [Chorus - anthemic], each on its own line. Do not stack many tags inside one bracket. Do not name any model. Reply with the lyrics only."
+        "refine": "Rewrite these lyrics as the timeline of the same track as the caption. Keep the theme. Use one short tag per section, such as [Chorus - anthemic], on its own line. Do not stack many modifiers inside one bracket. Instrument and vocal tags must name the same instruments and vocal color as the caption.",
+        "invent": "Write a short original lyric as a timeline. Safe for all ages. Use one short tag per section, such as [Verse] and [Chorus - anthemic], each on its own line. Do not stack many modifiers inside one bracket. Match the instruments and vocal color of the caption."
       },
       "negative_prompt": {
-        "refine": "Rewrite this as unwanted sounds: audible defects or instruments to leave out, such as harsh distortion or autotune. Keep the user's exclusions. Do not name moods or abstract ideas. Do not name any model. Reply with the negative prompt only.",
-        "invent": "Write a short negative prompt of audible defects to avoid, such as clipping, harsh distortion, or autotune. Do not name moods. Do not name any model. Reply with the negative prompt only."
+        "refine": "Rewrite this as unwanted sounds: audible defects or instruments to leave out, such as harsh distortion or autotune. Keep the user's exclusions. Do not name moods or abstract ideas.",
+        "invent": "Write a short negative prompt of audible defects to avoid, such as clipping, harsh distortion, or autotune. Do not name moods."
       }
     },
     "minimax_music_26": {
       "prompt": {
-        "refine": "Rewrite this as one music style line: tonal feel if the user gave one, tempo feel, vocal type, and mood. Keep the user's direction. Do not put sung lines or section tags in this line. Do not name any model. Reply with the style line only.",
-        "invent": "Write one original music style line for an instrumental piece: tempo feel, the main instruments, and the mood. No vocal type and no sung lines. Do not name any model. Reply with the style line only."
+        "refine": "Rewrite this as one music sentence, not a tag line. Include the key and a BPM when the user gave them or when a tempo is clear, then the genre, mood, vocal type, instruments, and production. Example shape: E minor, 90 BPM, acoustic guitar ballad, male vocal, close and worn. Keep the user's direction. Do not put sung lines or section tags in this sentence.",
+        "invent": "Write one original music sentence, not a tag line. Include a key, a BPM, the genre, the mood, the vocal type, the instruments, and the production. Example shape: A major, 118 BPM, bright indie pop, female vocal, clean electric guitar and soft drums. Do not put sung lines or section tags in this sentence."
       },
       "lyrics": {
-        "refine": "Rewrite these lyrics. Keep the theme and any sung lines the user wrote. Use [Intro], [Verse], [Pre Chorus], [Chorus], [Bridge], and [Outro], and put a blank line between sections. Do not name any model. Reply with the lyrics only.",
-        "invent": "Write only section tags for an instrumental piece, with a blank line between them and no sung lines: [Intro], [Verse], [Chorus], [Bridge], [Outro]. Do not name any model. Reply with the tags only."
+        "refine": "Rewrite these lyrics for the same song as the style sentence. Keep the theme and any sung lines the user wrote. Use [Intro], [Verse], [Pre Chorus], [Chorus], [Bridge], and [Outro], and put a blank line between sections. Write real sung lines unless the user asked for an instrumental, in which case use the tags only.",
+        "invent": "Write a short original lyric for the same song as the style sentence. Safe for all ages. Use [Intro], [Verse], [Pre Chorus], [Chorus], [Bridge], and [Outro], with a blank line between sections and real sung lines. Use tags with no sung lines only when the request is instrumental."
       }
     },
     "xai_tts": {
       "prompt": {
-        "refine": "Rewrite this as words that will be spoken aloud. Keep the user's meaning. Use natural sentences. Do not add a voice, an accent, or stage directions, because those words would be read aloud. The voice is chosen separately. Do not name any model. Reply with the spoken text only.",
-        "invent": "Write two or three natural sentences someone could say aloud. Safe for all ages. Do not add a voice, an accent, or stage directions, because those words would be read aloud. Do not name any model. Reply with the spoken text only."
+        "refine": "Rewrite this as words that will be spoken aloud. Keep the user's meaning. Use natural sentences. Do not add a voice, an accent, or stage directions, because those words would be read aloud. The voice is chosen separately.",
+        "invent": "Write two or three natural sentences someone could say aloud. Safe for all ages. Do not add a voice, an accent, or stage directions, because those words would be read aloud."
       }
     },
     "qwen_voice_design": {
       "prompt": {
-        "refine": "Rewrite this as words that will be spoken aloud. Keep the user's meaning. Use natural sentences. Do not describe the voice in this text. Do not name any model. Reply with the spoken text only.",
-        "invent": "Write two or three natural sentences someone could say aloud. Safe for all ages. Do not describe the voice in this text. Do not name any model. Reply with the spoken text only."
+        "refine": "Rewrite this as words that will be spoken aloud. Keep the user's meaning. Use natural sentences. Do not describe the voice in this text.",
+        "invent": "Write two or three natural sentences someone could say aloud. Safe for all ages. Do not describe the voice in this text."
       },
       "voice_description": {
-        "refine": "Rewrite this as one voice description line: age, gender, pitch, pace, emotion, and accent. Keep the user's voice. Do not write the words they will speak. Do not name any model. Reply with the description only.",
-        "invent": "Write one voice description line: age, gender, pitch, pace, emotion, and accent. Do not include words to be spoken. Do not name any model. Reply with the description only."
+        "refine": "Rewrite this as one voice description line: age, gender, pitch, pace, emotion, and accent. Keep the user's voice. Do not write the words they will speak.",
+        "invent": "Write one voice description line: age, gender, pitch, pace, emotion, and accent. Do not include words to be spoken."
       }
     },
     "qwen_voice_clone": {
       "prompt": {
-        "refine": "Rewrite this as words that will be spoken aloud. Keep the user's meaning and do not invent a new voice. Use natural sentences. Do not add an age, accent, or voice description, because the cloned voice already supplies that. Do not name any model. Reply with the spoken text only.",
-        "invent": "Write two or three natural sentences someone could say aloud in a cloned voice. Safe for all ages. Do not invent a new voice and do not add an age, accent, or voice description. Do not name any model. Reply with the spoken text only."
+        "refine": "Rewrite this as words that will be spoken aloud. Keep the user's meaning and do not invent a new voice. Use natural sentences. Do not add an age, accent, or voice description, because the cloned voice already supplies that.",
+        "invent": "Write two or three natural sentences someone could say aloud in a cloned voice. Safe for all ages. Do not invent a new voice and do not add an age, accent, or voice description."
       }
     },
-    "ltx2_3_t2v": {"prompt": {"kind": "video"}},
-    "ltx2_3_cinereal": {"prompt": {"kind": "video"}},
-    "ltx25_int8_t2v": {"prompt": {"kind": "video"}},
-    "ltx25_int8_i2v": {"prompt": {"kind": "video"}},
-    "minimax_h3": {"prompt": {"kind": "video"}},
-    "wan_22": {"prompt": {"kind": "video"}}
+    "ltx2_3_t2v": {
+      "prompt": {
+        "refine": "Rewrite this as one present-tense paragraph of four to six sentences. Keep the user's action. Name the shot scale, the light and the place, who is there, the action from start to finish, and one camera move plus where that move ends. Quote a line of dialogue only if someone speaks. Do not add a second scene.",
+        "invent": "Write one present-tense paragraph of four to six sentences. Safe for all ages. Name the shot scale, the light and the place, who is there, the action from start to finish, and one camera move plus where that move ends. Do not add a second scene."
+      }
+    },
+    "ltx2_3_cinereal": {
+      "prompt": {
+        "refine": "Rewrite this as one photographic present-tense paragraph of four to six sentences. Keep the user's action. Name one lens and one light, the place, who is there, the action from start to finish, and one camera move plus where that move ends. Do not add a second scene or a stylized look the user did not ask for.",
+        "invent": "Write one photographic present-tense paragraph of four to six sentences. Safe for all ages. Name one lens and one light, the place, who is there, the action from start to finish, and one camera move plus where that move ends. Do not add a second scene."
+      }
+    },
+    "ltx25_int8_t2v": {
+      "prompt": {
+        "refine": "Rewrite this as one present-tense paragraph of four to six sentences. Keep the user's action. Name the shot scale, the light and the place, who is there, the action from start to finish, and one camera move plus where that move ends. Do not add a second scene.",
+        "invent": "Write one present-tense paragraph of four to six sentences. Safe for all ages. Name the shot scale, the light and the place, who is there, the action from start to finish, and one camera move plus where that move ends. Do not add a second scene."
+      }
+    },
+    "ltx25_int8_i2v": {
+      "prompt": {
+        "refine": "Rewrite this as motion for a picture that already exists. Keep the user's action. In four to six present-tense sentences, say what starts moving, how that motion finishes, and one camera move plus where that move ends. Do not redescribe the whole still and do not add a second scene.",
+        "invent": "Write four to six present-tense sentences of motion for an existing picture. Safe for all ages. Say what starts moving, how that motion finishes, and one camera move plus where that move ends. Do not add a second scene."
+      }
+    },
+    "minimax_h3": {
+      "prompt": {
+        "refine": "Rewrite this as one continuous shot in natural language. Keep the user's action. Name the subject, one visible action, the setting, the light, and one camera move written in words. Do not use bracketed camera commands. Do not cut to another shot.",
+        "invent": "Write one continuous shot in natural language. Safe for all ages. Name a subject, one visible action, the setting, the light, and one camera move written in words. Do not use bracketed camera commands. Do not cut to another shot."
+      }
+    },
+    "wan_22": {
+      "prompt": {
+        "refine": "Rewrite this as one shot of about 80 to 120 words. Keep the user's action. Open on the first frame, then one camera move, choosing pan, tilt, dolly, orbit, or crane, then the payoff. Name the speed and one depth cue, such as foreground movement against a still background. Do not add a second scene.",
+        "invent": "Write one shot of about 80 to 120 words. Safe for all ages. Open on the first frame, then one camera move, choosing pan, tilt, dolly, orbit, or crane, then the payoff. Name the speed and one depth cue, such as foreground movement against a still background."
+      }
+    }
   }
 }

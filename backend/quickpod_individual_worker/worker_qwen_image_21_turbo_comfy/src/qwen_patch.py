@@ -12,6 +12,7 @@ logger = logging.getLogger("qwen_patch")
 
 SUBGRAPH_TYPE = "c291ceec-b98f-4751-9d0b-7bc288f27b30"
 SAVE_NODE_ID = 461
+MAX_REFERENCE_IMAGES = 10
 DEFAULT_UNET = "qwen-image-2.1-turbo-Q8_0.gguf"
 DEFAULT_CLIP = "qwen3vl_8b_int8_convrot.safetensors"
 DEFAULT_VAE = "qwen_image_2.1_vae_bf16.safetensors"
@@ -476,16 +477,126 @@ def _ensure_size(params: Dict[str, Any], guide_image: Optional[str] = None) -> D
     return size_info
 
 
+def _node_title(node: dict) -> str:
+    meta = node.get("_meta")
+    if isinstance(meta, dict) and meta.get("title"):
+        return str(meta["title"])
+    return ""
+
+
+def _is_link(value: Any) -> bool:
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) >= 2
+        and isinstance(value[0], (str, int))
+    )
+
+
+def _strip_reference_nodes(prompt_graph: dict) -> None:
+    """Drop reference loaders so a text-to-image queue does not require files."""
+    drop = []
+    for nid, node in list(prompt_graph.items()):
+        if not isinstance(node, dict):
+            continue
+        ctype = node.get("class_type")
+        title = _node_title(node)
+        inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+        if ctype == "LoadImage":
+            drop.append(str(nid))
+            continue
+        if ctype != "ComfySwitchNode" or title == "custom_size":
+            continue
+        has_false = "on_false" in inputs
+        has_true = "on_true" in inputs
+        if title.startswith("use_reference") or (has_true and not has_false):
+            drop.append(str(nid))
+    dropped = set(drop)
+    for nid in drop:
+        prompt_graph.pop(nid, None)
+    for node in prompt_graph.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for key in list(inputs):
+            value = inputs[key]
+            if key == "image_1" or str(key).startswith("images.image_"):
+                inputs.pop(key, None)
+                continue
+            if _is_link(value) and str(value[0]) in dropped:
+                inputs.pop(key, None)
+
+
+def _set_custom_canvas(prompt_graph: dict, custom: bool) -> None:
+    from workflow_converter import api_nodes_by_type, set_api_input
+
+    switched = False
+    for _, node in api_nodes_by_type(prompt_graph, "ComfySwitchNode"):
+        inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+        if _node_title(node) == "custom_size" or ("on_false" in inputs and "on_true" in inputs):
+            set_api_input(node, "switch", bool(custom))
+            switched = True
+    if switched or custom:
+        return
+    encoders = api_nodes_by_type(prompt_graph, "TextEncodeQwenImage21")
+    if not encoders:
+        return
+    enc_id = encoders[0][0]
+    for _, sampler in api_nodes_by_type(prompt_graph, "SamplerCustom"):
+        set_api_input(sampler, "latent_image", [enc_id, 2])
+
+
+def _attach_references(prompt_graph: dict, filenames: List[str]) -> None:
+    from workflow_converter import api_nodes_by_type
+
+    encoders = api_nodes_by_type(prompt_graph, "TextEncodeQwenImage21")
+    vaes = api_nodes_by_type(prompt_graph, "VAELoader")
+    if not encoders or not filenames:
+        return
+    _, encoder = encoders[0]
+    inputs = encoder.setdefault("inputs", {})
+    if not isinstance(inputs, dict):
+        inputs = {}
+        encoder["inputs"] = inputs
+    if vaes:
+        inputs["vae"] = [vaes[0][0], 0]
+    for index, filename in enumerate(filenames[:MAX_REFERENCE_IMAGES], start=1):
+        load_id = f"ref_load_{index}"
+        prompt_graph[load_id] = {
+            "class_type": "LoadImage",
+            "inputs": {"image": filename},
+            "_meta": {"title": f"reference_{index}"},
+        }
+        inputs.pop("image_1", None)
+        inputs[f"images.image_{index}"] = [load_id, 0]
+
+
 def apply_api_job_params(
     prompt_graph: dict,
     prompt: str,
     params: Dict[str, Any],
     guide_image: Optional[str] = None,
+    reference_images: Optional[List[str]] = None,
+    custom_canvas: Optional[bool] = None,
 ) -> None:
     """Patch a ComfyUI API-format prompt (no flatten)."""
     from workflow_converter import api_nodes_by_type, set_api_input
 
-    size_info = _ensure_size(params, guide_image)
+    refs = [str(name) for name in (reference_images or []) if name]
+    if not refs and guide_image:
+        refs = [str(guide_image)]
+    if len(refs) > MAX_REFERENCE_IMAGES:
+        logger.warning(
+            "Qwen reference list truncated from %d to %d",
+            len(refs),
+            MAX_REFERENCE_IMAGES,
+        )
+        refs = refs[:MAX_REFERENCE_IMAGES]
+    if custom_canvas is None:
+        custom_canvas = not bool(refs)
+    size_guide = refs[0] if refs and not custom_canvas else None
+    size_info = _ensure_size(params, size_guide)
     unet = params.get("unet_name") or params.get("gguf") or DEFAULT_UNET
     clip = params.get("clip_name") or DEFAULT_CLIP
     vae = params.get("vae_name") or DEFAULT_VAE
@@ -497,8 +608,6 @@ def apply_api_job_params(
     for _, node in api_nodes_by_type(prompt_graph, "VAELoader"):
         set_api_input(node, "vae_name", vae)
     text = prompt or params.get("prompt") or ""
-    if guide_image and "<image1>" not in text and "<image_1>" not in text:
-        text = "Keep the subject, pose, and composition of <image1>. " + text
     for _, node in api_nodes_by_type(prompt_graph, "TextEncodeQwenImage21"):
         set_api_input(node, "prompt", text)
         neg = params.get("negative_prompt")
@@ -529,28 +638,16 @@ def apply_api_job_params(
     if prefix:
         for _, node in api_nodes_by_type(prompt_graph, "SaveImageAdvanced"):
             set_api_input(node, "filename_prefix", str(prefix))
-    if guide_image:
-        encoders = api_nodes_by_type(prompt_graph, "TextEncodeQwenImage21")
-        vaes = api_nodes_by_type(prompt_graph, "VAELoader")
-        if encoders:
-            load_id = "qwen_guide_load"
-            prompt_graph[load_id] = {
-                "class_type": "LoadImage",
-                "inputs": {"image": guide_image},
-            }
-            enc_id, enc = encoders[0]
-            inp = enc.setdefault("inputs", {})
-            if not isinstance(inp, dict):
-                inp = {}
-                enc["inputs"] = inp
-            # execute() takes autogrow ``images`` (image_1..image_16), not a
-            # top-level image_1 kwarg. Visual socket name is images.image_1.
-            inp.pop("image_1", None)
-            inp["images.image_1"] = [load_id, 0]
-            if vaes:
-                inp["vae"] = [vaes[0][0], 0]
-            for _, sc in api_nodes_by_type(prompt_graph, "SamplerCustom"):
-                set_api_input(sc, "latent_image", [enc_id, 2])
+    _strip_reference_nodes(prompt_graph)
+    if refs:
+        _attach_references(prompt_graph, refs)
+    _set_custom_canvas(prompt_graph, bool(custom_canvas))
+    logger.info(
+        "Qwen prompt mode=%s references=%d custom_canvas=%s",
+        "reference" if refs else "text",
+        len(refs),
+        bool(custom_canvas),
+    )
 
 
 def apply_job_params(

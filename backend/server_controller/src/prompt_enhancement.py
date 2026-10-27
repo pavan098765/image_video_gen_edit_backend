@@ -14,7 +14,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from asset_prompt_vlm import suggest_text_with_gemini
 from nvidia_chat_client import (
@@ -251,6 +251,44 @@ def instruction_for(model: str, field: str, invent: bool) -> str:
     return text.strip()
 
 
+_ECHO_MARKERS = ("reply with", "do not name any model")
+
+
+class _InstructionEcho(Exception):
+    """The model copied the instructions instead of writing the prompt."""
+
+
+def _echoes_instruction(reply: str, instruction: str) -> bool:
+    cleaned = " ".join((reply or "").split()).strip().lower()
+    if not cleaned:
+        return True
+    source = " ".join((instruction or "").split()).strip().lower()
+    if source and cleaned == source:
+        return True
+    return any(marker in cleaned for marker in _ECHO_MARKERS)
+
+
+def _ask_once(parts: List[str], authorization: str) -> str:
+    ok, result = suggest_text_with_gemini("\n\n".join(parts), authorization)
+    if not ok:
+        raise RuntimeError(result or "Prompt suggestion failed.")
+    return (result or "").strip()
+
+
+def _ask_clean(parts: List[str], authorization: str, instruction: str) -> str:
+    reply = _ask_once(parts, authorization)
+    if not _echoes_instruction(reply, instruction):
+        return reply
+    retry = [
+        "The previous reply repeated the instructions. Write the content only.",
+        *parts,
+    ]
+    reply = _ask_once(retry, authorization)
+    if _echoes_instruction(reply, instruction):
+        raise RuntimeError("Auto-prompt repeated the instructions.")
+    return reply
+
+
 def suggest_prompt(
     model: str,
     field: str,
@@ -271,10 +309,151 @@ def suggest_prompt(
     else:
         parts.append("The box is empty. Write one new prompt.")
     parts.append("Reply with only the prompt text.")
-    ok, result = suggest_text_with_gemini("\n\n".join(parts), authorization)
-    if not ok:
-        raise RuntimeError(result or "Prompt suggestion failed.")
-    return result.strip()
+    return _ask_clean(parts, authorization, instruction)
+
+
+def _loads_object(raw: str) -> Optional[Dict[str, Any]]:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _field_text(data: Dict[str, Any], key: str) -> str:
+    names = {
+        "negative": ("negative", "negative_prompt", "negative_tags"),
+        "negative_prompt": ("negative_prompt", "negative", "negative_tags"),
+        "negative_tags": ("negative_tags", "negative", "negative_prompt"),
+    }.get(key, (key,))
+    for name in names:
+        value = data.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _split_related(
+    data: Dict[str, Any],
+    primary: str,
+    siblings: List[str],
+) -> Tuple[str, Dict[str, str]]:
+    related: Dict[str, str] = {}
+    for key in siblings:
+        value = _field_text(data, key)
+        if value:
+            related[key] = value
+    return _field_text(data, primary), related
+
+
+def _bundle_echoes(
+    text: str,
+    related: Dict[str, str],
+    rules_by_field: Dict[str, str],
+    primary: str,
+) -> bool:
+    if _echoes_instruction(text, rules_by_field.get(primary, "")):
+        return True
+    return any(
+        _echoes_instruction(value, rules_by_field.get(key, ""))
+        for key, value in related.items()
+    )
+
+
+def suggest_related(
+    model: str,
+    field: str,
+    text: str,
+    caption: Optional[str] = None,
+    authorization: str = "",
+    context: Optional[Dict[str, str]] = None,
+    also: Optional[List[str]] = None,
+) -> Tuple[str, Dict[str, str]]:
+    """Write the tapped box and any empty siblings in one JSON reply."""
+    typed = (text or "").strip()
+    picture = (caption or "").strip()
+    primary = (field or "prompt").strip() or "prompt"
+    ordered = [primary]
+    for name in also or []:
+        cleaned = (name or "").strip()
+        if cleaned and cleaned not in ordered and len(ordered) < 6:
+            ordered.append(cleaned)
+    siblings = ordered[1:]
+    rules_by_field: Dict[str, str] = {}
+    rule_lines: List[str] = []
+    for name in ordered:
+        invent = name != primary or not typed
+        rule = instruction_for(model or "", name, invent)
+        rules_by_field[name] = rule
+        rule_lines.append(f"{name}:\n{rule}")
+    rule_text = "\n\n".join(rule_lines)
+    parts = [
+        "Fill these boxes for the same piece. Return one JSON object and no other text.",
+        "Keys: " + ", ".join(ordered),
+        rule_text,
+    ]
+    filled: List[str] = []
+    for key, value in (context or {}).items():
+        label = (key or "").strip()
+        note = (value or "").strip()
+        if label and note and label != primary:
+            filled.append(f"{label}:\n{note[:2000]}")
+    if filled:
+        parts.append(
+            "Already written. Match these and do not rewrite them:\n"
+            + "\n\n".join(filled)
+        )
+    if picture:
+        parts.append(f"Picture description:\n{picture[:1500]}")
+    if typed:
+        parts.append(f"Text already in {primary}:\n{typed[:4000]}")
+    else:
+        parts.append(f"{primary} is empty. Write it.")
+    parts.append("Each JSON value is only the text for that box.")
+
+    def finish(raw: str) -> Tuple[str, Dict[str, str]]:
+        data = _loads_object(raw)
+        if data is None:
+            if _echoes_instruction(raw, rule_text):
+                raise _InstructionEcho()
+            return raw.strip(), {}
+        prompt, related = _split_related(data, primary, siblings)
+        if not prompt:
+            if _echoes_instruction(raw, rules_by_field.get(primary, "")):
+                raise _InstructionEcho()
+            raise RuntimeError("Auto-prompt did not return the requested field.")
+        if _bundle_echoes(prompt, related, rules_by_field, primary):
+            raise _InstructionEcho()
+        return prompt, related
+
+    try:
+        return finish(_ask_once(parts, authorization))
+    except _InstructionEcho:
+        retry = [
+            "The previous reply repeated the instructions. Write the content only.",
+            *parts,
+        ]
+        try:
+            return finish(_ask_once(retry, authorization))
+        except _InstructionEcho:
+            raise RuntimeError("Auto-prompt repeated the instructions.") from None
 
 
 def should_enhance_for_model(model: str, mode: Optional[str] = None) -> bool:
