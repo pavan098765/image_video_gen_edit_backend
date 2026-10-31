@@ -142,7 +142,7 @@ def describe_image_with_gemini(
     payload = {
         "step": "asset_prompt",
         "model": model,
-        "maxOutputTokens": 1024,
+        "maxOutputTokens": 4096,
         "contents": [
             {
                 "parts": [
@@ -164,7 +164,101 @@ def suggest_text_with_gemini(prompt_text: str, authorization: str) -> Tuple[bool
     payload = {
         "step": "suggest_prompt",
         "model": model,
-        "maxOutputTokens": 1024,
+        "maxOutputTokens": 4096,
         "contents": [{"parts": [{"text": text[:20000]}]}],
     }
-    return _post_gemini(payload, authorization, 2000)
+    return _post_gemini(payload, authorization, 8000)
+
+
+# VLC equalizer curve ids, plus style aliases that map to one of those curves.
+# The gains live in the app. This list only decides which id is allowed.
+_EQ_CURVE_IDS = (
+    "flat",
+    "classical",
+    "club",
+    "dance",
+    "fullbass",
+    "fullbasstreble",
+    "fulltreble",
+    "headphones",
+    "largehall",
+    "live",
+    "party",
+    "pop",
+    "reggae",
+    "rock",
+    "ska",
+    "soft",
+    "softrock",
+    "techno",
+)
+_EQ_ALIASES = (
+    ("hiphop", "fullbass"),
+    ("trap", "fullbass"),
+    ("edm", "techno"),
+    ("ballad", "soft"),
+    ("rnb", "soft"),
+    ("metal", "rock"),
+    ("jazz", "classical"),
+    ("acoustic", "live"),
+    ("lofi", "soft"),
+    ("ambient", "soft"),
+    ("latin", "dance"),
+    ("punjabi", "party"),
+    ("bhangra", "party"),
+    ("bollywood", "pop"),
+    ("indie", "softrock"),
+    ("country", "softrock"),
+)
+EQ_PRESET_IDS = _EQ_CURVE_IDS + tuple(alias for alias, _curve in _EQ_ALIASES)
+EQ_PRESET_ALLOWLIST = frozenset(EQ_PRESET_IDS)
+
+
+def normalize_eq_preset(raw: str) -> str:
+    """Keep a Gemini reply only when the trimmed text is exactly one allowed id."""
+    text = (raw or "").strip().lower()
+    if text in EQ_PRESET_ALLOWLIST:
+        return text
+    return "flat"
+
+
+def eq_preset_prompt(title: str, style: str, tags: str, lyrics: str) -> str:
+    """Tell Gemini every allowed id and which alias to use for a style."""
+    ids = "\n".join(EQ_PRESET_IDS)
+    aliases = "\n".join(f"{alias}: {curve}" for alias, curve in _EQ_ALIASES)
+    return (
+        "Choose one equalizer preset for this song. "
+        "Reply with exactly one id from the list and no other text.\n\n"
+        f"Ids:\n{ids}\n\n"
+        "When the style matches an alias, return that alias id:\n"
+        f"{aliases}\n\n"
+        f"Title: {(title or '').strip()[:200]}\n"
+        f"Style: {(style or '').strip()[:1000]}\n"
+        f"Tags: {(tags or '').strip()[:500]}\n"
+        f"Lyrics: {(lyrics or '').strip()[:500]}\n"
+    )
+
+
+def choose_eq_preset(
+    title: str,
+    style: str,
+    tags: str,
+    lyrics: str,
+    authorization: str,
+) -> str:
+    """Ask Gemini for one preset id. Anything else, including a failed call, is flat."""
+    if not is_asset_prompt_vlm_enabled():
+        return "flat"
+    model, _url = _gemini_target()
+    payload = {
+        "step": "eq_preset",
+        "model": model,
+        "maxOutputTokens": 16,
+        "contents": [
+            {"parts": [{"text": eq_preset_prompt(title, style, tags, lyrics)}]}
+        ],
+    }
+    ok, text = _post_gemini(payload, authorization, 80)
+    if not ok:
+        return "flat"
+    return normalize_eq_preset(text)

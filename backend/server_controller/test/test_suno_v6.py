@@ -513,7 +513,161 @@ def test_prices_match_the_sell_schedule():
         assert calculate_job_cost("suno_v6", {"action": "stems", "stem_type": "split_stem_advanced"}) == 30
         assert calculate_job_cost("suno_v6", {"action": "persona"}) == 10
         assert calculate_job_cost("suno_v6", {"action": "voice"}) == 2
+        assert calculate_job_cost("suno_v6", {"action": "extend"}) == 65
+        assert calculate_job_cost("suno_v6", {"action": "upload_extend"}) == 65
+        assert calculate_job_cost("suno_v6", {"action": "mashup"}) == 65
         assert suno_v6.SONG_USER_CREDITS == 65
+
+
+def test_extend_uses_a_saved_version_and_upload_extend_uses_a_file():
+    extended = suno_v6.prepare("keep the chorus, then open it up", {
+        "action": "extend",
+        "audio_id": "audio-1",
+        "style": "acoustic",
+        "title": "Night, longer",
+        "continue_at": 90,
+        "source_duration": 120,
+    })
+    assert extended.kie_model == "ai-music-api/extend"
+    assert extended.kie_input["audio_id"] == "audio-1"
+    assert extended.kie_input["model"] == "V6"
+    assert extended.kie_input["continue_at"] == 90
+    assert "upload_url" not in extended.kie_input
+    assert extended.music["commercial_rights"] is True
+    assert extended.music["phase"] == "extending"
+
+    omitted = suno_v6.prepare("", {
+        "action": "extend",
+        "audio_id": "audio-1",
+        "continue_at": 90,
+    })
+    assert "continue_at" not in omitted.kie_input
+
+    try:
+        suno_v6.prepare("", {
+            "action": "extend",
+            "audio_id": "audio-1",
+            "audio_urls": ["https://cdn.example/mine.mp3"],
+        })
+        raise AssertionError("expected extend to reject an upload")
+    except ValueError as exc:
+        assert "made here" in str(exc).lower()
+
+    uploaded = suno_v6.prepare("a longer last chorus", {
+        "action": "upload_extend",
+        "upload_url": "https://cdn.example/mine.mp3",
+        "confirm_audio_rights": True,
+        "source_duration": 200,
+        "continue_at": 180,
+    })
+    assert uploaded.kie_model == "ai-music-api/upload-and-extend-audio"
+    assert uploaded.kie_input["upload_url"] == "https://cdn.example/mine.mp3"
+    assert uploaded.kie_input["continue_at"] == 180
+    assert "audio_id" not in uploaded.kie_input
+
+    try:
+        suno_v6.prepare("", {
+            "action": "upload_extend",
+            "upload_url": "https://cdn.example/mine.mp3",
+            "confirm_audio_rights": True,
+            "source_duration": 500,
+        })
+        raise AssertionError("expected an over-long upload to be rejected")
+    except ValueError as exc:
+        assert "8 minutes" in str(exc)
+
+    try:
+        suno_v6.prepare("", {
+            "action": "upload_extend",
+            "upload_url": "https://cdn.example/mine.mp3",
+            "audio_id": "audio-1",
+            "confirm_audio_rights": True,
+        })
+        raise AssertionError("expected mixed extend sources to be rejected")
+    except ValueError as exc:
+        assert "not both" in str(exc).lower()
+
+
+def test_mashup_needs_two_owned_files():
+    mixed = suno_v6.prepare("a late-night blend", {
+        "action": "mashup",
+        "audio_urls": ["https://cdn.example/a.mp3", "https://cdn.example/b.mp3"],
+        "confirm_audio_rights": True,
+        "style": "jazz",
+        "title": "Two Rooms",
+    })
+    assert mixed.kie_model == "ai-music-api/mashup"
+    assert mixed.kie_input["upload_url_list"] == [
+        "https://cdn.example/a.mp3",
+        "https://cdn.example/b.mp3",
+    ]
+    assert mixed.kie_input["style"] == "jazz"
+    assert mixed.kie_input["title"] == "Two Rooms"
+    assert "audio_id" not in mixed.kie_input
+    assert mixed.music["phase"] == "mashing"
+
+    try:
+        suno_v6.prepare("", {
+            "action": "mashup",
+            "audio_urls": ["https://cdn.example/a.mp3"],
+            "confirm_audio_rights": True,
+            "style": "jazz",
+            "title": "Two Rooms",
+        })
+        raise AssertionError("expected one file to be rejected")
+    except ValueError as exc:
+        assert "two" in str(exc).lower()
+
+    try:
+        suno_v6.prepare("", {
+            "action": "mashup",
+            "audio_urls": ["https://cdn.example/a.mp3", "https://cdn.example/b.mp3"],
+            "audio_id": "audio-1",
+            "confirm_audio_rights": True,
+            "style": "jazz",
+            "title": "Two Rooms",
+        })
+        raise AssertionError("expected a saved song to be rejected")
+    except ValueError as exc:
+        assert "saved song" in str(exc).lower()
+
+
+def test_extend_waits_for_both_versions_and_does_not_paint_covers():
+    prepared = suno_v6.prepare("", {"action": "extend", "audio_id": "audio-1"})
+    one = {
+        "disposition": "success",
+        "kind": "tracks",
+        "tracks": [{"id": "new-1", "audio_url": "https://cdn.example/one.mp3", "title": "One"}],
+        "task_id": "extend-task",
+        "lyrics": [],
+        "covers": [],
+        "stems": [],
+        "video_url": "",
+        "persona": None,
+    }
+    waiting = suno_v6.advance(prepared.context, prepared.music, one)
+    assert waiting["action"] == "update"
+    assert waiting["music"]["phase"] == "first_track"
+    assert len(waiting["music"]["tracks"]) == 1
+
+    two = {
+        "disposition": "success",
+        "kind": "tracks",
+        "tracks": [
+            {"id": "new-1", "audio_url": "https://cdn.example/one.mp3", "title": "One"},
+            {"id": "new-2", "audio_url": "https://cdn.example/two.mp3", "title": "Two"},
+        ],
+        "task_id": "extend-task",
+        "lyrics": [],
+        "covers": [],
+        "stems": [],
+        "video_url": "",
+        "persona": None,
+    }
+    done = suno_v6.advance(waiting["context"], waiting["music"], two)
+    assert done["action"] == "finish"
+    assert done["music"]["phase"] == "complete"
+    assert done.get("kie_model") in (None, "")
 
 
 def test_router_submits_the_lyrics_task():

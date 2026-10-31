@@ -40,7 +40,7 @@ try:
         repo_id=SD35_REPO,
         allow_patterns=allow,
         resume_download=True,
-        token="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",
+        token=os.environ.get("HF_TOKEN"),
     )
     print(f"✓ SD 3.5 snapshot ready at {sd35_cache}")
 except Exception as e:

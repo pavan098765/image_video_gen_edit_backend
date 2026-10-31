@@ -31,7 +31,7 @@ if not os.listdir(SDXL_DIR):
             local_dir=SDXL_DIR,
             local_dir_use_symlinks=False,
             resume_download=True,
-            token="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",
+            token=os.environ.get("HF_TOKEN"),
         )
         print(f"✓ SDXL Lighting 8-steps ready at {SDXL_DIR}")
     except Exception as e:

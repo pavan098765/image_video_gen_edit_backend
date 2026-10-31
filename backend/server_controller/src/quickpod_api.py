@@ -1315,9 +1315,9 @@ if __name__ == "__main__":
     print("QuickPod API Test - Pod Lifecycle (Create & Destroy)")
     print("=" * 80)
     print()
-    # Set your credentials here
-    QUICKPOD_EMAIL = "pavanalur3@gmail.com"
-    QUICKPOD_PASSWORD = "T7CfN@@CTtQETn6"
+    # Credentials come from the environment. Do not hardcode them.
+    QUICKPOD_EMAIL = os.getenv("QUICKPOD_EMAIL", "")
+    QUICKPOD_PASSWORD = os.getenv("QUICKPOD_PASSWORD", "")
     
     # Initialize manager with email and password
     print("[1] Initializing QuickPodManager...")

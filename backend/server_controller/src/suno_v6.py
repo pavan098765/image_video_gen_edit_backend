@@ -17,7 +17,7 @@ MODEL_NAME = "suno_v6"
 SONG_USER_CREDITS = 65
 
 VARIANTS = ("V6", "V6_MINI", "V6_WILD")
-COMMERCIAL_ACTIONS = ("song", "sounds", "replace")
+COMMERCIAL_ACTIONS = ("song", "sounds", "replace", "extend", "upload_extend", "mashup")
 
 # Smaller actions keep the same ratio to a song. Override with tool_config actionCosts.
 ACTION_CREDITS = {
@@ -32,6 +32,9 @@ ACTION_CREDITS = {
     "stems_advanced": 30,
     "persona": 10,
     "voice": 2,
+    "extend": SONG_USER_CREDITS,
+    "upload_extend": SONG_USER_CREDITS,
+    "mashup": SONG_USER_CREDITS,
 }
 
 KIE_MODELS = {
@@ -44,6 +47,9 @@ KIE_MODELS = {
     "video": "ai-music-api/create-music-video",
     "persona": "ai-music-api/generate-persona",
     "voice": "ai-music-api/create-voice",
+    "extend": "ai-music-api/extend",
+    "upload_extend": "ai-music-api/upload-and-extend-audio",
+    "mashup": "ai-music-api/mashup",
 }
 
 PHASE_LABELS = {
@@ -56,6 +62,8 @@ PHASE_LABELS = {
     "replacing": "Replacing that section",
     "creating_voice": "Saving the voice",
     "creating_persona": "Creating the persona",
+    "extending": "Extending the song",
+    "mashing": "Mixing the tracks",
     "complete": "Ready",
 }
 
@@ -153,10 +161,16 @@ def normalize_action(value: Any) -> str:
         "mp4": "video",
         "persona": "persona",
         "voice": "voice",
+        "extend": "extend",
+        "upload_extend": "upload_extend",
+        "upload_and_extend": "upload_extend",
+        "mashup": "mashup",
     }
     action = aliases.get(raw)
     if not action:
-        raise ValueError("Choose a music action: song, lyrics, covers, video, stems, replace, sounds, persona, or voice.")
+        raise ValueError(
+            "Choose a music action: song, lyrics, covers, video, stems, replace, sounds, extend, mashup, persona, or voice."
+        )
     return action
 
 
@@ -230,11 +244,19 @@ def prepare(prompt: str, params: Optional[Dict[str, Any]], *, for_submit: bool =
         return _prepare_replace(context, params)
     if action == "sounds":
         return _prepare_sounds(context, params)
+    if action == "extend":
+        return _prepare_extend(context, params)
+    if action == "upload_extend":
+        return _prepare_upload_extend(context, params)
+    if action == "mashup":
+        return _prepare_mashup(context, params)
     if action == "persona":
         return _prepare_persona(context, params)
     if action == "voice":
         return _prepare_voice(context, params)
-    raise ValueError("Choose a music action: song, lyrics, covers, video, stems, replace, sounds, persona, or voice.")
+    raise ValueError(
+        "Choose a music action: song, lyrics, covers, video, stems, replace, sounds, extend, mashup, persona, or voice."
+    )
 
 
 def callback_summary(payload: Dict[str, Any]) -> str:
@@ -370,7 +392,7 @@ def advance(context: Dict[str, Any], music: Dict[str, Any], event: Dict[str, Any
     if disposition == "progress":
         _apply_assets(current, event)
         playable = any(_track_has_audio(track) for track in current.get("tracks") or [])
-        if playable and phase == "song":
+        if playable and phase in ("song", "extending", "mashing"):
             current["phase"] = "first_track"
             current["label"] = PHASE_LABELS["first_track"]
             if hold_for_second_version(ctx, current):
@@ -410,7 +432,7 @@ def advance(context: Dict[str, Any], music: Dict[str, Any], event: Dict[str, Any
         current["label"] = PHASE_LABELS["composing"]
         return _submit_song(ctx, current, lyric=lyrics[0])
     if kind == "tracks":
-        if phase not in ("song", "sounds", "replace"):
+        if phase not in ("song", "sounds", "replace", "extending", "mashing"):
             _apply_assets(current, event)
             return _step("update", ctx, current)
         _apply_assets(current, event)
@@ -419,7 +441,8 @@ def advance(context: Dict[str, Any], music: Dict[str, Any], event: Dict[str, Any
         if not ctx.get("music_task_id"):
             ctx["music_task_id"] = current.get("task_id") or event.get("task_id")
         if hold_for_second_version(ctx, current):
-            ctx["phase"] = "song"
+            if ctx.get("action") == "song":
+                ctx["phase"] = "song"
             current["phase"] = "first_track"
             current["label"] = PHASE_LABELS["first_track"]
             return _step("update", ctx, current)
@@ -762,6 +785,105 @@ def _prepare_replace(context: Dict[str, Any], params: Dict[str, Any]) -> Prepare
     return Prepared(KIE_MODELS["replace"], payload, context, _blank_music(context, "replacing"), "async")
 
 
+def _extend_fields(payload: Dict[str, Any], context: Dict[str, Any], params: Dict[str, Any]) -> None:
+    """Optional lyrics, style, and continue point shared by both extend calls."""
+    instrumental = bool(context.get("instrumental"))
+    if instrumental:
+        payload["instrumental"] = True
+    elif context.get("lyrics"):
+        payload["lyrics"] = context["lyrics"]
+    elif context.get("prompt"):
+        payload["prompt"] = context["prompt"]
+    if context.get("style"):
+        payload["style"] = context["style"]
+    if context.get("title"):
+        payload["title"] = _clip(context["title"], 100)
+    if context.get("negative_tags"):
+        payload["negative_tags"] = context["negative_tags"]
+    _add_custom_controls(payload, context, instrumental, include_duration=False)
+    continue_at = _continue_at(params, context.get("source_duration"))
+    if continue_at is not None:
+        payload["continue_at"] = continue_at
+
+
+def _continue_at(params: Dict[str, Any], duration: Optional[float]) -> Optional[float]:
+    """Send continue_at only when it sits inside a known duration."""
+    raw = params.get("continue_at")
+    if raw in (None, ""):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError("Continue-from must be a number of seconds.")
+    if duration is None:
+        return None
+    if value <= 0 or value >= float(duration):
+        raise ValueError("Continue-from must be after the start and before the end of the audio.")
+    return round(value, 2)
+
+
+def _prepare_extend(context: Dict[str, Any], params: Dict[str, Any]) -> Prepared:
+    _reject_upload(context, "Extend")
+    if not context["audio_id"]:
+        raise ValueError("Pick a version to extend.")
+    payload: Dict[str, Any] = {
+        "audio_id": context["audio_id"],
+        "model": context["variant"],
+    }
+    _extend_fields(payload, context, params)
+    context["phase"] = "extending"
+    return Prepared(KIE_MODELS["extend"], payload, context, _blank_music(context, "extending"), "async")
+
+
+def _prepare_upload_extend(context: Dict[str, Any], params: Dict[str, Any]) -> Prepared:
+    if context["audio_id"] or context["source_task_id"]:
+        raise ValueError("Upload audio to extend, or extend a song you made here, not both.")
+    urls = context["audio_urls"]
+    if len(urls) > 1:
+        raise ValueError("Extend uses one audio file.")
+    upload = urls[0] if urls else ""
+    if not upload:
+        raise ValueError("Upload the audio you want to extend.")
+    duration = context.get("source_duration")
+    if duration is not None and float(duration) > 8 * 60:
+        raise ValueError("Audio to extend must be 8 minutes or less.")
+    _require_audio_rights(params)
+    payload: Dict[str, Any] = {"upload_url": upload, "model": context["variant"]}
+    _extend_fields(payload, context, params)
+    context["phase"] = "extending"
+    return Prepared(
+        KIE_MODELS["upload_extend"], payload, context, _blank_music(context, "extending"), "async"
+    )
+
+
+def _prepare_mashup(context: Dict[str, Any], params: Dict[str, Any]) -> Prepared:
+    if context["audio_id"] or context["source_task_id"]:
+        raise ValueError("Mashup uses two uploaded tracks, not a saved song.")
+    urls = list(context["audio_urls"])
+    if len(urls) < 2:
+        raise ValueError("Upload two audio files to mash up.")
+    style = context["style"]
+    title = _clip(context["title"], 100)
+    if not style:
+        raise ValueError("Add a style for the mashup.")
+    if not title:
+        raise ValueError("Add a title for the mashup.")
+    _require_audio_rights(params)
+    payload: Dict[str, Any] = {
+        "upload_url_list": urls[:2],
+        "model": context["variant"],
+        "style": style,
+        "title": title,
+    }
+    if context.get("lyrics"):
+        payload["lyrics"] = context["lyrics"]
+    elif context.get("prompt"):
+        payload["prompt"] = context["prompt"]
+    _add_custom_controls(payload, context, bool(context.get("instrumental")), include_duration=False)
+    context["phase"] = "mashing"
+    return Prepared(KIE_MODELS["mashup"], payload, context, _blank_music(context, "mashing"), "async")
+
+
 def _prepare_stems(context: Dict[str, Any], params: Dict[str, Any]) -> Prepared:
     stem_type = _stem_type(params)
     payload: Dict[str, Any] = {"type": stem_type}
@@ -901,7 +1023,7 @@ def hold_for_second_version(
     ctx = context or {}
     current = music or {}
     action = ctx.get("action") or current.get("action") or "song"
-    if action != "song" or ctx.get("accept_single_track"):
+    if action not in ("song", "extend", "upload_extend", "mashup") or ctx.get("accept_single_track"):
         return False
     tracks = list(current.get("tracks") or [])
     if event and event.get("tracks"):
@@ -1191,7 +1313,7 @@ def _collect_media(params: Dict[str, Any], *, strict: bool) -> Dict[str, List[st
     videos = _media_values(params, ("video_urls", "input_video"), ("input_video_r2_key", "video_r2_key"), strict)
     audios = _media_values(
         params,
-        ("audio_urls", "reference_audio", "source_audio", "upload_url", "verify_url", "verify_audio"),
+        ("audio_urls", "audio", "reference_audio", "source_audio", "upload_url", "verify_url", "verify_audio"),
         ("audio_r2_keys", "reference_audio_r2_key", "upload_url_r2_key", "verify_audio_r2_key", "verify_url_r2_key"),
         strict,
     )

@@ -33,7 +33,7 @@ try:
         repo_id=SD15_REPO,
         allow_patterns=["stable-diffusion-v1-5-pruned-emaonly-Q8_0.gguf"],
         resume_download=True,
-        token="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",
+        token=os.environ.get("HF_TOKEN"),
 
     )
     print(f"✓ SD15 GGUF snapshot at {sd15_cache}")
@@ -67,7 +67,7 @@ try:
         repo_id=VAE_REPO,
         allow_patterns=["*.safetensors"],
         resume_download=True,
-        token="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",
+        token=os.environ.get("HF_TOKEN"),
     )
     print(f"✓ VAE snapshot at {vae_cache}")
 

@@ -118,6 +118,7 @@ from prompt_enhancement import (
     suggest_related,
 )
 from asset_prompt_vlm import (
+    choose_eq_preset,
     describe_image_with_gemini,
     get_max_image_bytes,
     is_asset_prompt_vlm_enabled,
@@ -129,6 +130,8 @@ from models import (
     DescribeAssetForPromptResponse,
     SuggestPromptRequest,
     SuggestPromptResponse,
+    EqPresetRequest,
+    EqPresetResponse,
     RegisterWorkerRequest,
     HeartbeatRequest,
     JobStartedRequest,
@@ -4311,6 +4314,26 @@ async def suggest_prompt_route(
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return SuggestPromptResponse(prompt=text, related=related)
+
+
+@client_router.post("/eq_preset", response_model=EqPresetResponse)
+async def eq_preset_route(
+    payload: EqPresetRequest,
+    authorization: Optional[str] = Header(None),
+    auth: Dict = Depends(require_firebase_auth),
+):
+    """Pick one VLC equalizer id for a HitMaker song. No gem charge."""
+    if auth.get("user_id") is None:
+        raise HTTPException(status_code=401, detail="User id missing from auth")
+    preset = await asyncio.to_thread(
+        choose_eq_preset,
+        payload.title,
+        payload.style,
+        payload.tags,
+        payload.lyrics,
+        authorization or "",
+    )
+    return EqPresetResponse(preset=preset)
 
 
 def _bulk_entries_include_multi_image_group(entries: Optional[List[Any]]) -> bool:

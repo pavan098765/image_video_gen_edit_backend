@@ -70,7 +70,7 @@ for name, repo in REPOS.items():
             local_dir=target_path,
             local_dir_use_symlinks=False,
             resume_download=True,
-            token="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",
+            token=os.environ.get("HF_TOKEN"),
             ignore_patterns=ignore,
         )
         print(f"✓ {name} ready at {target_path}")

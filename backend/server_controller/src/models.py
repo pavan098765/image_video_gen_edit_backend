@@ -618,6 +618,21 @@ class SuggestPromptResponse(BaseModel):
     related: Dict[str, str] = Field(default_factory=dict)
 
 
+class EqPresetRequest(BaseModel):
+    """Song text used to pick one saved equalizer. No credit charge."""
+
+    title: str = Field(default="", max_length=200)
+    style: str = Field(default="", max_length=1000)
+    tags: str = Field(default="", max_length=500)
+    lyrics: str = Field(default="", max_length=500)
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+
+class EqPresetResponse(BaseModel):
+    preset: str = Field(..., description="One allowlisted equalizer id, or flat")
+
+
 # =============================================================================
 # Response Models
 # =============================================================================

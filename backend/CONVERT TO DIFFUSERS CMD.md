@@ -1,10 +1,7 @@
-TOGETHER_API_KEY = os.environ.get(
-    "TOGETHER_API_KEY",
-    "d9d8a62fa13d36b44cbb16188734e5dc17eec3fd65c2ebc4e0d533bd9bc6c33f",
-)
+TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")
 
 
-python upload_quantized.py --repo-id "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers" --model-dir "/work_space/models/wan2.2_i2v_a14b_remix_nsfw" --token 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
+python upload_quantized.py --repo-id "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers" --model-dir "/work_space/models/wan2.2_i2v_a14b_remix_nsfw" --token 
 
 
 https://civitai.com/models/1888857?modelVersionId=2137972 FEM BD ENHANCER 
@@ -37,7 +34,7 @@ python convert_wan_to_diffusers.py --output_path ./wan_out --model_type Wan2.2-T
 python convert_wan_to_diffusers.py --output_path ./wan_out --model_type Wan2.2-T2V-A14B --dtype fp16
 
 
- python3 upload_quantized.py --repo-id "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_sndq_fp8_svd_64" --model-dir "/work_space/models/wan2.2_i2v_a14b_remix_nsfw_sdnq_fp8_svd_r64" --token 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
+ python3 upload_quantized.py --repo-id "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_sndq_fp8_svd_64" --model-dir "/work_space/models/wan2.2_i2v_a14b_remix_nsfw_sdnq_fp8_svd_r64" --token 
 
 
 python3 convert_wan_lora_to_diffusers.py \
@@ -64,14 +61,14 @@ python3 quantize_sdnq.py --repo rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_di
 
 
 
-python3 upload_quantized.py --repo-id "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_lora_Pornmaster_sdnq_fp8_svd_r64" --model-dir "/work_space/models/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_lora_Pornmaster_sdnq_fp8_svd_r64" --token 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
+python3 upload_quantized.py --repo-id "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_lora_Pornmaster_sdnq_fp8_svd_r64" --model-dir "/work_space/models/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_lora_Pornmaster_sdnq_fp8_svd_r64" --token 
 
 
 python3 convert_wan_lora_to_diffusers.py \
       --hf-repo lkzd7/WAN2.2_LoraSet_NSFW \
       --hf-files W22_Multiscene_Photoshoot_Softcore_i2v_HN.safetensors W22_Multiscene_Photoshoot_Softcore_i2v_LN.safetensors \
       --upload-repo rockapaper/wan22_nsfw_lora_diffusers \
-      --token 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
+      --token 
 
 
 python3 quantize_sdnq.py \
@@ -119,7 +116,7 @@ python3 quantize_sdnq.py --repo rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_di
         --lora-t2 /work_space/models/loras/NSFW-22-L-e8_diffusers.safetensors \
 	--lora-strength 0.8 
 
-python3 upload_quantized.py --repo-id "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_lora_GENERAL_NSFW_sdnq_fp8_svd_r64" --model-dir "/work_space/models/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_lora_GENERAL_NSFW_sdnq_fp8_svd_r64" --token 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
+python3 upload_quantized.py --repo-id "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_lora_GENERAL_NSFW_sdnq_fp8_svd_r64" --model-dir "/work_space/models/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_lora_GENERAL_NSFW_sdnq_fp8_svd_r64" --token 
 
 
 python3 quantize_sdnq.py --repo rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers --dtype fp8 --svd-rank 64 --svd-steps 16 \
@@ -127,7 +124,7 @@ python3 quantize_sdnq.py --repo rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_di
         --lora-t2 /work_space/models/loras/W22_NSFW_Posing_Nude_i2v_LN_v2_diffusers.safetensors \
 	--lora-strength 0.8 
 
-python3 upload_quantized.py --repo-id "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_lora_NSFW_POSING_sdnq_fp8_svd_r64" --model-dir "/work_space/models/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_lora_NSFW_POSING_sdnq_fp8_svd_r64" --token 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
+python3 upload_quantized.py --repo-id "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_lora_NSFW_POSING_sdnq_fp8_svd_r64" --model-dir "/work_space/models/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_lora_NSFW_POSING_sdnq_fp8_svd_r64" --token 
 
 
 python3 quantize_sdnq.py --repo rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers --dtype fp8 --svd-rank 64 --svd-steps 16 \
@@ -135,7 +132,7 @@ python3 quantize_sdnq.py --repo rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_di
         --lora-t2 /work_space/models/loras/Wan2.2-T2V-Femaled-Vaginus-High-v1_diffusers.safetensors \
 	--lora-strength 0.8 
 
-python3 upload_quantized.py --repo-id "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_Multiscene_SVI_sdnq_fp8_svd_r64" --model-dir "/work_space/models/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_Multiscene_SVI_sdnq_fp8_svd_r64" --token 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
+python3 upload_quantized.py --repo-id "rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_Multiscene_SVI_sdnq_fp8_svd_r64" --model-dir "/work_space/models/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers_Multiscene_SVI_sdnq_fp8_svd_r64" --token 
 
 
 
@@ -143,7 +140,7 @@ python3 convert_wan_lora_to_diffusers.py \
       --hf-repo vita-video-gen/svi-model \
       --hf-files version-2.0/SVI_Wan2.2-I2V-A14B_high_noise_lora_v2.0_pro.safetensors version-2.0/SVI_Wan2.2-I2V-A14B_low_noise_lora_v2.0_pro.safetensors \
       --upload-repo rockapaper/_wan22_nsfw_lora_diffusers \
-      --token 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
+      --token 
 
 
     python3 quantize_sdnq_multi.py --repo rockapaper/wan2.2_14b_i2v_480p_lightning_nsfw_diffusers --dtype fp8 --svd-rank 64 --svd-steps 16 \

@@ -216,7 +216,7 @@ docker run --rm -p 8000:8000 pavanalur3/quickpod_worker:image_upscaler_realesrga
 docker run --rm pavanalur3/deps-base-extended:py311-cu129 sh -c "pip show fastapi && pip show uvicorn && pip show stable-diffusion-cpp-python"
 
 
--p 8000:8000 -e CONTROLLER_SHARED_SECRET="SECRETKEY" -e CONTROLLER_API_KEY="SECRETKEY" -e ENABLE_AUTOTEST=1 -e CONTROLLER_URL="https://genedit.mooo.com" -e HF_TOKEN="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"
+-p 8000:8000 -e CONTROLLER_SHARED_SECRET="SECRETKEY" -e CONTROLLER_API_KEY="SECRETKEY" -e ENABLE_AUTOTEST=1 -e CONTROLLER_URL="https://genedit.mooo.com" -e HF_TOKEN=""
 
 uvicorn src.app:app --host 0.0.0.0 --port 8000 --log-level debug --access-log | tee uvicorn.log; echo quickpodflux_kontext
 

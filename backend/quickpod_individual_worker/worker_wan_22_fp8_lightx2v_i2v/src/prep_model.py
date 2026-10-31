@@ -57,7 +57,7 @@ if not os.path.exists(MODEL_LOCAL_DIR) or not os.listdir(MODEL_LOCAL_DIR):
             local_dir=MODEL_LOCAL_DIR,
             local_dir_use_symlinks=False,
             resume_download=True,
-            token="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"
+            token=os.environ.get("HF_TOKEN")
         )
         print(f"✓ Model downloaded successfully to {MODEL_LOCAL_DIR}")
         
@@ -84,7 +84,7 @@ if not os.path.exists(RIFE_MODEL_DIR) or not os.listdir(RIFE_MODEL_DIR):
             local_dir=RIFE_MODEL_DIR,
             local_dir_use_symlinks=False,
             resume_download=True,
-            token="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"
+            token=os.environ.get("HF_TOKEN")
         )
         print(f"✓ RIFE model weights downloaded successfully to {RIFE_MODEL_DIR}")
     except Exception as e:

@@ -108,3 +108,14 @@ work_space/**/*.zip
 **/src/_archive/
 *.gguf
 *.safetensors
+
+# Local secrets. Keep the files on disk; do not commit them.
+**/.env
+**/.env.*
+!**/.env.example
+**/config.env
+**/*[Ss]ervice[Aa]ccount*.json
+**/*.pem
+**/*.p12
+**/*.pfx
+backend/server_controller/src/server_config.py

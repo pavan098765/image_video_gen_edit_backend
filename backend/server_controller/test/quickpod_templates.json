@@ -31,7 +31,7 @@
     "user_id": 36545,
     "image_path": "quickpod/jupyterlab:4.3.1-py3.10.12-cuda12.9-cudnn9.10-ubuntu22.04",
     "version_tag": "",
-    "docker_options": "-p 8000:8000 -e CONTROLLER_SHARED_SECRET=\"SECRETKEY\" -e CONTROLLER_API_KEY=\"SECRETKEY\" -e HF_TOKEN=\"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\" -e CONTROLLER_URL=\"https://ky3libvtbr544cocs4lk4lqp6q.apigateway.ap-hyderabad-1.oci.customer-oci.com/imgvidgen\"",
+    "docker_options": "-p 8000:8000 -e CONTROLLER_SHARED_SECRET=\"SECRETKEY\" -e CONTROLLER_API_KEY=\"SECRETKEY\" -e HF_TOKEN=\"\" -e CONTROLLER_URL=\"https://ky3libvtbr544cocs4lk4lqp6q.apigateway.ap-hyderabad-1.oci.customer-oci.com/imgvidgen\"",
     "launch_mode": "ssh",
     "on_start_script": "",
     "extra_filters": "",

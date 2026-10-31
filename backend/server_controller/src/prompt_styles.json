@@ -17,24 +17,24 @@
       "invent": "Write one short note that continues the existing scene past the frame, matching its light and perspective. Do not add new people."
     },
     "music": {
-      "refine": "Rewrite this as a music caption: genre, mood, vocal type, and the main instruments. Keep the user's idea. Do not put lyrics or bracket tags in this field.",
-      "invent": "Write one original music caption: genre, mood, vocal type, and the main instruments. No lyrics and no bracket tags."
+      "refine": "Rewrite this as a music caption of about 40 to 80 words: genre, mood, vocal type, and the main instruments. Keep the user's idea. Do not put lyrics or bracket tags in this field.",
+      "invent": "Write one original music caption of about 40 to 80 words: genre, mood, vocal type, and the main instruments. No lyrics and no bracket tags."
     },
     "lyrics": {
-      "refine": "Rewrite these lyrics. Keep the theme. Put each section tag on its own line, and keep tags the user already used.",
-      "invent": "Write a short original lyric. Put [Verse] and [Chorus] on their own lines. Safe for all ages."
+      "refine": "Rewrite these lyrics as a complete song, about 180 to 320 words of sung lines. Keep the theme and any lines the user already wrote. If they only gave a hook, expand it into a full song. Put each section tag on its own line, and keep tags the user already used. Include two verses, a chorus repeated in full, and a bridge.",
+      "invent": "Write a complete original lyric, about 180 to 320 words of sung lines. Safe for all ages. Put [Verse] and [Chorus] on their own lines. Include two verses, a chorus repeated in full, and a bridge."
     },
     "style": {
-      "refine": "Rewrite this as a style description that leads with genre, then mood, vocal type, and instruments. No brackets and no artist names. Keep the user's direction.",
-      "invent": "Write a style description that leads with genre, then mood, vocal type, and instruments. No brackets and no artist names."
+      "refine": "Rewrite this as a style description of about 40 to 90 words that leads with genre, then mood, vocal type, instruments, and production. No brackets and no artist names. Keep the user's direction.",
+      "invent": "Write a style description of about 40 to 90 words that leads with genre, then mood, vocal type, instruments, and production. No brackets and no artist names."
     },
     "negative": {
       "refine": "Rewrite this as a short list of things to leave out. Keep the user's exclusions. Do not restate the positive idea.",
       "invent": "Write a short list of audible defects to avoid for this kind of result."
     },
     "speech": {
-      "refine": "Rewrite this as words to be spoken aloud. Keep the user's meaning. Use natural sentences. Do not add a voice, an accent, or stage directions.",
-      "invent": "Write two or three sentences someone could say aloud. Safe for all ages. Do not add a voice description."
+      "refine": "Rewrite this as words to be spoken aloud. Keep the user's meaning. If they only gave a topic or a fragment, expand it to about 80 to 160 words. If they already wrote a full passage, keep its length. Use natural sentences. Do not add a voice, an accent, or stage directions.",
+      "invent": "Write a spoken passage of about 80 to 160 words in natural sentences. Safe for all ages. Do not add a voice description."
     },
     "voice_description": {
       "refine": "Rewrite this as one voice description: age, gender, pitch, pace, emotion, and accent. Keep the user's voice.",
@@ -146,16 +146,16 @@
     },
     "suno_v6": {
       "prompt": {
-        "refine": "Rewrite this as a short song idea in plain sentences: the genre and subgenre, the mood, who is singing, and what the song is about. Keep the user's idea. Do not put bracket tags, sung lines, or artist names in this field.",
-        "invent": "Write one original song idea in plain sentences: a genre and subgenre, a mood, who sings, and what the song is about. Safe for all ages. No bracket tags, no sung lines, and no artist names."
+        "refine": "Rewrite this as a song idea of about 40 to 80 words in plain sentences: the genre and subgenre, the mood, who is singing, and what the song is about. Keep the user's idea. Do not put bracket tags, sung lines, or artist names in this field.",
+        "invent": "Write one original song idea of about 40 to 80 words in plain sentences: a genre and subgenre, a mood, who sings, and what the song is about. Safe for all ages. No bracket tags, no sung lines, and no artist names."
       },
       "style": {
-        "refine": "Rewrite this as the Style of Music in natural language, with no brackets. Lead with the genre and subgenre, then the mood, the vocal type and texture, the signature instruments and production, and a tempo feel. Use about 8 to 15 descriptors, and put the genre first because the first words carry the most weight. No artist names. Do not put exclusions such as no drums in this box. Keep the user's direction.",
-        "invent": "Write the Style of Music in natural language, with no brackets. Lead with a genre and subgenre, then a mood, a vocal type and texture, the signature instruments and production, and a tempo feel. Use about 8 to 15 descriptors, genre first. No artist names and no exclusions."
+        "refine": "Rewrite this as the Style of Music in natural language, about 40 to 90 words, with no brackets. Lead with the genre and subgenre, then the mood, the vocal type and texture, the signature instruments and production, and a tempo feel. Put the genre first because the first words carry the most weight. No artist names. Do not put exclusions such as no drums in this box. Keep the user's direction.",
+        "invent": "Write the Style of Music in natural language, about 40 to 90 words, with no brackets. Lead with a genre and subgenre, then a mood, a vocal type and texture, the signature instruments and production, and a tempo feel. Genre first. No artist names and no exclusions."
       },
       "lyrics": {
-        "refine": "Rewrite these lyrics. Keep the theme. Put each section tag on its own line, using [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Bridge], [Outro], and close with [End]. One short modifier is allowed, as in [Chorus | anthemic], not a stack of modifiers. Repeat the chorus lines word for word under every [Chorus]. Ad-libs go in parentheses on their own line, three words or fewer. Do not put style tags in the sung lines.",
-        "invent": "Write a short original lyric. Safe for all ages. Put [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Bridge], [Outro], and [End] each on its own line. One short modifier is allowed, as in [Chorus | anthemic], not a stack. Repeat the chorus lines word for word under every [Chorus]. Ad-libs go in parentheses on their own line, three words or fewer."
+        "refine": "Rewrite these lyrics as a complete song, about 180 to 320 words of sung lines. Keep the theme and any lines the user wrote. If they only gave a hook, expand it into a full song. Put each section tag on its own line, using [Intro], [Verse 1], [Verse 2], [Pre-Chorus], [Chorus], [Bridge], [Outro], and close with [End]. One short modifier is allowed, as in [Chorus | anthemic], not a stack of modifiers. Repeat the chorus lines word for word under every [Chorus]. Give each verse its own lines. Ad-libs go in parentheses on their own line, three words or fewer. Do not put style tags in the sung lines.",
+        "invent": "Write a complete original lyric, about 180 to 320 words of sung lines. Safe for all ages. Put [Intro], [Verse 1], [Verse 2], [Pre-Chorus], [Chorus], [Bridge], [Outro], and [End] each on its own line. One short modifier is allowed, as in [Chorus | anthemic], not a stack of modifiers. Repeat the chorus lines word for word under every [Chorus]. Give each verse its own lines. Ad-libs go in parentheses on their own line, three words or fewer."
       },
       "negative": {
         "refine": "Rewrite this as a few comma-separated audible exclusions, such as an unwanted instrument or vocal effect. Keep the user's exclusions. Do not restate the genre they want, and do not hide a phrase like no drums inside the style line.",
@@ -168,16 +168,16 @@
     },
     "suno_music": {
       "prompt": {
-        "refine": "Rewrite this as a short song idea in plain sentences: the genre and subgenre, the mood, who is singing, and what the song is about. Keep the user's idea. Do not put bracket tags, sung lines, or artist names in this field.",
-        "invent": "Write one original song idea in plain sentences: a genre and subgenre, a mood, who sings, and what the song is about. Safe for all ages. No bracket tags, no sung lines, and no artist names."
+        "refine": "Rewrite this as a song idea of about 40 to 80 words in plain sentences: the genre and subgenre, the mood, who is singing, and what the song is about. Keep the user's idea. Do not put bracket tags, sung lines, or artist names in this field.",
+        "invent": "Write one original song idea of about 40 to 80 words in plain sentences: a genre and subgenre, a mood, who sings, and what the song is about. Safe for all ages. No bracket tags, no sung lines, and no artist names."
       },
       "style": {
-        "refine": "Rewrite this as the Style of Music in natural language, with no brackets. Lead with the genre and subgenre, then the mood, the vocal type and texture, the signature instruments and production, and a tempo feel. Use about 8 to 15 descriptors, and put the genre first. No artist names and no exclusions. Keep the user's direction.",
-        "invent": "Write the Style of Music in natural language, with no brackets. Lead with a genre and subgenre, then a mood, a vocal type and texture, the signature instruments and production, and a tempo feel. Use about 8 to 15 descriptors, genre first. No artist names and no exclusions."
+        "refine": "Rewrite this as the Style of Music in natural language, about 40 to 90 words, with no brackets. Lead with the genre and subgenre, then the mood, the vocal type and texture, the signature instruments and production, and a tempo feel. Put the genre first. No artist names and no exclusions. Keep the user's direction.",
+        "invent": "Write the Style of Music in natural language, about 40 to 90 words, with no brackets. Lead with a genre and subgenre, then a mood, a vocal type and texture, the signature instruments and production, and a tempo feel. Genre first. No artist names and no exclusions."
       },
       "lyrics": {
-        "refine": "Rewrite these lyrics. Keep the theme. Put each section tag on its own line, using [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Bridge], [Outro], and close with [End]. One short modifier is allowed, as in [Chorus | anthemic], not a stack. Repeat the chorus lines word for word under every [Chorus]. Ad-libs go in parentheses on their own line, three words or fewer. Do not put style tags in the sung lines.",
-        "invent": "Write a short original lyric. Safe for all ages. Put [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Bridge], [Outro], and [End] each on its own line. One short modifier is allowed, as in [Chorus | anthemic], not a stack. Repeat the chorus lines word for word under every [Chorus]."
+        "refine": "Rewrite these lyrics as a complete song, about 180 to 320 words of sung lines. Keep the theme and any lines the user wrote. If they only gave a hook, expand it into a full song. Put each section tag on its own line, using [Intro], [Verse 1], [Verse 2], [Pre-Chorus], [Chorus], [Bridge], [Outro], and close with [End]. One short modifier is allowed, as in [Chorus | anthemic], not a stack. Repeat the chorus lines word for word under every [Chorus]. Give each verse its own lines. Ad-libs go in parentheses on their own line, three words or fewer. Do not put style tags in the sung lines.",
+        "invent": "Write a complete original lyric, about 180 to 320 words of sung lines. Safe for all ages. Put [Intro], [Verse 1], [Verse 2], [Pre-Chorus], [Chorus], [Bridge], [Outro], and [End] each on its own line. One short modifier is allowed, as in [Chorus | anthemic], not a stack. Repeat the chorus lines word for word under every [Chorus]. Give each verse its own lines."
       },
       "negative": {
         "refine": "Rewrite this as a few comma-separated audible exclusions, such as an unwanted instrument or vocal effect. Keep the user's exclusions. Do not restate the genre they want.",
@@ -186,18 +186,18 @@
     },
     "suno_sfx": {
       "prompt": {
-        "refine": "Rewrite this as one short sound effect: a single event, what makes the sound, the room it is in, and how the sound ends. Keep the user's event. Do not write a song, lyrics, or section tags such as [Chorus].",
-        "invent": "Write one original sound effect: a single event, what makes the sound, the room it is in, and how the sound ends. Safe for all ages. Do not write a song or section tags."
+        "refine": "Rewrite this as one sound effect of about 40 to 80 words: a single event, what makes the sound, the room it is in, and how the sound ends. Keep the user's event. Do not write a song, lyrics, or section tags such as [Chorus].",
+        "invent": "Write one original sound effect of about 40 to 80 words: a single event, what makes the sound, the room it is in, and how the sound ends. Safe for all ages. Do not write a song or section tags."
       }
     },
     "ace_step_music": {
       "prompt": {
-        "refine": "Rewrite this as the caption, the portrait of the track: style, emotion, instruments, timbre, era, production, and vocal color. Keep the user's idea. Do not put BPM, key, section tags, or sung lines in this caption. The instruments and vocal color must be the same ones the lyrics will use.",
-        "invent": "Write one original caption: style, emotion, instruments, timbre, era, production, and a vocal color, or say it is instrumental. Safe for all ages. Do not put BPM, key, section tags, or sung lines here."
+        "refine": "Rewrite this as the caption, the portrait of the track, in about 50 to 90 words: style, emotion, instruments, timbre, era, production, and vocal color. Keep the user's idea. Do not put BPM, key, section tags, or sung lines in this caption. The instruments and vocal color must be the same ones the lyrics will use.",
+        "invent": "Write one original caption of about 50 to 90 words: style, emotion, instruments, timbre, era, production, and a vocal color, or say it is instrumental. Safe for all ages. Do not put BPM, key, section tags, or sung lines here."
       },
       "lyrics": {
-        "refine": "Rewrite these lyrics as the timeline of the same track as the caption. Keep the theme. Use one short tag per section, such as [Chorus - anthemic], on its own line. Do not stack many modifiers inside one bracket. Instrument and vocal tags must name the same instruments and vocal color as the caption.",
-        "invent": "Write a short original lyric as a timeline. Safe for all ages. Use one short tag per section, such as [Verse] and [Chorus - anthemic], each on its own line. Do not stack many modifiers inside one bracket. Match the instruments and vocal color of the caption."
+        "refine": "Rewrite these lyrics as a complete timeline of the same track as the caption, about 160 to 280 words of sung lines. Keep the theme and any lines the user wrote. If they only gave a hook, expand it into a full song. Use one short tag per section, such as [Chorus - anthemic], on its own line. Include two verses, a chorus repeated in full, and a bridge. Do not stack many modifiers inside one bracket. Instrument and vocal tags must name the same instruments and vocal color as the caption.",
+        "invent": "Write a complete original lyric as a timeline, about 160 to 280 words of sung lines. Safe for all ages. Use one short tag per section, such as [Verse] and [Chorus - anthemic], each on its own line. Include two verses, a chorus repeated in full, and a bridge. Do not stack many modifiers inside one bracket. Match the instruments and vocal color of the caption."
       },
       "negative_prompt": {
         "refine": "Rewrite this as unwanted sounds: audible defects or instruments to leave out, such as harsh distortion or autotune. Keep the user's exclusions. Do not name moods or abstract ideas.",
@@ -206,24 +206,24 @@
     },
     "minimax_music_26": {
       "prompt": {
-        "refine": "Rewrite this as one music sentence, not a tag line. Include the key and a BPM when the user gave them or when a tempo is clear, then the genre, mood, vocal type, instruments, and production. Example shape: E minor, 90 BPM, acoustic guitar ballad, male vocal, close and worn. Keep the user's direction. Do not put sung lines or section tags in this sentence.",
-        "invent": "Write one original music sentence, not a tag line. Include a key, a BPM, the genre, the mood, the vocal type, the instruments, and the production. Example shape: A major, 118 BPM, bright indie pop, female vocal, clean electric guitar and soft drums. Do not put sung lines or section tags in this sentence."
+        "refine": "Rewrite this as a music description of about 40 to 80 words, not a tag line. Include the key and a BPM when the user gave them or when a tempo is clear, then the genre, mood, vocal type, instruments, and production. Example shape: E minor, 90 BPM, acoustic guitar ballad, male vocal, close and worn. Keep the user's direction. Do not put sung lines or section tags in this description.",
+        "invent": "Write one original music description of about 40 to 80 words, not a tag line. Include a key, a BPM, the genre, the mood, the vocal type, the instruments, and the production. Example shape: A major, 118 BPM, bright indie pop, female vocal, clean electric guitar and soft drums. Do not put sung lines or section tags in this description."
       },
       "lyrics": {
-        "refine": "Rewrite these lyrics for the same song as the style sentence. Keep the theme and any sung lines the user wrote. Use [Intro], [Verse], [Pre Chorus], [Chorus], [Bridge], and [Outro], and put a blank line between sections. Write real sung lines unless the user asked for an instrumental, in which case use the tags only.",
-        "invent": "Write a short original lyric for the same song as the style sentence. Safe for all ages. Use [Intro], [Verse], [Pre Chorus], [Chorus], [Bridge], and [Outro], with a blank line between sections and real sung lines. Use tags with no sung lines only when the request is instrumental."
+        "refine": "Rewrite these lyrics as a complete song for the same piece as the style description, about 180 to 320 words of sung lines. Keep the theme and any sung lines the user wrote. If they only gave a hook, expand it into a full song. Use [Intro], [Verse], [Pre Chorus], [Chorus], [Bridge], and [Outro], and put a blank line between sections. Include two verses and repeat the chorus in full. Write real sung lines unless the user asked for an instrumental, in which case use the tags only.",
+        "invent": "Write a complete original lyric for the same song as the style description, about 180 to 320 words of sung lines. Safe for all ages. Use [Intro], [Verse], [Pre Chorus], [Chorus], [Bridge], and [Outro], with a blank line between sections. Include two verses, repeat the chorus in full, and write real sung lines. Use tags with no sung lines only when the request is instrumental."
       }
     },
     "xai_tts": {
       "prompt": {
-        "refine": "Rewrite this as words that will be spoken aloud. Keep the user's meaning. Use natural sentences. Do not add a voice, an accent, or stage directions, because those words would be read aloud. The voice is chosen separately.",
-        "invent": "Write two or three natural sentences someone could say aloud. Safe for all ages. Do not add a voice, an accent, or stage directions, because those words would be read aloud."
+        "refine": "Rewrite this as words that will be spoken aloud. Keep the user's meaning. If they only gave a topic or a fragment, expand it to about 80 to 160 words. If they already wrote a full passage, keep its length. Use natural sentences. Do not add a voice, an accent, or stage directions, because those words would be read aloud. The voice is chosen separately.",
+        "invent": "Write a spoken passage of about 80 to 160 words in natural sentences. Safe for all ages. Do not add a voice, an accent, or stage directions, because those words would be read aloud."
       }
     },
     "qwen_voice_design": {
       "prompt": {
-        "refine": "Rewrite this as words that will be spoken aloud. Keep the user's meaning. Use natural sentences. Do not describe the voice in this text.",
-        "invent": "Write two or three natural sentences someone could say aloud. Safe for all ages. Do not describe the voice in this text."
+        "refine": "Rewrite this as words that will be spoken aloud. Keep the user's meaning. If they only gave a topic or a fragment, expand it to about 80 to 160 words. If they already wrote a full passage, keep its length. Use natural sentences. Do not describe the voice in this text.",
+        "invent": "Write a spoken passage of about 80 to 160 words in natural sentences. Safe for all ages. Do not describe the voice in this text."
       },
       "voice_description": {
         "refine": "Rewrite this as one voice description line: age, gender, pitch, pace, emotion, and accent. Keep the user's voice. Do not write the words they will speak.",
@@ -232,8 +232,8 @@
     },
     "qwen_voice_clone": {
       "prompt": {
-        "refine": "Rewrite this as words that will be spoken aloud. Keep the user's meaning and do not invent a new voice. Use natural sentences. Do not add an age, accent, or voice description, because the cloned voice already supplies that.",
-        "invent": "Write two or three natural sentences someone could say aloud in a cloned voice. Safe for all ages. Do not invent a new voice and do not add an age, accent, or voice description."
+        "refine": "Rewrite this as words that will be spoken aloud. Keep the user's meaning and do not invent a new voice. If they only gave a topic or a fragment, expand it to about 80 to 160 words. If they already wrote a full passage, keep its length. Use natural sentences. Do not add an age, accent, or voice description, because the cloned voice already supplies that.",
+        "invent": "Write a spoken passage of about 80 to 160 words in natural sentences for a cloned voice. Safe for all ages. Do not invent a new voice and do not add an age, accent, or voice description."
       }
     },
     "ltx2_3_t2v": {
