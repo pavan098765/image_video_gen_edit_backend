@@ -84,9 +84,13 @@ class ExternalExecutionResult:
 
 
 def carry_moderation_flag(raw: Any, prepared: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep the moderation decision after internal keys are stripped for the provider."""
-    if isinstance(raw, dict) and raw.get("_moderation_flagged") is True:
+    """Keep routing decisions after internal keys are stripped for the provider."""
+    if not isinstance(raw, dict):
+        return prepared
+    if raw.get("_moderation_flagged") is True:
         prepared["_moderation_flagged"] = True
+    if raw.get("_runware_rejected") is True:
+        prepared["_runware_rejected"] = True
     return prepared
 
 
@@ -134,16 +138,27 @@ class ExternalApiRouter:
     def resolve_model_config(
         self, model: str, params: Optional[Dict[str, Any]] = None
     ) -> Optional[Dict[str, Any]]:
-        """Runware is the default. Qwen uses its Kie block only when this job was flagged."""
+        """Runware is the default. Qwen uses Kie when moderation or Runware rejected the job."""
         cfg = self.get_model_config(model)
         if not cfg:
             return None
         params = params or {}
-        if params.get("_moderation_flagged") is True:
+        flagged = params.get("_moderation_flagged") is True
+        runware_rejected = params.get("_runware_rejected") is True
+        if flagged or runware_rejected:
             alternate = cfg.get("when_flagged")
             if isinstance(alternate, dict) and alternate.get("provider"):
                 return alternate
         return cfg
+
+    def uses_kie_when_flagged(self, model: str) -> bool:
+        """True when this model has a Kie config for requests Runware will not run."""
+        cfg = self.get_model_config(model) or {}
+        alternate = cfg.get("when_flagged")
+        if not isinstance(alternate, dict):
+            return False
+        provider = alternate.get("provider") or {}
+        return str(provider.get("type") or "").lower() == "kie"
 
     def should_use_external(self, model: str, params: Optional[Dict[str, Any]]) -> bool:
         cfg = self.get_model_config(model)

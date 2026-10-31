@@ -468,6 +468,19 @@ def test_qwen_stays_on_runware_unless_this_job_was_flagged():
     assert "_batch_id" not in prepared
     assert "_moderation_flagged" not in carry_moderation_flag({"_moderation_flagged": False}, {})
 
+    seen.clear()
+    rejected = router.execute("qwen2_1_i2i", "change the jacket", {
+        "_runware_rejected": True,
+        "init_image": "https://cdn.example/a.jpg",
+    })
+    assert rejected.provider == "kie"
+    assert seen["model"] == "qwen2-1/image-to-image"
+    assert router.uses_kie_when_flagged("qwen2_1_i2i") is True
+    assert router.uses_kie_when_flagged("flux2_klein_9b") is False
+    kept = carry_moderation_flag({"_runware_rejected": True}, {})
+    assert kept["_runware_rejected"] is True
+    assert "_runware_rejected" not in carry_moderation_flag({"_runware_rejected": "true"}, {})
+
 
 def test_flagged_qwen_text_uses_the_kie_text_model():
     router = ExternalApiRouter()

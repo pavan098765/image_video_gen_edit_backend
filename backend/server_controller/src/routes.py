@@ -3839,13 +3839,78 @@ async def _chain_runware_upscale(
     return True
 
 
+async def _submit_runware_reject_to_kie(job_id: str) -> None:
+    """Send a job Runware rejected to the model's Kie config."""
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if not job or job.status != JobState.RUNNING.value:
+            return
+        cached_params = get_cached_job_params(job_id)
+        raw_params = cached_params if cached_params else (job.params or {})
+        source_params = carry_moderation_flag(raw_params, _prepare_external_params(raw_params))
+        result = await asyncio.to_thread(
+            _external_api_router.execute, job.model, job.prompt or "", source_params
+        )
+        if result.pending and result.external_task_id and result.provider == "kie":
+            existing = db.query(KieTask).filter(KieTask.task_id == result.external_task_id).first()
+            if not existing:
+                db.add(KieTask(task_id=result.external_task_id, job_id=job_id, model=job.model))
+            params = dict(job.params or {})
+            params["_kie_task_id"] = result.external_task_id
+            params["_runware_rejected"] = True
+            job.params = params
+            db.commit()
+            logger.info("[KIE] Job %s Runware failure routed to task %s", job_id, result.external_task_id)
+            return
+        err = result.error or "Kie did not accept the job Runware rejected"
+    except Exception as exc:
+        logger.exception("[KIE] Runware fallback failed for %s", job_id)
+        err = str(exc)
+    finally:
+        db.close()
+
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        if not job or job.status in (
+            JobState.COMPLETED.value,
+            JobState.FAILED.value,
+            JobState.CANCELLED.value,
+        ):
+            return
+        if _job_manager:
+            _job_manager.mark_failed(job_id, err, worker_id=None)
+        else:
+            job.status = JobState.FAILED.value
+            job.error = err
+            job.updated_at = utc_naive_now()
+            db.commit()
+        job = db.query(Job).filter(Job.job_id == job_id).first()
+        meta = job.params if job and isinstance(job.params, dict) else {}
+        await _send_job_notification(
+            token=job.fcm_token if job else None,
+            job_id=job_id,
+            model=job.model if job else "",
+            success=False,
+            batch_id=meta.get("_batch_id"),
+            variation_index=int(meta.get("_variation_index", 0) or 0),
+            total_variations=int(meta.get("_total_variations", 1) or 1),
+        )
+        clear_cached_job_params(job_id)
+        logger.error("[KIE] Job %s Runware fallback failed: %s", job_id, err)
+    finally:
+        db.close()
+
+
 async def _apply_runware_job_result(job_id: str, payload: Dict[str, Any]) -> str:
-    """Apply a Runware payload. Returns applied, failed, processing, or ignored."""
+    """Apply a Runware payload. Returns applied, failed, processing, ignored, or rerouted."""
     import runware_client
 
     if runware_client.is_processing(payload):
         return "processing"
 
+    reroute_kie = False
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.job_id == job_id).first()
@@ -3901,29 +3966,42 @@ async def _apply_runware_job_result(job_id: str, payload: Dict[str, Any]) -> str
             return "applied"
 
         err = runware_client.failure_message(payload) or "Runware task failed"
-        logger.error("[RUNWARE] job %s failed: %s", job_id, err)
-        if _job_manager:
-            _job_manager.mark_failed(job_id, err, worker_id=None)
-        else:
-            job.status = JobState.FAILED.value
-            job.error = err
-            job.updated_at = utc_naive_now()
+        already_rerouted = isinstance(job.params, dict) and job.params.get("_runware_rejected") is True
+        if not already_rerouted and _external_api_router.uses_kie_when_flagged(job.model):
+            stored = dict(job.params or {})
+            stored["_runware_rejected"] = True
+            job.params = stored
+            cached = get_cached_job_params(job_id)
+            cache_job_params(job_id, {**(cached or stored), "_runware_rejected": True})
             db.commit()
-        job = db.query(Job).filter(Job.job_id == job_id).first()
-        meta = job.params if isinstance(job.params, dict) else {}
-        await _send_job_notification(
-            token=job.fcm_token,
-            job_id=job.job_id,
-            model=job.model,
-            success=False,
-            batch_id=meta.get("_batch_id"),
-            variation_index=int(meta.get("_variation_index", 0) or 0),
-            total_variations=int(meta.get("_total_variations", 1) or 1),
-        )
-        clear_cached_job_params(job_id)
-        return "failed"
+            reroute_kie = True
+            logger.info("[RUNWARE] job %s failed (%s); routing to Kie", job_id, err)
+        else:
+            logger.error("[RUNWARE] job %s failed: %s", job_id, err)
+            if _job_manager:
+                _job_manager.mark_failed(job_id, err, worker_id=None)
+            else:
+                job.status = JobState.FAILED.value
+                job.error = err
+                job.updated_at = utc_naive_now()
+                db.commit()
+            job = db.query(Job).filter(Job.job_id == job_id).first()
+            meta = job.params if isinstance(job.params, dict) else {}
+            await _send_job_notification(
+                token=job.fcm_token,
+                job_id=job.job_id,
+                model=job.model,
+                success=False,
+                batch_id=meta.get("_batch_id"),
+                variation_index=int(meta.get("_variation_index", 0) or 0),
+                total_variations=int(meta.get("_total_variations", 1) or 1),
+            )
+            clear_cached_job_params(job_id)
+            return "failed"
     finally:
         db.close()
+    asyncio.create_task(_submit_runware_reject_to_kie(job_id))
+    return "rerouted"
 
 
 @public_router.post("/runware/callback")
