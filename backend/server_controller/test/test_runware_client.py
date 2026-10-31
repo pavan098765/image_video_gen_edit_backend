@@ -267,6 +267,20 @@ def test_response_parser_covers_webhook_poll_and_errors():
     assert failure_message(failed).startswith("The external provider")
     assert is_processing(failed) is False
 
+    alibaba = {
+        "errors": [
+            {
+                "taskUUID": "cb58bd98-25bc-4de7-afe2-fc705cb6e330",
+                "message": "Alibaba responded with HTTP 400. Additional information below.",
+                "responseContent": "width and height are not supported",
+            }
+        ]
+    }
+    detail = failure_message(alibaba)
+    assert detail is not None
+    assert "HTTP 400" in detail
+    assert "width and height are not supported" in detail
+
     audio = {"data": [{"audioURL": "https://am.runware.ai/audio/out.mp3", "status": "success"}]}
     assert media_url(audio).endswith("out.mp3")
 

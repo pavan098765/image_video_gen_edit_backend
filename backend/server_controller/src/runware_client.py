@@ -555,27 +555,45 @@ def task_uuid_of(payload: Any) -> Optional[str]:
     return None
 
 
+def _error_text(err: Dict[str, Any]) -> str:
+    """Runware puts the provider's reason in responseContent, not in message."""
+    parts: List[str] = []
+    summary = err.get("message") or err.get("code")
+    if isinstance(summary, str) and summary.strip():
+        parts.append(summary.strip())
+    extra = err.get("responseContent")
+    if extra in (None, ""):
+        extra = err.get("response")
+    if isinstance(extra, (dict, list)):
+        extra = str(extra)
+    if isinstance(extra, str):
+        extra = " ".join(extra.split())
+        if extra and extra not in parts:
+            parts.append(extra)
+    return " ".join(parts).strip()[:1500]
+
+
 def failure_message(payload: Any) -> Optional[str]:
     if media_url(payload):
         return None
     messages: List[str] = []
     for err in _error_items(payload):
-        text = err.get("message") or err.get("code")
-        if isinstance(text, str) and text.strip():
-            messages.append(text.strip())
+        text = _error_text(err)
+        if text:
+            messages.append(text)
     for task in _walk_tasks(payload):
         if str(task.get("status") or "").lower() != "error":
             continue
         nested = task.get("error")
         if isinstance(nested, dict):
-            text = nested.get("message") or nested.get("code")
-            if isinstance(text, str) and text.strip():
-                messages.append(text.strip())
+            text = _error_text(nested)
+            if text:
+                messages.append(text)
         elif isinstance(task.get("message"), str):
-            messages.append(task["message"].strip())
+            messages.append(task["message"].strip()[:1500])
     if not messages:
         return None
-    return messages[0][:500]
+    return messages[0]
 
 
 def is_processing(payload: Any) -> bool:
