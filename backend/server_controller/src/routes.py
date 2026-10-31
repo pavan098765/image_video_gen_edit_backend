@@ -484,6 +484,10 @@ def validate_model(model: str) -> str:
     from pod_manager import PodManager
     
     model_lower = model.lower()
+
+    # Phone-side music video. Credits only; the app renders the file.
+    if model_lower == "kala_music_video":
+        return model_lower
     
     if not _model_requirements:
         return model_lower
@@ -3359,6 +3363,71 @@ def _public_suno_music(job: Job) -> Optional[Dict[str, Any]]:
     return dict(music)
 
 
+_SUNO_LINK_SECONDS = 12 * 60
+
+
+def _suno_audio_links_stale(music: Dict[str, Any]) -> bool:
+    tracks = music.get("tracks") or []
+    has_audio = any(isinstance(track, dict) and track.get("audio_url") for track in tracks)
+    if not has_audio:
+        return False
+    try:
+        minted = float(music.get("download_minted_at") or 0)
+    except (TypeError, ValueError):
+        minted = 0
+    if time.time() - minted > _SUNO_LINK_SECONDS:
+        return True
+    return any(
+        isinstance(track, dict) and track.get("audio_url") and not track.get("download_url")
+        for track in tracks
+    )
+
+
+async def _mint_suno_audio_links(music: Dict[str, Any]) -> Dict[str, Any]:
+    """Mint a fresh 20-minute link for every clip. The original audio URL stays."""
+    fresh = dict(music)
+    tracks = []
+    for track in fresh.get("tracks") or []:
+        if not isinstance(track, dict):
+            continue
+        item = dict(track)
+        if item.get("audio_url"):
+            minted = await asyncio.to_thread(_mint_suno_url, item.get("audio_url"))
+            if minted:
+                item["download_url"] = minted
+        tracks.append(item)
+    if tracks:
+        fresh["tracks"] = tracks
+    fresh["download_minted_at"] = time.time()
+    return fresh
+
+
+async def _ensure_suno_download_links(db, job) -> Optional[Dict[str, Any]]:
+    """KIE download links die after 20 minutes. Refresh them when the phone asks."""
+    music = _public_suno_music(job)
+    if music is None:
+        return None
+    if str(job.status) != JobState.COMPLETED.value or not _suno_audio_links_stale(music):
+        return music
+    try:
+        fresh = await _mint_suno_audio_links(music)
+    except Exception as exc:
+        logger.warning("[SUNO] could not refresh download links for %s: %s", job.job_id, exc)
+        return music
+    params = dict(job.params or {})
+    params["_music"] = fresh
+    job.params = params
+    db.commit()
+    import suno_v6
+
+    logger.info(
+        "[SUNO] refreshed download links job=%s %s",
+        job.job_id,
+        suno_v6.track_log(fresh.get("tracks") or []),
+    )
+    return fresh
+
+
 def _mint_suno_url(url: Optional[str]) -> Optional[str]:
     import kie_client
 
@@ -4553,6 +4622,10 @@ async def submit_job(
         model = validate_model(payload.model)
     except InvalidModelError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # This model is rendered on the phone. Never assign a worker.
+    if model == "kala_music_video":
+        on_device_flag = True
     
     # Full params for dispatch (R2 keys only; embedded media rejected in SubmitRequest)
     full_params = dict(payload.params) if payload.params else {}
@@ -8176,7 +8249,7 @@ async def get_job_status(
             all_completed=all_completed,
             estimated_wait_seconds=estimated_wait_seconds,
             queue_position=queue_position,
-            music=_public_suno_music(job),
+            music=await _ensure_suno_download_links(db, job),
         )
     finally:
         db.close()

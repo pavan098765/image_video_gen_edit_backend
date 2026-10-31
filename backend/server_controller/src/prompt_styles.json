@@ -44,8 +44,12 @@
   "models": {
     "flux2_klein_9b": {
       "prompt": {
-        "refine": "Rewrite this as one image prompt in narrative prose, about 40 to 70 words. The first words are the priority, so put the subject first, then what they are doing, the place, the light, and the mood. Keep the user's subject, counts, and any exact color they named. Write a color as a hex code only when they already gave one. A short line will not be expanded later, so the prompt itself must carry the detail. Do not use keyword lists, tags, or a negative prompt.",
+        "refine": "Rewrite this as one image prompt in narrative prose, about 40 to 70 words. The first words are the priority, so put the subject first, then what they are doing, the place, the light, and the mood. Keep the user's subject and the scene they described. Do not swap in a different subject, place, or story. Keep counts and any exact color they named. Write a color as a hex code only when they already gave one. A short line will not be expanded later, so the prompt itself must carry the detail. Do not add writing, a title, or a logo unless they asked for words in the picture. Do not use keyword lists, tags, or a negative prompt.",
         "invent": "Write one original image prompt in narrative prose, about 40 to 70 words. Safe for all ages. Open with a clear subject, then the action, the place, the light, and the mood. Describe the scene the way a novelist would. Do not use keyword lists or tags, and do not add a negative prompt."
+      },
+      "album_cover": {
+        "refine": "Turn the song style and lyrics below into one square album-cover prompt, about 50 to 80 words of narrative prose. This picture is the official single artwork for a streaming page and a phone feed, so it has to look like a finished music release: bold, graphic, and specific. Use the places, objects, weather, and colors suggested by the lyrics and the style. Put that subject first. Do not depict a person singing, a vocalist, a microphone, a stage, a concert, headphones, or a crowd. Do not turn feelings into a portrait. Do not paint any words, a title, a logo, or a signature. Do not quote the lyrics.",
+        "invent": "Write one square album-cover prompt, about 50 to 80 words of narrative prose, for a finished music single. Safe for all ages. A bold graphic scene, place, or object, with cinematic light and rich color. No singer, no microphone, no stage, and no lettering."
       }
     },
     "flux2_klein_9b_edit": {
@@ -158,8 +162,8 @@
         "invent": "Write a complete original lyric, about 180 to 320 words of sung lines. Safe for all ages. Put [Intro], [Verse 1], [Verse 2], [Pre-Chorus], [Chorus], [Bridge], [Outro], and [End] each on its own line. One short modifier is allowed, as in [Chorus | anthemic], not a stack of modifiers. Repeat the chorus lines word for word under every [Chorus]. Give each verse its own lines. Ad-libs go in parentheses on their own line, three words or fewer."
       },
       "extend_lyrics": {
-        "refine": "Write only the next sung section, about 40 to 120 words. The text already in the box is the song so far, or a note about what should come next. Continue the theme, the point of view, and the rhyme. Do not copy the earlier verses back, except a chorus that should return word for word. Start with the next section tag on its own line, such as [Verse], [Chorus], or [Bridge]. One short modifier is allowed, as in [Chorus | anthemic]. Ad-libs go in parentheses on their own line, three words or fewer. Do not explain.",
-        "invent": "Write one new sung section that can follow a song, about 40 to 100 words. Safe for all ages. Start with [Verse] or [Chorus] on its own line. One short modifier is allowed, as in [Chorus | anthemic]. Do not explain and do not write a whole song."
+        "refine": "Write the next sung section of this song, a full verse and a chorus, about 80 to 160 words. The text is the song so far. Continue its theme, point of view, language, and rhyme. Do not copy the earlier verses back, except a chorus that should return word for word. Do not answer with only an outro, a post-outro, or an ending, and do not use [End] or [Post-Outro]. Start with [Verse] or [Chorus] on its own line. One short modifier is allowed, as in [Chorus | anthemic]. Ad-libs go in parentheses on their own line, three words or fewer. Do not explain.",
+        "invent": "Write a new verse and chorus that can follow a song, about 80 to 140 words. Safe for all ages. Start with [Verse] on its own line, then a [Chorus]. Do not write only an outro or use [End]. Do not explain and do not write a whole song."
       },
       "negative": {
         "refine": "Rewrite this as a few comma-separated audible exclusions, such as an unwanted instrument or vocal effect. Keep the user's exclusions. Do not restate the genre they want, and do not hide a phrase like no drums inside the style line.",

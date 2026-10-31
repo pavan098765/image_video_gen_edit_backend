@@ -87,6 +87,7 @@ def test_format_rules_from_the_vendor_guides():
     extend = instruction_for("suno_v6", "extend_lyrics", False).lower()
     assert "next sung section" in extend
     assert "complete song" not in extend
+    assert "[end]" not in extend or "do not use [end]" in extend
 
 
 def test_empty_box_selects_invent():

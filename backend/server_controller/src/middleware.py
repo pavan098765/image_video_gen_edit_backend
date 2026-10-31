@@ -120,6 +120,7 @@ ALLOWED_PATHS: List[str] = [
     "/get_media_upload_urls",  # R2 presigned media upload (images/videos)
     "/describe_asset_for_prompt",  # VLM caption from R2 key (Firebase auth)
     "/suggest_prompt",
+    "/eq_preset",              # HitMaker equalizer preset (Firebase auth)
     "/batch_status",           # Batch/variation status polling
     "/kie",
     "/runware",
@@ -147,6 +148,7 @@ TRUSTED_API_PATHS: List[str] = [
     "/get_media_upload_urls",
     "/describe_asset_for_prompt",
     "/suggest_prompt",
+    "/eq_preset",
     "/auth",  # Firebase auth endpoints require Bearer token
     "/admin",
 ]

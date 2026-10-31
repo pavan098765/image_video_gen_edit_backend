@@ -532,6 +532,7 @@ def test_extend_uses_a_saved_version_and_upload_extend_uses_a_file():
     assert extended.kie_input["audio_id"] == "audio-1"
     assert extended.kie_input["model"] == "V6"
     assert extended.kie_input["continue_at"] == 90
+    assert "duration" not in extended.kie_input
     assert "upload_url" not in extended.kie_input
     assert extended.music["commercial_rights"] is True
     assert extended.music["phase"] == "extending"
@@ -542,6 +543,26 @@ def test_extend_uses_a_saved_version_and_upload_extend_uses_a_file():
         "continue_at": 90,
     })
     assert "continue_at" not in omitted.kie_input
+
+    longer = suno_v6.prepare("", {
+        "action": "extend",
+        "audio_id": "audio-1",
+        "continue_at": 90,
+        "source_duration": 120,
+        "duration": 180,
+    })
+    assert longer.kie_input["duration"] == 180
+
+    try:
+        suno_v6.prepare("", {
+            "action": "extend",
+            "audio_id": "audio-1",
+            "source_duration": 120,
+            "duration": 90,
+        })
+        raise AssertionError("expected a shorter final length to be rejected")
+    except ValueError as exc:
+        assert "longer" in str(exc).lower()
 
     try:
         suno_v6.prepare("", {
@@ -693,3 +714,24 @@ def test_router_submits_the_lyrics_task():
         assert create.call_args.args[0] == "ai-music-api/generate-lyrics"
         assert result.raw["music"]["phase"] == "writing_lyrics"
         assert result.raw["suno_context"]["phase"] == "lyrics"
+
+
+def test_timestamped_lyrics_asks_kie_for_word_times():
+    prepared = suno_v6.prepare("", {
+        "action": "timestamped_lyrics",
+        "source_task_id": "task-9",
+        "audio_id": "audio-9",
+    })
+    assert prepared.kind == "timestamped"
+    assert prepared.kie_model == "ai-music-api/timeStamped-lyrics"
+    assert prepared.kie_input == {"task_id": "task-9", "audio_id": "audio-9"}
+    assert suno_v6.user_credit_cost({"action": "timestamped_lyrics"}) == 0
+    assert calculate_job_cost("suno_v6", {"action": "timestamped_lyrics"}) == 0
+    words = suno_v6.aligned_word_list({
+        "data": {"alignedWords": [{"word": "hello", "startS": 1.2, "endS": 1.6}], "hootCer": 0.9},
+    })
+    assert words[0]["word"] == "hello"
+    music = suno_v6.timestamped_music(prepared.music, "audio-9", words, {"hootCer": 0.9})
+    assert music["tracks"][0]["id"] == "audio-9"
+    assert music["aligned_words"][0]["startS"] == 1.2
+    assert music["phase"] == "complete"

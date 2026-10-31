@@ -92,6 +92,7 @@ FALLBACK_CREDIT_COSTS: Dict[str, Dict[str, int]] = {
             "voice": 2,
         },
     },
+    "kala_music_video": {"cost": 25, "cost_upscale": 0, "offer": 0},
     "flux2_klein_9b": {"cost": 10, "cost_upscale": 0, "offer": 0},
     "flux2_klein_9b_edit": {"cost": 10, "cost_upscale": 0, "offer": 0},
     "twinflow_z_image": {"cost": 6, "cost_upscale": 0, "offer": 0},
@@ -488,6 +489,18 @@ def calculate_job_cost(
 
     if model == "suno_v6":
         import suno_v6
+
+        timed = str((params or {}).get("action") or "").strip().lower().replace("-", "_")
+        if timed in ("timestamped_lyrics", "timestamped", "timed_lyrics"):
+            if return_meta:
+                return 0, {
+                    "model": model,
+                    "pricing_type": "suno_v6_action",
+                    "action": "timestamped_lyrics",
+                    "base_cost": 0,
+                    "effective_offer_percent": 0,
+                }
+            return 0
 
         per_job_cost = suno_v6.user_credit_cost(params, cost_info)
         if effective_offer_percent > 0:

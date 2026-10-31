@@ -1094,6 +1094,19 @@
         ],
         "eta_seconds_default": 180
     },
+    "kala_music_video": {
+        "preferred_variant": null,
+        "fallback_variants": [],
+        "min_tflops": {},
+        "allowed_gpu_names": [],
+        "min_gpu_count": 0,
+        "comment": "On-phone music video. The server only charges gems and never starts a worker.",
+        "group_id": "on_device",
+        "supported_models": [
+            "kala_music_video"
+        ],
+        "eta_seconds_default": 60
+    },
     "default": {
         "preferred_variant": null,
         "fallback_variants": []

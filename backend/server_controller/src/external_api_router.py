@@ -628,6 +628,43 @@ class ExternalApiRouter:
                 raw={"taskId": str(task_id), "music": prepared.music, "suno_context": prepared.context},
             )
 
+        if prepared.kind == "timestamped":
+            data: Dict[str, Any] = {}
+            try:
+                data = kie_client.create_task_response(prepared.kie_model, prepared.kie_input, callback_url)
+                words = suno_v6.aligned_word_list(data)
+                task_id = str(data.get("taskId") or data.get("task_id") or "") if isinstance(data, dict) else ""
+                if not words and task_id:
+                    for _ in range(6):
+                        time.sleep(0.6)
+                        info = kie_client.record_info(task_id)
+                        words = suno_v6.aligned_word_list(info)
+                        if words:
+                            data = info if isinstance(info, dict) else data
+                            break
+            except Exception as exc:
+                return ExternalExecutionResult(success=False, error=str(exc), provider="kie")
+            if not words:
+                return ExternalExecutionResult(
+                    success=False,
+                    error="Timed lyrics are not available for this version.",
+                    provider="kie",
+                    raw=data if isinstance(data, dict) else None,
+                )
+            music = suno_v6.timestamped_music(
+                prepared.music,
+                str((prepared.context or {}).get("audio_id") or ""),
+                words,
+                data,
+            )
+            return ExternalExecutionResult(
+                success=True,
+                result_text=json.dumps(music),
+                result_content_type="application/json",
+                provider="kie",
+                raw={"music": music, "suno_context": prepared.context},
+            )
+
         try:
             task_id = kie_client.create_task(prepared.kie_model, prepared.kie_input, callback_url)
         except Exception as exc:

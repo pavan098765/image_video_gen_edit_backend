@@ -35,6 +35,8 @@ ACTION_CREDITS = {
     "extend": SONG_USER_CREDITS,
     "upload_extend": SONG_USER_CREDITS,
     "mashup": SONG_USER_CREDITS,
+    # Kie bills about half a credit. The phone does not charge the user.
+    "timestamped_lyrics": 0,
 }
 
 KIE_MODELS = {
@@ -50,6 +52,7 @@ KIE_MODELS = {
     "extend": "ai-music-api/extend",
     "upload_extend": "ai-music-api/upload-and-extend-audio",
     "mashup": "ai-music-api/mashup",
+    "timestamped": "ai-music-api/timeStamped-lyrics",
 }
 
 PHASE_LABELS = {
@@ -131,6 +134,8 @@ def user_credit_cost(params: Optional[Dict[str, Any]], cost_info: Optional[Dict[
     overrides = {}
     if isinstance(cost_info, dict) and isinstance(cost_info.get("actionCosts"), dict):
         overrides = cost_info["actionCosts"]
+    if key == "timestamped_lyrics":
+        return 0
     if key in overrides:
         return max(1, int(overrides[key]))
     return ACTION_CREDITS[key]
@@ -165,11 +170,14 @@ def normalize_action(value: Any) -> str:
         "upload_extend": "upload_extend",
         "upload_and_extend": "upload_extend",
         "mashup": "mashup",
+        "timestamped_lyrics": "timestamped_lyrics",
+        "timestamped": "timestamped_lyrics",
+        "timed_lyrics": "timestamped_lyrics",
     }
     action = aliases.get(raw)
     if not action:
         raise ValueError(
-            "Choose a music action: song, lyrics, covers, video, stems, replace, sounds, extend, mashup, persona, or voice."
+            "Choose a music action: song, lyrics, covers, video, stems, replace, sounds, extend, mashup, persona, voice, or timestamped_lyrics."
         )
     return action
 
@@ -254,9 +262,35 @@ def prepare(prompt: str, params: Optional[Dict[str, Any]], *, for_submit: bool =
         return _prepare_persona(context, params)
     if action == "voice":
         return _prepare_voice(context, params)
+    if action == "timestamped_lyrics":
+        return _prepare_timestamped_lyrics(context)
     raise ValueError(
-        "Choose a music action: song, lyrics, covers, video, stems, replace, sounds, extend, mashup, persona, or voice."
+        "Choose a music action: song, lyrics, covers, video, stems, replace, sounds, extend, mashup, persona, voice, or timestamped_lyrics."
     )
+
+
+def _url_host(url: Optional[str]) -> str:
+    text = str(url or "").strip()
+    if "://" not in text:
+        return "-"
+    return text.split("://", 1)[1].split("/", 1)[0] or "-"
+
+
+def track_log(tracks: List[Dict[str, Any]]) -> str:
+    """One line per stored clip. Hosts only, so signed links are not written out."""
+    lines = []
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        words = track.get("lyrics") or track.get("prompt") or ""
+        lines.append(
+            f"{track.get('id') or '-'}:title={track.get('title') or '-'}"
+            f":duration={track.get('duration') or '-'}:lyrics={len(str(words))}"
+            f":audio={_url_host(track.get('audio_url'))}"
+            f":download={_url_host(track.get('download_url'))}"
+            f":stream={_url_host(track.get('stream_url'))}"
+        )
+    return " | ".join(lines) if lines else "none"
 
 
 def callback_summary(payload: Dict[str, Any]) -> str:
@@ -280,17 +314,18 @@ def callback_summary(payload: Dict[str, Any]) -> str:
                 if not isinstance(item, dict):
                     continue
                 clip_id = _first_text(item.get("id"), item.get("audio_id"), item.get("audioId")) or "-"
-                audio = bool(_first_text(item.get("audio_url"), item.get("audioUrl"), item.get("source_audio_url")))
-                stream = bool(_first_text(
+                audio = _first_text(item.get("audio_url"), item.get("audioUrl"), item.get("source_audio_url"))
+                stream = _first_text(
                     item.get("stream_audio_url"), item.get("stream_url"),
                     item.get("streamAudioUrl"), item.get("source_stream_audio_url"),
-                ))
-                raw_ids.append(f"{clip_id}:audio={int(audio)}:stream={int(stream)}")
+                )
+                words = item.get("prompt") or item.get("lyrics") or ""
+                raw_ids.append(
+                    f"{clip_id}:title={item.get('title') or '-'}:duration={item.get('duration') or '-'}"
+                    f":lyrics={len(str(words))}:audio={_url_host(audio)}:stream={_url_host(stream)}"
+                )
     event = interpret(payload if isinstance(payload, dict) else {})
-    parsed = [
-        f"{track.get('id') or '-'}:audio={int(bool(track.get('audio_url')))}:stream={int(bool(track.get('stream_url')))}"
-        for track in event.get("tracks") or []
-    ]
+    parsed = track_log(event.get("tracks") or [])
     return (
         f"code={payload.get('code') if isinstance(payload, dict) else '-'} "
         f"msg={payload.get('msg') if isinstance(payload, dict) else '-'} "
@@ -801,9 +836,23 @@ def _extend_fields(payload: Dict[str, Any], context: Dict[str, Any], params: Dic
     if context.get("negative_tags"):
         payload["negative_tags"] = context["negative_tags"]
     _add_custom_controls(payload, context, instrumental, include_duration=False)
+    target = _extend_duration(context)
+    if target is not None:
+        payload["duration"] = target
     continue_at = _continue_at(params, context.get("source_duration"))
     if continue_at is not None:
         payload["continue_at"] = continue_at
+
+
+def _extend_duration(context: Dict[str, Any]) -> Optional[float]:
+    """Final length of the extended song. V6 accepts duration from 10 to 360 seconds."""
+    target = context.get("duration")
+    if target is None:
+        return None
+    source = context.get("source_duration")
+    if source is not None and float(target) <= float(source):
+        raise ValueError("Final length has to be longer than this song.")
+    return target
 
 
 def _continue_at(params: Dict[str, Any], duration: Optional[float]) -> Optional[float]:
@@ -971,6 +1020,86 @@ def _prepare_voice(context: Dict[str, Any], params: Dict[str, Any]) -> Prepared:
     music["label"] = "Voice saved"
     music["note"] = "The voice can take about a minute to become usable. Pass it as persona_id with persona_model set to voice_persona."
     return Prepared(KIE_MODELS["voice"], payload, context, music, "voice")
+
+
+def _prepare_timestamped_lyrics(context: Dict[str, Any]) -> Prepared:
+    _require_source(context, "Timed lyrics")
+    context["phase"] = "lyrics"
+    payload = {
+        "task_id": context["source_task_id"],
+        "audio_id": context["audio_id"],
+    }
+    music = _blank_music(context, "writing_lyrics")
+    return Prepared(KIE_MODELS["timestamped"], payload, context, music, "timestamped")
+
+
+def _is_aligned_word_list(words: Any) -> bool:
+    if not isinstance(words, list) or not words:
+        return False
+    first = words[0]
+    if not isinstance(first, dict) or "word" not in first:
+        return False
+    start = first.get("startS", first.get("start_s"))
+    return isinstance(start, (int, float)) and not isinstance(start, bool)
+
+
+def aligned_word_list(payload: Any) -> List[Dict[str, Any]]:
+    """Pull KIE alignedWords out of a createTask or recordInfo body."""
+    found: List[List[Dict[str, Any]]] = []
+
+    def walk(node: Any, depth: int) -> None:
+        if found or depth > 8 or node is None:
+            return
+        if isinstance(node, dict):
+            words = node.get("alignedWords") or node.get("aligned_words")
+            if _is_aligned_word_list(words):
+                found.append(words)
+                return
+            for value in node.values():
+                walk(value, depth + 1)
+            return
+        if isinstance(node, list):
+            if _is_aligned_word_list(node):
+                found.append(node)
+                return
+            for item in node:
+                walk(item, depth + 1)
+
+    walk(payload, 0)
+    return list(found[0]) if found else []
+
+
+def _hoot_cer(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return None
+    direct = payload.get("hootCer", payload.get("hoot_cer"))
+    if direct is not None:
+        return direct
+    nested = payload.get("data")
+    if isinstance(nested, dict):
+        return nested.get("hootCer", nested.get("hoot_cer"))
+    return None
+
+
+def timestamped_music(
+    music: Dict[str, Any],
+    audio_id: str,
+    words: List[Dict[str, Any]],
+    payload: Any,
+) -> Dict[str, Any]:
+    current = copy.deepcopy(music or {})
+    confidence = _hoot_cer(payload)
+    current["aligned_words"] = words
+    if confidence is not None:
+        current["hoot_cer"] = confidence
+    current["tracks"] = [{
+        "id": audio_id,
+        "aligned_words": words,
+        "hoot_cer": confidence,
+    }]
+    current["phase"] = "complete"
+    current["label"] = PHASE_LABELS["complete"]
+    return current
 
 
 def _simple(context: Dict[str, Any], action: str, phase: str, payload: Dict[str, Any]) -> Prepared:
