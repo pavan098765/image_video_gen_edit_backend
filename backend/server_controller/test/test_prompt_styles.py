@@ -31,6 +31,7 @@ OWNED = [
     ("suno_v6", "prompt", "suno_missing"),
     ("suno_v6", "style", "suno_missing"),
     ("suno_v6", "lyrics", "suno_missing"),
+    ("suno_v6", "extend_lyrics", "suno_missing"),
     ("suno_v6", "negative", "suno_missing"),
     ("suno_v6", "negative_tags", "suno_missing"),
     ("suno_music", "prompt", "suno_missing"),
@@ -83,6 +84,9 @@ def test_format_rules_from_the_vendor_guides():
     assert "quotation marks" in instruction_for("recraft_v41_flash", "prompt", False).lower()
     assert "[Chorus]" in instruction_for("suno_v6", "lyrics", False)
     assert "[Chorus]" in instruction_for("suno_v6", "lyrics", True)
+    extend = instruction_for("suno_v6", "extend_lyrics", False).lower()
+    assert "next sung section" in extend
+    assert "complete song" not in extend
 
 
 def test_empty_box_selects_invent():
